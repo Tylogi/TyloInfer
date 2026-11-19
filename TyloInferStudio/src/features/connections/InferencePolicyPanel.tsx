@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import { Switch } from '../../shared/ui/Switch';
+import { InferencePolicyView } from './InferencePolicyView';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
 
@@ -32,17 +31,5 @@ export function InferencePolicyPanel() {
     }
   }
 
-  return <>
-    <SectionLabel title={tr('推理控制', 'Inference controls')} />
-    <TMPanel>
-      <SettingRow title="MTP"
-        detail={tr('关闭后，所有模型与 API 请求均使用普通解码。切换无需重载模型。', 'When off, all models and API requests use ordinary decoding. No model reload is needed.')}
-        trailing={<Switch label={tr('服务 MTP', 'Service MTP')} checked={enabled === true}
-          disabled={!ready || busy || typeof enabled !== 'boolean'} onCheckedChange={(next) => void changeMtp(next)} />} />
-      <SettingRow title={tr('视觉输入', 'Vision input')}
-        detail={tr('默认启用；关闭后图片和视频请求会被明确拒绝。', 'On by default; when off, image and video requests are rejected explicitly.')}
-        trailing={<Switch label={tr('视觉输入', 'Vision input')} checked={settings.enableVision}
-          onCheckedChange={next => updateSettings({ enableVision: next, inheritModelDefaults: false })} />} />
-    </TMPanel>
-  </>;
+  return <InferencePolicyView enabled={enabled} ready={ready} busy={busy} changeMtp={next => void changeMtp(next)} visionEnabled={settings.enableVision} changeVision={next => updateSettings({ enableVision: next, inheritModelDefaults: false })} tr={tr} />;
 }

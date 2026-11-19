@@ -2,6 +2,7 @@
 #include "tyloinfer/qsa_adaptive_cache.h"
 #include <memory>
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace tyloinfer::qsa {
@@ -16,6 +17,7 @@ struct CpuTqRow {
 // ordinary TQ16; smaller profiles keep the same bits-per-value payload budget.
 CpuTqRow fit_cpu_tq_row(const float* input,int bits,int candidate_budget=1024,int state_bits=16);
 std::vector<float> decode_cpu_tq_row(const CpuTqRow& row);
+std::vector<std::uint8_t> encode_cpu_qsa_affine8(const std::uint8_t* fp16_modes, std::size_t bytes, std::size_t rows);
 
 class CpuTqBlockFitter {
 public:

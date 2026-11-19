@@ -19,7 +19,7 @@ test('overview shares statistics scope with the compact footer and keeps concurr
           generated_tokens: 0, prefill_tps: 2400, decode_tps: 0, elapsed_seconds: 1, updated_at: 1 }] }],
     } });
   });
-  await page.goto('/');
+  await page.goto('/inference');
   const footer = page.locator('.overview-footer-grid');
   const summary = footer.locator('.overview-session-panel');
   await expect(footer.locator('.overview-endpoint-panel')).toBeVisible();

@@ -120,7 +120,8 @@ __global__ void pack_archive(const uint8_t* k,const uint8_t* v,const float* raw,
     else if(at-2*bytes<values)reinterpret_cast<half*>(output+2*bytes)[at-2*bytes]=__float2half_rn(raw[at-2*bytes]);
 }
 __global__ void archive_indexer(const int16_t* codes,const uint16_t* scales,const int16_t* zero,
-        uint16_t* output,int width,int64_t start,const int64_t* position) {
+        uint16_t* output,int width,int64_t start,const int64_t* position,bool complete_only) {
+    if(complete_only && ((*position&3)!=3))return;
     const auto block=position?*position/4:start+blockIdx.x;
     auto* destination=output+int64_t(blockIdx.x)*(width+2);
     for(int d=threadIdx.x;d<width;d+=blockDim.x)destination[d]=uint16_t(codes[block*width+d]);
@@ -232,7 +233,8 @@ template<int W,bool Query=false> __global__ void append_pending(const void* keys
 }
 
 __global__ void finalize_pending(const float* km,const float* vm,const float* raw,const TqBlockView* destination,
-    TqBlockView* views,const int64_t* position,uint8_t* archive,int rows,int iw,int slots) {
+    TqBlockView* views,const int64_t* position,uint8_t* archive,int rows,int iw,int slots,bool complete_only) {
+    if(complete_only && ((*position&3)!=3))return;
     const int row=blockIdx.x,kind=blockIdx.y,d=threadIdx.x,lane=d&31,warp=d/32;
     const auto view=destination[(*position/4)%slots];
     if((view.key_bits&255u)==0 && (view.value_bits&255u)==0) {
@@ -324,7 +326,8 @@ template<int W,bool F16> __global__ void prepare_modes(const void* keys,const vo
 }
 
 template<bool Records=false> __global__ void affine_encode(const float* input,int16_t* output,uint16_t* scales,
-                            int16_t* zero,int width,const int64_t* position=nullptr,int capacity=INT_MAX) {
+                            int16_t* zero,int width,const int64_t* position=nullptr,int capacity=INT_MAX,bool complete_only=false) {
+    if(complete_only && ((*position&3)!=3))return;
     const int input_row=blockIdx.x,lane=threadIdx.x;
     const int64_t row=position?*position/4+input_row:input_row;
     if(row>=capacity)return;
@@ -825,9 +828,11 @@ template<int W,bool Snapshots,int SG> __device__ __forceinline__ void sparse_att
             const bool causal=valid && (selected_block.token_mask&(1u<<t)) && int64_t(selected_block.id)*4+t<=boundary;
             scores[t]=causal?dot:-CUDART_INF_F;block_top=fmaxf(block_top,scores[t]);
         }
-        float block_mass=0;
-        for (int t=0;t<4;++t){weights[t]=isfinite(scores[t])?expf(scores[t]-block_top):0;block_mass+=weights[t];}
-        if(active && !lane) block_log_mass[row*count+slot]=block_mass>0?block_top+logf(block_mass):-CUDART_INF_F;
+        for (int t=0;t<4;++t)weights[t]=isfinite(scores[t])?expf(scores[t]-block_top):0;
+        if(block_log_mass && active && !lane) {
+            const float block_mass=((weights[0]+weights[1])+weights[2])+weights[3];
+            block_log_mass[row*count+slot]=block_mass>0?block_top+logf(block_mass):-CUDART_INF_F;
+        }
         const float top=fmaxf(maximum,block_top);
         const float factor=isfinite(maximum)?expf(maximum-top):0;
         mass*=factor;
@@ -943,10 +948,12 @@ template<int W,bool Snapshots> __global__ void sparse_attention_mma(const float*
             const float weight=isfinite(score)?expf(score-top):0;
             mass[r]=mass[r]*factors[r]+warp_sum(weight);maximum[r]=top;
             if(lane<16)probability[local*16+lane]=__float2half_rn(weight);
-            const float sum2=weight+__shfl_xor_sync(0xffffffff,weight,1);
-            const float sum4=sum2+__shfl_xor_sync(0xffffffff,sum2,2);
-            if(active && lane<16 && !(lane&3) && first+lane/4<end)
-                block_log_mass[(int64_t(token)*heads+head)*count+first+lane/4]=sum4>0?top+logf(sum4):-CUDART_INF_F;
+            if(block_log_mass) {
+                const float sum2=weight+__shfl_xor_sync(0xffffffff,weight,1);
+                const float sum4=sum2+__shfl_xor_sync(0xffffffff,sum2,2);
+                if(active && lane<16 && !(lane&3) && first+lane/4<end)
+                    block_log_mass[(int64_t(token)*heads+head)*count+first+lane/4]=sum4>0?top+logf(sum4):-CUDART_INF_F;
+            }
         }
         __syncthreads();
         for(int column=warp;column<W/16;column+=4) {
@@ -1055,7 +1062,7 @@ template<int W,bool Half> __global__ void merge_output(const float* partial,cons
             factors[p]=factor;local_mass+=factor*stats[at+1];
         }
         const float mass=warp_sum(local_mass);
-        if(!d){denominator=mass;log_norm[row]=mass>0?maximum+logf(mass):-CUDART_INF_F;}
+        if(!d){denominator=mass;if(log_norm)log_norm[row]=mass>0?maximum+logf(mass):-CUDART_INF_F;}
     }
     __syncthreads();
     float sum=0;
@@ -1073,7 +1080,7 @@ template<int W,bool Half> __global__ void merge_output(const float* partial,cons
     }
 }
 
-__global__ void observe_mass(const SelectedBlock* selected,const int64_t* positions,const float* block_log_mass,
+template<bool Mass> __global__ void observe_selection(const SelectedBlock* selected,const int64_t* positions,const float* block_log_mass,
     const float* log_norm,float* hits,float* mass,int heads,int count) {
     // Each warp reads adjacent blocks for one query head. Four warps share
     // the head reduction, keeping those reads coalesced while shortening
@@ -1088,6 +1095,10 @@ __global__ void observe_mass(const SelectedBlock* selected,const int64_t* positi
         const auto visible=positions[token]-int64_t(block.id)*4+1;
         const auto causal_mask=visible<=0?0u:visible>=4?15u:(1u<<int(visible))-1;
         active=block.id>=0 && (block.token_mask&causal_mask);
+    }
+    if constexpr(!Mass) {
+        if(active)atomicAdd(hits+block.id,1.f);
+        return;
     }
     float value=0;
     for (int h=warp;active && h<heads;h+=head_warps) {
@@ -1143,10 +1154,22 @@ template<int W,bool Snapshots> int launch_attention(const void* query,const floa
 #undef ATTEND
     if(output_half)merge_output<W,true><<<queries*heads,W,0,stream>>>(partial,stats,vs,output,log_norm,width,parts,gate,gate_half,heads,gt,gh);
     else merge_output<W,false><<<queries*heads,W,0,stream>>>(partial,stats,vs,output,log_norm,width,parts,gate,gate_half,heads,gt,gh);
-    if (hits && mass)observe_mass<<<dim3((count+31)/32,queries),dim3(32,4),0,stream>>>(selected,positions,block_log_mass,log_norm,hits,mass,heads,count);
+    if(hits) {
+        if(!mass)return tq_observe_selection_hits(selected,positions,hits,queries,count,stream);
+        observe_selection<true><<<dim3((count+31)/32,queries),dim3(32,4),0,stream>>>(
+            selected,positions,block_log_mass,log_norm,hits,mass,heads,count);
+    }
     return int(cudaGetLastError());
 }
 } // namespace
+
+int tq_observe_selection_hits(const SelectedBlock* selected,const int64_t* positions,
+        float* hits,int queries,int count,cudaStream_t stream) {
+    if(!selected || !positions || !hits || queries<=0 || count<=0)return int(cudaErrorInvalidValue);
+    observe_selection<false><<<dim3(unsigned((int64_t(count)+31)/32),queries),32,0,stream>>>(
+        selected,positions,nullptr,nullptr,hits,nullptr,0,count);
+    return int(cudaGetLastError());
+}
 
 int tq_attention_partitions(int queries,int heads,int kv_heads,int padded,int count,
     bool fp16,bool fp16_math,bool snapshots) {
@@ -1209,9 +1232,9 @@ int indexer_affine16_encode(const float* input,int16_t* output,uint16_t* scales,
     affine_encode<false><<<rows,32,0,stream>>>(input,output,scales,zero,width);return int(cudaGetLastError());
 }
 int indexer_affine16_append(const float* input,int16_t* output,uint16_t* scales,int16_t* zero,
-    const int64_t* position,int width,cudaStream_t stream) {
+    const int64_t* position,int width,cudaStream_t stream,bool complete_only) {
     if(!input || !output || !scales || !zero || !position || width<=0)return int(cudaErrorInvalidValue);
-    affine_encode<false><<<1,32,0,stream>>>(input,output,scales,zero,width,position);return int(cudaGetLastError());
+    affine_encode<false><<<1,32,0,stream>>>(input,output,scales,zero,width,position,INT_MAX,complete_only);return int(cudaGetLastError());
 }
 int indexer_affine16_append_batch(const float* input,int16_t* output,uint16_t* scales,int16_t* zero,
     const int64_t* position,int rows,int width,int capacity,cudaStream_t stream) {
@@ -1307,10 +1330,10 @@ int tq_pack_archive(const uint8_t* k,const uint8_t* v,const float* raw,uint8_t* 
     return int(cudaGetLastError());
 }
 int tq_archive_indexer(const int16_t* codes,const uint16_t* scales,const int16_t* zero,
-        uint8_t* archive,std::size_t offset,int blocks,int width,int64_t start,const int64_t* position,cudaStream_t stream) {
+        uint8_t* archive,std::size_t offset,int blocks,int width,int64_t start,const int64_t* position,cudaStream_t stream,bool complete_only) {
     if(!codes || !scales || !zero || !archive || (offset&1) || blocks<=0 || width<=0 ||
-            (!position && (start<0 || start>INT64_MAX-blocks)) || (position && blocks!=1))return int(cudaErrorInvalidValue);
-    archive_indexer<<<blocks,128,0,stream>>>(codes,scales,zero,reinterpret_cast<uint16_t*>(archive+offset),width,start,position);
+            (!position && (complete_only || start<0 || start>INT64_MAX-blocks)) || (position && blocks!=1))return int(cudaErrorInvalidValue);
+    archive_indexer<<<blocks,128,0,stream>>>(codes,scales,zero,reinterpret_cast<uint16_t*>(archive+offset),width,start,position,complete_only);
     return int(cudaGetLastError());
 }
 int tq_copy_pending_tail(PendingTail source,PendingTail destination,int heads,int width,int padded,int iw,cudaStream_t stream) {
@@ -1361,9 +1384,9 @@ int tq_append_pending(const void* key,const void* value,const void* index,bool k
     return int(cudaGetLastError());
 }
 int tq_finalize_pending(const float* km,const float* vm,const float* raw,const TqBlockView* destination,
-    TqBlockView* views,const int64_t* position,uint8_t* archive,int rows,int iw,int slots,cudaStream_t stream) {
+    TqBlockView* views,const int64_t* position,uint8_t* archive,int rows,int iw,int slots,cudaStream_t stream,bool complete_only) {
     if(!km || !vm || !raw || !destination || !views || !position || !archive || rows<=0 || iw<=0 || slots<=0)return int(cudaErrorInvalidValue);
-    finalize_pending<<<dim3(rows,2),256,0,stream>>>(km,vm,raw,destination,views,position,archive,rows,iw,slots);
+    finalize_pending<<<dim3(rows,2),256,0,stream>>>(km,vm,raw,destination,views,position,archive,rows,iw,slots,complete_only);
     return int(cudaGetLastError());
 }
 int tq_initialize_destinations(uint8_t* payload,TqBlockView* output,int bytes,int slots,cudaStream_t stream) {
@@ -1386,7 +1409,7 @@ int tq_sparse_attention_staged(const uint16_t* staged_keys,const uint16_t* stage
     int queries,int heads,int kv_heads,int width,int padded,int count,int parts,int64_t ts,int64_t hs,cudaStream_t stream,bool snapshots,
     const void* gate,bool gate_half,bool output_half,int64_t gt,int64_t gh,bool query_half,bool allow_fp16_math,bool query_pre_rotated) {
     if (!query || !ks || !vs || !relative || !blocks || !selected || !positions || !output || !rotated ||
-        !partial || !stats || !block_log_mass || !log_norm || queries<=0 || heads<=0 || kv_heads<=0 ||
+        !partial || !stats || (mass && (!hits || !block_log_mass || !log_norm)) || queries<=0 || heads<=0 || kv_heads<=0 ||
         heads%kv_heads || width<=0 || width>padded || count<=0 || parts<=0 || parts>128 || ts<=0 || hs<=0 || (gate && (gt<=0 || gh<=0)))
         return int(cudaErrorInvalidValue);
 #define CALL(W,S) launch_attention<W,S>(query,ks,vs,relative,blocks,selected,positions,output,rotated,partial,stats,block_log_mass,log_norm,hits,mass,queries,heads,kv_heads,width,count,parts,ts,hs,stream,gate,gate_half,output_half,gt,gh,query_half,allow_fp16_math,query_pre_rotated,staged_keys,staged_values)

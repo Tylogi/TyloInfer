@@ -17,12 +17,12 @@ export function NotFoundPage() {
         </div>
         <h1 id="not-found-title">{tr('页面不存在', 'Page not found')}</h1>
         <p className="failure-page-description">
-          {tr('这个地址没有对应的页面。请检查网址，或返回概览继续使用。', 'There is no page at this address. Check the URL or return to the overview.')}
+          {tr('这个地址没有对应的页面。请检查网址，或返回工作台继续使用。', 'There is no page at this address. Check the URL or return to the Agent workspace.')}
         </p>
         <div className="failure-page-actions">
           <button className="failure-page-primary" onClick={() => navigate('/')} type="button">
             <HouseIcon size={16} />
-            {tr('返回概览', 'Back to overview')}
+            {tr('返回工作台', 'Back to workspace')}
           </button>
           <button
             className="failure-page-secondary"

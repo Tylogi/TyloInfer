@@ -11,14 +11,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from tyloinfer.server.api.auth import ApiKeyManager, AuthenticationPolicy, required_scope
 from tyloinfer.server.api.anthropic_compat import (
     error_body as anthropic_error_body,
+)
+from tyloinfer.server.api.anthropic_compat import (
     error_type as anthropic_error_type,
+)
+from tyloinfer.server.api.anthropic_compat import (
     is_anthropic_request,
 )
-from tyloinfer.server.api.routes.anthropic import router as anthropic_router
+from tyloinfer.server.api.auth import ApiKeyManager, AuthenticationPolicy, required_scope
 from tyloinfer.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
+from tyloinfer.server.api.routes.anthropic import router as anthropic_router
 from tyloinfer.server.api.routes.auth import router as auth_router
 from tyloinfer.server.api.routes.jobs import event_router as job_event_router
 from tyloinfer.server.api.routes.jobs import router as job_router
@@ -31,9 +35,9 @@ from tyloinfer.server.api.routes.runtime import router as runtime_router
 from tyloinfer.server.api.routes.sessions import initial_router as initial_session_router
 from tyloinfer.server.api.routes.sessions import router as session_router
 from tyloinfer.server.api.static import SPAStaticFiles
+from tyloinfer.server.instance import server_identity as make_server_identity
 from tyloinfer.server.protocol.models import ErrorDetail, ErrorResponse
 from tyloinfer.server.services.service import ServerService, ServiceError
-from tyloinfer.server.instance import server_identity as make_server_identity
 
 
 def create_app(
@@ -61,6 +65,7 @@ def create_app(
         title="TyloInfer Server API",
         summary="Persistent sessions, media, model workers, and realtime inference",
         version="1.0.0",
+        separate_input_output_schemas=False,
         lifespan=lifespan,
     )
     app.openapi_version = "3.1.0"

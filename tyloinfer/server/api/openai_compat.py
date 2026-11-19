@@ -352,7 +352,7 @@ async def collect_chat_completion(
         ],
     }
     if accumulator.usage is not None:
-        result["usage"] = accumulator.usage.model_dump(mode="json")
+        result["usage"] = accumulator.usage.model_dump(mode="json", exclude_none=True)
     if accumulator.performance is not None:
         result["mfq_metrics"] = accumulator.performance.model_dump(mode="json")
     return result
@@ -500,7 +500,7 @@ async def stream_chat_completion(
                 "choices": [],
             }
             if final_usage is not None:
-                usage_payload["usage"] = final_usage.model_dump(mode="json")
+                usage_payload["usage"] = final_usage.model_dump(mode="json", exclude_none=True)
             if final_performance is not None:
                 usage_payload["mfq_metrics"] = final_performance.model_dump(mode="json")
             yield _sse(usage_payload)

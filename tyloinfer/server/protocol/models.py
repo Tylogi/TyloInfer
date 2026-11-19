@@ -309,10 +309,15 @@ class ErrorDetail(ProtocolModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class PromptTokenDetails(ProtocolModel):
+    cached_tokens: int = Field(ge=0)
+
+
 class TokenUsage(ProtocolModel):
     prompt_tokens: int = Field(ge=0)
     completion_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
+    prompt_tokens_details: PromptTokenDetails | None = None
 
 
 class ToolFunctionDefinition(ProtocolModel):
@@ -542,6 +547,7 @@ class QsaKvStorageSettings(ProtocolModel):
 
 
 class KvMemorySettings(ProtocolModel):
+    qsa_mode: Literal["auto", "fp16", "affine8", "tq4", "legacy"] = "auto"
     placement: Literal["auto", "auto_ssd", "vram", "ram"] = "auto"
     allocation: Literal["preallocated", "dynamic"] = "preallocated"
     gpu_budget_bytes: int | None = Field(default=None, ge=1, le=1 << 50)

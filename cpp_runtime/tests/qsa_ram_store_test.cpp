@@ -47,6 +47,83 @@ std::shared_ptr<mfq::cache::QsaKvStore> disk(const std::filesystem::path& path) 
     mfq::cache::QsaKvStoreConfig c;c.directory=path.string();c.buffer_bytes=c.budget_bytes=64<<10;
     return std::make_shared<mfq::cache::QsaKvStore>(c);
 }
+void check_backed_eviction(const std::filesystem::path& root) {
+    tq::RamKvStoreConfig config;
+    config.pressure.ssd_enabled=config.prefix_enabled=true;
+    config.session_ssd=disk(root);
+    tq::RamKvStore store(config,allocate,[](const auto&,auto)->std::vector<tq::RamKvImagePtr> {
+        throw std::runtime_error("Eviction with a durable backing invoked the codec");
+    },[](const auto&){});
+    auto backing=std::make_shared<tq::RamKvBacking>();
+    backing->key_bytes=backing->value_bytes=512;
+    backing->tier=tq::RamKvTier::Fp16;
+    qsa_test::reader(*backing).read_range=[](std::size_t,std::size_t)->std::vector<std::uint8_t> {
+        throw std::runtime_error("Eviction read the durable backing");
+    };
+    const std::array<std::size_t,3> sizes{1024,512,256};
+    store.append(image(1),sizes,1);
+    store.append(image(2),sizes,2,backing);
+    store.append_at_tier(image(3,256,4),sizes,tq::RamKvTier::Tq4,3,backing);
+    store.append(image(4),sizes,4,backing);
+    auto lease=store.resident(1);
+    const auto old_generation=store.generation(2);
+    const auto plan=store.evict_backed(store.stats().ram_bytes-256);
+    if(!plan.fits() || !store.resident(0) || !store.resident(1) || store.resident(2) || !store.resident(3)
+            || store.generation(2)<=old_generation || store.backing(2)!=backing || store.stats().ssd_written_bytes)
+        throw std::runtime_error("Backed eviction changed unbacked, leased or hotter KV images");
+}
+void check_pressure_spill_preserves_precision(const std::filesystem::path& root) {
+    tq::RamKvStoreConfig config;
+    config.pressure.ssd_enabled=true;
+    config.session_ssd=disk(root);
+    tq::RamKvStore store(config,allocate,[](const auto&,auto)->std::vector<tq::RamKvImagePtr> {
+        throw std::runtime_error("A partial precision batch was sent to the codec");
+    },[](const auto&){});
+    const std::array<std::size_t,3> sizes{1024,512,256};
+    store.append(image(1),sizes,1);
+    store.append(image(2),sizes,2);
+    const auto expected=store.source(0).read();
+    const auto version=store.generation(0);
+    if(store.maintain(1024,true).fits())throw std::runtime_error("Fixture did not reach the protected partial batch");
+    if(!store.spill_preserving_precision(1024).fits() || store.resident(0) || !store.resident(1) ||
+            store.backing(0)->tier!=tq::RamKvTier::Fp16 || store.generation(0)!=version)
+        throw std::runtime_error("Exact spill did not preserve the cold block version and tier");
+    const auto recalled=store.source(0).read();
+    if(recalled.key!=expected.key || recalled.value!=expected.value)
+        throw std::runtime_error("Exact spill changed the cold block bytes");
+    auto restore=store.snapshot(2);
+    restore->blocks[0].tier=tq::RamKvTier::Fp16;
+    store.restore(*restore,1024,true,false);
+    const auto restored=store.source(0).read();
+    if(store.resident(0) || !store.resident(1) || store.backing(0)!=restore->blocks[0].backing ||
+            restored.key!=expected.key || restored.value!=expected.value)
+        throw std::runtime_error("Tight prefix restore changed the durable cold block");
+}
+void check_fixed_precision(const std::filesystem::path& root) {
+    for(unsigned tier=0;tier<3;++tier) {
+        const unsigned tag=tier==0?0:tier==1?254:4;const int bytes=1024>>tier;
+        for(bool ssd:{false,true}) {
+            tq::RamKvStoreConfig cfg;cfg.pressure.canonical_tier=tq::RamKvTier(tier);
+            cfg.pressure.adaptive_precision=false;cfg.pressure.ssd_enabled=ssd;
+            if(ssd)cfg.session_ssd=disk(root/std::to_string(tier));
+            tq::RamKvStore store(cfg,allocate,[](const auto&,auto)->std::vector<tq::RamKvImagePtr> {
+                throw std::runtime_error("Fixed precision invoked a quantization codec");
+            },[](const auto&){});
+            for(unsigned i=0;i<16;++i)store.append(image(i,bytes,tag),{1024,512,256},i);
+            if(store.stats().resident_target_bytes!=std::size_t(16*bytes))
+                throw std::runtime_error("Fixed precision used an adaptive RAM target");
+            const auto plan=store.maintain(0);
+            if(plan.fits()!=ssd || store.stats().quantized_blocks)
+                throw std::runtime_error("Fixed precision changed instead of preserving storage");
+            if(ssd)for(unsigned i=0;i<16;++i) {
+                const auto original=store.read(i,0,false);
+                if(original->key_bits!=tag || original->value_bits!=tag || original->bytes()!=std::size_t(bytes) || original->key[0]!=std::uint8_t(i))
+                    throw std::runtime_error("Fixed SSD recall changed the original image");
+            }
+        }
+    }
+    std::cout<<"Fixed FP16/Affine8/TQ4: no silent demotion, original-precision SSD spill/recall PASS\n";
+}
 void check_deferred_reads(const std::filesystem::path& root) {
     tq::RamKvStoreConfig cfg;cfg.pressure.canonical_tier=tq::RamKvTier::Tq4;
     cfg.pressure.ssd_enabled=true;cfg.prefix_enabled=true;cfg.session_ssd=disk(root);
@@ -77,6 +154,13 @@ void check_deferred_reads(const std::filesystem::path& root) {
     assert(allocations==before_allocations && !store.resident(0) && store.stats().ram_bytes==1024);
     store.truncate(1);
     store.append(image(31,256,4),{1024,512,256},1);
+    tq::RamKvImage borrowed;
+    borrowed.key=bytes.key.data();borrowed.value=bytes.value.data();
+    borrowed.key_bytes=bytes.key.size();borrowed.value_bytes=bytes.value.size();
+    borrowed.key_bits=bytes.key_bits;borrowed.value_bits=bytes.value_bits;
+    borrowed.key_state_bits=bytes.key_state_bits;borrowed.value_state_bits=bytes.value_state_bits;
+    store.admit_read(0,source.generation,borrowed,256,false);
+    assert(allocations==before_allocations && !store.resident(0) && store.resident(1));
     {
         auto selected=store.lease({1},40);
         store.admit_read(0,source.generation,bytes,256);
@@ -576,9 +660,10 @@ void check_random_prefix_batch() {
     std::vector<std::uint8_t> bytes(1024);for(std::size_t i=0;i<bytes.size();++i)bytes[i]=std::uint8_t(i*13+7);
     unsigned single=0,batches=0;std::size_t transferred=0;
     source->read_range_into=[&](std::size_t offset,std::uint8_t* destination,std::size_t count){++single;transferred+=count;std::memcpy(destination,bytes.data()+offset,count);};
-    source->read_ranges_into=[&](const std::vector<mfq::ReadSpan>& spans){
+    const auto read_batch=[&](const std::vector<mfq::ReadSpan>& spans){
         ++batches;for(const auto& span:spans){transferred+=span.size;std::memcpy(span.destination,bytes.data()+span.offset,span.size);}
     };
+    source->read_ranges_into=read_batch;
     tq::RamKvStoreConfig config;tq::RamKvStore store(config,allocate,encode,[](const auto&){});
     std::vector<tq::RamKvSnapshotBlock> blocks(3);std::vector<std::vector<std::uint8_t>> output(3,std::vector<std::uint8_t>(64,0xa5));
     std::vector<tq::RamKvReadInto> reads;
@@ -603,6 +688,26 @@ void check_random_prefix_batch() {
     source->read_ranges_into=[](const auto&){throw std::runtime_error("expected batch source error");};
     try{store.read_cpu_into_batch(reads,false);assert(false);}catch(const std::runtime_error& e){assert(std::string(e.what())=="expected batch source error");}
     assert(store.stats().ssd_read_bytes==216);
+    source->read_ranges_into=read_batch;
+    tq::RamKvSnapshot snapshot;snapshot.blocks=blocks;
+    for(auto& block:snapshot.blocks)block.bytes={144,72,36};
+    std::size_t restored=0;
+    store.restore_reserved(snapshot,108,false,[&](std::size_t id){assert(id==restored);++restored;},
+        [](const auto& layout,std::size_t remaining) {
+            assert(layout.key_bytes==17 && layout.value_bytes==19 && remaining>0);
+            auto storage=std::make_shared<std::vector<std::uint8_t>>(64,0xa5);
+            auto image=std::make_shared<tq::RamKvImage>(layout);image->owner=storage;
+            image->key=storage->data();image->value=storage->data()+32;
+            return image;
+        });
+    assert(restored==blocks.size() && batches==2 && single==before && transferred==324);
+    assert(store.stats().ssd_read_bytes==216 && store.stats().ram_bytes==108);
+    for(std::size_t id=0;id<blocks.size();++id) {
+        const auto image=store.resident(id);const auto offset=blocks[id].backing->offset;
+        assert(std::equal(image->key,image->key+17,bytes.data()+offset));
+        assert(std::equal(image->value,image->value+19,bytes.data()+offset+17));
+        assert(image->value[19]==0xa5);
+    }
     std::cout<<"Random prefix batch exact ranges/duplicates/padding, prevalidation, legacy fallback and failure propagation PASS\n";
 }
 void check_relocation() {
@@ -942,6 +1047,9 @@ int main(int argc,char** argv)try {
         root=parent/("r"+std::to_string(id));
         if(std::filesystem::create_directory(root))break;
     }
+    check_fixed_precision(root/"fixed-precision");
+    check_backed_eviction(root/"backed-eviction");
+    check_pressure_spill_preserves_precision(root/"exact-pressure-spill");
     check_deferred_reads(root/"deferred");
     check_session_read_window(root/"session-window");
     check_native_file_batch(root/"packed-native-files",true);
@@ -1028,8 +1136,14 @@ int main(int argc,char** argv)try {
         tq::RamKvStore indexed(config,allocate,encode,[](const auto&){});
         indexed.append(image(77,256,4),{1024,512,256},1,backing);indexed.append(image(77,256,4),{1024,512,256},1,backing);
         assert(indexed.maintain(256).fits());indexed.touch({0},2);
+        const auto generation=indexed.generation(0);
         auto read=std::async(std::launch::async,[&]{return indexed.read(0,256);});
-        ready.wait();indexed.touch({0},50);resume.set_value();auto image=read.get();
+        ready.wait();
+        auto optional=std::async(std::launch::async,[&]{indexed.admit_read(0,generation,image(77,256,4),512,false);});
+        const auto skipped=optional.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+        indexed.touch({0},50);resume.set_value();
+        optional.get();auto image=read.get();
+        if(!skipped)throw std::runtime_error("Optional SSD recall waited for RAM maintenance");
         indexed.touch({0},60);indexed.touch({1},40);(void)indexed.read(1,256);
         assert(indexed.resident(0)==image && !indexed.resident(1));
     }

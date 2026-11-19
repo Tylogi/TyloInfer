@@ -16,6 +16,8 @@ struct RamKvImage {
     const std::uint8_t* value=nullptr;
     std::size_t key_bytes=0,value_bytes=0;
     std::uint8_t key_bits=0,value_bits=0,key_state_bits=16,value_state_bits=16;
+    // A request owns its image lease and shares the encoded allocation.
+    bool shared_prefix_allocation=false;
     std::size_t bytes()const{return key_bytes+value_bytes;}
 };
 using RamKvImagePtr=std::shared_ptr<const RamKvImage>;
@@ -63,6 +65,7 @@ struct RamKvStoreConfig {
 };
 struct RamKvStoreStats {
     std::size_t blocks=0,ram_bytes=0;
+    std::size_t shared_prefix_ram_bytes=0;
     // Capacity for this context's nominal precision mix, before SSD eviction.
     std::size_t resident_target_bytes=0;
     std::size_t session_disk_bytes=0;
@@ -101,9 +104,11 @@ public:
     // Synchronously copy a borrowed encoded image directly into backend
     // storage, without constructing temporary owning K/V arrays.
     using AllocateView=std::function<RamKvImagePtr(const RamKvImage&)>;
-    // Remaining images of this K/V byte extent in the current policy batch,
-    // including the current one. File-only blocks are excluded from the hint.
     using RestoreAllocate=std::function<RamKvImagePtr(const MicroblockImage&,std::size_t)>;
+    // Reserve writable storage for this layout, with V at align16(key_bytes).
+    // The count includes this image and the remaining images of the same size
+    // in the batch. Blocks kept exclusively on SSD are excluded.
+    using RestoreReserve=std::function<RamKvImagePtr(const RamKvImage&,std::size_t)>;
     using Encode=std::function<std::vector<RamKvImagePtr>(const std::vector<RamKvImagePtr>&,RamKvTier)>;
     // Queue descriptors in stream order and retain each previous owner until
     // preceding GPU readers finish. Publication must have a strong exception
@@ -127,6 +132,10 @@ public:
     // Optional format maintenance may quantize full batches without spilling
     // data to SSD merely to meet its artificial byte target.
     RamPressurePlan maintain(std::size_t budget,bool allow_ssd=true);
+    // Reclaim cold images that have a durable copy without coding or writing.
+    RamPressurePlan evict_backed(std::size_t budget);
+    // Under physical pressure, use SSD placement without changing the live encoding.
+    RamPressurePlan spill_preserving_precision(std::size_t budget);
     // Replace immutable physical images without changing precision, LRU,
     // generation or backing. Publication retains every previous reader.
     using Relocate=std::function<std::vector<RamKvRelocation>(const std::vector<RamKvImagePtr>&)>;
@@ -155,8 +164,10 @@ public:
     void read_packed_cpu_into_batch(const std::vector<RamKvReadInto>& requests,bool sequential=true);
     void admit_read(std::size_t id,std::uint64_t generation,const MicroblockImage& image,std::size_t budget);
     // A borrowed view is consumed synchronously; rejected admissions do not copy it.
-    void admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,std::size_t budget);
-    void admit_read(std::size_t id,std::uint64_t generation,RamKvImagePtr image,std::size_t budget);
+    void admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,std::size_t budget,
+                    bool evict_cold=true);
+    void admit_read(std::size_t id,std::uint64_t generation,RamKvImagePtr image,std::size_t budget,
+                    bool evict_cold=true);
     bool graph_reads_supported()const;
     RamKvImagePtr resident(std::size_t id)const;
     std::uint64_t generation(std::size_t id)const;
@@ -169,7 +180,9 @@ public:
     // request boundary can return it without touching retained snapshot data.
     std::size_t release_idle_metadata();
     RamKvStoreStats stats()const;
-    std::shared_ptr<RamKvSnapshot> snapshot(std::size_t blocks)const;
+    // Per-block admission charge for live entries and immutable backing owners.
+    static std::size_t metadata_bytes_per_block();
+    std::shared_ptr<RamKvSnapshot> snapshot(std::size_t blocks,std::size_t first=0)const;
     void restore(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,
                  bool reuse_resident=false);
     // Runs in block order after each source is read (or retained on SSD),
@@ -182,9 +195,19 @@ public:
     void restore(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,
                  bool reuse_resident,const std::function<void(std::size_t)>& block_read,
                  const RestoreAllocate& allocate_batch,std::size_t append_bytes);
+    void restore_reserved(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,
+                 const std::function<void(std::size_t)>& block_read,
+                 const RestoreReserve& reserve_batch,std::size_t append_bytes=0,
+                 const std::vector<RamKvImagePtr>* shared_images=nullptr);
 private:
+    enum class PressureMode { Adaptive, Backed, ExactSpill };
+    RamPressurePlan maintain(std::size_t budget,bool allow_ssd,PressureMode mode);
     void read_cpu_image(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity,bool padded);
-    void read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded);
+    void read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded,bool count_reads=true);
+    void restore_impl(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,bool reuse_resident,
+                 const std::function<void(std::size_t)>& block_read,const RestoreAllocate& allocate_batch,
+                 const RestoreReserve& reserve_batch,std::size_t append_bytes,
+                 const std::vector<RamKvImagePtr>* shared_images=nullptr);
     struct Impl;std::shared_ptr<Impl> impl_;
 };
 } // namespace tyloinfer::qsa

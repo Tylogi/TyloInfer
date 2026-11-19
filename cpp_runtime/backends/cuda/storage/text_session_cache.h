@@ -57,6 +57,7 @@ public:
     TextSessionCache& operator=(const TextSessionCache&) = delete;
 
     bool persistent_prefix_enabled() const noexcept;
+    std::size_t prefix_block_tokens() const noexcept { return prefix_block_tokens_; }
 
     template <typename Model>
     TextSessionRestore restore_best(
@@ -87,6 +88,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::size_t prefix_block_tokens_ = 1;
 };
 
 } // namespace mfq::cuda::internal

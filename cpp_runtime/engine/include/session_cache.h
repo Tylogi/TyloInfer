@@ -3,6 +3,7 @@
 #include "mfq_paged_prefix_cache.h"
 #include "paged_session_bindings.h"
 #include "session_snapshot_cache.h"
+#include "tyloinfer/runtime.h"
 
 #include <algorithm>
 #include <iostream>
@@ -67,6 +68,15 @@ template <class Backend> class SessionCache {
                 return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp, input_key);
             return {};
         }
+        if(paged_cache_ && native_hot_snapshots_ && model.supports_paged_text_session_state() &&
+                prompt.size()>1 && match->tokens()<std::min(maximum_prefix_tokens,prompt.size()-1)) {
+            const auto limit=std::min(maximum_prefix_tokens,prompt.size()-1);
+            const std::vector<int64_t> candidate(prompt.begin(),prompt.begin()+static_cast<std::ptrdiff_t>(limit));
+            if(paged_cache_->match(candidate,input_key,false).matched_tokens>match->tokens()) {
+                auto restored=restore_paged(model,requested_session,prompt,maximum_prefix_tokens,mtp,input_key,match->tokens());
+                if(restored.tokens)return restored;
+            }
+        }
         try {
             if constexpr(requires { Backend::prepare_restore(*match->state,bool{}); })
                 Backend::prepare_restore(*match->state,paged_cache_ && paged_disk_budget_>0);
@@ -84,6 +94,10 @@ template <class Backend> class SessionCache {
                           << " prefill_tokens=" << prompt.size() - match->tokens() << std::endl;
             }
             return restored;
+        } catch (const MfqResourceExhausted &) {
+            model.reset(1);
+            if (mtp != nullptr) mtp->reset(1);
+            throw;
         } catch (const std::exception &error) {
             const auto selected_session = match->session_id;
             snapshots_.erase(*match);
@@ -186,6 +200,8 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_dynamic_budget", 1.0},
                 {"prefix_cache_pending_writes", static_cast<double>(value.pending_writes)},
                 {"prefix_cache_pending_bytes", static_cast<double>(value.pending_bytes)},
+                {"prefix_cache_deferred_writes", static_cast<double>(value.deferred_writes)},
+                {"prefix_cache_dirty_bytes", static_cast<double>(value.dirty_bytes)},
                 {"prefix_cache_pending_max_bytes", static_cast<double>(value.pending_max_bytes)},
                 {"prefix_cache_writes", static_cast<double>(value.writes)},
                 {"prefix_cache_deduplicated_writes",
@@ -297,7 +313,7 @@ template <class Backend> class SessionCache {
     template <typename Model>
     Restore restore_paged(Model &model, const std::string &requested_session,
         const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens, Predictor* mtp,
-        const std::string& input_key = {}) {
+        const std::string& input_key = {},std::size_t minimum_prefix_tokens=0) {
         if (snapshots_.max_sessions() == 0 || !model.supports_paged_text_session_state() ||
             prompt.size() < 2) {
             return {};
@@ -355,6 +371,7 @@ template <class Backend> class SessionCache {
             }
             }();
             if(state.tokens.empty()) {paged_cache_->record_match(0);return {};}
+            if(state.tokens.size()<minimum_prefix_tokens)return {};
             state.input_key=input_key;
             if(mtp && (!mtp->supports_session_state() || !state.mtp)) {
                 paged_cache_->record_match(0);return {};
@@ -386,6 +403,10 @@ template <class Backend> class SessionCache {
                           << std::endl;
             }
             return restored;
+        } catch (const MfqResourceExhausted &) {
+            model.reset(1);
+            if (mtp != nullptr) mtp->reset(1);
+            throw;
         } catch (const StateError &error) {
             return fail(invalid_action, error, true);
         } catch (const std::exception &error) {

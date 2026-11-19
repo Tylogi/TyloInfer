@@ -70,7 +70,7 @@ beforeEach(() => {
   updateSettings.mockImplementation((patch) => { settings = { ...settings, ...patch }; });
   vi.mocked(useSettings).mockImplementation(() => ({
     settings, updateSettings, english: true, tr: (_zh: string, en: string) => en,
-    replaceSettings: vi.fn(), contextSize: 32768, setContextSize: vi.fn(),
+    replaceSettings: vi.fn(), contextSize: 32768, setContextSize: vi.fn(), persistenceError: false,
   }));
   vi.mocked(useConversationSelector).mockImplementation((selector) => selector({
     activeId: 'session', sessions: [{ id: 'session', mode: 'text' }],

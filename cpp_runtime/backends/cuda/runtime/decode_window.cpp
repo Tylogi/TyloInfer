@@ -108,8 +108,8 @@ struct DecodeWindow::ProfileClock {
     ProfileClock(){TYLOINFER_NATIVE_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device),capacity*sizeof(uint64_t)));}
     ~ProfileClock(){if(device)(void)cudaFree(device);}
 };
-DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile,bool independent_sequences)
-    :stream_(stream),graphs_(stream),layer_profile_(layer_profile),independent_sequences_(independent_sequences) {
+DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile,bool qsa_indexer_graph_task)
+    :stream_(stream),graphs_(stream),layer_profile_(layer_profile),qsa_indexer_graph_task_(qsa_indexer_graph_task) {
     // External CUDA timing events split Windows graph submissions. Device
     // timestamps preserve the graph's submission and use the same clock as
     // Strata's verifier profiler. This storage exists only when tracing.
@@ -135,7 +135,8 @@ void DecodeWindow::mark(int layer,const char* phase) {
             "cpu_merge_begin","cpu_merge_end","resident_gate_up_end","resident_down_end","stream_copy_join","stream_gate_up_join","stream_down_join",
             "gdn_projection_end","gdn_input_end","gdn_recurrence_end","qsa_projection_end","qsa_input_end","qsa_attention_end",
             "cpu_input_publish_end","route_publish_end","input_fusion_end","head_begin","head_norm_end","head_projection_end"};
-        if(std::none_of(std::begin(phases),std::end(phases),
+        if(!(std::strcmp(scope,"3")==0 && std::strncmp(phase,"qsa_cache_",10)==0) &&
+            std::none_of(std::begin(phases),std::end(phases),
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;}) &&
             (std::strcmp(scope,"3")!=0 || std::none_of(std::begin(boundaries),std::end(boundaries),
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;})))return;
@@ -339,6 +340,7 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
             if(!nodes())throw Error("CUDA decode window body produced no work");
         } catch(const std::exception& failure) {
             recording_segments_=false;graphs_.clear();
+            if(dynamic_cast<const MfqResourceExhausted*>(&failure))throw;
             const std::string error=failure.what();
             // Preserve quota errors so admission can discard this request
             // without marking the entire backend unhealthy.

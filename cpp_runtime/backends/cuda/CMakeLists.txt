@@ -32,6 +32,9 @@ set(TYLOINFER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+# Build the d1 decision worker alongside the common managed runtime.
+add_subdirectory(d1)
+
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_library(mfq-cuda-storage STATIC
     ${TYLOINFER_CUDA_ROOT}/storage/mfe_expert_store.cpp
@@ -1396,6 +1399,7 @@ add_executable(mfq-runtime
 )
 target_link_libraries(mfq-runtime PRIVATE
     mfq-cuda-runtime mfq-runtime-communication)
+add_dependencies(mfq-runtime tyloinfer-d1-native)
 target_include_directories(mfq-runtime PRIVATE
     ${TYLOINFER_CUDA_ROOT}
     ${TYLOINFER_CUDA_ROOT}/include

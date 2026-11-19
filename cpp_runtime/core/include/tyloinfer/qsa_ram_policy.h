@@ -22,6 +22,7 @@ struct RamPressureConfig {
     unsigned quantize_tokens=2048;
     bool ssd_enabled=false;
     RamKvTier canonical_tier=RamKvTier::Fp16;
+    bool adaptive_precision=true;
 };
 struct RamPressureAction {
     RamKvTier from,to;
@@ -73,8 +74,10 @@ inline std::size_t ram_precision_target(std::size_t blocks,const std::array<long
         RamKvTier canonical,unsigned quantize_tokens=2048) {
     if(unsigned(canonical)>2 || !quantize_tokens || quantize_tokens%4)
         throw std::invalid_argument("Invalid RAM precision target");
+    if(!blocks)return 0;
+    const auto affine_blocks=blocks/10+(blocks%10!=0);
     const auto mixed=canonical==RamKvTier::Fp16?(b[0]+3.L*b[1]+16.L*b[2])/20.L:
-        canonical==RamKvTier::Affine8?(3.L*b[1]+17.L*b[2])/20.L:b[2];
+        canonical==RamKvTier::Affine8?b[2]+(b[1]-b[2])*affine_blocks/blocks:b[2];
     const auto slack=ram_batch_tail_bytes(blocks,b,canonical,quantize_tokens);
     const auto target=std::min(b[unsigned(canonical)],mixed+slack);
     const auto maximum=std::numeric_limits<std::size_t>::max();
@@ -85,8 +88,12 @@ inline std::size_t ram_precision_target(std::size_t blocks,const std::array<long
 inline std::array<std::uint64_t,2> ram_precision_floors(std::uint64_t total,
         std::size_t budget,const std::array<long double,3>& bytes,RamKvTier canonical,unsigned quantum=2048) {
     if(!total || canonical==RamKvTier::Tq4)return {0,0};
-    const auto mixed=canonical==RamKvTier::Fp16?(bytes[0]+3.L*bytes[1]+16.L*bytes[2])/20.L:
-        (3.L*bytes[1]+17.L*bytes[2])/20.L;
+    if(canonical==RamKvTier::Affine8) {
+        const auto blocks=total/4+(total%4!=0);
+        const auto affine_blocks=blocks/10+(blocks%10!=0);
+        return {0,std::min(total,4*affine_blocks)};
+    }
+    const auto mixed=(bytes[0]+3.L*bytes[1]+16.L*bytes[2])/20.L;
     const auto base=bytes[2];
     // All low-precision blocks still occupy RAM until an actual SSD eviction.
     // Only the remaining capacity can protect higher-precision images. Leave
@@ -109,7 +116,7 @@ inline std::array<std::uint64_t,2> ram_precision_floors(std::uint64_t total,
         const auto rounded=population/20*numerator+(population%20*numerator+19)/20;
         return std::min(total,rounded/4*4+(rounded%4?4u:0u));
     };
-    const auto fp16=canonical==RamKvTier::Fp16?floor(1):0;
+    const auto fp16=floor(1);
     return {fp16,std::min(total-fp16,floor(3))};
 }
 
@@ -139,6 +146,30 @@ inline RamPressurePlan plan_ram_pressure(const std::vector<RamPressureBlock>& bl
         total+=block.tokens;result.tokens[tier]+=block.tokens;
         if(tier<3)add_bytes(result.ram_bytes,block.bytes[tier]);
         for(unsigned i=0;i<3;++i)precision_bytes[i]+=block.bytes[i];
+    }
+    if(!config.adaptive_precision) {
+        std::vector<std::size_t> candidates;
+        for(std::size_t i=0;i<blocks.size();++i) {
+            const auto& b=blocks[i];
+            if(unsigned(b.tier)<3 && !b.pinned && b.tokens==4)candidates.push_back(i);
+            else if(unsigned(b.tier)<3)result.needs_readers=true;
+        }
+        if(result.fits())return result;
+        if(!config.ssd_enabled){result.needs_ssd=!candidates.empty();return result;}
+        std::sort(candidates.begin(),candidates.end(),[&](auto a,auto b) {
+            return blocks[a].last_access!=blocks[b].last_access?
+                blocks[a].last_access<blocks[b].last_access:blocks[a].id<blocks[b].id;
+        });
+        for(auto i:candidates) {
+            if(result.fits())break;
+            const auto& b=blocks[i];const auto tier=unsigned(b.tier);
+            if(result.actions.empty() || result.actions.back().from!=b.tier)
+                result.actions.push_back({b.tier,RamKvTier::Ssd});
+            auto& action=result.actions.back();action.blocks.push_back(i);
+            action.tokens+=b.tokens;action.saved_bytes+=b.bytes[tier];
+            result.ram_bytes-=b.bytes[tier];result.tokens[tier]-=b.tokens;result.tokens[3]+=b.tokens;
+        }
+        return result;
     }
     const auto floors=ram_precision_floors(total,budget,precision_bytes,config.canonical_tier,config.quantize_tokens);
     result.minimum_fp16=floors[0];result.minimum_affine8=floors[1];

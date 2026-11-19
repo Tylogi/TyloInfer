@@ -5,6 +5,7 @@ import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
 import type { JobResource } from '../../shared/api/types';
 import { useJobStore } from '../../stores/jobStore';
 import { RuntimeHero } from './RuntimeHero';
+import { getApiBaseUrl, setApiBaseUrl } from '../../shared/api/client';
 
 const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, instances: [], studio: null, chinese: false }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
@@ -23,6 +24,16 @@ it.each([false, true])('opens local checkpoints from the empty-model Load action
   expect(screen.queryByRole('button', { name: chinese ? '模型' : 'Models' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: chinese ? '加载' : 'Load' }));
   expect(screen.getByTestId('location')).toHaveTextContent('/models#local-checkpoints');
+});
+
+it('uses the serving Studio origin rather than a guessed port when no remote service is configured', () => {
+  const previous = getApiBaseUrl();
+  setApiBaseUrl('');
+  try {
+    const { container } = render(<MemoryRouter><RuntimeHero /></MemoryRouter>);
+    expect(container.querySelector('.runtime-endpoint')).toHaveTextContent(`${window.location.origin}/v1`);
+    expect(container.querySelector('.runtime-endpoint')).not.toHaveTextContent(':8090/v1');
+  } finally { setApiBaseUrl(previous); }
 });
 
 it('retains the normal Models action when a model is running', () => {

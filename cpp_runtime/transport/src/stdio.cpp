@@ -929,7 +929,7 @@ public:
                                         config_.model_name);
                                     usage["usage"] = usage_json(
                                         completion->prompt_tokens,
-                                        result.completion_tokens);
+                                        result.completion_tokens, metrics.cached_tokens);
                                     send_event(id, std::move(usage));
                                 }
                             } else {
@@ -938,7 +938,7 @@ public:
                                     result,
                                     usage_json(
                                         completion->prompt_tokens,
-                                        result.completion_tokens),
+                                        result.completion_tokens, metrics.cached_tokens),
                                     std::move(performance)));
                             }
                             send_done(id);

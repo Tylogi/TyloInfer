@@ -11,6 +11,7 @@
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/nemotron_h/ops.h"
+#include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ops.h"
 #include "core/full_block.h"
 #include "cuda_sampling.h"
@@ -18,6 +19,7 @@
 #include "mfq_cuda_sampling_ops.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
+#include "runtime/prefill_projection_plan.h"
 #include "prefill_budget.h"
 
 #include <algorithm>
@@ -27,6 +29,24 @@
 namespace mfq::cuda::internal {
 using mfq::engine::Generation;
 namespace {
+class PrefillProfileScope {
+    CudaProfiler& profiler_;
+    const char* title_;
+    bool active_;
+public:
+    PrefillProfileScope(CudaProfiler& profiler,const char* title)
+        :profiler_(profiler),title_(title),active_(!profiler.enabled) {
+        const auto* setting=std::getenv("TYLOINFER_PROFILE_PREFILL");
+        active_=active_ && setting && setting[0]=='1';
+        if(active_){profiler_.reset();profiler_.enabled=true;}
+    }
+    ~PrefillProfileScope() {
+        if(!active_)return;
+        try{profiler_.report(title_);}catch(...){}
+        profiler_.reset();profiler_.enabled=false;
+    }
+};
+
 template <typename Model>
 static mfq_tensor_backend::Tensor sample_token(Model &model, mfq_tensor_backend::Tensor ids,
     mfq::cuda::Sampler &sampler, mfq_tensor_backend::Tensor counts,
@@ -71,17 +91,19 @@ template <typename Model> struct CudaGenerationOps {
     bool graph_active = false;
     bool graph_prepared = false;
     int64_t prefill_compute_chunk=1024;
+    int64_t host_layer_major_rows=0;
+    bool reuse_prefill_workspace=false;
     mfq::engine::InferenceOutput* output=nullptr;
     mfq_tensor_backend::Tensor* readout_hidden=nullptr;
 
     CudaGenerationOps(Model &model, DecodeGraphCache &graph,
         const mfq::engine::InferenceRequest &request, const CudaPreparedPrompt *prepared,
         const CudaDecodeGraphConfig &graph_config,int64_t compute_chunk=1024,
-        mfq::engine::InferenceOutput* inference_output=nullptr)
+        mfq::engine::InferenceOutput* inference_output=nullptr,bool reuse_workspace=false)
         : model(model), graph(graph), constraint(request.token_constraint),
           sampler(request.sampling),
           has_penalties(sampler.has_penalties()), prepared(prepared), graph_config(graph_config),
-          prefill_compute_chunk(compute_chunk),output(inference_output) {
+          prefill_compute_chunk(compute_chunk),reuse_prefill_workspace(reuse_workspace),output(inference_output) {
         full_ids = mfq_tensor_backend::tensor(request.prompt,
             mfq_tensor_backend::TensorOptions()
                 .dtype(mfq_tensor_backend::kInt64)
@@ -96,8 +118,37 @@ template <typename Model> struct CudaGenerationOps {
         graph_active = graph_eligible();
     }
 
+    mfq::engine::PrefillChunk prefill_chunk(mfq::engine::PrefillChunk chunk) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            const auto rows=std::min(chunk.count,prefill_compute_chunk);
+            const auto target=std::max<int64_t>(full_ids.size(1),model.decode_reserve_until);
+            const auto planned=qwen4_rebalance_dense_prefill_weights(model,nullptr,target,rows);
+            if(planned<rows)prefill_compute_chunk=planned;
+            host_layer_major_rows=(!prepared || !prepared->transformed()) ?
+                qwen4_dense_layer_major_prefill_rows(model,chunk.count,prefill_compute_chunk):0;
+            if(!host_layer_major_rows && !model.config.experts && chunk.count>prefill_compute_chunk) {
+                chunk.count=prefill_compute_chunk;
+                chunk.last=false;
+            }
+        }
+#endif
+        return chunk;
+    }
+
     double prefill(const mfq::engine::PrefillChunk &chunk) {
         using Tensor = mfq_tensor_backend::Tensor;
+        const PrefillProfileScope profile(model.execution->profiler,"runtime.prefill");
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        const PrefillAllocationScope prefill_storage([&] {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                return reuse_prefill_workspace || qwen4_borrowed_dense_weight_bytes(model)>0;
+            return false;
+        }(),reuse_prefill_workspace);
+#endif
+        // The final prompt token can run alone after a prefix restore. Its
+        // recall buffers still belong to prefill and must not reserve decode KV.
+        const qwen4_exp::Qsa::PrefillWorkspaceScope attention_workspace(std::is_same_v<Model,Qwen4CausalLm>);
         PrefillCudaTimer timer;
         bool prefill_finished=false;
         const auto finish_prefill=[&] {
@@ -133,10 +184,11 @@ template <typename Model> struct CudaGenerationOps {
                     offset+=rows;
                 }
             } else if((!prepared || !prepared->transformed()) &&
-                qwen4_layer_major_prefill_eligible(model,chunk.count)) {
+                (host_layer_major_rows || qwen4_layer_major_prefill_eligible(model,chunk.count))) {
                 layer_major=true;
-                hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
-                    [&] {return output && output->stopped();},nullptr,false,finish_prefill);
+                const auto rows=host_layer_major_rows?host_layer_major_rows:prefill_compute_chunk;
+                hidden=qwen4_layer_major_prefill_hidden(model,ids,rows,true,
+                    [&] {return output && output->stopped();},nullptr,false,finish_prefill,host_layer_major_rows>0);
             }
         }
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
@@ -200,6 +252,15 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t first_token() {
         const auto token=pending.template item<int64_t>();
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(qwen4_borrowed_dense_weight_bytes(model)) {
+                full_ids={};
+                ResidentAllocationScope decode_storage;
+                pending=pending.clone();
+            }
+        }
+#endif
         // Prefill temporaries have retired; expert-cache maintenance remains
         // before token publication, inside TTFT for every CUDA model family.
         if(model.restore_decode_workspace)model.restore_decode_workspace();
@@ -381,6 +442,7 @@ template <class Model> struct CudaGenerationContext {
     std::optional<CudaPreparedPrompt> prepared;
     mfq::engine::ContinuousBatch<CudaBatchOperations<Model>>* batching;
     std::string request_id;
+    bool reuse_prefill_workspace=false;
 
     bool batched() const { return batching != nullptr; }
     void trace_expert_cache(const char* boundary, bool drain = true) {
@@ -466,11 +528,21 @@ template <class Model> struct CudaGenerationContext {
             moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
     }
     int64_t prefill_chunk(std::size_t tokens) {
+        reuse_prefill_workspace=false;
         // Reuse ordinary/MTP widths before allocating wider temporary graphs
         // whose activation storage would displace persistent expert images.
         const auto limit=config.generation.prefill_chunk_size;
         if(short_streamed_prefill(tokens))return std::min<int64_t>(4,limit);
-        if(tokens<=128)return std::min<int64_t>(std::max<std::size_t>(1,tokens),limit);
+        if(tokens<=128) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+            bool needs_attention_workspace=false;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                needs_attention_workspace=!model.config.experts && model.cache_pos>0 && !model.layer_weights &&
+                    qwen4_append_attention_workspace_bytes(model,1)>0;
+            if(!needs_attention_workspace)
+#endif
+                return std::min<int64_t>(std::max<std::size_t>(1,tokens),limit);
+        }
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         bool allow_borrow=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
@@ -481,15 +553,37 @@ template <class Model> struct CudaGenerationContext {
         auto available=mfq::engine::prefill_budget_add(
             mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()),
             budget.lendable_bytes);
-        const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
+        const auto residual_row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float);
+        auto row_bytes=residual_row_bytes*8;
         const auto sequence_bytes=allow_borrow
-            ? std::size_t(tokens<=16384?tokens:std::min<std::size_t>(tokens,limit))*row_bytes*3/8 : 0;
-        const auto reserve=moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)
+            ? std::size_t(tokens<=16384?tokens:std::min<std::size_t>(tokens,limit))*residual_row_bytes*3 : 0;
+        const auto wanted=std::min<int64_t>({int64_t(tokens),limit,mfq::engine::max_prefill_compute_chunk});
+        auto reserve=moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)
             ? std::max(std::size_t(1)<<30,mfq::cuda::runtime_options::workspace_reserve_bytes())
             : std::size_t(1)<<30;
-        const auto fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
-        const auto wanted=std::min<int64_t>({int64_t(tokens),limit,mfq::engine::max_prefill_compute_chunk});
-        const auto required=mfq::engine::prefill_budget_add(fixed,std::size_t(wanted)*row_bytes);
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(!model.config.experts) {
+                reserve=qwen4_prefill_state_growth_bytes(model,wanted);
+                row_bytes=qwen4_dense_prefill_workspace(model,reserve).row_bytes;
+            }
+        }
+        auto fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
+        const auto append_attention=[&](int64_t rows) -> std::size_t {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                if(model.cache_pos>0 && !model.config.experts && !model.layer_weights)
+                    return qwen4_append_attention_workspace_bytes(model,rows);
+            return 0;
+        };
+        const auto tile_bytes=[&](int64_t rows) {
+            return mfq::engine::PrefillWorkspace{fixed,row_bytes}.bytes(rows,append_attention(rows));
+        };
+        const auto required=tile_bytes(wanted);
+        const auto append_workspace=append_attention(wanted);
+        std::size_t packed_history=0;
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            if(append_workspace && (!prepared || !prepared->transformed()))
+                packed_history=qwen4_append_packed_history_bytes(model,wanted);
+        const auto loan_target=mfq::engine::prefill_budget_add(required,packed_history);
         if(required>available) {
             // Expert overflow in the unused KV budget is revocable too. Ask
             // its existing owner to return pages before reducing the tile.
@@ -498,14 +592,45 @@ template <class Model> struct CudaGenerationContext {
             available=mfq::engine::prefill_budget_add(
                 context->available_memory()+context->workspace_available(),budget.lendable_bytes);
         }
-        const auto selected=mfq::engine::select_prefill_chunk(tokens,limit,available,fixed,row_bytes);
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(!model.config.experts) {
+                if(required>available && append_workspace && context->reusable_workspace_bytes()) {
+                    // The ordinary pool can keep charged pages after trimming.
+                    // Count those pages only when this prefill uses that pool.
+                    reuse_prefill_workspace=true;
+                    available=available_prefill_workspace(*context);
+                }
+                // Sparse append also publishes into persistent CUDA pools.
+                // Reusable pages in the ordinary pool cannot cover that growth.
+                const auto loan_available=append_workspace?
+                    mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()):available;
+                if(loan_target>loan_available && !model.layer_weights) {
+                    graph.invalidate();
+                    const auto reserved_ram=std::max(qwen4_pinned_transaction_bytes(model,wanted),
+                        qwen4_fixed_prefill_ram_reservation(model,
+                            std::max(model.cache_pos+int64_t(tokens),model.decode_reserve_until),wanted));
+                    qwen4_borrow_dense_prefill_weights(model,mtp,loan_target-loan_available,
+                        [&](std::size_t bytes){cache.reserve_ram(bytes);},reserved_ram,
+                        tokens>std::size_t(wanted));
+                    // A long activation tile needs physical headroom. Vacant
+                    // pages in a fragmented pool need not satisfy its next allocation.
+                    available=reuse_prefill_workspace?available_prefill_workspace(*context):
+                        mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available());
+                    reserve=qwen4_prefill_state_growth_bytes(model,wanted);
+                    fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
+                }
+            }
+        }
+        const auto selected=mfq::engine::select_prefill_chunk(tokens,limit,available,tile_bytes,
+            append_workspace>0);
         if(!selected)throw mfq::engine::InferenceInputError(
             mfq::engine::InferenceInputErrorCode::ContextLength,
             "insufficient CUDA workspace for prefill computation and expert transfer buffers");
         std::cerr<<"runtime_prefill_plan mode="<<(config.prefill_chunk_auto?"auto":"limited")
             <<" tokens="<<tokens<<" limit="<<limit<<" compute_chunk="<<selected
             <<" available_bytes="<<available<<" lendable_bytes="<<budget.lendable_bytes
-            <<" transfer_bytes="<<budget.transfer_bytes<<'\n';
+            <<" transfer_bytes="<<budget.transfer_bytes<<" packed_history_bytes="<<packed_history
+            <<" reuse_workspace="<<reuse_prefill_workspace<<'\n';
         return selected;
 #else
         return std::min<int64_t>(tokens,limit);
@@ -623,6 +748,10 @@ template <class Model> struct CudaGenerationContext {
                 (!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,prompt_tokens))
                 logical_chunk=prompt_tokens;
+            // The executing prefill step chooses traversal for the real
+            // segment, after prefix boundaries and the memory rebalance.
+            if(!model.config.experts && (!prepared || !prepared->transformed()))
+                logical_chunk=prompt_tokens-reused;
         }
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
             if(!short_streamed_prefill(prompt_tokens-reused) &&
@@ -638,7 +767,7 @@ template <class Model> struct CudaGenerationContext {
         const auto logical_chunk=logical_prefill_chunk(input.prompt.size(),reused,stable,compute_chunk);
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
-                config.decode_graph,compute_chunk,&output),
+                config.decode_graph,compute_chunk,&output,reuse_prefill_workspace),
             output, input.prompt.size(), reused, stable,logical_chunk);
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
@@ -662,14 +791,7 @@ CudaReadoutHidden prefill_readout(Model& model,DecodeGraphCache& graph,TextSessi
         std::size_t stable_prefix,const std::string& input_key,bool prefix_cache) {
     if(prompt.empty() || prompt.size()>std::size_t(model.max_position_embeddings()))
         throw std::invalid_argument("decision prompt exceeds the loaded context");
-    auto& profiler=model.execution->profiler;
-    const auto* profile_setting=std::getenv("TYLOINFER_PROFILE_PREFILL");
-    const bool profiling=profile_setting && profile_setting[0]=='1' && !profiler.enabled;
-    if(profiling){profiler.reset();profiler.enabled=true;}
-    struct ProfileScope {
-        CudaProfiler& profiler;bool active;
-        ~ProfileScope(){if(active){try{profiler.report("runtime.decision_prefill");}catch(...){}profiler.reset();profiler.enabled=false;}}
-    } profile_scope{profiler,profiling};
+    const PrefillProfileScope profile(model.execution->profiler,"runtime.decision_prefill");
     mfq::engine::InferenceRequest input;input.prompt=prompt;
     input.sampling.max_tokens=0;input.sampling.enable_mtp=false;
     CudaGenerationContext<Model> owner{model,graph,cache,config,nullptr,{},nullptr,{}};
@@ -731,12 +853,14 @@ CudaReadoutHidden prefill_readout(Model& model,DecodeGraphCache& graph,TextSessi
     const auto compute_chunk=owner.prefill_chunk(prompt.size()-restored.tokens);
     const auto logical_chunk=owner.logical_prefill_chunk(prompt.size(),restored.tokens,boundary,compute_chunk);
     CudaReadoutHidden result;result.cached_tokens=restored.tokens;
-    CudaGenerationOps<Model> ops(model,graph,input,nullptr,config.decode_graph,compute_chunk);
+    CudaGenerationOps<Model> ops(model,graph,input,nullptr,config.decode_graph,compute_chunk,nullptr,
+        owner.reuse_prefill_workspace);
     ops.readout_hidden=&result.hidden;
     for(auto offset=int64_t(restored.tokens);offset<int64_t(prompt.size());) {
         auto chunk=mfq::engine::next_prefill_chunk(prompt.size(),offset,logical_chunk);
         if(std::size_t(offset)<boundary && std::size_t(offset+chunk.count)>boundary)
             chunk.count=int64_t(boundary)-offset;
+        chunk=ops.prefill_chunk(chunk);
         result.prefill_ms+=ops.prefill(chunk);offset+=chunk.count;
         if(caching && std::size_t(offset)==boundary) {
             try {

@@ -179,6 +179,22 @@ bool grouped_f16_available(int device);
 void grouped_matmul_f16(ggml_type type, const GemmJob* jobs, int count, std::int64_t max_tokens,
     std::uint64_t row_bytes, std::int64_t rows, std::int64_t columns,
     const void* input, std::int64_t routes, bool routed_input, void* output, cudaStream_t stream);
+// Q8_0 weights stay packed; only shared-memory tiles are decoded to BF16.
+// BF16 WMMA requires compute capability 8.0 or newer.
+void grouped_matmul_bf16(ggml_type type, const GemmJob* jobs, int count, std::int64_t max_tokens,
+    std::uint64_t row_bytes, std::int64_t rows, std::int64_t columns,
+    const void* input, std::int64_t routes, bool routed_input, void* output, cudaStream_t stream);
+// Dense Q8_0 weight projection with contiguous BF16 input/output rows.
+// Input must be 16-byte aligned for asynchronous 16-byte tile copies.
+void matmul_q8_bf16(const void* packed, std::uint64_t row_bytes, std::int64_t rows,
+    std::int64_t columns, std::int64_t tokens, const void* input, void* output, cudaStream_t stream);
+// Lossless weight-only reordering: [K/8,N,8] int8 codes, then [K/32,N] FP16 scales.
+// The allocation size is identical to the original Q8_0 weight matrix.
+void repack_q8_bf16_columns(const void* packed, std::uint64_t row_bytes, std::int64_t rows,
+    std::int64_t columns, void* output, cudaStream_t stream);
+enum class Q8Bf16Kernel { None, Native64, Native32, Pipeline32, Pipeline32Plain };
+Q8Bf16Kernel matmul_q8_bf16_columns(const void* packed, std::int64_t rows, std::int64_t columns,
+    std::int64_t tokens, const void* input, void* output, cudaStream_t stream);
 void grouped_swiglu_f16(const std::int64_t* slots, std::int64_t count, std::int64_t width,
     const void* gate, const void* up, void* hidden, float limit, cudaStream_t stream);
 void grouped_decode_f16(ggml_type type,const GemmJob* jobs,int experts,

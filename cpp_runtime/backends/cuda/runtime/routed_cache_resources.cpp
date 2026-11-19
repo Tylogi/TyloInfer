@@ -174,9 +174,9 @@ void reserve_routed_capture_workspace(CudaExecutionContext& execution,std::size_
 }
 
 void restore_routed_decode_workspace(CudaExecutionContext& execution,std::size_t growth,
-        std::optional<std::size_t> transient) {
+        std::optional<std::size_t> transient,bool rebalance_gguf_cache) {
     prepare_moe_decode_residency(execution.moe_expert_cache);
-    restore_gguf_decode_workspace(execution.gguf_expert_cache,growth,transient);
+    restore_gguf_decode_workspace(execution.gguf_expert_cache,growth,transient,rebalance_gguf_cache);
     restore_tq_decode_workspace(execution.tq_expert_cache,growth,transient);
 }
 
@@ -196,6 +196,9 @@ std::size_t reclaim_routed_expert_duplicates(CudaExecutionContext& execution,std
     if(released<bytes)released+=reclaim_tq_expert_duplicates(execution.tq_expert_cache,bytes-released);
     if(released<bytes)released+=reclaim_moe_expert_duplicates(execution.moe_expert_cache,bytes-released);
     return released;
+}
+std::size_t reclaim_routed_expert_pinned(CudaExecutionContext& execution,std::size_t bytes) {
+    return reclaim_gguf_expert_pinned(execution.gguf_expert_cache,bytes);
 }
 std::size_t share_routed_expert_host(CudaExecutionContext& execution,std::size_t bytes) {
     auto released=share_gguf_expert_host(execution.gguf_expert_cache,bytes);

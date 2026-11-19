@@ -151,7 +151,8 @@
 .model-browser-empty.compact { padding: 14px; }
 .model-companion-picker { margin-top: 7px; color: var(--muted); font-size: 11px; }
 .model-companion-picker summary { cursor: pointer; }
-.model-companion-picker input { box-sizing: border-box; width: 100%; min-width: 0; margin-top: 8px; border: 1px solid var(--panel-line); border-radius: 7px; padding: 8px 9px; color: var(--ink); background: var(--panel-control); font: inherit; }
+.model-companion-picker > small { display: block; margin-top: 6px; white-space: normal; overflow-wrap: anywhere; }
+.model-companion-picker :is(input, select) { box-sizing: border-box; width: 100%; min-width: 0; margin-top: 8px; border: 1px solid var(--panel-line); border-radius: 7px; padding: 8px 9px; color: var(--ink); background: var(--panel-control); font: inherit; }
 
 .model-download-page { min-width: 0; padding-bottom: 72px; }
 body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env(safe-area-inset-bottom)); }

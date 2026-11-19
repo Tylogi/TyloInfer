@@ -130,10 +130,12 @@ template<int W,bool Snapshots,bool Staged=false,int HeadTiles=1> __global__ void
             for(int delta=8;delta;delta/=2)total+=__shfl_xor_sync(0xffffffffu,total,delta,16);
             mass=mass*factor+total;maximum=top;
             probability[local*16+column]=__float2half_rn(weight);
-            const float sum2=weight+__shfl_xor_sync(0xffffffffu,weight,1,16);
-            const float sum4=sum2+__shfl_xor_sync(0xffffffffu,sum2,2,16);
-            if(active && !(column&3) && first+column/4<end)
-                block_log_mass[(int64_t(token)*heads+head)*count+first+column/4]=sum4>0?top+logf(sum4):-CUDART_INF_F;
+            if(block_log_mass) {
+                const float sum2=weight+__shfl_xor_sync(0xffffffffu,weight,1,16);
+                const float sum4=sum2+__shfl_xor_sync(0xffffffffu,sum2,2,16);
+                if(active && !(column&3) && first+column/4<end)
+                    block_log_mass[(int64_t(token)*heads+head)*count+first+column/4]=sum4>0?top+logf(sum4):-CUDART_INF_F;
+            }
         }
         if constexpr(Staged) {
             for(int at=4*tid;at<16*W;at+=256*4) {

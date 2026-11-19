@@ -61,6 +61,7 @@ template <class Model> struct CudaMtpOps {
   bool transformed_prompt;
   int position_axes;
   int64_t prefill_compute_chunk;
+  bool resized_dense_prefill=false;
   InferenceOutput* output;
   // Destroy after local/result tensors, including cancellation of priming.
   std::unique_ptr<mfq::cuda::RoutedPrefillWorkspaceLoan> predictor_loan;
@@ -472,6 +473,21 @@ template <class Model> struct CudaMtpOps {
     }
     TYLOINFER_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
     return timer.elapsed_ms();
+  }
+  mfq::engine::PrefillChunk prefill_chunk(mfq::engine::PrefillChunk chunk) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      const auto rows=std::min(chunk.count,prefill_compute_chunk);
+      const auto target_tokens=std::max<int64_t>(input_ids.size(1),model.decode_reserve_until);
+      const auto planned=mfq::cuda::qwen4_rebalance_dense_prefill_weights(model,&mtp,target_tokens,rows);
+      if(planned<rows) {
+        prefill_compute_chunk=planned;
+        resized_dense_prefill=true;
+      }
+      if(resized_dense_prefill)chunk.count=std::min(chunk.count,prefill_compute_chunk);
+    }
+#endif
+    return chunk;
   }
   PrefillResult prefill(mfq::engine::PrefillChunk chunk) {
     PrefillCudaTimer timer;

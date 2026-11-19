@@ -1,5 +1,5 @@
 
-import { ApiError } from '../shared/api/client';
+import { ApiError } from '../shared/api/ApiError';
 
 
 export function errorMessage(error: unknown, tr?: (chinese: string, english: string) => string): string {

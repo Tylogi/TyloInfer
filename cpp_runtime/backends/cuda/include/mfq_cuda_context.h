@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -209,6 +210,7 @@ public:
     // Idle pages in the ordinary temporary pool can be reused without growing
     // physical residency. Captured graph pools remain reserved for their owner.
     std::size_t reusable_workspace_bytes() const;
+    std::size_t reusable_dense_weight_bytes() const;
     std::size_t local_memory_usage() const;
     // Process-owned pages, including idle allocator pages and CUDA libraries.
     std::size_t resident_memory_usage() const;
@@ -340,6 +342,40 @@ inline bool pinned_allocation_rejected(cudaError_t status) noexcept {
     return status == cudaErrorMemoryAllocation || status == cudaErrorAlreadyMapped ||
            status == cudaErrorMapBufferObjectFailed;
 }
+
+// Required request workspaces can reclaim optional pinned quota at their
+// model-thread boundary. Optional cache growth and held cache locks suppress
+// this hook; worker threads never inherit it.
+class PinnedAllocationScope {
+    const PinnedAllocationScope* previous_=nullptr;
+    friend std::size_t reclaim_pinned_allocation(std::size_t);
+    int device_;
+    cudaStream_t stream_;
+    std::function<std::size_t(std::size_t)> reclaim_;
+public:
+    PinnedAllocationScope(int device,cudaStream_t stream,std::function<std::size_t(std::size_t)> reclaim);
+    ~PinnedAllocationScope();
+    PinnedAllocationScope(const PinnedAllocationScope&)=delete;
+    PinnedAllocationScope& operator=(const PinnedAllocationScope&)=delete;
+};
+class PinnedReclaimPause {
+public:
+    PinnedReclaimPause();
+    ~PinnedReclaimPause();
+    PinnedReclaimPause(const PinnedReclaimPause&)=delete;
+    PinnedReclaimPause& operator=(const PinnedReclaimPause&)=delete;
+};
+bool pinned_allocation_scope_active() noexcept;
+std::size_t reclaim_pinned_allocation(std::size_t bytes);
+cudaError_t allocate_pinned_host(void** destination,std::size_t bytes,unsigned flags,const char* role);
+cudaError_t release_pinned_host(void* pointer,std::size_t bytes) noexcept;
+struct PinnedMemoryBudgetStats {std::size_t live_bytes=0,proven_bytes=0;bool proven=false;};
+PinnedMemoryBudgetStats pinned_memory_budget_stats() noexcept;
+std::size_t pinned_headroom_shortage(std::size_t live,std::size_t budget,std::size_t required,std::size_t margin) noexcept;
+// Reserve against the last proven committed population, not a presumed device
+// limit. The margin is a caller-priced transaction, not a hardware constant.
+void reserve_pinned_workspace(std::size_t required,std::size_t margin,
+    const std::function<std::size_t(std::size_t)>& reclaim);
 
 class HostBuffer final {
 public:

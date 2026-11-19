@@ -11,7 +11,33 @@ from fastapi import APIRouter, Path, Query, Response
 from tyloinfer.server.api.dependencies import ServiceDependency
 from tyloinfer.server.api.routes import ERROR_RESPONSES
 from tyloinfer.server.protocol.analysis import CheckpointAnalysis
-from tyloinfer.server.protocol.models import (ArtifactLineageList, CreateRemoteNodeRequest, DeleteWorkspaceArtifactRequest, DeleteModelRequest, ModelDeletionPlan, HubModelInfo, HubModelSearchResult, HubReferenceRequest, HubDownloadProbeRequest, HubDownloadReuseRequest, HubDownloadReuseResponse, ModelArtifactList, ModelCacheProfile, ModelDirectoryList, ModelLoadRequest, ModelUnloadRequest, OfficialModelList, OpenModelDirectoryRequest, OpenModelDirectoryResult, OperationAccepted, RegisterModelDirectoryRequest, ConfigureDownloadDirectoryRequest, RemoteNodeList, RemoteNodeResource, UpdateRemoteNodeRequest)
+from tyloinfer.server.protocol.models import (
+    ArtifactLineageList,
+    ConfigureDownloadDirectoryRequest,
+    CreateRemoteNodeRequest,
+    DeleteModelRequest,
+    DeleteWorkspaceArtifactRequest,
+    HubDownloadProbeRequest,
+    HubDownloadReuseRequest,
+    HubDownloadReuseResponse,
+    HubModelInfo,
+    HubModelSearchResult,
+    HubReferenceRequest,
+    ModelArtifactList,
+    ModelCacheProfile,
+    ModelDeletionPlan,
+    ModelDirectoryList,
+    ModelLoadRequest,
+    ModelUnloadRequest,
+    OfficialModelList,
+    OpenModelDirectoryRequest,
+    OpenModelDirectoryResult,
+    OperationAccepted,
+    RegisterModelDirectoryRequest,
+    RemoteNodeList,
+    RemoteNodeResource,
+    UpdateRemoteNodeRequest,
+)
 from tyloinfer.server.services.service import ServiceError
 
 hub_router = APIRouter()
@@ -57,6 +83,16 @@ async def configure_download_directory(service: ServiceDependency, body: Configu
         raise ServiceError(400, "invalid_download_directory", str(error)) from error
     except OSError:
         raise ServiceError(500, "download_directory_save_failed", "could not save download directory") from None
+
+
+@hub_router.get(
+    "/api/v1/hub/official/local",
+    response_model=OfficialModelList,
+    responses=ERROR_RESPONSES,
+    tags=["models"],
+)
+async def local_official_hub_models(service: ServiceDependency) -> OfficialModelList:
+    return await service.local_official_hub_models()
 
 
 @hub_router.get(
@@ -212,6 +248,11 @@ async def register_model_directory(
 )
 async def model_artifact_directory(service: ServiceDependency, model_id: str) -> ModelDirectoryList:
     return await service.model_artifact_directory(model_id)
+
+
+@router.get("/api/v1/models/{model_id}/companion-reference", responses=ERROR_RESPONSES, tags=["models"])
+async def model_companion_reference(service: ServiceDependency, model_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")]) -> dict[str, str]:
+    return await service.model_companion_reference(model_id)
 
 
 @router.get("/api/v1/models/{model_id}/deletion", response_model=ModelDeletionPlan, responses=ERROR_RESPONSES, tags=["models"])

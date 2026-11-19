@@ -1,21 +1,7 @@
 
 import type { ApiErrorBody } from './types';
-
-export class ApiError extends Error {
-  readonly status: number;
-  readonly code: string;
-  readonly retryable: boolean;
-  readonly details: Record<string, unknown>;
-
-  constructor(status: number, body: ApiErrorBody) {
-    super(body.error.message);
-    this.name = 'ApiError';
-    this.status = status;
-    this.code = body.error.code;
-    this.retryable = body.error.retryable;
-    this.details = body.error.details;
-  }
-}
+import { ApiError } from './ApiError';
+export { ApiError } from './ApiError';
 
 let apiBaseUrl = '';
 let apiToken = '';
@@ -121,6 +107,10 @@ export async function errorFromResponse(response: Response): Promise<ApiError> {
 
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await requestResponse(path, init)).json() as Promise<T>;
+}
+
+export async function requestResponse(path: string, init?: RequestInit): Promise<Response> {
   const endpoint = apiBaseUrl;
   const token = apiToken;
   const instance = apiServerInstance;
@@ -140,7 +130,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw error;
   }
-  return (await response.json()) as T;
+  return response;
 }
 
 

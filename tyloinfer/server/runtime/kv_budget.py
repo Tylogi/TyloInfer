@@ -41,6 +41,9 @@ class KvTierBudget:
     gpu_budget_bytes: int
     ram_required_bytes: int
     fraction: float
+    cache_mode: str = "legacy"
+    ram_working_set_bytes: int = 0
+    ssd_capacity_bytes: int = 0
 
 
 def kv_tier_budget(context: int, indexer_bytes: int, raw_bytes: int,
@@ -55,7 +58,10 @@ def kv_tier_budget(context: int, indexer_bytes: int, raw_bytes: int,
 
 
 def checkpoint_kv_budget(artifact: DiscoveredModel, context: int,
-    settings: KvMemorySettings, quantization: KvQuantizationSettings) -> KvTierBudget:
+    settings: KvMemorySettings, quantization: KvQuantizationSettings, *, qsa_mode: str = 'legacy') -> KvTierBudget:
+    if qsa_mode != 'legacy':
+        from tyloinfer.server.runtime.qsa_cache_policy import qsa_cache_budget
+        return qsa_cache_budget(artifact, context, settings, qsa_mode)
     from tyloinfer.server.services.model_memory import checkpoint_cache_profile
 
     if settings.allocation == "dynamic" and settings.placement not in {"auto", "vram"}:

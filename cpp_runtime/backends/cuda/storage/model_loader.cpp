@@ -164,7 +164,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
     auto definition=load_model_config_json(source, config_path);
     execution.yarn={};
     if(execution.yarn_context_extension) {
-        if(model.graph.backbone!="qwen3_5" && model.graph.backbone!="qwen4_exp")
+        if(model.graph.backbone!="qwen3_5" && model.graph.backbone!="qwen4_exp" && model.graph.backbone!="qwen4")
             throw std::invalid_argument("YaRN extension requires a Qwen model");
         auto config=nlohmann::json::parse(definition);
         auto& text=config.contains("text_config") ? config["text_config"] : config.contains("language_config") ? config["language_config"] : config;

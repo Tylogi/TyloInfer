@@ -296,6 +296,7 @@ __global__ void qsa_fa_restore(tyloinfer::qsa::TqPrefillAttention a) {
 static int qsa_prefill_supported(const tyloinfer::qsa::TqPrefillAttention& a) {
     if(a.queries<32 || a.width<1 || a.width>256 || a.heads<1 || a.kv_heads<1 || a.heads%a.kv_heads || a.kv_rows<4 || a.kv_rows%4 || a.count<1)
         return int(cudaErrorNotSupported);
+    if(a.mass && (!a.hits || !a.logmass || !a.norm))return int(cudaErrorInvalidValue);
     if(tyloinfer::qsa::tq_prefill_attention_scratch(a.queries,a.heads,a.kv_rows)>a.temporary_bytes)
         return int(cudaErrorNotSupported);
     return qsa_llama_launch(nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,a.queries,a.kv_heads,a.kv_rows,a.stream,{});
@@ -355,7 +356,13 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
         }
     }
     qsa_fa_restore<<<a.queries*a.heads,256,0,a.stream>>>(a);
-    if(a.hits && a.mass)qsa_llama_observe(a.selected,a.positions,a.logmass,a.norm,a.hits,a.mass,a.queries,a.heads,a.count,a.stream);
+    if(a.hits) {
+        if(a.mass)qsa_llama_observe(a.selected,a.positions,a.logmass,a.norm,a.hits,a.mass,a.queries,a.heads,a.count,a.stream);
+        else {
+            const auto status=tq_observe_selection_hits(a.selected,a.positions,a.hits,a.queries,a.count,a.stream);
+            if(status!=int(cudaSuccess))return status;
+        }
+    }
     if(const auto* flag=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");flag && flag[0]=='1') {
         static std::atomic<bool> printed{false};if(!printed.exchange(true)){std::fprintf(stderr,"native_qsa_tq_prefill_fa actual_match=1 queries=%d heads=%d kv_heads=%d width=%d kv_rows=%d scratch_reused=1 history=1 packed_mask=1 fused_selection=1\n",a.queries,a.heads,a.kv_heads,a.width,a.kv_rows);}
     }

@@ -43,6 +43,8 @@ struct InferenceMetrics {
     Clock::time_point first_token;
     Clock::time_point last_token;
     std::size_t prefill_tokens = 0;
+    std::size_t cached_tokens = 0;
+    double prefix_restore_ms = 0.0;
     double prefill_ms = 0.0;
     double multimodal_ms = 0.0;
     double model_prefill_ms = 0.0;

@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { PauseIcon, PlayIcon } from '@phosphor-icons/react';
+import { LogUpdateControl } from './LogUpdateControl';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import type { JobResource } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -148,8 +148,7 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
   return <section className="dashboard-view logs-view">
     <ScreenHeader title={tr('日志', 'Logs')} subtitle={tr('查看服务事件、请求性能与任务记录。', 'Inspect service events, request performance, and job records.')}
       trailing={<>
-        <button type="button" aria-pressed={paused} onClick={() => setPaused((current) => !current)} disabled={!history.ready}>
-          {paused ? <PlayIcon size={13} /> : <PauseIcon size={13} />}{paused ? tr('继续更新', 'Resume updates') : tr('暂停更新', 'Pause updates')}</button>
+        <LogUpdateControl paused={paused} onChange={setPaused} disabled={!history.ready} tr={tr} />
         <button type="button" onClick={() => void refresh()} disabled={refreshBusy || history.loading || !history.ready}><Icon name="refresh" size={13} />{tr('刷新', 'Refresh')}</button>
       </>} />
     <TMPanel className="logs-console">

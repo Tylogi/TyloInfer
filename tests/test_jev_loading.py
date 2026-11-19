@@ -109,7 +109,7 @@ def test_service_backend_forwards_decision_calls_to_the_local_runtime():
             async def decide(self, *, model, payload):
                 assert model == 'decision' and payload == {'state': 'blue'}
                 return {'object': 'structured_decision'}
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             backend = ClusterBackend(Local(), None, client=client)
             assert await backend.decide(model='decision', payload={'state': 'blue'}) == {'object': 'structured_decision'}
     asyncio.run(run())

@@ -26,10 +26,24 @@ the newest eligible request receives a context-capacity error and existing
 requests retain their state. Unexpected CUDA failures still fail the backend.
 This does not resize the resident expert cache or automatically enable KV offload.
 
-Explicit continuous batching currently runs ordinary token decoding. Batched
-requests do not use MTP or persistent prefix reuse. Explicit session IDs and
-multimodal requests remain exclusive. The default single-request path retains
-MTP and prefix caching. Configured QSA KV offload uses the eager batch path.
+Explicit continuous batching runs ordinary token decoding. Flash-Next text
+requests without an explicit session ID can reuse the existing persistent prefix
+cache. A cold request saves a stable checkpoint at a configured cache-page
+boundary (or the exact boundary for a shorter prefix); matching requests restore
+independent QSA, exact Indexer, GDN recurrent, PLE convolution/ngram and positional
+state. Immutable snapshot storage may be shared, but mutable request state is not.
+Cancelling one request does not consume the snapshot or change its siblings.
+
+A cache hit is reported as `usage.prompt_tokens_details.cached_tokens` and
+`mfq_metrics.cached_tokens`; `prefill_tokens` counts only newly computed input.
+`mfq_metrics.prefix_restore_ms` reports request-local restore/setup time, which
+remains inside TTFT. A retained expert-weight cache is not a prefix hit. Reuse
+requires a complete matching checkpoint and enabled cache budgets; it is not
+guaranteed merely because another request previously used similar text.
+
+Batched requests do not use MTP. Explicit session IDs and multimodal requests
+remain exclusive. The default single-request path retains MTP and prefix caching.
+Configured QSA KV offload uses the eager batch path.
 
 Run the state check with the native diagnostics executable:
 

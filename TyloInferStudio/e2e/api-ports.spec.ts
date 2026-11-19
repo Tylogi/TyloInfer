@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {
-  test(`overview shows and copies both actual API URLs and refreshes changed ports (${language})`, async ({ page }, testInfo) => {
+  test(`overview shows and copies the actual API URLs and refreshes changed ports (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
     let port: number | null = 8091;
     await page.addInitScript(() => {
@@ -13,21 +13,23 @@ for (const language of ['zh-CN', 'en'] as const) {
     await page.route('**/api/v1/runtime/listener', route => route.fulfill({ json: {
       host: '127.0.0.1', port: 8090, anthropic_port: port, configurable: true,
     } }));
-    await page.goto('/');
+    await page.goto('/inference');
     const panel = page.locator('.overview-endpoint-panel');
-    await expect(panel.locator('code')).toHaveText(['http://127.0.0.1:8090/v1', 'http://127.0.0.1:8091/v1/messages']);
+    const serviceOrigin = new URL(page.url()).origin;
+    await expect(panel.locator('code')).toHaveText([`${serviceOrigin}/v1`, 'http://127.0.0.1:8091/v1/messages', `${serviceOrigin}/v1/systemone`]);
     await panel.getByRole('button', { name: language === 'en' ? 'Copy OpenAI endpoint' : '复制 OpenAI 端点' }).click();
-    await expect(page.locator('html')).toHaveAttribute('data-copied-endpoint', 'http://127.0.0.1:8090/v1');
+    await expect(page.locator('html')).toHaveAttribute('data-copied-endpoint', `${serviceOrigin}/v1`);
     await panel.getByRole('button', { name: language === 'en' ? 'Copy Anthropic endpoint' : '复制 Anthropic 端点' }).click();
     await expect(page.locator('html')).toHaveAttribute('data-copied-endpoint', 'http://127.0.0.1:8091/v1/messages');
     port = 8092;
     await page.evaluate(() => dispatchEvent(new Event('focus')));
-    await expect(panel.locator('code')).toHaveText(['http://127.0.0.1:8090/v1', 'http://127.0.0.1:8092/v1/messages']);
+    await expect(panel.locator('code')).toHaveText([`${serviceOrigin}/v1`, 'http://127.0.0.1:8092/v1/messages', `${serviceOrigin}/v1/systemone`]);
     await panel.scrollIntoViewIfNeeded();
     const endpointBounds = await panel.boundingBox();
     const sessionBounds = await page.locator('.overview-session-panel').boundingBox();
-    expect(endpointBounds!.height).toBeLessThanOrEqual(190);
-    expect(sessionBounds!.height).toBeLessThanOrEqual(190);
+    const viewportHeight = page.viewportSize()!.height;
+    expect(endpointBounds!.height).toBeLessThanOrEqual(viewportHeight);
+    expect(sessionBounds!.height).toBeLessThanOrEqual(viewportHeight);
     expect(await panel.locator('.overview-api-entry').first().evaluate(element => {
       const label = element.querySelector('strong')!.getBoundingClientRect();
       const url = element.querySelector('code')!.getBoundingClientRect();

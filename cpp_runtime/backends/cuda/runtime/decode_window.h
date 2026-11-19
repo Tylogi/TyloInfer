@@ -32,8 +32,8 @@ public:
         int64_t total_ns,min_ns,max_ns;
         int from_tile=-1,tile=-1;
     };
-    explicit DecodeWindow(cudaStream_t stream,bool layer_profile=false,bool independent_sequences=false);
-    bool independent_sequences() const noexcept {return independent_sequences_;}
+    explicit DecodeWindow(cudaStream_t stream,bool layer_profile=false,bool qsa_indexer_graph_task=false);
+    bool allows_qsa_indexer_graph_task() const noexcept {return qsa_indexer_graph_task_;}
     bool layer_profiling() const noexcept {return layer_profile_;}
     ~DecodeWindow();
     DecodeWindow(const DecodeWindow&)=delete;
@@ -64,6 +64,8 @@ public:
     }
     void mark(int layer,const char* phase);
     void mark_current(const char* phase) {mark(profile_layer_,phase);}
+    int profile_layer() const noexcept {return profile_layer_;}
+    int profile_tile() const noexcept {return profile_tile_;}
     int set_profile_tile(int tile) noexcept {const int previous=profile_tile_;profile_tile_=tile;return previous;}
     class ProfileTileScope {
         DecodeWindow& window_;
@@ -96,7 +98,7 @@ private:
     int profile_tile_=-1;
     int profile_layer_=-1;
     bool layer_profile_;
-    bool independent_sequences_;
+    bool qsa_indexer_graph_task_;
     bool prediction_enabled_=true;
     std::string profile_role_="unknown";
     int profile_rows_=1;

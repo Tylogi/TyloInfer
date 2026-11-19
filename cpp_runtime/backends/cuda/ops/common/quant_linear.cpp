@@ -2084,11 +2084,15 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
                 x.scalar_type()==mfq_tensor_backend::kFloat16,x.numel(),mode==2,gated.data_ptr(),stream.stream());
             return 0;
         });
+        // The down projection needs only the product. Return both input
+        // activations to the stream allocator before its weight tile grows.
+        x={};gate={};local_gate={};
         return is_dense()?forward_dense(gated):forward(execution,gated);
     }
     auto gated = mode == 1
         ? x * mfq_tensor_backend::sigmoid(local_gate)
         : x * mfq_tensor_backend::silu(local_gate);
+    x={};gate={};local_gate={};
     return is_dense()?forward_dense(gated):forward(execution,gated);
 }
 

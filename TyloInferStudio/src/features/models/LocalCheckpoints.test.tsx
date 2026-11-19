@@ -52,6 +52,29 @@ it('passes an explicit external Engram path only for the selected GGUF model', a
   expect(screen.getByRole('button', { name: 'Load' })).toBeDisabled();
 });
 
+it('selects only complete registered GGUF companion identities when embedded in the Agent product', async () => {
+  const artifact = { id: 'a'.repeat(32), name: 'Main GGUF', architecture: 'deepseek_v41', format: 'gguf', shard_count: 1,
+    gguf_companion_required: true, total_bytes: 100, complete: true, loadable: true, modified_at: '' } as ModelArtifact;
+  const table = { ...artifact, id: 'b'.repeat(32), name: 'Registered table', asset_kind: 'engram', gguf_companion_required: false, loadable: false } as ModelArtifact;
+  const incomplete = { ...table, id: 'c'.repeat(32), name: 'Incomplete table', complete: false };
+  const loadArtifact = vi.fn();
+  const catalog = { runtime: null, artifacts: [artifact, table, incomplete], filteredArtifacts: [artifact], instances: [], busy: false,
+    modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact, chooseModelDirectory: vi.fn(), openModelFiles: vi.fn() } as unknown as ReturnType<typeof useModelCatalog>;
+  const view = render(<LocalCheckpoints catalog={catalog} companionMode="registered-id" />);
+  expect(screen.getByRole('button', { name: 'Load' })).toBeDisabled();
+  await userEvent.click(screen.getByText('Engram companion'));
+  const picker = screen.getByRole('combobox', { name: 'Engram companion: Main GGUF' });
+  expect(within(picker).queryByRole('option', { name: 'Incomplete table' })).toBeNull();
+  expect(screen.queryByRole('textbox', { name: /Engram path/ })).toBeNull();
+  await userEvent.selectOptions(picker, table.id);
+  await userEvent.click(screen.getByRole('button', { name: 'Load' }));
+  expect(loadArtifact).toHaveBeenCalledExactlyOnceWith('Main GGUF', [table.id]);
+  catalog.connectionRevision = 1;
+  view.rerender(<LocalCheckpoints catalog={catalog} companionMode="registered-id" />);
+  expect(picker).toHaveValue('');
+  expect(screen.getByRole('button', { name: 'Load' })).toBeDisabled();
+});
+
 it('opens deletion confirmation by ID and prevents deleting loaded models', async () => {
   const artifact = { id: 'a', name: 'Model', architecture: 'qwen35', format: 'tq', shard_count: 1,
     total_bytes: 100, tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '' } as ModelArtifact;

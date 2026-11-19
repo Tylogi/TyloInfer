@@ -128,7 +128,23 @@ curl -H "Content-Type: application/json" --data-binary "@request.json" http://12
 响应中的 `mfq_metrics` 提供 `prefill_tps`、`decode_tps`、`ttft_ms`、`mtp_used` 和
 `mtp_acceptance_rate`。流式请求加 `"stream_options":{"include_usage":true}`，在末尾获取指标。
 MTP 在有对应权重的模型上默认允许使用，会自适应决定是否采用；示例把深度上限明确设为 3。
-测试普通 decode 时设 `"enable_mtp":false`。
+测试普通 decode 时设 `"enable_mtp":false`。也可对 `/v1/chat/completions` 使用
+`X-TyloInfer-MTP: off` 请求头，但请求体中的 `enable_mtp` 优先；上面的示例已显式设为
+`true`，因此仅加 `off` 请求头不会关闭 MTP，需修改或移除该字段。
+
+结构化决策使用单独的 [`POST /v1/systemone`](api/http.md#82-structured-decisions)，
+不是聊天请求。它需要支持决策的模型和空闲运行时。运行时先检查是否为 `READY`：
+活动聊天会使实例进入 `BUSY`，此时返回 `409 model_not_ready`；只有实例仍为 `READY`，
+但已有活动请求、排队请求或控制租约时，才返回 `409 runtime_busy`。
+提高聊天并发容量不会解除此独占限制。
+CUDA 决策模型默认 `--jev-weights stream`，使用 RAM 权重和两个 GPU 分层流式缓冲区；
+`--jev-weights vram` 改为全显存驻留，显存需求更高。API 加载对应字段为 `jev_weights`，
+默认同为 `"stream"`，详见[权重放置说明](cli/serve.md#jev-decision-model-weight-placement)。
+d1 文本模型也使用同一接口，但当前仅支持 CUDA 全显存驻留：CLI 启动时指定
+`--jev-weights vram`；API 加载时省略 `jev_weights` 自动选驻留，或显式设为 `"vram"`，
+显式 `"stream"` 会被拒绝。需配套 HF 配置、tokenizer、calibration 与原生 companion，
+详见 [d1 接入与限制](cli/d1-native.md#managed-serving)。Score 由模型定义：D3 保留均值，
+d1 保留官方中位数；通用接口不强制某一种读出。
 
 上面的短请求用于确认服务可用。比较 PP 时使用 **4K / 8K 的真实输入**，保持模型、上下文、
 分块和 MTP 设置相同；记录前缀命中情况，分别看首轮和热轮。前缀复用减少了实际 PP 工作量，

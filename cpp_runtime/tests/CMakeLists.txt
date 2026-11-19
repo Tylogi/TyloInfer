@@ -59,6 +59,11 @@ target_compile_features(mfq-session-snapshot-cache-test PRIVATE cxx_std_17)
 add_test(NAME mfq-session-snapshot-cache-test
     COMMAND mfq-session-snapshot-cache-test)
 
+add_executable(tyloinfer-session-cache-restore-test session_cache_restore_test.cpp)
+target_link_libraries(tyloinfer-session-cache-restore-test PRIVATE mfq-engine)
+target_compile_features(tyloinfer-session-cache-restore-test PRIVATE cxx_std_20)
+add_test(NAME tyloinfer-session-cache-restore-test COMMAND tyloinfer-session-cache-restore-test)
+
 function(mfq_add_core_test target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE mfq-core)

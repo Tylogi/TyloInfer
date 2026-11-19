@@ -1,12 +1,99 @@
 # CUDA KV memory policies
 
 The CUDA Flash-Next/QSA worker exposes `kv_memory` in model load requests and
-per-model context settings. It is independent of `kv_quantization`; FP16 remains
-the default. Metal keeps its existing dynamic allocation and storage controls.
+per-model context settings. Metal keeps its existing allocation controls.
+
+## Explicit QSA cache modes
+
+Managed CUDA Flash-Next selects `kv_memory.qsa_mode: "auto"` for supported
+four-token QSA blocks with automatic RAM placement. The CLI option
+`tyloinfer serve --qsa-cache-mode auto` makes that selection explicit. The independent
+`kv_quantization` setting still selects the ordinary packed-KV implementation;
+explicit VRAM, mapped-RAM and dynamic raw allocation retain their old paths.
+Other attention backends are not changed by the QSA policy.
 
 ```json
-{"kv_memory": {"placement": "auto", "allocation": "preallocated"}}
+{"kv_memory": {"qsa_mode": "auto", "placement": "auto"}}
 ```
+
+- `auto` reuses the RAM precision policy: nominal 5% FP16, 15% Affine INT8 and
+  80% TQ4, with complete 2048-token conversion batches and bounded batch tails.
+  Actual protected fractions depend on the RAM budget and resident population.
+- `fp16`, `affine8` and `tq4` retain fixed encoded precision. RAM pressure does
+  not silently demote them. With SSD enabled, their original images can spill
+  and be read back without refitting. Partial append buffers remain temporary.
+- `legacy` retains the ordinary raw-KV implementation and its admission checks.
+
+Auto does not by itself enable SSD. `placement: "auto_ssd"` enables the existing
+cold-block SSD tier. Admission then reserves resident index/descriptor metadata
+and bounded staging/codec buffers, not the entire historical KV population in
+RAM. Disk capacity is checked independently against the selected encoded
+format. Without SSD, the budget includes actual packed images, scales,
+alignment, index archives, metadata and conversion tails. GGUF experts receive
+the remaining RAM budget after this reservation. Cache payload grows with live
+tokens rather than preallocating a full-context FP16 image.
+
+Available physical RAM does not guarantee that CUDA can lock more pages. If a
+QSA image-pool allocation is rejected, the model thread may release idle GGUF
+expert pinned arenas and retry that allocation once. The expert pin ceiling is
+reduced by the returned quota so optional cache growth cannot immediately take
+it back. Background codecs defer this recovery to the model thread; live graph
+and transfer leases remain protected. This does not enable SSD KV or change the
+selected precision policy. `native_gguf_pinned_reclaim` reports physical arena
+bytes returned, not just deleted cache payload.
+
+Before a managed QSA chunk advances state, its immediate canonical append,
+codec batches and required row packets are priced together with an additional
+transaction-sized safety margin. Optional GGUF pinned arenas proactively return
+quota to satisfy that headroom. The conservative budget uses a previously proven
+committed pinned population; it is not advertised as the driver's exact limit.
+An unsatisfied known budget is rejected before that chunk advances, rather than
+silently reducing precision, context or request capacity. Unknown limits are not
+replaced with a device-specific constant.
+
+Without an explicit user RAM cap, managed GGUF QSA can reclaim optional expert
+RAM as independent request stores grow. The initial model-load KV reservation
+is not frozen into a shared multi-request RAM ceiling. Explicit user caps and
+ordinary raw-KV admission keep their existing semantics.
+
+Flash-Next batch prefill acquires required GGUF PLE row-stage leases before
+swapping in request state. Plans include the encoded pinned packet, pageable
+prefetch packet, GPU packet and decoded output; they use the table's actual
+staged representation, including row corrections. Full and tail stages in
+layer-major prefill are prepared before reset or forward-state advancement.
+Cancellation and failures retain each stage until its finite CPU/GPU consumers
+have retired. This is workspace admission, not a global token-slot allocator.
+
+A request-local pinned-allocation scope also covers tensor transfers and mapped
+plans that do not use the QSA image pool. On allocation rejection it can return
+optional GGUF pinned quota and retry only that uncommitted allocation once.
+Optional expert arenas, locked resident-view creation, background threads and
+captured/host-served graphs cannot invoke that recovery. Native allocation
+failures remain errors when no safe reclaim is possible; numerical chunks are
+never replayed as a memory-allocation retry.
+
+`continuous_batching_qsa_*` telemetry reports the independent requests' actual
+host payload, deduplicated image-pool allocation and precision-tier tokens. The
+base model's `qsa_adaptive_*` counters alone do not include those request stores.
+
+Configuration precedence is explicit API/per-model `qsa_mode`, then
+`TYLOINFER_QSA_CACHE_MODE`, then legacy `TYLOINFER_QSA_RAM_KV_BITS`, then the
+managed Auto default. The native environment accepts `auto`, `fp16`, `affine8`,
+`tq4` and `legacy`. Legacy numeric values 16/8/4 migrate to fixed modes, not
+Auto; zero selects legacy. Existing configurations that used 16 to request
+adaptation must now select `qsa_mode: "auto"` explicitly. The managed service
+migrates `TYLOINFER_QSA_ADAPTIVE_TQ=1` to Auto and forwards the resolved mode.
+Standalone native calls without any mode keep the ordinary legacy path; the old
+standalone GPU-adaptive experimental flag retains its separate implementation.
+Prefix compatibility keys include the resolved mode, so old or differently
+configured precision caches are not silently reused. Native startup logs report
+`native_qsa_cache_mode`; runtime metrics expose `qsa_cache_auto_enabled`,
+`qsa_cache_fixed_enabled` and actual RAM/SSD tier occupancy.
+
+## Ordinary raw-KV placement
+
+The following policies apply to `qsa_mode: "legacy"` and ordinary raw KV.
+FP16 remains their default precision.
 
 | Placement | Raw K/V storage |
 | --- | --- |

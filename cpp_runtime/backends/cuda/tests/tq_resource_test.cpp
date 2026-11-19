@@ -26,6 +26,10 @@
 #include "storage/routed_host_image.h"
 #include "qwen4_exp.h"
 #include "models/qwen4_exp/ops.h"
+#include "models/qwen4_exp/mtp.h"
+#include "engine/cuda_batching.h"
+#include "storage/text_session_cache.h"
+#include "runtime_config.h"
 #include "float_projection.h"
 #include "common_prefill_projection_test.h"
 #include "mfq_cuda_activation_ops.h"
@@ -1259,8 +1263,178 @@ void check_selected_projection_rows(Source& source,CudaExecutionContext& executi
     }
     std::cout<<"Selected TQ/GGUF/F16/BF16/F32 projections: "<<cases<<" FP64 oracles, repeated rows and bounds passed\n";
 }
+void check_qwen4_batch_verification(const std::string& path) {
+    CudaExecutionContext execution;
+    auto model=mfq::cuda::load_causal_lm<mfq::cuda::Qwen4CausalLm>(execution,path,{});
+    auto scope=model.execution_scope();
+    const auto options=tb::TensorOptions().dtype(tb::kInt64).device(tb::kCPU);
+    const auto ids=[&](const std::vector<int64_t>& tokens) {
+        return tb::tensor(tokens,options).reshape({1,-1}).to(tb::kCUDA);
+    };
+    const std::vector<std::vector<int64_t>> prompts{{5,6,7},{13,14,15,16},{22,23}};
+    const std::vector<std::vector<int64_t>> drafts{{8,9,10,11},{17,18,19},{24}};
+    const std::vector<int64_t> keep{2,3,1};
+    const std::vector<int64_t> next{12,20,25};
+    std::vector<std::unique_ptr<mfq::cuda::Qwen4BatchRequestState>> states;
+    std::vector<mfq::cuda::Qwen4BatchRequestState*> requests;
+    std::vector<tb::Tensor> chunks;
+    for(const auto& prompt:prompts) {
+        states.push_back(std::make_unique<mfq::cuda::Qwen4BatchRequestState>(model,prompts.size()));
+        requests.push_back(states.back().get());
+        chunks.push_back(ids(prompt));
+    }
+    std::vector<tb::Tensor> prompt_rows;
+    mfq::cuda::qwen4_batch_prefill(model,requests,chunks,&prompt_rows);
+    std::vector<int64_t> packed,widths,offsets{0};
+    for(const auto& draft:drafts) {
+        packed.insert(packed.end(),draft.begin(),draft.end());
+        widths.push_back(static_cast<int64_t>(draft.size()));
+        offsets.push_back(static_cast<int64_t>(packed.size()));
+    }
+    mfq::cuda::Qwen4BatchDecodeGraph graph(model);
+    tb::Tensor raw;
+    const auto logits=graph.run(requests,tb::tensor(packed,options).reshape({1,-1}),false,widths,&raw);
+    require(logits && raw.defined() && logits->size(0)==offsets.back() && raw.size(1)==offsets.back(),
+        "packed verification graph omitted token rows");
+    for(std::size_t row=0;row<requests.size();++row) {
+        requests[row]->finish_verification(keep[row]);
+        require(requests[row]->position()==int64_t(prompts[row].size())+keep[row],
+            "packed verification advanced a request across rejected tokens");
+    }
+    const auto continued=graph.run(requests,tb::tensor(next,options).reshape({-1,1}));
+    require(continued && graph.replays()==2,"packed verification continuation did not replay CUDA Graph");
+    graph.clear();
+    const auto near=[](const tb::Tensor& observed,const tb::Tensor& expected,const char* error) {
+        const auto reference=expected.to(tb::kFloat32);
+        const auto scale=std::max(reference.abs().max().item<float>(),1e-5f);
+        require((reference-observed.to(tb::kFloat32)).abs().max().item<float>()<.01f*scale,error);
+    };
+    for(std::size_t row=0;row<requests.size();++row) {
+        model.reset(1);
+        auto tokens=prompts[row];
+        tokens.insert(tokens.end(),drafts[row].begin(),drafts[row].end());
+        tb::Tensor raw_expected;
+        const auto expected=model.hidden_forward(ids(tokens),mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw_expected);
+        const auto expected_logits=model.logits_from_hidden(expected.narrow(1,prompts[row].size(),widths[row]));
+        near(logits->narrow(0,offsets[row],widths[row]),expected_logits.reshape({widths[row],-1}),
+            "packed verification changed target output rows");
+        near(raw.narrow(1,offsets[row],widths[row]),raw_expected.narrow(1,prompts[row].size(),widths[row]),
+            "packed verification changed predictor hidden rows");
+        model.reset(1);
+        tokens.resize(prompts[row].size()+keep[row]);
+        tokens.push_back(next[row]);
+        const auto expected_continuation=model.hidden_forward(ids(tokens));
+        const auto continuation_logits=model.logits_from_hidden(expected_continuation.narrow(1,expected_continuation.size(1)-1,1));
+        near(continued->narrow(0,row,1),continuation_logits.reshape({1,-1}),
+             "packed verification changed the continuation after rollback or commit");
+    }
+    if(auto base=mfq::cuda::qwen4_exp::Qwen4ExpMtp::load_if_present(execution,*model.source,model.config)) {
+        const MtpTarget target(model);
+        mfq::cuda::internal::TextSessionCache prefix_cache({},{});
+        std::vector<std::unique_ptr<mfq::cuda::qwen4_exp::Qwen4ExpMtp>> predictors;
+        std::vector<tb::Tensor> previous;
+        for(std::size_t row=0;row<prompts.size();++row) {
+            predictors.push_back(base->fork_empty());
+            previous.push_back(predictors.back()->prime_prompt(target,prompt_rows[row].narrow(1,0,1),
+                ids({prompts[row].front()}),{}));
+        }
+        for(std::size_t row=0;row<prompts.size();++row) {
+            const auto tail=prompts[row].size()-1;
+            previous[row]=predictors[row]->prime_prompt(target,prompt_rows[row].narrow(1,1,tail),
+                ids(prompts[row]).narrow(1,1,tail),previous[row]);
+        }
+        for(std::size_t row=0;row<prompts.size();++row) {
+            base->reset();
+            const auto reference=base->prime_prompt(target,prompt_rows[row],ids(prompts[row]),{});
+            const auto proposed=ids({drafts[row].front()});
+            const auto expected=base->step(target,reference,proposed);
+            const auto observed=predictors[row]->step(target,previous[row],proposed);
+            near(observed.sample_hidden,expected.sample_hidden,"Qwen4 predictor histories crossed requests");
+            const auto committed=static_cast<int64_t>(prompts[row].size())-1;
+            predictors[row]->trim_cache_to(committed);
+            mfq::cuda::Qwen4BatchRequestState target_prefix(model);
+            mfq::cuda::qwen4_batch_prefill(model,{&target_prefix},{ids(prompts[row])});
+            prefix_cache.store("mtp-verification",target_prefix.capture_prefix(model,prompts[row],
+                predictors[row].get(),previous[row]));
+            auto restored=base->fork_empty();
+            mfq::cuda::Qwen4BatchRequestState restored_target(model);
+            auto continuation=prompts[row];
+            continuation.push_back(drafts[row].front());
+            tb::Tensor restored_hidden;
+            const auto reused=restored_target.restore_prefix(model,prefix_cache,"mtp-verification",continuation,
+                prompts[row].size(),restored.get(),&restored_hidden);
+            require(reused==prompts[row].size() && restored->cache_position()==committed,
+                "Qwen4 predictor and target prefix boundaries disagree");
+            const auto replay=restored->step(target,std::move(restored_hidden),proposed);
+            near(replay.sample_hidden,expected.sample_hidden,"Qwen4 predictor prefix lost state after rollback");
+        }
+        std::cout<<"Qwen4 independent predictor priming, restore and rollback passed\n";
+        const auto run=[&](bool speculation) {
+            mfq::cuda::CudaContinuousBatchConfig config;
+            config.max_sequences=prompts.size();
+            config.cuda_graph=true;
+            mfq::engine::ContinuousBatch<mfq::cuda::FlashNextBatchOperations> batch(
+                4,16,model,execution,config,speculation?&*base:nullptr);
+            std::vector<mfq::engine::InferenceRequest> input(prompts.size());
+            std::vector<std::unique_ptr<mfq::engine::InferenceOutput>> output;
+            std::vector<mfq::engine::Generation> streams;
+            std::vector<std::vector<int64_t>> tokens(prompts.size());
+            std::vector<std::string> names;
+            std::vector<bool> done(prompts.size());
+            for(std::size_t i=0;i<prompts.size();++i) {
+                auto& request=input[i];
+                request.prompt=prompts[i];
+                request.chat=false;
+                request.sampling.temperature=0;
+                request.sampling.max_tokens=7;
+                request.sampling.enable_mtp=speculation && i<2;
+                names.push_back(std::to_string(i));
+                output.push_back(std::make_unique<mfq::engine::InferenceOutput>(request,nullptr,names.back()));
+                streams.push_back(batch.generate(names.back(),request,*output.back()));
+            }
+            for(int tick=0;!batch.empty() || tick==0;++tick) {
+                require(tick<64,"Qwen4 MTP scheduler stalled");
+                std::vector<std::string> eligible;
+                for(std::size_t i=0;i<streams.size();++i) {
+                    if(done[i])continue;
+                    const auto step=streams[i].next();
+                    if(!step){done[i]=true;continue;}
+                    eligible.push_back(names[i]);
+                    if(step.value)if(const auto* delta=std::get_if<mfq::engine::OutputDelta>(&*step.value))
+                        tokens[i].insert(tokens[i].end(),delta->token_ids.begin(),delta->token_ids.end());
+                }
+                batch.step(eligible);
+            }
+            for(std::size_t i=0;i<output.size();++i) {
+                require(tokens[i].size()==7,"Qwen4 MTP scheduler lost output positions");
+                if(speculation && i<2)require(output[i]->metrics.mtp.drafted_tokens>0,
+                    "Qwen4 MTP scheduler executed no draft proposals");
+            }
+            if(speculation) {
+                const auto metrics=batch.metrics();
+                const auto maximum=std::find_if(metrics.begin(),metrics.end(),[](const auto& metric) {
+                    return metric.first=="continuous_batching_mtp_maximum_batch";
+                });
+                require(maximum!=metrics.end() && maximum->second==2,"Qwen4 MTP verification was serialized");
+                const auto replay=std::find_if(metrics.begin(),metrics.end(),[](const auto& metric) {
+                    return metric.first=="continuous_batching_cuda_graph_replays";
+                });
+                require(replay!=metrics.end() && replay->second>0,"Qwen4 MTP verification did not replay CUDA Graph");
+            }
+            return tokens;
+        };
+        const auto ordinary=run(false);
+        require(run(true)==ordinary,"Qwen4 MTP scheduler changed greedy output in a mixed cohort");
+        std::cout<<"Qwen4 continuous CUDA MTP mixed cohort matches ordinary generation\n";
+    }
+    std::cout<<"Qwen4 packed verification and independent acceptance passed\n";
 }
-int main()try {
+}
+int main(int argc,char** argv)try {
+    if(argc==3 && std::string_view(argv[1])=="--qwen4-batch-verification") {
+        check_qwen4_batch_verification(argv[2]);
+        return 0;
+    }
     {
         Source source;source.batch_rows=true;
         GgufRowTable table(source,"rows.F32");

@@ -3,6 +3,7 @@ add_library(mfq-cpu-ops STATIC
     ops/common/host_memory_copy.cpp
     ops/common/host_memory_copy.h
     ops/common/gguf_cpu.cpp
+    ops/common/qsa_indexer_cpu.cpp
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-cpu-ops PRIVATE
@@ -19,13 +20,13 @@ set_target_properties(mfq-cpu-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|i.86)$")
     # The GGUF row arithmetic actually uses AVX2, FMA and half conversion.
     # Only these translation units get the ISA flags; baseline dispatch is safe.
-    target_sources(mfq-cpu-ops PRIVATE ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp)
+    target_sources(mfq-cpu-ops PRIVATE ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp ops/common/qsa_indexer_cpu_avx2.cpp)
     target_compile_definitions(mfq-cpu-ops PRIVATE TYLOINFER_GGUF_CPU_AVX2=1)
     if(MSVC)
-        set_source_files_properties(ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp
+        set_source_files_properties(ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp ops/common/qsa_indexer_cpu_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
     else()
-        set_source_files_properties(ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp
+        set_source_files_properties(ops/common/gguf_cpu_avx2.cpp ops/common/gguf_cpu_q2_avx2.cpp ops/common/gguf_cpu_prepare_avx2.cpp ops/common/qsa_indexer_cpu_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
     endif()
     # Compile wide rows independently; baseline feature detection stays free

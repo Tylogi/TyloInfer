@@ -90,10 +90,14 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     auto query=tb::tensor(query_data,f).reshape({1,length,heads,width}).permute({0,2,1,3});
     auto iq=tb::tensor(iq_data,f).reshape({1,length,1,iw});
     const auto pool=[](const auto& x,const auto&){return x.slice(1,0,x.size(1),4).contiguous();};
-    const auto append=[&](int begin,int count) {
+    const auto append_cache=[&](mfq::cuda::QsaTqCache& target,int begin,int count,tb::Tensor output={}) {
         auto positions=tb::arange(begin,begin+count,f.dtype(tb::kInt64)).reshape({1,count});
-        return runtime.forward(query.narrow(2,begin,count),values.narrow(1,begin,count),values.narrow(1,begin,count),
-            iq.narrow(1,begin,count),raw.narrow(1,begin,count),positions,pool,false,tb::zeros({1,count,heads,width},f)).to(tb::kCPU).contiguous();
+        return target.forward(query.narrow(2,begin,count),values.narrow(1,begin,count),values.narrow(1,begin,count),
+            iq.narrow(1,begin,count),raw.narrow(1,begin,count),positions,pool,false,tb::zeros({1,count,heads,width},f),
+            std::move(output)).to(tb::kCPU).contiguous();
+    };
+    const auto append=[&](int begin,int count,tb::Tensor output={}) {
+        return append_cache(runtime,begin,count,std::move(output));
     };
     append(0,prefix);
     TextSessionState state;state.cache_pos=prefix;for(int i=0;i<prefix;++i)state.tokens.push_back(i+1);
@@ -113,6 +117,15 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     state.mtp->qwen4_lengths.push_back(prefix);
     refresh_cuda_qwen4_session_bytes(state);const auto old_bytes=state.bytes;
     const auto expected=append(prefix,3);
+    {
+        const auto& snapshot=*std::get<std::vector<Qwen4BlockSessionState>>(state.payload)[0].adaptive_qsa;
+        runtime.restore_session(snapshot,false);
+        bool rejected=false;
+        try{append(prefix,3,tb::empty({1},f));}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected && runtime.position()==prefix+3,"Fixture did not fail after advancing an incomplete QSA append");
+        runtime.truncate(prefix);
+        same(expected,append(prefix,3));
+    }
     {
         auto sliced=*std::get<std::vector<Qwen4BlockSessionState>>(state.payload)[0].adaptive_qsa;
         auto reads=std::make_shared<std::size_t>(0);
@@ -152,7 +165,7 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
         std::vector<mfq::cache::BlockHash> blocks;mfq::cache::BlockHash parent{};
         for(size_t i=0;i<payloads.size();++i) {
             const auto at=i*page,count=std::min(page,state.tokens.size()-at);
-            parent=cache.store(parent,state.tokens.data()+at,count,encode_cuda_qwen4_paged_block(ordinary,page,i));
+            parent=cache.replace(parent,state.tokens.data()+at,count,encode_cuda_qwen4_paged_block(ordinary,page,i));
             blocks.push_back(parent);
         }
         cache.trim_hot();cache.flush();
@@ -198,6 +211,60 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     require(imported.tokens==state.tokens,"Streamed prefix selected the wrong recurrent boundary");
     auto restored=std::get<std::vector<Qwen4BlockSessionState>>(imported.payload)[0].adaptive_qsa;
     require(restored->borrow_prefix && restored->durable_prefix,"Streamed prefix lost its SSD file leases");
+    auto imported_again=decode_cuda_qwen4_paged_prefix(cache,blocks,prompt,page);
+    const auto shared=std::get<std::vector<Qwen4BlockSessionState>>(imported_again.payload)[0].adaptive_qsa;
+    require(shared->index==restored->index,"Repeated prefix restore duplicated immutable Indexer archives");
+    for(size_t id=0;id<shared->kv->blocks.size();++id)
+        require(shared->kv->blocks[id].backing==restored->kv->blocks[id].backing,
+            "Repeated prefix restore duplicated immutable KV descriptors");
+    if(bits==8 && page==64) {
+        setting("TYLOINFER_QSA_CACHE_MODE","auto");
+        setting("TYLOINFER_QSA_TQ_DIRECTORY",(directory/"shared-adaptive-kv").string());
+        mfq::cuda::QsaTqCache first(length,heads,kh,width,1,iw,32,f,true);
+        mfq::cuda::QsaTqCache second(length,heads,kh,width,1,iw,32,f,true);
+        first.enable_prefix_sharing();second.enable_prefix_sharing();
+        auto adaptive=*restored;adaptive.ram_bits=0;
+        first.restore_session(adaptive,true);
+        {
+            auto original=first.capture_session(prefix);
+            setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","16384");
+            second.restore_session(adaptive,true,std::array<const mfq::cuda::QsaTqCache*,1>{&first});
+            setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
+            auto reused=second.capture_session(prefix);
+            for(size_t id=0;id<original->kv->blocks.size();++id) {
+                const auto& a=original->kv->blocks[id].image;
+                const auto& b=reused->kv->blocks[id].image;
+                require(a && b && a!=b && a->owner==b->owner && b->shared_prefix_allocation,
+                    "Adaptive QSA prefix did not retain an independent lease of the same RAM image");
+            }
+        }
+        first.truncate(0);
+        same(expected,append_cache(second,prefix,3));
+        auto left=adaptive,right=adaptive;
+        left.kv=std::make_shared<tyloinfer::qsa::RamKvSnapshot>(*adaptive.kv);
+        right.kv=std::make_shared<tyloinfer::qsa::RamKvSnapshot>(*adaptive.kv);
+        const auto middle=left.kv->blocks.size()/2;
+        for(size_t id=0;id<left.kv->blocks.size();++id)
+            (id<middle?right:left).kv->blocks[id].tier=tyloinfer::qsa::RamKvTier::Ssd;
+        first.restore_session(left,true);second.restore_session(right,true);
+        mfq::cuda::QsaTqCache combined(length,heads,kh,width,1,iw,32,f,true);
+        combined.enable_prefix_sharing();
+        combined.restore_session(adaptive,true,std::array<const mfq::cuda::QsaTqCache*,2>{&first,&second});
+        {
+            auto a=first.capture_session(prefix),b=second.capture_session(prefix),both=combined.capture_session(prefix);
+            for(size_t id=0;id<both->kv->blocks.size();++id) {
+                const auto& original=(id<middle?a:b)->kv->blocks[id].image;
+                const auto& shared_image=both->kv->blocks[id].image;
+                require(original && shared_image && original->owner==shared_image->owner && shared_image->shared_prefix_allocation,
+                    "QSA prefix could not combine resident images from independent requests");
+            }
+        }
+        first.truncate(0);second.truncate(0);
+        same(expected,append_cache(combined,prefix,3));
+        setting("TYLOINFER_QSA_CACHE_MODE","");
+        setting("TYLOINFER_QSA_TQ_DIRECTORY","");
+        std::cout<<"Shared adaptive QSA prefix RAM survives independent request reset PASS\n";
+    }
     for(size_t start=0;start<size_t(prefix);start+=page) {
         const auto first=start/4,last=std::min(start+page,size_t(prefix))/4;
         for(auto id=first;id<last;++id) {
@@ -211,6 +278,26 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     require(!imported.mtp->qwen4_blocks[0].adaptive_qsa->borrow_prefix,"Disabled SSD prefix still lent MTP head KV");
     prepare_cuda_qwen4_session_restore(imported,true);require(restored->borrow_prefix,"Enabled SSD prefix did not lend its files");
     cache.clear();runtime.reset();runtime.restore_session(*restored,true);same(expected,append(prefix,3));
+    {
+        mfq::cuda::QsaTqCache peer(length,heads,kh,width,1,iw,32,f,false);
+        peer.restore_session(*shared,true,std::array<const mfq::cuda::QsaTqCache*,1>{&runtime});
+        same(expected,append_cache(peer,prefix,3));
+
+        auto partial=*shared;
+        const auto middle=partial.index.size()/2;
+        const auto bytes=partial.index[middle]->read();
+        auto reads=std::make_shared<std::size_t>(0);
+        auto source=std::make_shared<tyloinfer::qsa::RamKvReadSource>();source->bytes=bytes->size();
+        source->read_range_into=[bytes,reads](std::size_t at,std::uint8_t* destination,std::size_t count) {
+            require(at==8*iw && count==2*(iw+2),"Nonshared prefix read did not use its exact index slice");
+            ++*reads;std::memcpy(destination,bytes->data()+at,count);
+        };
+        partial.index[middle]=std::make_shared<mfq::cuda::QsaIndexArchive>();
+        partial.index[middle]->bind(source,0,bytes->size());
+        peer.restore_session(partial,true,std::array<const mfq::cuda::QsaTqCache*,1>{&runtime});
+        require(*reads==1,"Mixed prefix did not read the one unmatched Indexer record");
+        same(expected,append_cache(peer,prefix,3));
+    }
     runtime.reset();runtime.restore_session(*imported.mtp->qwen4_blocks[0].adaptive_qsa,true);same(expected,append(prefix,3));
     require(cache.metrics().writes==payloads.size()+1,"Prefix reuse wrote pages beyond the explicit replacement");
     auto truncated=std::make_shared<std::vector<uint8_t>>(*payloads.back());truncated->resize(truncated->size()-1);
@@ -220,7 +307,9 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     std::cout<<"Packed QSA prefix, exact INT16 index, unaligned pages, retained SSD file and continuation PASS bits="<<bits<<" page="<<page<<"\n";
 }
 void pressure(const std::filesystem::path& directory) {
-    setting("TYLOINFER_QSA_RAM_KV_BITS","16");setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(7<<20));
+    setting("TYLOINFER_QSA_CACHE_MODE","auto");
+    constexpr std::size_t ram_budget=3<<20;
+    setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(ram_budget));
     setting("TYLOINFER_QSA_TQ_DIRECTORY",(directory/"session").string());
     const auto f=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
     constexpr int n=8192,heads=6,kh=2,width=63,iw=4;
@@ -237,7 +326,8 @@ void pressure(const std::filesystem::path& directory) {
     TextSessionState state;state.cache_pos=n;for(int i=0;i<n;++i)state.tokens.push_back(i+1);
     Qwen4BlockSessionState layer;layer.adaptive_qsa=runtime.capture_session(n);
     std::array<size_t,4> tiers{};for(const auto& b:layer.adaptive_qsa->kv->blocks)++tiers[unsigned(b.tier)];
-    require(tiers[0] && tiers[1] && tiers[2] && tiers[3],"Pressure prefix did not cover all four real RAM/SSD tiers");
+    require(!tiers[0] && tiers[1]*10>=layer.adaptive_qsa->kv->blocks.size() && tiers[2] && tiers[3],
+        "Pressure prefix did not retain its INT8 floor across RAM and SSD tiers");
     state.payload=std::vector<Qwen4BlockSessionState>{layer};state.qwen4_positions=tb::arange(n,f.dtype(tb::kInt64)).reshape({1,n});
     const auto expected=append(n,3);
     const auto expected_continuation=append(n+3,12);
@@ -252,9 +342,10 @@ void pressure(const std::filesystem::path& directory) {
     runtime.reset();failed_restore(runtime,*snapshot,true);
     runtime.restore_session(*snapshot,true);same(expected,append(n,3));runtime.wait();
     same(expected_continuation,append(n+3,12));runtime.wait();
-    require(runtime.stats().resident_bytes<=size_t(7<<20),"Prefix restore exceeded the RAM pressure budget");
-    std::cout<<"Real mixed FP16/A8/TQ4/session-SSD prefix restore under RAM budget PASS\n";
+    require(runtime.stats().resident_bytes<=ram_budget,"Prefix restore exceeded the RAM pressure budget");
+    std::cout<<"Auto mixed INT8/TQ4/session-SSD prefix restore under RAM budget PASS\n";
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
+    setting("TYLOINFER_QSA_CACHE_MODE","");
 }
 void shared_codec(bool fingerprints=false) {
     setting("TYLOINFER_QSA_RAM_KV_BITS","4");setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");

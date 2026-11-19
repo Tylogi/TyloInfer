@@ -70,6 +70,17 @@ int main()try {
     const auto unconstrained=tq::plan_ram_pressure(blocks,64*MiB,{2048,true});
     require(unconstrained.minimum_fp16==1640 && unconstrained.minimum_affine8==4916,
         "An affordable cache changed its protected fractions");++cases;
+    {
+        auto input=blocks;
+        for(auto& block:input)block.tier=tq::RamKvTier::Affine8;
+        const tq::RamPressureConfig config{2048,true,tq::RamKvTier::Affine8};
+        const auto plan=tq::plan_ram_pressure(input,8*MiB,config);
+        check_plan(input,plan,config);
+        require(plan.fits() && !plan.minimum_fp16 && plan.minimum_affine8==3280 &&
+            plan.tokens[1]>=plan.minimum_affine8 && plan.tokens[2] && plan.tokens[3],
+            "INT8 minimum fell below ten percent under SSD pressure");
+        ++cases;
+    }
     // Keep only a short live tail in RAM while growing SSD history to 1M.
     // Historical tokens must not create an unbounded high-precision floor.
     std::uint64_t previous_fp16=0,previous_affine8=0;
@@ -134,6 +145,17 @@ int main()try {
     require(tq::ram_precision_target(0,{0,0,0},tq::RamKvTier::Fp16)==0,"Empty KV retained a RAM reservation");
     require(tq::ram_precision_target(1,{1024,512,256},tq::RamKvTier::Fp16)==1024,"Short KV lost its bounded precision tail");
     require(tq::ram_precision_target(10000,{10240000,5120000,2560000},tq::RamKvTier::Tq4)==2560000,"TQ4 reservation grew beyond its payload");
-    std::printf("QSA RAM pressure reserve, LRU, 2048-token batches, protected tiers and SSD policy PASS cases=%d\n",cases);
+    for(auto canonical:{tq::RamKvTier::Fp16,tq::RamKvTier::Affine8,tq::RamKvTier::Tq4}) {
+        auto fixed=fixture(32);for(auto& b:fixed)b.tier=canonical;
+        tq::RamPressureConfig config;config.canonical_tier=canonical;config.adaptive_precision=false;
+        auto plan=tq::plan_ram_pressure(fixed,0,config);
+        require(!plan.fits() && plan.actions.empty() && plan.needs_ssd,"Fixed precision was silently demoted without SSD");
+        config.ssd_enabled=true;plan=tq::plan_ram_pressure(fixed,0,config);
+        require(plan.fits() && plan.tokens[3]==128,"Fixed precision did not spill its original images");
+        for(const auto& action:plan.actions)require(action.from==canonical && action.to==tq::RamKvTier::Ssd,
+            "Fixed precision requested a codec instead of moving its original image");
+        ++cases;
+    }
+    std::printf("QSA Auto/fixed precision, RAM reserve, LRU, batch tails and SSD policy PASS cases=%d\n",cases);
     return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}

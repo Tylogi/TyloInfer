@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import math
 import os
 import platform
@@ -292,17 +291,18 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
     import uvicorn
 
     from tyloinfer.server.api import create_app
-    from tyloinfer.server.api.listener import RuntimeServer, saved_service_port
     from tyloinfer.server.api.auth import ApiKeyManager
-    from tyloinfer.server.state.catalog import ModelCatalog
-    from tyloinfer.server.runtime.cluster import ClusterBackend
-    from tyloinfer.server.services.components import VoiceOutputComponent
-    from tyloinfer.server.services.jobs import JobManager
+    from tyloinfer.server.api.listener import RuntimeServer, saved_service_port
     from tyloinfer.server.protocol.models import ModelLoadRequest
+    from tyloinfer.server.runtime.cluster import ClusterBackend
     from tyloinfer.server.runtime.runtime_pool import RuntimePool
+    from tyloinfer.server.services.components import VoiceOutputComponent
+    from tyloinfer.server.services.download_policy import apply_download_policy
+    from tyloinfer.server.services.jobs import JobManager
     from tyloinfer.server.services.service import ServerService
-    from tyloinfer.server.state.storage import SessionStore
     from tyloinfer.server.services.tool_jobs import ToolJobHandlers, ToolJobPaths
+    from tyloinfer.server.state.catalog import ModelCatalog
+    from tyloinfer.server.state.storage import SessionStore
     from tyloinfer.server.vision import clear_image_decode_cache
 
     data_dir = args.data_dir.expanduser().resolve()
@@ -372,6 +372,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
                 prefix_cache_disk_bytes=args.prefix_cache_disk_size,
                 prefix_cache_hot_bytes=args.prefix_cache_hot_size,
                 prefix_cache_block_tokens=args.prefix_cache_block_tokens,
+                **({"kv_memory": {"qsa_mode": args.qsa_cache_mode}} if args.qsa_cache_mode is not None else {}),
             )
         )
     runtime_manager = RuntimePool(
@@ -399,7 +400,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
     binary_dir = Path(sys.executable).parent
     handlers = ToolJobHandlers(
         catalog,
-        ToolJobPaths(
+        apply_download_policy(ToolJobPaths(
             work_root=work_dir,
             python=Path(sys.executable),
             modelscope=(
@@ -412,9 +413,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
                 if selected_backend == "cuda" else executable
             ),
             standalone_cli=bool(getattr(sys, "frozen", False)),
-            internal_modelscope=importlib.util.find_spec("modelscope_hub") is not None,
-            internal_huggingface=importlib.util.find_spec("huggingface_hub") is not None,
-        ),
+        ), getattr(args, "downloads", "auto")),
         voice_component=voice_component,
         activate_voice_output=runtime_manager.enable_realtime,
         runtime_manager=runtime_manager,
@@ -498,6 +497,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--jev-weights", choices=("stream", "vram"), default="stream",
         help="Jev layer weights: two streaming buffers (default) or full VRAM")
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
+    parser.add_argument("--qsa-cache-mode", choices=("auto", "fp16", "affine8", "tq4", "legacy"),
+                        help="QSA RAM cache policy; Auto adapts precision, numeric precision modes stay fixed")
     parser.add_argument(
         "--prefill-chunk-size", type=_prefill_chunk_size, default="auto",
         metavar="auto|N",
@@ -556,6 +557,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     web.add_argument("--no-web-ui", action="store_true")
     parser.add_argument("--model-dir", action="append", type=Path, default=[])
     parser.add_argument("--work-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--downloads", choices=("auto", "disabled", "enabled"), default="auto",
+        help="Hub handlers: auto detects installed providers, disabled registers none, enabled requires an installed provider")
     parser.add_argument(
         "--api-key-env",
         default="TYLOINFER_SERVER_API_KEY",

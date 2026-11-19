@@ -15,10 +15,10 @@ function contrast(foreground: string, background: string) {
 }
 
 for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
-  test(`copper accent covers controls and charts (${mode})`, async ({ page }, testInfo) => {
+  test(`workspace accent covers controls and charts (${mode})`, async ({ page }, testInfo) => {
     const dark = mode.endsWith('dark');
     const theme = mode.startsWith('system') ? 'system' : mode;
-    const expected = dark ? 'rgb(214, 170, 115)' : 'rgb(159, 98, 50)';
+    const expected = dark ? 'rgb(122, 170, 255)' : 'rgb(65, 118, 230)';
     const expectedBar = dark ? 'rgb(153, 157, 158)' : 'rgb(95, 98, 100)';
     const state = await mockStudioServer(page);
     await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light' });
@@ -50,7 +50,7 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
 
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     await expect(page.getByRole('switch', { name: 'Vision input', exact: true })).toHaveCount(0);
     await page.goto('/runtime');
@@ -64,7 +64,7 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     await expect(vision).not.toBeChecked();
     await expect(thumb).toHaveCSS('background-color', 'rgb(255, 255, 255)');
 
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.locator('main h1')).toBeVisible();
     const modelColors = Array(4).fill(expectedBar);
     await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
@@ -75,13 +75,17 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
       expect(await tier.locator(':scope > span').evaluateAll(elements =>
         elements.map(element => getComputedStyle(element).backgroundColor))).toEqual(modelColors);
     }
-    const chatColors = await page.locator('.runtime-hero-actions .runtime-hero-chat').evaluate(element => {
+    const actionColors = await page.locator('.runtime-hero-actions button').evaluate(element => {
       const style = getComputedStyle(element);
-      return { foreground: style.color, background: style.backgroundColor };
+      const probe = document.createElement('span');
+      probe.style.backgroundColor = 'var(--surface)';
+      element.appendChild(probe);
+      const surface = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return { foreground: style.color, background: style.backgroundColor, surface };
     });
-    const channels = chatColors.background.match(/[\d.]+/g)!.map(Number);
-    expect(Math.max(...channels) - Math.min(...channels)).toBeLessThanOrEqual(4);
-    expect(contrast(chatColors.foreground, chatColors.background)).toBeGreaterThanOrEqual(4.5);
+    expect(actionColors.background).toBe(actionColors.surface);
+    expect(contrast(actionColors.foreground, actionColors.background)).toBeGreaterThanOrEqual(4.5);
     for (const monogram of await page.locator('.runtime-hero .model-monogram.ready, .overview-model-card .model-monogram.ready').all()) {
       const color = await monogram.evaluate(element => getComputedStyle(element).color);
       const rgb = color.match(/[\d.]+/g)!.map(Number);

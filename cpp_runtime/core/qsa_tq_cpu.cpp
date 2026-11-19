@@ -138,6 +138,40 @@ std::vector<float> decode_cpu_tq_row(const CpuTqRow& row) {
     return output;
 }
 
+namespace {
+void pack_affine8_row(const float* input,std::vector<std::uint8_t>& output,std::size_t rows,std::size_t row) {
+    float lo=0,hi=0;
+    for(int d=0;d<256;++d){lo=std::min(lo,input[d]);hi=std::max(hi,input[d]);}
+    const float step=std::max((hi-lo)/255.f,0x1p-24f);
+    auto encoded=ggml_fp32_to_fp16(step);
+    if(ggml_fp16_to_fp32(encoded)<step)++encoded;
+    const float scale=ggml_fp16_to_fp32(encoded);
+    const int zero=std::clamp(-128-int(std::nearbyint(lo/scale)),-128,127);
+    output[2*row]=std::uint8_t(encoded);output[2*row+1]=std::uint8_t(encoded>>8);
+    output[2*rows+row]=std::uint8_t(std::int8_t(zero));
+    auto* codes=output.data()+((3*rows+3)&~std::size_t(3))+row*256;
+    for(int d=0;d<256;++d)codes[d]=std::uint8_t(std::int8_t(
+        std::clamp(int(std::nearbyint(input[d]/scale))+zero,-128,127)));
+}
+} // namespace
+
+std::vector<std::uint8_t> encode_cpu_qsa_affine8(const std::uint8_t* fp16_modes,std::size_t bytes,std::size_t rows) {
+    if(!fp16_modes || !rows || rows%4 || rows>std::numeric_limits<std::size_t>::max()/520 || bytes!=rows*512)
+        throw std::invalid_argument("invalid FP16 QSA affine geometry");
+    std::vector<std::uint8_t> output(((3*rows+3)&~std::size_t(3))+rows*256);
+    std::array<float,256> decoded;
+    for(std::size_t row=0;row<rows;++row) {
+        const auto* input=fp16_modes+row*512;
+        for(std::size_t d=0;d<decoded.size();++d) {
+            const auto half=std::uint16_t(input[2*d]|std::uint16_t(input[2*d+1])<<8);
+            if((half&0x7c00)==0x7c00)throw std::invalid_argument("non-finite canonical QSA modes");
+            decoded[d]=ggml_fp16_to_fp32(half);
+        }
+        pack_affine8_row(decoded.data(),output,rows,row);
+    }
+    return output;
+}
+
 struct CpuTqBlockFitter::Impl {
     MicroblockImage canonical;
     std::size_t rows=0;
@@ -197,20 +231,7 @@ struct CpuTqBlockFitter::Impl {
             // includes zero in each row's range. No trellis fit is needed.
             const auto header=(3*rows+3)&~std::size_t(3);
             std::vector<std::uint8_t> output(header+rows*256);
-            for(std::size_t row=0;row<rows;++row) {
-                const auto* x=decoded[kind].data()+row*256;
-                float lo=0,hi=0;
-                for(int d=0;d<256;++d){lo=std::min(lo,x[d]);hi=std::max(hi,x[d]);}
-                const float step=std::max((hi-lo)/255.f,0x1p-24f);
-                auto encoded=ggml_fp32_to_fp16(step);
-                if(ggml_fp16_to_fp32(encoded)<step)++encoded;
-                const float scale=ggml_fp16_to_fp32(encoded);
-                const int zero=std::max(-128,std::min(127,-128-int(std::nearbyint(lo/scale))));
-                output[2*row]=std::uint8_t(encoded);output[2*row+1]=std::uint8_t(encoded>>8);
-                output[2*rows+row]=std::uint8_t(std::int8_t(zero));
-                for(int d=0;d<256;++d)output[header+row*256+d]=std::uint8_t(std::int8_t(
-                    std::max(-128,std::min(127,int(std::nearbyint(x[d]/scale))+zero))));
-            }
+            for(std::size_t row=0;row<rows;++row)pack_affine8_row(decoded[kind].data()+row*256,output,rows,row);
             packed_tags[kind]=affine8_tag;return output;
         }
         if(budget_bits==8){packed_tags[kind]=kind?canonical.value_bits:canonical.key_bits;return kind?canonical.value:canonical.key;}

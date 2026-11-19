@@ -354,13 +354,45 @@ not override the corresponding runtime environment policies; record inherited
 
 For an OpenAI chat request, `"enable_mtp": false` requests an ordinary decode
 baseline; `"enable_mtp": true` permits speculation and
-`"mtp_max_draft_tokens": 3` caps draft depth. Availability still depends on
+`"mtp_max_draft_tokens": 3` caps draft depth. For `/v1/chat/completions`,
+`X-TyloInfer-MTP: on` or `off` supplies `enable_mtp` only when the body omits it;
+an explicit body value takes precedence. Other header values are ignored.
+Without either override, the chat parser defaults to `true`. This is a
+request-local chat control, not a `/v1/systemone` option. Availability still depends on
 model weights, runtime support, and scheduling (see
 [continuous batching limits](../runtime/cuda-continuous-batching.md)). Inspect
 reported `mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate` when present;
 do not assume the requested path actually ran. The metrics name is a retained
 wire-format identifier, not the public CLI name. See the
 [performance guide](../benchmarking.md) for measurement steps.
+
+## Jev decision-model weight placement
+
+For supported CUDA decision models, `--jev-weights stream` is the default.
+Layer weights remain in RAM and use two GPU streaming buffers sized for the
+largest layer. Eligible embedding/output tables normally attempt mapped RAM
+placement; unavailable mapping or an ineligible layout can fall back to device
+tables and require additional VRAM. Explicit mapping overrides may report failure
+instead of falling back. Output normalization and any trained readout also consume
+resident GPU memory. `--jev-weights vram` places
+these weights in VRAM instead, increasing residency and avoiding layer-weight
+streaming transfers. Neither mode guarantees that a model fits: execution
+workspaces and other allocations also require memory.
+
+```shell
+uv run tyloinfer serve --backend cuda --model ./models/decision.tq --jev-weights stream --no-web-ui
+```
+
+Replace the example artifact with a supported decision checkpoint. The setting
+is forwarded to CUDA workers only for artifacts marked `structured_decisions`;
+it is not a general MoE expert-cache switch. API loading uses the corresponding
+`jev_weights` field, also defaulting to `"stream"`. See the
+[decision request contract](../api/http.md#82-structured-decisions) for request
+fields and exclusive-runtime limits. The CUDA d1 text adapter uses this same API
+but requires resident weights: use `--jev-weights vram` for CLI startup loading.
+For API loading, omit `jev_weights` to use d1 residency automatically, or select
+`"vram"` explicitly; explicit `"stream"` is rejected. See
+[d1 serving setup](d1-native.md#managed-serving).
 
 ## Command options
 
@@ -372,6 +404,7 @@ wire-format identifier, not the public CLI name. See the
 | `--port PORT` | OpenAI API bind port. | Saved listener port or `8090` |
 | `--anthropic-port PORT` | Dedicated Anthropic Messages API port. | Saved listener port or `8091` |
 | `--access-log / --no-access-log` | Emit one HTTP access-log line per request. | Enabled |
+| `--jev-weights {stream,vram}` | Weight placement for supported CUDA decision models: RAM with layer streaming or VRAM residency. | `stream` |
 | `--context-size N` | Target context; `0` uses saved policy or declared model capacity. | `0` |
 | `--prefill-chunk-size auto\|N` | Native compute chunk limit; CUDA selects a fitting tile up to 8192. | `auto` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |

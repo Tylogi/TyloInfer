@@ -18,6 +18,7 @@
 struct Dsv4PoolState;
 struct FullBlock;
 namespace mfq::cuda {struct QsaTqSession;}
+namespace mfq::cache {struct PagedPrefixReadLease;}
 namespace mfq::models::deepseek_v41 { struct EngramHashSnapshot; }
 
 struct FullBlockSessionState {
@@ -177,7 +178,8 @@ private:
 class CudaPagedReader {
 public:
     explicit CudaPagedReader(const std::vector<uint8_t>& bytes)
-        : cursor_(bytes.data()), end_(bytes.data() + bytes.size()) {}
+        : data_(bytes.data()), size_(bytes.size()) {}
+    explicit CudaPagedReader(const mfq::cache::PagedPrefixReadLease& lease);
 
     template <typename T>
     T scalar(const char* name) {
@@ -185,28 +187,35 @@ public:
             throw CudaSessionStateError(
                 std::string("truncated CUDA paged cache ") + name);
         }
+        std::array<uint8_t,sizeof(T)> temporary;
+        const auto* input=data_?data_+offset_:temporary.data();
+        if(data_)offset_+=sizeof(T);
+        else raw(temporary.data(),temporary.size(),name);
         using Unsigned = std::make_unsigned_t<T>;
         Unsigned value = 0;
         for (size_t index = 0; index < sizeof(T); ++index) {
-            value |= static_cast<Unsigned>(cursor_[index]) << (index * 8);
+            value |= static_cast<Unsigned>(input[index]) << (index * 8);
         }
-        cursor_ += sizeof(T);
         return static_cast<T>(value);
     }
 
     void raw(void* destination, size_t size, const char* name);
     std::pair<mfq_tensor_backend::Tensor, int> tensor();
     void expect_end() const;
-    size_t remaining() const;
+    size_t remaining() const {return size_-offset_;}
+    size_t position() const {return offset_;}
+    size_t size() const {return size_;}
     void skip(size_t bytes) {
         if(bytes>remaining())throw CudaSessionStateError("truncated CUDA paged cache range");
-        cursor_+=bytes;
+        offset_+=bytes;
     }
 
 private:
 
-    const uint8_t* cursor_;
-    const uint8_t* end_;
+    const uint8_t* data_=nullptr;
+    const mfq::cache::PagedPrefixReadLease* lease_=nullptr;
+    size_t size_=0,offset_=0,window_offset_=0;
+    std::vector<uint8_t> window_;
 };
 
 struct CudaDecodedPagedLayer {

@@ -90,6 +90,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_residual_parser(sub)
     add_build_parser(sub)
     add_serve_parser(sub)
+    from tyloinfer.commands.d1_reference import add_parser as add_d1_reference_parser
+    add_d1_reference_parser(sub)
     sub.add_parser(
         "voice-runtime-check",
         help="verify optional MiniCPM-o voice output dependencies",

@@ -1,11 +1,12 @@
 
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { useEffect, useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useRuntime } from './RuntimeProvider';
 import { StudioShell } from './StudioShell';
 import { NotFoundPage } from './NotFoundPage';
+import { useUiStore } from '../stores/uiStore';
 
 vi.mock('./RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../features/settings/SettingsProvider', () => ({
@@ -49,19 +50,31 @@ function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '
 describe('StudioShell 持久运行时告警', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('expands Tools by default and still lets users collapse it', () => {
+  it('expands inference navigation inline by default and keeps settings independent', () => {
     renderShell({});
-    const tools = screen.getByRole('button', { name: '工具' });
-    expect(tools).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByRole('button', { name: '分析' })).toBeVisible();
-    expect(screen.queryByText('Agent', { selector: '.sidebar-group-label' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '新建会话' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '测评' })).not.toBeInTheDocument();
-    expect(screen.queryByText('代理', { selector: '.sidebar-group-label' })).not.toBeInTheDocument();
-    expect(document.querySelector('#studio-sidebar .appearance-controls')).toBeNull();
-    fireEvent.click(tools);
-    expect(tools).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: '新建会话' })).toBeNull();
+    expect(screen.getByRole('complementary', { name: '推理 Studio' })).toBeVisible();
+    const engine = screen.getByRole('button', { name: '推理引擎' });
+    const navigation = screen.getByRole('navigation', { name: '推理导航' });
+    expect(engine).toHaveAttribute('aria-expanded', 'true');
+    expect(within(navigation).getByRole('button', { name: '分析' })).toBeVisible();
+    expect(navigation.compareDocumentPosition(engine) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(engine);
+    expect(engine).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByRole('button', { name: '分析' })).not.toBeInTheDocument();
+    act(() => useUiStore.getState().openSidebar());
+    fireEvent.click(screen.getByRole('button', { name: '设置' }));
+    const settings = screen.getByRole('dialog');
+    expect(settings).toBeVisible();
+    fireEvent.keyDown(within(settings).getByRole('button', { name: '关闭' }), { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(useUiStore.getState().sidebarOpen).toBe(true);
+    expect(engine).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(engine);
+    fireEvent.click(screen.getByRole('button', { name: '模型' }));
+    expect(screen.getByText('Models content')).toBeVisible();
+    expect(engine).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('shows explicit connection confirmation instead of a perpetual loading page for CLI servers', () => {
@@ -148,15 +161,15 @@ describe('StudioShell 持久运行时告警', () => {
     expect(screen.queryByRole('heading', { name: '服务暂时无法连接' })).toBeNull();
   });
 
-  it('未知地址即使服务未就绪也显示 404，返回概览后显示连接状态', () => {
+  it('未知地址即使服务未就绪也显示 404，返回工作台后显示连接状态', () => {
     renderShell({ ready: false, connectionError: 'server offline' }, '/missing');
     expect(screen.getByRole('heading', { name: '页面不存在' })).toBeTruthy();
     expect(screen.queryByRole('heading', { name: '服务暂时无法连接' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '返回概览' }));
+    fireEvent.click(screen.getByRole('button', { name: '返回工作台' }));
     expect(screen.getByRole('heading', { name: '服务暂时无法连接' })).toBeTruthy();
   });
 
-  it('页面渲染异常显示独立故障页并允许返回概览', () => {
+  it('页面渲染异常显示独立故障页并允许返回工作台', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     function CrashingPage(): never {
       throw new Error('page render failed');
@@ -180,7 +193,7 @@ describe('StudioShell 持久运行时告警', () => {
     fireEvent.click(screen.getByText('查看错误详情'));
     expect(screen.getByText('page render failed')).toBeTruthy();
     expect(screen.getByRole('button', { name: '重试页面' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '返回概览' }));
+    fireEvent.click(screen.getByRole('button', { name: '返回工作台' }));
     expect(screen.getByText('Overview content')).toBeTruthy();
     vi.restoreAllMocks();
   });

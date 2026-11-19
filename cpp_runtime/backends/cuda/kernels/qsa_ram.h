@@ -3,11 +3,15 @@
 #include <cstddef>
 
 namespace tyloinfer::qsa {
+int tq_publish_indexer_request(const float* query,const std::int64_t* positions,std::size_t elements,
+    int queries,float* mapped_query,std::int64_t* mapped_positions,std::uint32_t* mapped_ready,cudaStream_t stream);
+
 inline constexpr int ram_cache_ways=8;
 // A live append may change on every graph replay. Stage it for this window
 // without retaining a persistent copy under an immutable block generation.
 inline constexpr std::uint64_t ram_uncached_generation=~std::uint64_t(0);
-__host__ __device__ constexpr unsigned ram_cache_set(unsigned id,unsigned sets) {
+__host__ __device__ constexpr unsigned ram_cache_set(unsigned id,unsigned sets,std::uint64_t owner=0) {
+    id^=unsigned(owner)*0x9e3779b9u^unsigned(owner>>32);
     // Mix high bits before indexing: regular token strides must not all
     // compete for the same small subset of cache sets.
     id^=id>>16;id*=0x7feb352du;id^=id>>15;id*=0x846ca68bu;id^=id>>16;
@@ -24,12 +28,28 @@ struct RamBlockView {
     std::uint64_t generation=0;
 };
 
+// Diagnostic metadata only; no encoded payload is exported.
+struct RamSelectedRecord {
+    SelectedBlock selected;
+    RamBlockView source;
+};
+// Export the current source descriptor for each valid selection. Invalid IDs
+// and empty masks retain their selection but expose a zero source descriptor.
+int tq_export_ram_selected(const RamBlockView* sources,int capacity,
+    const SelectedBlock* selected,int queries,int count,RamSelectedRecord* output,cudaStream_t stream);
+// Resolve opaque GPU-readable images without copying their payload. The
+// source owners must survive the subsequent attention, not just resolution.
+int tq_resolve_ram_selected(const RamBlockView* sources,int capacity,
+    const SelectedBlock* selected,int queries,int count,TqBlockView* output,
+    std::size_t slot_bytes,cudaStream_t stream);
+
 struct RamCacheSlot {
     // An image can occupy a power-of-two aligned group of base slots. Every
     // occupied way repeats its owner/version; overlapping evictions clear
     // that entire owner before any part of its payload can be reused.
     std::int32_t id=-1;
     std::uint64_t generation=0,last_frame=0;
+    std::uint64_t owner=0;
 };
 struct RamStageCache {
     // Set-associative LRU. A selected slot is protected through the
@@ -42,6 +62,9 @@ struct RamStageCache {
     std::uint8_t* payload=nullptr;
     std::size_t payload_bytes=0,slot_bytes=0;
     int sets=0;
+    std::uint64_t owner=0;
+    std::uint64_t* window_frames=nullptr;
+    bool expensive_only=false;
 };
 // Resolve selected records from an already uploaded layer; copy descriptors
 // only. Payloads remain shared across all prefill query windows.
@@ -72,8 +95,10 @@ int tq_collect_ram_missing(const RamBlockView* sources,int capacity,const Select
 // Control data only: write the selected IDs and miss list to mapped pinned
 // memory. The caller joins the containing graph before reading either list.
 int tq_export_ram_selection(const std::int32_t* missing,const SelectedBlock* selected,
-    std::int32_t* mapped_missing,SelectedBlock* mapped_selected,int queries,int count,cudaStream_t stream);
+    std::int32_t* mapped_missing,SelectedBlock* mapped_selected,int queries,int count,cudaStream_t stream,
+    std::uint32_t* graph_control=nullptr);
 enum RamGraphControl {RamGraphRequest=0,RamGraphReady=1,RamGraphImages=2,RamGraphError=3};
+enum RamGraphRequestKind {RamGraphHostRead=1,RamGraphDeviceReady=2};
 // Temporarily publish CPU-read packed images for one selected window. Backup
 // count is device-owned, so cancellation cannot prevent its later rollback.
 int tq_publish_ram_graph(RamBlockView* sources,int capacity,const std::int32_t* mapped_ids,
@@ -92,11 +117,13 @@ int tq_restore_ram_graph(RamBlockView* sources,const std::int32_t* mapped_ids,co
 // tq_sparse_attention(selected_views=true). Invalid/empty selections have
 // null views. Preserve source images and scratch until prior readers finish.
 // All storage is caller-owned, allowing reuse in a captured CUDA graph.
+// With device appends enabled, uncached views published on this stream already
+// reside on device and can be returned directly, even if larger than a slot.
 int tq_stage_ram_selected(const RamBlockView* sources,int capacity,
     const SelectedBlock* selected,int queries,int count,
     std::uint32_t* first_use,TqBlockView* selected_views,
     void* arena,std::size_t arena_bytes,std::size_t slot_bytes,
-    std::uint64_t* copied_bytes,cudaStream_t stream);
+    std::uint64_t* copied_bytes,cudaStream_t stream,bool device_appends=false);
 
 // The cache and source table belong to one serialized execution stream.
 // Store only original packed images, without persistent FP16 expansion.
@@ -130,6 +157,6 @@ int tq_stage_ram_selected_step(const RamBlockView* sources,int capacity,
     std::uint32_t* first_use,TqBlockView* selected_views,
     void* arena,std::size_t arena_bytes,std::size_t slot_bytes,
     const RamStageCache& cache,RamStageStep step,std::uint64_t* copied_bytes,
-    std::uint64_t* hit_blocks,cudaStream_t stream);
+    std::uint64_t* hit_blocks,cudaStream_t stream,const RamStageCache* device_cache=nullptr);
 
 } // namespace tyloinfer::qsa

@@ -26,6 +26,20 @@ class GgufDecodeDma {
         return !option || option[0]!='0';
     }();
     std::atomic<std::uint64_t> bytes_{0},copies_{0},batches_{0},signals_{0};
+    void submit_copies(const std::vector<mfq::cuda::DmaCopy>& copies,
+            std::uint32_t* host,std::uint32_t* device) {
+        if(copies.empty()) {
+            mfq::cuda::publish_mapped_flag(host);
+            return;
+        }
+        const bool batched=mfq::cuda::submit_routed_transfers(copies,stream_.stream(),native_mode_,
+            [](const void* mapped,std::size_t){return reinterpret_cast<CUdeviceptr>(mapped);});
+        if(mfq::cuda::enqueue_routed_completion(host,device,stream_.stream(),stream_signals_))
+            signals_.fetch_add(1,std::memory_order_relaxed);
+        if(batched)batches_.fetch_add(1,std::memory_order_relaxed);
+        copies_.fetch_add(copies.size(),std::memory_order_relaxed);
+        for(const auto& copy:copies)bytes_.fetch_add(copy.bytes,std::memory_order_relaxed);
+    }
 public:
     static bool default_enabled() {
         // Individual driver submissions can outweigh graph-copy savings for
@@ -58,24 +72,31 @@ public:
         }
         // An empty phase has no pending producer to wait for.
         for(int phase=0;phase<2;++phase) {
-            const auto& copies=phases_[phase];
-            auto* host=phase?down_host:gu_host;
-            if(copies.empty()) {
-                mfq::cuda::publish_mapped_flag(host);
-                continue;
-            }
-            const bool batched=mfq::cuda::submit_routed_transfers(copies,stream_.stream(),native_mode_,
-                [](const void* mapped,std::size_t){return reinterpret_cast<CUdeviceptr>(mapped);});
-            if(mfq::cuda::enqueue_routed_completion(host,phase?down_device:gu_device,stream_.stream(),stream_signals_))
-                signals_.fetch_add(1,std::memory_order_relaxed);
-            if(batched)batches_.fetch_add(1,std::memory_order_relaxed);
-            copies_.fetch_add(copies.size(),std::memory_order_relaxed);
-            for(const auto& copy:copies)bytes_.fetch_add(copy.bytes,std::memory_order_relaxed);
+            submit_copies(phases_[phase],phase?down_host:gu_host,phase?down_device:gu_device);
         }
         // Submit this lane's new WDDM work before the caller waits for the
         // next layer's route publication on a different stream.
         mfq::cuda::check_stream_progress(stream_.stream());
 
+    }
+    // A finished Gate/Up packet may transfer while its caller prepares Down.
+    // This phase never publishes the other phase's readiness word.
+    void submit_phase(const mfq::cuda::MoeMappedCopyDescriptor* descriptors,std::size_t count,
+            std::size_t split,bool down,std::uint32_t* host,std::uint32_t* device=nullptr) {
+        const std::lock_guard lock(mutex_);
+        const mfq::cuda::DeviceGuard guard(stream_.device());
+        if(!host || (count && !descriptors))throw std::invalid_argument("missing decode DMA phase packet");
+        auto& copies=phases_[down?1:0];copies.clear();
+        for(std::size_t i=0;i<count;++i) {
+            const auto& d=descriptors[i];
+            if(!d.source || !d.destination || !d.bytes || d.offset>UINT64_MAX-d.bytes ||
+                    (down?d.offset<split:d.offset>=split || d.bytes>split-d.offset))
+                throw std::invalid_argument("invalid decode DMA phase descriptor");
+            copies.push_back({reinterpret_cast<void*>(d.destination),
+                reinterpret_cast<const void*>(d.source),std::size_t(d.bytes)});
+        }
+        submit_copies(copies,host,device);
+        mfq::cuda::check_stream_progress(stream_.stream());
     }
     std::uint64_t bytes()const{return bytes_.load(std::memory_order_relaxed);}
     std::uint64_t copies()const{return copies_.load(std::memory_order_relaxed);}

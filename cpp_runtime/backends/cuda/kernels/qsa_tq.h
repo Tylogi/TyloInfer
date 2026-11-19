@@ -73,7 +73,7 @@ int tq_pack_archive(const std::uint8_t* keys,const std::uint8_t* values,const fl
 // Copy the exact pooled INT16 Affine index beside its immutable raw archive.
 int tq_archive_indexer(const std::int16_t* codes,const std::uint16_t* scales,
     const std::int16_t* zero,std::uint8_t* archive,std::size_t offset,int blocks,int width,
-    std::int64_t start,const std::int64_t* position,cudaStream_t stream);
+      std::int64_t start,const std::int64_t* position,cudaStream_t stream,bool complete_only=false);
 // Single-token incomplete block: append raw tails, H4/RHT, and publish FP16
 // modes on device. The logical position remains live across graph replays.
 // Optional query rotation shares the append launch. The result uses the
@@ -132,7 +132,7 @@ int tq_append_pending(const void* key,const void* value,const void* index,bool k
 // each replay can own a different immutable image without recapturing.
 int tq_finalize_pending(const float* key_modes,const float* value_modes,const float* raw_index,
     const TqBlockView* destination,TqBlockView* views,const std::int64_t* position,
-    std::uint8_t* archive,int rows,int index_width,int destination_slots,cudaStream_t stream);
+      std::uint8_t* archive,int rows,int index_width,int destination_slots,cudaStream_t stream,bool complete_only=false);
 int tq_initialize_destinations(std::uint8_t* payload,TqBlockView* destinations,int image_bytes,int slots,cudaStream_t stream);
 int tq_initialize_fp16_destinations(std::uint8_t* payload,TqBlockView* destinations,int image_bytes,int slots,cudaStream_t stream);
 // Publish fixed-size K/V planes directly on device. The base flags are
@@ -148,7 +148,7 @@ int indexer_affine16_record_scores(const float* query,const std::int16_t* record
 int indexer_affine16_encode(const float* input, std::int16_t* output,
     std::uint16_t* scales, std::int16_t* zero, int rows, int width, cudaStream_t stream);
 int indexer_affine16_append(const float* input,std::int16_t* output,std::uint16_t* scales,
-    std::int16_t* zero,const std::int64_t* position,int width,cudaStream_t stream);
+      std::int16_t* zero,const std::int64_t* position,int width,cudaStream_t stream,bool complete_only=false);
 int indexer_affine16_append_batch(const float* input,std::int16_t* output,std::uint16_t* scales,
     std::int16_t* zero,const std::int64_t* position,int rows,int width,int capacity,cudaStream_t stream);
 int indexer_affine16_scores(const float* query, const std::int16_t* keys,
@@ -179,10 +179,14 @@ int tq8_fit_online(const float* rows, const std::uint16_t* codebook,
 // Workspace sizes in floats: partial=queries*heads*parts*padded_width,
 // partial_stats=queries*heads*parts*2, block_log_mass=queries*heads*selected,
 // log_norm=queries*heads, rotated_query=queries*heads*padded_width.
+// block_log_mass and log_norm may be null when mass observation is disabled.
 // Choose bounded partial storage from the actual kernel occupancy. Both
 // graph preparation and eager execution must use this same plan.
 int tq_attention_partitions(int queries,int heads,int kv_heads,int padded,int count,
     bool query_fp16,bool allow_fp16_math,bool snapshots=false);
+
+int tq_observe_selection_hits(const SelectedBlock* selected,const std::int64_t* positions,
+    float* hits,int queries,int count,cudaStream_t stream);
 
 int tq_sparse_attention(const void* query, const float* key_signs, const float* value_signs,
     const std::uint16_t* relative, const TqBlockView* blocks, const SelectedBlock* selected,

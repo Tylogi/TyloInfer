@@ -136,7 +136,8 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
     for (size_t i = 0; i < first_prompt.size(); ++i) first_prompt[i] = (101 + (i * 37) % 900) % model.vocab_size();
     for (size_t i = 0; i < second_prompt.size(); ++i) second_prompt[i] = (113 + (i * 53) % 880) % model.vocab_size();
     DecodeGraphCache graph(model.max_position_embeddings());
-    TextSessionCache cache(config.session_cache, config.prefix_cache);
+    TextSessionCache cache(config.session_cache, config.prefix_cache,{},true,0,
+        std::is_same_v<Model,Qwen4CausalLm>);
     auto serial = [&](const std::vector<int64_t>& prompt, MfqPromptCachePlan plan = {}) {
         InferenceRequest request; request.prompt = prompt; request.sampling = sampling; request.cache_plan = std::move(plan);
         InferenceOutput output(request, nullptr, "serial");
@@ -159,7 +160,7 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
                       const CudaRuntimeConfig& config)
                 : model(model), graph(graph), cache(cache), config(config),
                   batcher(64, config.continuous_batch.prefill_token_budget,
-                          model, *model.execution, config.continuous_batch) {}
+                          model, *model.execution, config.continuous_batch) { batcher.set_prefix_cache(cache); }
             bool can_batch(const EngineRequest&) const { return true; }
             bool exclusive() const { return false; }
             bool mtp_available() const { return false; }
@@ -177,9 +178,12 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
         info.max_context = model.max_position_embeddings();
         std::map<std::string, std::vector<int64_t>> tokens;
         std::map<std::string, int> terminals, cancellations, prefills;
-        const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt) {
+        std::map<std::string,InferenceMetrics> completed_metrics;
+        const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt,
+                MfqPromptCachePlan plan = {}) {
             EngineRequest request;
             request.id = id; request.token_ids = prompt; request.input.sampling = sampling;
+            request.input.cache_plan=std::move(plan);
             TYLOINFER_RUNTIME_CHECK(executor.admit(std::move(request), nullptr, info, execution) == Admission::accepted,
                               "diagnostic request was not admitted");
         };
@@ -192,6 +196,8 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
                 prefills[event.id] += std::holds_alternative<PrefillProgress>(event.data);
                 cancellations[event.id] += std::holds_alternative<Cancelled>(event.data);
                 terminals[event.id] += terminal(event.data);
+                if(const auto* done=std::get_if<Completed>(&event.data))completed_metrics[event.id]=done->metrics;
+                if(const auto* done=std::get_if<Cancelled>(&event.data))completed_metrics[event.id]=done->metrics;
             }
         };
         admit("first", first_prompt); admit("second", second_prompt);
@@ -265,6 +271,56 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
             for(int row=0;row<requests;++row)
                 TYLOINFER_RUNTIME_CHECK(tokens[ids[row]]==(row%2?second_reference:first_reference) &&
                     terminals[ids[row]]==1,"packed prefill differs from serial oracle");
+        }
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            constexpr std::size_t boundary=128;
+            std::array<std::vector<int64_t>,4> prompts,oracles;
+            for(std::size_t row=0;row<prompts.size();++row) {
+                prompts[row]=first_prompt;
+                prompts[row].back()=(prompts[row].back()+row)%model.vocab_size();
+                oracles[row]=serial(prompts[row]);
+            }
+            graph.invalidate();cache.clear();
+            admit("prefix-cold",prompts[0],{"",boundary});
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick({"prefix-cold"});
+            TYLOINFER_RUNTIME_CHECK(executor.empty() && tokens["prefix-cold"]==oracles[0] &&
+                completed_metrics["prefix-cold"].cached_tokens==0,
+                "cold batch prefix differs from its serial oracle");
+            std::vector<RequestId> ids;
+            for(std::size_t row=0;row<prompts.size();++row) {
+                ids.push_back("prefix-hot-"+std::to_string(row));
+                admit(ids.back(),prompts[row],{"",boundary});
+            }
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick(ids);
+            TYLOINFER_RUNTIME_CHECK(executor.empty(),"hot prefix batch did not finish");
+            for(std::size_t row=0;row<prompts.size();++row) {
+                const auto& measured=completed_metrics[ids[row]];
+                TYLOINFER_RUNTIME_CHECK(tokens[ids[row]]==oracles[row] && measured.cached_tokens==boundary &&
+                    measured.prefill_tokens==prompts[row].size()-boundary && measured.prefix_restore_ms>0,
+                    "hot batch prefix lost independent state or true cache accounting");
+            }
+            admit("prefix-cancel",prompts[0],{"",boundary});
+            admit("prefix-survivor",prompts[1],{"",boundary});
+            for(int ticks=0;ticks<100 && tokens["prefix-cancel"].empty();++ticks)
+                tick({"prefix-cancel","prefix-survivor"});
+            TYLOINFER_RUNTIME_CHECK(!tokens["prefix-cancel"].empty(),"hot prefix cancel never decoded");
+            executor.cancel("prefix-cancel");
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick({"prefix-survivor"});
+            TYLOINFER_RUNTIME_CHECK(executor.empty() && cancellations["prefix-cancel"]==1 &&
+                tokens["prefix-survivor"]==oracles[1],"hot prefix cancellation damaged a sibling");
+            admit("prefix-reuse",prompts[2],{"",boundary});
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick({"prefix-reuse"});
+            TYLOINFER_RUNTIME_CHECK(executor.empty() && tokens["prefix-reuse"]==oracles[2] &&
+                completed_metrics["prefix-reuse"].cached_tokens==boundary,
+                "hot prefix cancellation consumed its immutable snapshot");
+            auto changed=prompts[0];changed.front()=(changed.front()+1)%model.vocab_size();
+            const auto changed_oracle=serial(changed);graph.invalidate();
+            admit("prefix-miss",changed,{"",boundary});
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick({"prefix-miss"});
+            TYLOINFER_RUNTIME_CHECK(executor.empty() && tokens["prefix-miss"]==changed_oracle &&
+                completed_metrics["prefix-miss"].cached_tokens==0,"nonmatching batch prefix was reused");
+            std::cout<<"continuous_batching_prefix_check PASS cached_tokens=128 independent_rows=4 "
+                "cancel_isolation=1 immutable_reuse=1 mismatch_miss=1\n";
         }
         for (const auto& [key, value] : batcher.metrics()) {
             if (key == "paged_kv_live_pages") TYLOINFER_RUNTIME_CHECK(value == 0, "paged KV leaked");

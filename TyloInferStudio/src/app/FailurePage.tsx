@@ -76,11 +76,11 @@ export function FailurePage({ kind, detail, onRetry }: FailurePageProps) {
       code={connection ? 'CONNECTION / 01' : 'PAGE / 02'}
       description={connection
         ? tr('无法获取工作区数据。请检查服务状态或连接配置，然后重新连接。', 'Workspace data is unavailable. Check the service or connection settings, then try again.')
-        : tr('当前页面遇到了意外问题。可以重试，或先返回概览继续使用。', 'Something went wrong on this page. Try again, or return to the overview.')}
+        : tr('当前页面遇到了意外问题。可以重试，或先返回工作台继续使用。', 'Something went wrong on this page. Try again, or return to the Agent workspace.')}
       detail={detail}
       detailLabel={tr('查看错误详情', 'View error details')}
       kind={kind}
-      leaveLabel={connection ? tr('连接设置', 'Connection settings') : tr('返回概览', 'Back to overview')}
+      leaveLabel={connection ? tr('连接设置', 'Connection settings') : tr('返回工作台', 'Back to workspace')}
       onLeave={() => navigate(connection ? '/runtime' : '/')}
       onRetry={onRetry}
       retryLabel={connection ? tr('重新连接', 'Reconnect') : tr('重试页面', 'Retry page')}

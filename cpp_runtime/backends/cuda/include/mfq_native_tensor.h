@@ -137,6 +137,7 @@ struct TensorStorage {
     std::size_t bytes = 0;
     Device device{};
     bool pinned = false;
+    bool mapped_host = false;
     std::function<void(std::uintptr_t,std::shared_ptr<void>)> record_stream;
 };
 
@@ -243,6 +244,7 @@ public:
     int get_device() const noexcept { return device().index; }
     bool is_cpu() const noexcept { return defined() && device().is_cpu(); }
     bool is_cuda() const noexcept { return defined() && device().is_cuda(); }
+    bool is_mapped_host() const noexcept { return storage_ && storage_->mapped_host; }
     bool is_contiguous() const noexcept { return defined() && view_.is_contiguous(); }
     std::size_t element_size() const noexcept { return scalar_size(scalar_type()); }
 

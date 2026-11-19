@@ -14,14 +14,15 @@ for (const language of ['zh-CN', 'en'] as const) {
     expect(family).not.toContain('SF Pro Text');
     expect(family).not.toContain('MFQ Small Numerals');
     await expect(heading).toHaveCSS('font-family', family);
-    await expect(page.locator('.sectioned-nav button').first()).toHaveCSS('font-family', family);
+    await expect(page.locator('.studio-engine-trigger')).toHaveCSS('font-family', family);
     await page.goto('/model-hub');
     await expect(page.locator('.model-detail-heading h3')).toBeVisible();
     await expect(page.locator('.model-detail-heading h3')).toHaveCSS('font-family', family);
     const numeric = page.locator('.download-concurrency select');
-    expect(await numeric.evaluate(element => getComputedStyle(element).fontFamily)).toBe(`"MFQ Small Numerals", ${family}`);
+    expect(await numeric.evaluate(element => getComputedStyle(element).fontFamily)).not.toContain('MFQ Small Numerals');
+    expect(await numeric.evaluate(element => getComputedStyle(element).fontVariantNumeric)).toContain('tabular-nums');
     const pressure = page.locator('.variant-memory-pressure > strong').first();
     await expect(pressure).toBeVisible();
-    expect(await pressure.evaluate(element => getComputedStyle(element).fontFamily)).toContain('ui-monospace');
+    expect(await pressure.evaluate(element => getComputedStyle(element).fontFamily)).not.toContain('MFQ Small Numerals');
   });
 }

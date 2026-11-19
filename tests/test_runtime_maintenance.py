@@ -16,6 +16,11 @@ from tests.test_runtime_memory_policy import GIB, artifact
 from tests.test_server_openai_compat import _Service
 
 
+@pytest.fixture(autouse=True)
+def isolated_gpu_capacity(monkeypatch):
+    monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.gpu_memory_status', lambda: [])
+
+
 class MaintenanceBackend(BudgetBackend):
     def __init__(self):
         super().__init__(GIB, 3 * GIB, GIB, 2 * GIB, 8 * GIB, [])

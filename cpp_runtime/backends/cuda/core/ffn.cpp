@@ -1044,12 +1044,12 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         [&](Tensor hidden) {
             return profiler.measure("ffn.down", [&] { return down.forward(execution, hidden); });
         },
-        [&](const Tensor &gate, const Tensor &up, Activation activation,
+        [&](Tensor &gate, Tensor &up, Activation activation,
             double limit) -> std::optional<Tensor> {
             if (activation != Activation::silu || limit > 0.0 || down.is_dense() || down.is_mxfp8())
                 return {};
             return profiler.measure("ffn.down",
-                                    [&] { return down.forward_input_mul(execution, up, gate, 2); });
+                                    [&] { return down.forward_input_mul(execution, std::move(up), std::move(gate), 2); });
         });
 }
 

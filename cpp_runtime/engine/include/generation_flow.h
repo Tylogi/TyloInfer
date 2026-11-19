@@ -96,13 +96,18 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
     ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
     if constexpr(requires { ops.prepare_request(request); })ops.prepare_request(request);
     typename Ops::Restore restored;
-    if (caching && (!use_mtp || mtp->supports_session_state()))
+    if (caching && (!use_mtp || mtp->supports_session_state())) {
+        const auto started=Clock::now();
         restored = session_cache.restore_best(model,
             use_mtp ? mtp : nullptr,
             cache_plan.session_id,
             prompt,
             plan.stable_prefix_tokens,
             input_key);
+        output.metrics.cached_tokens=restored.tokens;
+        if(restored.tokens)output.metrics.prefix_restore_ms=
+            std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+    }
     if (restored.tokens || use_mtp)
         ops.invalidate_plan();
     if (!restored.tokens) ops.reset();

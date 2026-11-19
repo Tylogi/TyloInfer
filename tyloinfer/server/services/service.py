@@ -728,6 +728,15 @@ class ServerService:
         except HubError as error:
             raise ServiceError(502, "model_hub_error", str(error), retryable=True) from error
 
+    async def local_official_hub_models(self) -> OfficialModelList:
+        snapshot = getattr(self.hub_catalog, "official_local", None)
+        if not callable(snapshot):
+            raise ServiceError(501, "local_official_catalog_unavailable", "Local official catalog snapshots are unavailable.")
+        try:
+            return await snapshot(profile=self._hub_system_profile())
+        except HubError as error:
+            raise ServiceError(502, "model_hub_error", str(error), retryable=True) from error
+
     async def official_hub_models(self, *, refresh: bool = False) -> OfficialModelList:
         try:
             return await self.hub_catalog.official(
@@ -1232,6 +1241,20 @@ class ServerService:
                 "model_directory_not_found",
                 "model directory is unavailable",
             ) from error
+
+    async def model_companion_reference(self, model_id: str) -> dict[str, str]:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id, refresh=True)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        if artifact.resource.format != "gguf" or not artifact.resource.complete:
+            raise ServiceError(422, "invalid_gguf_companion", "Select a complete registered GGUF artifact")
+        path = artifact.path.resolve()
+        if not path.is_file():
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable")
+        return {"model_id": artifact.resource.id, "format": "gguf", "path": str(path)}
 
     async def model_artifact_directory(self, model_id: str) -> ModelDirectoryList:
         if self.catalog is None:

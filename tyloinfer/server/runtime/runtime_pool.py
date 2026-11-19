@@ -68,6 +68,8 @@ from tyloinfer.server.runtime.backend import (
     preflight_backend_request,
 )
 from tyloinfer.server.runtime.client import HttpRuntimeClient, StdioRuntimeClient
+from tyloinfer.server.runtime.d1_support import d1_launch_configuration, is_d1_config
+from tyloinfer.server.runtime.d1_adapter import D1DecisionBackend
 from tyloinfer.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget, inspect_prefix_cache, purge_prefix_cache, read_prefix_cache_tokens, prefix_cache_identity
 from tyloinfer.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
 from tyloinfer.server.runtime.qsa_kv_policy import QSA_KV_BUFFER_BYTES, qsa_index_requirement
@@ -601,6 +603,12 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        if is_d1_config(artifact.source_config):
+            if self.backend != 'cuda':
+                raise _job_error('backend_unsupported', 'd1 native serving currently requires CUDA')
+            if len(request.device_ids) > 1:
+                raise _job_error('unsupported_device', 'd1 requires a single CUDA device')
+            request = request.model_copy(update={'prefix_cache_enabled': False})
         if artifact.resource.gguf_companion_required and not request.gguf_companions:
             raise _job_error("gguf_companion_required", "Select the external Engram tables before loading this GGUF model")
         try:
@@ -708,7 +716,7 @@ class RuntimePool:
                 f"row-streamed={artifact.always_streamed_bytes / gib:.2f} GiB; "
                 f"experts={artifact.routed_expert_bytes / gib:.2f} GiB"
             )
-        request_capacity = native_request_capacity(
+        request_capacity = 1 if is_d1_config(artifact.source_config) else native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,
             requested=self.max_requests_per_instance,
@@ -948,7 +956,8 @@ class RuntimePool:
             if self.transport == "stdio"
             else HttpRuntimeClient(f"http://127.0.0.1:{port}")
         )
-        backend = OpenAIChatBackend(
+        backend_class = D1DecisionBackend if is_d1_config(artifact.source_config) else OpenAIChatBackend
+        backend = backend_class(
             runtime_client,
             local_tensor_files=True,
             model_type=artifact.resource.architecture,
@@ -1993,6 +2002,8 @@ class RuntimePool:
                 response_format=response_format,
             )
             return
+        if is_d1_config(instance.artifact.source_config):
+            await instance.backend.preflight(model=instance.artifact.resource.name)
         async with self._lock:
             await self._wait_for_runtime_maintenance_locked(instance)
             queue_full = (
@@ -4591,6 +4602,20 @@ class RuntimePool:
                 return port
         raise RuntimeManagementError("unable to reserve a unique runtime port")
 
+    def _qsa_cache_mode(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> str:
+        if getattr(self, 'backend', 'cuda') != 'cuda':
+            return 'legacy'
+        from tyloinfer.server.runtime.qsa_cache_policy import resolve_qsa_cache_mode
+        environment = {**os.environ, **getattr(self, 'runtime_environment', {})}
+        return resolve_qsa_cache_mode(artifact, request.kv_memory, request.kv_quantization, environment)
+
+    def _checkpoint_kv_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest):
+        context = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
+        mode = RuntimePool._qsa_cache_mode(self, artifact, request)
+        if mode != 'legacy':
+            return checkpoint_kv_budget(artifact, context, request.kv_memory, request.kv_quantization, qsa_mode=mode)
+        return checkpoint_kv_budget(artifact, context, request.kv_memory, request.kv_quantization)
+
     def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
         return self._cuda_expert_host_budget_plan(artifact, request).bytes
 
@@ -4611,9 +4636,7 @@ class RuntimePool:
         # KV has priority over the evictable expert tier. Price the target KV
         # before filling RAM, so SSD experts do not consume its reservation.
         try:
-            plan = checkpoint_kv_budget(artifact,
-                self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
-                request.kv_memory, request.kv_quantization)
+            plan = RuntimePool._checkpoint_kv_budget(self, artifact, request)
         except ValueError:
             # Missing/unsupported KV metadata is validated by its own path.
             plan = None
@@ -4664,16 +4687,22 @@ class RuntimePool:
         )
 
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
+        if (self.backend == 'cuda' and artifact.resource.format == 'gguf'
+                and RuntimePool._qsa_cache_mode(self, artifact, request) != 'legacy'):
+            # Optional expert RAM can retreat as independent request stores
+            # grow. Do not freeze the initial single-context complement into
+            # a shared multi-request KV ceiling. Explicit user caps still hold.
+            return request.kv_memory.ram_budget_bytes
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
         if available is not None:
             resident_weights = max(0, artifact.resource.total_bytes - artifact.always_streamed_bytes)
             host_experts = max(0, resident_weights - self._estimated_load_bytes(artifact, request))
             if (self.backend == "cuda" and (request.moe_gpu_cache_gb or 0) > 0
-                    and supports_cuda_ram_expert_pipeline(artifact.path)):
+                    and (artifact.resource.format == 'gguf' or supports_cuda_ram_expert_pipeline(artifact.path))):
                 budget = self._cuda_expert_host_budget(artifact, request)
                 host_experts = min(host_experts, budget)
-                if budget >= self._cuda_expert_preload_bytes(artifact):
+                if artifact.resource.format != 'gguf' and budget >= self._cuda_expert_preload_bytes(artifact):
                     # Preload keeps the complete routed set in host memory,
                     # including experts mirrored in the GPU cache.
                     host_experts = self._cuda_expert_preload_bytes(artifact)
@@ -4683,9 +4712,14 @@ class RuntimePool:
 
     def _validate_kv_memory_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest):
         try:
-            plan = checkpoint_kv_budget(artifact,
-                self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
-                request.kv_memory, request.kv_quantization)
+            plan = RuntimePool._checkpoint_kv_budget(self, artifact, request)
+            if plan.cache_mode != 'legacy':
+                limit = request.kv_memory.ram_budget_bytes
+                if limit is not None and limit < plan.ram_required_bytes:
+                    raise ValueError('kv_memory_insufficient: QSA RAM budget cannot hold its selected precision and mandatory working set')
+                if request.kv_memory.placement == 'auto_ssd':
+                    check_ssd_capacity(self._prefix_cache_directory(), plan.ssd_capacity_bytes + (64 << 20))
+                return plan
             if request.kv_memory.placement == "auto_ssd":
                 # Dynamic RAM may need to release every cold block. Verify that
                 # SSD can hold the complete L1 overflow before loading weights.
@@ -4706,6 +4740,10 @@ class RuntimePool:
         *,
         port: int,
     ) -> tuple[list[str], dict[str, str]]:
+        if is_d1_config(artifact.source_config):
+            resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
+            return d1_launch_configuration(self.executable, artifact, request.model_copy(update={'context_size': resolved}),
+                transport=self.transport, port=port, backend=self.backend, environment=self.runtime_environment)
         request_capacity = native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,
@@ -4817,6 +4855,20 @@ class RuntimePool:
                 # Older expert containers use the resident CPU loader, followed
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("TYLOINFER_DISABLE_MOE_SSD_RANGES", "1")
+        if self.backend == 'cuda' and artifact.resource.format == 'gguf' and artifact.routed_expert_bytes > 0:
+            process_environment['TYLOINFER_MOE_HOST_CACHE_BYTES'] = str(self._cuda_expert_host_budget(artifact, request))
+            device_limit = self._cuda_device_vram_limit(request)
+            if device_limit is not None:
+                process_environment.setdefault('TYLOINFER_CUDA_VRAM_LIMIT_GIB', str(device_limit / float(1 << 30)))
+        qsa_mode = self._qsa_cache_mode(artifact, request)
+        qsa_plan = self._checkpoint_kv_budget(artifact, request) if qsa_mode != 'legacy' else None
+        if self.backend == 'cuda':
+            process_environment['TYLOINFER_QSA_CACHE_MODE'] = qsa_mode
+            if qsa_plan is not None:
+                process_environment.setdefault('TYLOINFER_QSA_TQ_DIRECTORY', str(self._prefix_cache_directory() / 'qsa-kv'))
+                logger.info('qsa_cache_policy mode=%s ram_required_bytes=%d working_set_bytes=%d gpu_budget_bytes=%d ssd_capacity_bytes=%d',
+                    qsa_mode, qsa_plan.ram_required_bytes, qsa_plan.ram_working_set_bytes,
+                    qsa_plan.gpu_budget_bytes, qsa_plan.ssd_capacity_bytes)
         process_environment["TYLOINFER_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
         if self.backend == "cuda" and request.context_management is not None:
             defaults = request.context_management
@@ -4830,6 +4882,8 @@ class RuntimePool:
                 process_environment["TYLOINFER_KV_GPU_BUDGET_BYTES"] = str(request.kv_memory.gpu_budget_bytes)
             ram_limit = self._kv_ram_limit(artifact, request)
             if ram_limit is not None:
+                if qsa_plan is not None:
+                    ram_limit = max(0, ram_limit - qsa_plan.ram_working_set_bytes)
                 process_environment["TYLOINFER_KV_RAM_LIMIT_BYTES"] = str(ram_limit)
         process_environment.pop("TYLOINFER_QSA_KV_BUDGET_BYTES", None)
         process_environment.pop("TYLOINFER_QSA_KV_TARGET_CONTEXT", None)

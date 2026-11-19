@@ -5,11 +5,9 @@ import {
   Icon,
   ScreenHeader,
   SectionLabel,
-  TMPanel,
-  ModelMonogram,
   EmptyPanel,
 } from '../../app/display';
-import { errorMessage, formatNumber } from '../../app/formatters';
+import { errorMessage } from '../../app/formatters';
 import { runtimeModelNames } from './modelSelection';
 import { ServingStatisticsPanel, ServingTotalsPanel } from './ServingStatisticsPanel';
 import { useServingStatistics } from './useServingStatistics';
@@ -20,7 +18,7 @@ import { anthropicEndpoint, jevEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
-import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { OverviewModels, OverviewEndpoints } from './OverviewPanels';
 import { AppearanceControls } from '../../app/AppearanceControls';
 
 export function OverviewPage() {
@@ -106,64 +104,7 @@ export function OverviewPage() {
         }
       />
       <RuntimeHero />
-      {availableModelNames.length > 1 && (
-        <>
-          <SectionLabel
-            title={tr('已加载模型', 'Loaded models')}
-            subtitle={tr(
-              `${availableModelNames.length} 个可用于推理`,
-              `${availableModelNames.length} available for inference`,
-            )}
-          />
-          <TMPanel className="overview-models-panel">
-            <div className="overview-model-grid">
-              {availableModelNames.map((name) => {
-                const instance = instances.find(
-                  (candidate) => candidate.model === name && candidate.state !== 'failed',
-                );
-                const selected = name === model;
-                const stateLabel =
-                  instance?.state === 'busy' ? tr('使用中', 'Busy') : tr('就绪', 'Ready');
-                const details = [
-                  instance?.devices.join(' + '),
-                  instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
-                  instance
-                    ? tr(
-                        `${instance.active_sessions} 个会话`,
-                        `${instance.active_sessions} sessions`,
-                      )
-                    : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ');
-                return (
-                  <button
-                    aria-pressed={selected}
-                    className={`overview-model-card${selected ? ' selected' : ''}`}
-                    disabled={busy || selected}
-                    key={name}
-                    onClick={() => selectModel(name)}
-                    type="button"
-                  >
-                    <ModelMonogram name={name} state="ready" />
-                    <span className="overview-model-copy">
-                      <strong title={name}>{name}</strong>
-                      <small>{details || stateLabel}</small>
-                    </span>
-                    <span className="model-identity-trailing">
-                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
-                      <span className="runtime-status-pill ready">
-                        <i />
-                        {selected ? tr('当前', 'Current') : stateLabel}
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </TMPanel>
-        </>
-      )}
+      <OverviewModels names={availableModelNames} instances={instances} runtime={runtime} selectedModel={model} busy={busy} selectModel={selectModel} tr={tr} />
       <ServingStatisticsPanel data={servingStatistics} error={statisticsError} scope={scope} onScopeChange={setScope} />
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
@@ -180,27 +121,7 @@ export function OverviewPage() {
         />
       )}
       <div className="overview-footer-grid">
-        <TMPanel className="overview-endpoint-panel">
-          <div className="overview-panel-title">
-            <Icon name="link" size={15} />
-            <h2>{tr('API 端点', 'API endpoints')}</h2>
-          </div>
-          <div className="overview-api-list">
-            {endpoints.map(({ id, name, label, url }) => (
-              <div className="overview-api-entry" key={id} data-protocol={id}>
-                  <strong title={label}>{name}</strong>
-                  {url ? <code title={url}>{url}</code> : <span>{tr('暂不可用', 'Unavailable')}</span>}
-                  <button aria-label={tr(`复制 ${name} 端点`, `Copy ${name} endpoint`)}
-                    className={endpointCopied === id ? 'copied' : ''} disabled={!url}
-                    onClick={() => { if (url) void copyEndpoint(id, url); }} type="button">
-                    <Icon name={endpointCopied === id ? 'check' : 'copy'} size={14} />
-                  </button>
-              </div>
-            ))}
-          </div>
-          <p>{tr('Jev 与 OpenAI 共用端口。客户端需显式向 Jev 地址发送 POST 请求，不能使用 chat/completions。',
-            'Jev shares the OpenAI port. Send POST requests to the Jev URL explicitly; chat/completions does not support Jev decisions.')}</p>
-        </TMPanel>
+        <OverviewEndpoints endpoints={endpoints} copied={endpointCopied} copyEndpoint={(id, url) => void copyEndpoint(id, url)} tr={tr} />
         <ServingTotalsPanel data={servingStatistics} scope={scope} runtime={runtime} />
       </div>
     </section>

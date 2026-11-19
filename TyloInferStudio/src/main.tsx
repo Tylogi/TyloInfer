@@ -44,7 +44,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
           detail={this.state.error.message || this.state.error.name}
           detailLabel={chinese ? '查看错误详情' : 'View error details'}
           kind="render"
-          leaveLabel={chinese ? '返回概览' : 'Back to overview'}
+          leaveLabel={chinese ? '返回工作台' : 'Back to workspace'}
           onLeave={() => window.location.assign(isStudio() ? '#/' : '/')}
           onRetry={() => window.location.reload()}
           retryLabel={chinese ? '重新载入' : 'Reload'}

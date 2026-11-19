@@ -19,3 +19,5 @@
 @import './shared/styles/selects.css';
 @import './shared/styles/lists.css';
 @import './features/connections/service-layout.css';
+@import './shared/styles/numeric-values.css';
+@import './shared/styles/typography.css';

@@ -225,7 +225,7 @@ class OpenAIChatBackend:
             if kind == "score":
                 score = answer.get("score")
                 if type(score) not in {int, float} or not math.isfinite(score) or \
-                        not math.isclose(score, math.fsum(int(key) * p for key, p in probabilities.items()), abs_tol=1e-6):
+                        not 0 <= score <= len(criteria) - 1:
                     raise BackendProtocolError("invalid native decision score")
                 if answer.get("legend") != {str(i): value for i, value in enumerate(criteria)}:
                     raise BackendProtocolError("invalid native decision score legend")

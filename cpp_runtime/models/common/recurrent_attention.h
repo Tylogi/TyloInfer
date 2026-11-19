@@ -31,11 +31,12 @@ template <class Project, class Convolve, class Gates, class Recur, class NormGat
           class Commit>
 auto gated_delta_attention(bool cache, Project project, Convolve convolve, Gates gates, Recur recur,
                            NormGate norm_gate, Output output, Commit commit) {
-    auto projected = project();
-    auto convolution = convolve(std::move(projected));
-    auto decay = gates();
-    auto recurrent = recur(convolution, std::move(decay));
-    auto result = output(norm_gate(recurrent[0]));
+    auto convolution = convolve(project());
+    auto recurrent = recur(convolution, gates());
+    // The output projection can reuse the Q/K/V buffers. Commit still needs
+    // the convolution tail and the new recurrent state.
+    for(int i=0;i<3;++i)std::exchange(convolution[i],{});
+    auto result = output(norm_gate(std::move(recurrent[0])));
     if (cache)
         commit(convolution, recurrent[1]);
     return result;

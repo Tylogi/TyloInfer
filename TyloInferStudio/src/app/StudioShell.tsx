@@ -13,6 +13,7 @@ import { RuntimeAlerts } from './RuntimeAlerts';
 import { ServerConnectionPage } from './ServerConnectionPage';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
 import { isAssetLoadError } from './assetRecovery';
+import './studio-chrome.css';
 
 
 class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: string | null }> {
@@ -48,7 +49,7 @@ export function StudioShell() {
   );
   useEffect(() => {
     const title = location.pathname === '/'
-      ? 'Overview' : location.pathname.slice(1).replaceAll('-', ' ');
+      ? tr('概览', 'Overview') : location.pathname.slice(1).replaceAll('-', ' ');
     document.title = `${authenticationRequired ? tr('登录', 'Sign in') : title} · TyloInfer`;
   }, [location.pathname, authenticationRequired, tr]);
 
@@ -56,7 +57,7 @@ export function StudioShell() {
 
   return (
     <TooltipPrimitive.Provider delayDuration={300}>
-      <div className="app-shell">
+      <div className="app-shell agent-first-shell">
         <ToastContainer />
         <a className="skip-link" href="#studio-main">
           {tr('跳到主要内容', 'Skip to main content')}

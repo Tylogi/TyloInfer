@@ -55,7 +55,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     expect(proof.base).not.toContain('MFQ Small Numerals');
     expect(proof.heading).not.toContain('MFQ Small Numerals');
     await page.screenshot({ path: testInfo.outputPath('download-small-numerals.png'), fullPage: true });
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.locator('.metric-tile > strong').first()).toBeVisible();
     expect(await page.locator('.metric-tile > strong').first().evaluate(element => getComputedStyle(element).fontFamily)).not.toContain('MFQ Small Numerals');
     expect(errors).toEqual([]);

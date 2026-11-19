@@ -57,8 +57,9 @@ public:
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
         pageable.resize(kRing);
+        const mfq::cuda::PinnedReclaimPause optional_ring;
         for (int i = 0; i < kRing; ++i) {
-            pinned[i] = cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
+            pinned[i] = mfq::cuda::allocate_pinned_host((void**) &buf[i],blob_bytes,cudaHostAllocDefault,"optional_expert_ring") == cudaSuccess;
             if (!pinned[i]) {
                 cudaGetLastError();
                 pageable[(size_t) i].resize(blob_bytes);
@@ -82,7 +83,7 @@ public:
         for (auto& t : threads) t.join();
         for (std::size_t i = 0; i < buf.size(); ++i) {
             if(i<dma_done.size() && dma_done[i]) {cudaEventSynchronize(dma_done[i]);cudaEventDestroy(dma_done[i]);}
-            if (buf[i]) {if(pinned[i])cudaFreeHost(buf[i]);mfq::cuda::tensor_host_bytes.fetch_sub(capacity);}
+            if (buf[i]) {if(pinned[i])mfq::cuda::release_pinned_host(buf[i],capacity);mfq::cuda::tensor_host_bytes.fetch_sub(capacity);}
         }
         if(restore)(void)cudaSetDevice(previous);
     }

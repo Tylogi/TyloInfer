@@ -11,8 +11,8 @@ import os
 import re
 import struct
 import sys
-from dataclasses import dataclass, replace
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -21,24 +21,43 @@ from tyloinfer.architectures.tensor_schema import (
     graph_spec_for_source_names,
     map_source_tensor_name,
 )
-from tyloinfer.formats.assets import is_asset_record, MODEL_CONFIG_ASSET, HF_TOKENIZER_CONFIG_ASSET
+from tyloinfer.formats.assets import HF_TOKENIZER_CONFIG_ASSET, MODEL_CONFIG_ASSET, is_asset_record
 from tyloinfer.formats.compat import canonical_dtype
+from tyloinfer.formats.gguf import (
+    gguf_is_table_component,
+    gguf_part_paths,
+    is_gguf_path,
+    matching_gguf_shard_paths,
+    parse_gguf_shard_path,
+)
 from tyloinfer.formats.header import TYLOINFER_SUFFIXES
 from tyloinfer.formats.io import open_mmap
-from tyloinfer.formats.shards import matching_shard_paths as _matching_tq_shards, parse_shard_path as _parse_tq_shard
-from tyloinfer.formats.gguf import gguf_is_table_component, gguf_part_paths, is_gguf_path, matching_gguf_shard_paths, parse_gguf_shard_path
+from tyloinfer.formats.shards import matching_shard_paths as _matching_tq_shards
+from tyloinfer.formats.shards import parse_shard_path as _parse_tq_shard
 from tyloinfer.server.protocol.models import (
+    JevWeightMemoryEstimate,
     ModelArtifactList,
     ModelArtifactResource,
-    JevWeightMemoryEstimate,
     ModelDirectoryEntry,
     ModelDirectoryFile,
     ModelDirectoryList,
 )
-from tyloinfer.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, jev_weight_memory, weight_role
-from tyloinfer.server.services.model_context import declared_context_size, yarn_context_limits
+from tyloinfer.server.runtime.d1_support import d1_assets, d1_gguf_metadata, is_d1_config
 from tyloinfer.server.services.desktop import directory_opener
-from tyloinfer.server.state.table_components import TableComponent, component_base, component_resource, inspect_table_component, table_record_kind
+from tyloinfer.server.services.model_context import declared_context_size, yarn_context_limits
+from tyloinfer.server.state.model_weights import (
+    estimated_resident_weight_bytes,
+    estimated_weight_roles,
+    jev_weight_memory,
+    weight_role,
+)
+from tyloinfer.server.state.table_components import (
+    TableComponent,
+    component_base,
+    component_resource,
+    inspect_table_component,
+    table_record_kind,
+)
 
 MODEL_FILE_INDEX = ".tq-files.json"
 _MODEL_SUFFIXES = (*TYLOINFER_SUFFIXES, '.gguf')
@@ -79,6 +98,7 @@ class DiscoveredModel:
     source_config: dict | None = None
     source_tensors: dict | None = None
     file_paths: tuple[Path, ...] = ()
+    source_cache_layout: dict | None = None
 
 
 def parse_shard_path(path: Path):
@@ -831,7 +851,8 @@ class ModelCatalog:
                     'jev_weight_memory': JevWeightMemoryEstimate(**decision_memory) if decision_memory else None,
                 })
                 return replace(artifact, resource=resource, routed_expert_bytes=roles['experts'],
-                    always_streamed_bytes=streamed, source_config=config, source_tensors=tensors)
+                    always_streamed_bytes=streamed, source_config=config, source_tensors=tensors,
+                    source_cache_layout=metadata.get('qsa_cache_layout'))
             except Exception as failure:
                 return replace(artifact, resource=artifact.resource.model_copy(update={
                     'loadable': False, 'error': str(failure).replace(str(root), '<model-root>'),
@@ -864,10 +885,10 @@ class ModelCatalog:
                 raise ValueError(f'GGUF checkpoint is missing {missing} shard(s)')
             if gguf_is_table_component(path):
                 raise ValueError('This GGUF is a shared table, not a standalone model')
-            metadata = self._inspect_native_metadata(path, signature)
+            metadata = d1_gguf_metadata(path) or self._inspect_native_metadata(path, signature)
             config = metadata['config']
             tensors = metadata['tensors']
-            architecture = _native_architecture(metadata)
+            architecture = 'lfm3_d1' if is_d1_config(config) else _native_architecture(metadata)
             supported = {'Q4_0', 'Q4_1', 'Q5_0', 'Q5_1', 'Q8_0', 'Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q6_K',
                 'Q8_K', 'IQ1_S', 'IQ1_M', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0',
                 'PTQ1_0', 'TQ2_T', 'TQK4', 'TQK5', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7',
@@ -906,7 +927,8 @@ class ModelCatalog:
             tensor_count=len(tensors), record_count=len(tensors), dtypes=sorted({item['dtype'] for item in tensors.values()}),
             complete=not missing, loadable=loadable, error=error,
             modified_at=datetime.fromtimestamp(max((stat.st_mtime for stat in stats), default=path.stat().st_mtime), timezone.utc))
-        return DiscoveredModel(resource, path, experts, streamed, config, tensors, paths)
+        return DiscoveredModel(resource, path, experts, streamed, config, tensors, paths,
+            metadata.get('qsa_cache_layout') if tensors else None)
 
     def _inspect_native_metadata(self, path: Path, signature: tuple) -> dict:
         if self._native_inspector is None:
@@ -1104,6 +1126,8 @@ class ModelCatalog:
             tensors: set[str] = set()
             tensor_sizes: dict[str, int] = {}
             tensor_dtypes: dict[str, str] = {}
+            tensor_metadata: dict[str, dict] = {}
+            d1 = is_d1_config(config)
             dtypes: set[str] = set()
             for shard in shard_paths:
                 for tensor_name, entry in ModelCatalog._safetensors_header(shard).items():
@@ -1127,6 +1151,9 @@ class ModelCatalog:
                     tensors.add(tensor_name)
                     tensor_sizes[tensor_name] = offsets[1] - offsets[0]
                     tensor_dtypes[tensor_name] = entry["dtype"]
+                    if d1:
+                        tensor_metadata[tensor_name] = {'nbytes': offsets[1] - offsets[0],
+                            'dtype': entry['dtype'], 'shape': entry.get('shape')}
                     dtypes.add(entry["dtype"])
             if indexed_names is not None and not indexed_names.issubset(tensors):
                 raise ValueError("Safetensors index references missing tensors")
@@ -1142,7 +1169,9 @@ class ModelCatalog:
                 ]
             )
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
-            loadable = graph_spec_for_source_names(config, sorted(tensors)) is not None
+            if d1:
+                d1_assets(path)
+            loadable = d1 or graph_spec_for_source_names(config, sorted(tensors)) is not None
             routed_expert_bytes = 0
             always_streamed_bytes = 0
             weight_bytes_by_dtype: dict[str, int] = {}
@@ -1165,9 +1194,10 @@ class ModelCatalog:
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
-                architecture=f"{model_type}-hf-full-mfq",
+                architecture='lfm3_d1-hf' if d1 else f"{model_type}-hf-full-mfq",
                 format="hf",
-                structured_decisions=(path / "decision_config.json").is_file(),
+                structured_decisions=d1 or (path / "decision_config.json").is_file(),
+                jev_weight_memory=jev_weight_memory(tensor_metadata, config, trained_readout=False) if d1 else None,
                 shard_count=len(shard_paths),
                 total_bytes=sum(stat.st_size for stat in stats),
                 estimated_resident_weight_bytes=estimated_resident_weight_bytes(sum(weight_bytes_by_dtype.values()), weight_bytes_by_dtype),

@@ -13,6 +13,7 @@ struct QsaIndexArchive {
     mfq::cache::QsaKvStore::BlockPtr block;
     std::shared_ptr<const tyloinfer::qsa::RamKvReadSource> source;
     std::size_t offset=0,bytes=0;
+    bool shared_prefix=false; // An alias into immutable deserialized page storage.
     std::shared_ptr<const std::vector<std::uint8_t>> read()const {
         if(resident)return resident;
         if(source)return std::make_shared<const std::vector<std::uint8_t>>(source->read(offset,bytes));
@@ -21,12 +22,22 @@ struct QsaIndexArchive {
     }
     // Restore the active INT16 suffix directly without copying its retained
     // FP32 companion. Validate the complete archive geometry before any read.
-    void read_slice_into(std::size_t at,std::uint8_t* destination,std::size_t count,std::size_t expected_bytes)const {
+    void read_slice_into(std::size_t at,std::uint8_t* destination,std::size_t count,std::size_t expected_bytes,
+                         std::vector<mfq::FileReadRange>* pending=nullptr)const {
         if(at>expected_bytes || count>expected_bytes-at)throw std::out_of_range("QSA index slice exceeds archive");
         if(count && !destination)throw std::invalid_argument("QSA index destination is null");
         if(source && !resident) {
             if(bytes!=expected_bytes)throw std::runtime_error("Incompatible QSA snapshot index archive length");
-            source->validate(offset,bytes);source->read_into(offset+at,destination,count);return;
+            source->validate(offset,bytes);
+            if(!count)return;
+            if(pending && source->file_reader) {
+                if(offset+at>UINT64_MAX-source->file_offset)throw std::out_of_range("QSA index file offset overflow");
+                pending->push_back({source->file_reader,{source->file_offset+offset+at,
+                    reinterpret_cast<std::byte*>(destination),count}});
+                return;
+            }
+            source->read_into(offset+at,destination,count);
+            return;
         }
         const auto data=read();
         if(data->size()!=expected_bytes)throw std::runtime_error("Incompatible QSA snapshot index archive length");

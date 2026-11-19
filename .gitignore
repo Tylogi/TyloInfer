@@ -1,5 +1,7 @@
 
 references/
+.tyloinfer-agent-runtime/
+/research/ds-bot/
 
 # ---- Python ----
 __pycache__/
@@ -81,3 +83,4 @@ data/*
 *.pth
 docs/benchmarks/
 *.jsonl
+/vendor/dsh/runtime/node_modules/

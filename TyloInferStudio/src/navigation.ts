@@ -13,7 +13,8 @@ export interface StudioLocation {
 }
 
 export const STUDIO_PATHS = {
-  overview: '/',
+  root: '/',
+  overview: '/inference',
   models: '/models',
   server: '/runtime',
   resources: '/resources',

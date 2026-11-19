@@ -1,8 +1,8 @@
 @import '../../shared/styles/numeric-values.css';
 
 .analysis-page, .architecture-dialog {
-  --small-numerals-font: "MFQ Small Numerals", var(--text-font);
-  font-family: var(--small-numerals-font);
+  --small-numerals-font: inherit;
+  font-family: inherit;
 }
 
 .analysis-page { display: grid; min-width: 0; gap: 22px; }

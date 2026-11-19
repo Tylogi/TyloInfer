@@ -68,7 +68,7 @@ struct Mapped {
     void* host=nullptr;void* device=nullptr;std::size_t bytes=0;
     std::shared_ptr<Mapped> shared_owner;
     explicit Mapped(std::size_t n):bytes(n) {
-        const auto allocation=cudaHostAlloc(&host,n,cudaHostAllocMapped);
+        const auto allocation=mfq::cuda::allocate_pinned_host(&host,n,cudaHostAllocMapped,"mapped_plan");
         if(mfq::cuda::pinned_allocation_rejected(allocation)) {
             (void)cudaGetLastError();
             throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(n)+
@@ -77,16 +77,16 @@ struct Mapped {
         }
         TYLOINFER_CUDA_CHECK(allocation);
         const auto status=cudaHostGetDevicePointer(&device,host,0);
-        if(status!=cudaSuccess) {cudaFreeHost(host);host=nullptr;TYLOINFER_CUDA_CHECK(status);}
+        if(status!=cudaSuccess) {mfq::cuda::release_pinned_host(host,bytes);host=nullptr;TYLOINFER_CUDA_CHECK(status);}
         mfq::cuda::charge_tensor_host_bytes(n);std::memset(host,0,n);
     }
     Mapped(const Mapped&)=delete;
     Mapped& operator=(const Mapped&)=delete;
     void borrow(std::shared_ptr<Mapped> owner) {
-        if(host && !shared_owner){cudaFreeHost(host);mfq::cuda::tensor_host_bytes.fetch_sub(bytes);}
+        if(host && !shared_owner){mfq::cuda::release_pinned_host(host,bytes);mfq::cuda::tensor_host_bytes.fetch_sub(bytes);}
         shared_owner=std::move(owner);host=shared_owner->host;device=shared_owner->device;bytes=shared_owner->bytes;
     }
-    ~Mapped(){if(host && !shared_owner){cudaFreeHost(host);mfq::cuda::tensor_host_bytes.fetch_sub(bytes);}}
+    ~Mapped(){if(host && !shared_owner){mfq::cuda::release_pinned_host(host,bytes);mfq::cuda::tensor_host_bytes.fetch_sub(bytes);}}
     template<class T>T* h()const{return static_cast<T*>(host);}
     template<class T>T* d()const{return static_cast<T*>(device);}
 };

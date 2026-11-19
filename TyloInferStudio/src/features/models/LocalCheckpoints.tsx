@@ -13,7 +13,7 @@ import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate'
 import { readLoadContext } from './loadContextDefaults';
 import { groupCheckpoints } from './checkpointGroups';
 
-export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
+export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = 'path' }: { catalog: ReturnType<typeof useModelCatalog>; capabilities?: { files?: boolean; settings?: boolean; deletion?: boolean; companions?: boolean }; companionMode?: 'path' | 'registered-id' }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
     setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
@@ -86,6 +86,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                 <h4 className="checkpoint-model-heading" id={`${headingId}-${familyIndex}-${modelIndex}`}>{group.name}</h4>
             {group.artifacts.map((item) => {
               const component = isComponent(item);
+              const companion = companions[item.id]?.trim();
+              const validCompanion = Boolean(companion && (companionMode === 'path' || artifacts.some(candidate => candidate.id === companion && candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && /^[0-9a-f]{32}$/.test(candidate.id))));
               const componentLabel = item.asset_kind === 'engram' ? tr('可独立使用的Engram', 'Independently usable Engram')
                 : tr('可独立使用的PLE', 'Independently usable PLE');
               const instance = instances.find(
@@ -124,12 +126,17 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {instance.pinned ? ` · ${tr('固定', 'Pinned')}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ''}
                     </small>}
                     {!component && <ModelLoadProgress model={item.name} />}
-                    {!loaded && item.gguf_companion_required && <details className="model-companion-picker">
+                    {capabilities.companions !== false && !loaded && item.gguf_companion_required && <details className="model-companion-picker">
                       <summary>{tr('Engram 配套文件', 'Engram companion')}</summary>
-                      <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
+                      {companionMode === 'registered-id' ? <>
+                        <select aria-label={tr(`Engram 配套资产：${item.name}`, `Engram companion: ${item.name}`)} disabled={busy} value={companions[item.id] ?? ''} onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))}>
+                          <option value="">{tr('选择已登记 GGUF 配套资产', 'Select a registered GGUF companion')}</option>
+                          {artifacts.filter(candidate => candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && /^[0-9a-f]{32}$/.test(candidate.id)).map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+                        </select><small>{tr('核心将核实所选工件与实际文件，兼容性由加载器校验；不接受任意路径。', 'The core verifies the selected artifact and file; the loader checks compatibility. Arbitrary paths are not accepted.')}</small>
+                      </> : <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
                         disabled={busy} value={companions[item.id] ?? ''}
                         placeholder={tr('服务端的 GGUF/TQ/MFQ 表文件或 Engram 文件夹', 'Server-side GGUF/TQ/MFQ table file or Engram folder')}
-                        onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))} />
+                        onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))} />}
                     </details>}
                   </div>
                   {!component && <div className="local-checkpoint-resources">
@@ -145,11 +152,11 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       tr={tr} />
                     </div>
                   </div>}
-                  <div className="model-row-controls"><div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} /><button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>
+                  <div className="model-row-controls"><div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{capabilities.files !== false && <button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>}
                   {!component && <>
-                  <button className="model-settings-action" aria-label={tr(`配置模型：${item.name}`, `Configure model: ${item.name}`)}
+                  {capabilities.settings !== false && <button className="model-settings-action" aria-label={tr(`配置模型：${item.name}`, `Configure model: ${item.name}`)}
                     title={tr('模型设置', 'Model settings')} disabled={busy || !item.loadable && !loaded}
-                    onClick={() => catalog.openModelSettings(item.name)} type="button"><Icon name="settings" size={14} /></button>{instance ? (
+                    onClick={() => catalog.openModelSettings(item.name)} type="button"><Icon name="settings" size={14} /></button>}{instance ? (
                     <button className="model-load-action" disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
@@ -157,15 +164,15 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   ) : loaded ? (
                     <em className="model-load-action">{tr('已加载', 'Loaded')}</em>
                   ) : (
-                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !companions[item.id]?.trim())} title={!item.loadable ? item.error || unavailableLabel : undefined}
+                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !validCompanion)} title={!item.loadable ? item.error || unavailableLabel : undefined}
                       aria-describedby={!item.loadable ? `checkpoint-unavailable-${item.id}` : streamsExperts ? `expert-streaming-${item.id}` : undefined}
                       onClick={() => void (companions[item.id]?.trim()
                         ? loadArtifact(item.name, [companions[item.id].trim()]) : loadArtifact(item.name))} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}<button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
+                  )}{capabilities.deletion !== false && <button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
                     disabled={busy || loaded} title={loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
-                    onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button></>}
+                    onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button>}</>}
                     </div>
                   </div>
                 </div>

@@ -1,7 +1,9 @@
 #include "../../../tests/qsa_reader_fixture.h"
 #include "runtime/qsa_tq_cache.h"
 #include "runtime/qsa_ram_cache.h"
+#include "runtime/pinned_allocation_retry.h"
 #include "kernels/qsa_ram.h"
+#include "kernels/qsa_tq.h"
 #include "runtime/qsa_tq_session.h"
 #include "runtime/decode_window.h"
 #include "tyloinfer/qsa_ram_policy.h"
@@ -28,7 +30,9 @@ void setting(const char* name,const std::string& value) {
     setenv(name,value.c_str(),1);
 #endif
 }
-void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=11) {
+void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=11,bool staging_probe=false,bool direct_mapped=false) {
+    setting("TYLOINFER_PROFILE_QSA_STAGING",staging_probe?"1":"0");
+    setting("TYLOINFER_QSA_RAM_DIRECT_ATTENTION",direct_mapped?"1":"0");
     setting("TYLOINFER_QSA_RAM_KV_BITS",std::to_string(bits));
     setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",std::to_string(cache_bytes));
     const auto f=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32),h=f.dtype(tb::kFloat16);
@@ -62,17 +66,20 @@ void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=
     // The second large chunk must reuse its complete layer staging, including
     // a partial microblock and different query tiles, before Graph decode.
     int token=0;for(int count:{initial_count,67,1,2,3,4,5,6,7,8}){append(token,count);token+=count;}
-    // Retain both graphs while the exact live position and input change.
-    mfq::cuda::DecodeWindow partial(mfq_current_cuda_stream()),complete(mfq_current_cuda_stream());
+    // A retained graph must cross all four microblock phases without capture.
+    mfq::cuda::DecodeWindow graph(mfq_current_cuda_stream(),staging_probe);
     auto query=tb::zeros({1,heads,1,width},h),raw=tb::zeros({1,1,iw},f),iq=tb::zeros({1,1,3,iw},f);
     auto gate=tb::zeros({1,1,heads,width},h),destination=tb::empty({1,heads,width},h);
     auto v=tb::empty({1,1,kh,width},f),positions=tb::empty({1,1},f.dtype(tb::kInt64));
-    for(int i=0;i<9;++i,++token) {
+    const auto rotary_axes=tb::arange(3,positions.options()).reshape({3,1,1})*4;
+    for(int i=0;i<21;++i,++token) {
         v.copy_(values.narrow(1,token,1));positions.copy_(tb::tensor(std::vector<int64_t>{token},f.dtype(tb::kInt64)).reshape({1,1}));
         cache.prepare_decode(true);const auto kind=cache.device_graph_kind(1);
         if(!kind)throw std::runtime_error("All-RAM path unexpectedly disabled its CUDA Graph");
-        auto& graph=kind==2?complete:partial;
-        if(!graph.valid())graph.capture([&]{cache.forward_pending_graph(query,v,v,iq,raw,positions,gate,destination,pool);},[]{});
+        if(!graph.valid())graph.capture([&]{
+            if(staging_probe)graph.mark(0,"qsa_probe_begin");
+            cache.forward_pending_graph(query,v,v,iq,raw,positions,gate,destination,pool,positions.unsqueeze(0)+rotary_axes);
+        },[]{});
         graph.run();cache.advance_graph(1);verify(destination,token,1);
     }
     cache.wait();const auto before=cache.stats();
@@ -81,14 +88,23 @@ void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=
         throw std::runtime_error("QSA RAM telemetry lost payload, physical pages or placement");
     if(before.blocks!=std::size_t(token/4) || !before.resident_bytes)throw std::runtime_error("RAM cache accounting lost completed blocks");
     cache.truncate(5);append(5,7);cache.reset();append(0,3);append(3,5);cache.wait();
-    std::cout<<"QSA RAM runtime causal M1..8, FP16 gate, immutable archive, Graph phases and rollback PASS bits="<<bits<<" heads="<<heads<<" width="<<width<<" cache="<<cache_bytes<<"\n";
+    setting("TYLOINFER_PROFILE_QSA_STAGING","0");
+    setting("TYLOINFER_QSA_RAM_DIRECT_ATTENTION","0");
+    std::cout<<"QSA RAM runtime causal M1..8, FP16 gate, immutable archive, Graph phases and rollback PASS bits="<<bits<<" heads="<<heads<<" width="<<width<<" cache="<<cache_bytes<<" staging_probe="<<staging_probe<<" direct_mapped="<<direct_mapped<<"\n";
 }
-void snapshot_roundtrip(int bits) {
+void snapshot_roundtrip(int bits,const std::string& migration_directory={}) {
     setting("TYLOINFER_QSA_RAM_KV_BITS",std::to_string(bits));setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
     setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",std::to_string(1<<20));
     const auto f=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
     constexpr int heads=6,kh=2,width=63,iw=7,length=160;
     mfq::cuda::QsaTqCache cache(length,heads,kh,width,1,iw,32,f,false);
+    constexpr auto indexer_bytes=std::size_t(length/4)*(iw+2)*sizeof(std::int16_t);
+    if(cache.indexer_growth_bytes()!=indexer_bytes)
+        throw std::runtime_error("Empty QSA cache should defer Indexer allocation");
+    const bool host_metadata=mfq::cuda::qsa_host_metadata_enabled(true);
+    const bool discarded=cache.discard_idle_descriptors();
+    if(discarded==host_metadata)
+        throw std::runtime_error("Empty QSA cache used unexpected descriptor placement");
     std::vector<float> kv(length*kh*width),raw_values(length*iw),queries(length*heads*width),iq_values(length*iw);
     for(std::size_t i=0;i<kv.size();++i)kv[i]=.13f*std::sin(float(i)*.017f);
     for(std::size_t i=0;i<raw_values.size();++i){raw_values[i]=std::sin(float(i)*.071f);iq_values[i]=std::cos(float(i)*.029f);}
@@ -97,10 +113,10 @@ void snapshot_roundtrip(int bits) {
     const auto query=tb::tensor(queries,f).reshape({1,length,heads,width}).permute({0,2,1,3});
     const auto iq=tb::tensor(iq_values,f).reshape({1,length,1,iw});
     const auto pool=[](const auto& x,const auto&){return x.slice(1,0,x.size(1),4).contiguous();};
-    const auto append=[&](int begin,int count){
+    const auto append=[&](int begin,int count,mfq::cuda::QsaTqCache* target=nullptr){
         auto positions=tb::arange(begin,begin+count,f.dtype(tb::kInt64)).reshape({1,count});
         auto gate=tb::zeros({1,count,heads,width},f);
-        return cache.forward(query.narrow(2,begin,count),values.narrow(1,begin,count),values.narrow(1,begin,count),
+        return (target?*target:cache).forward(query.narrow(2,begin,count),values.narrow(1,begin,count),values.narrow(1,begin,count),
             iq.narrow(1,begin,count),raw.narrow(1,begin,count),positions,pool,false,gate).to(tb::kCPU).contiguous();
     };
     const auto same=[](const auto& a,const auto& b){
@@ -111,6 +127,16 @@ void snapshot_roundtrip(int bits) {
     // queries, including nonconstant index selection and a partial last block.
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES",std::to_string(64ULL<<20));
     const auto expected_initial=append(0,129);cache.reset();
+    const auto tiled_prefix=[&] {
+        const auto first=append(0,43),middle=append(43,43),last=append(86,43);
+        return tb::cat({first,middle,last},0);
+    };
+    const auto restaged_parts=tiled_prefix();cache.reset();
+    cache.begin_prefill_workspace(129);
+    const auto staged_parts=tiled_prefix();
+    cache.release_prefill_workspace();
+    same(restaged_parts,staged_parts);
+    cache.reset();
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES","512");
     const auto actual_initial=append(0,129);
     for(std::int64_t i=0;i<expected_initial.numel();++i)
@@ -118,9 +144,108 @@ void snapshot_roundtrip(int bits) {
             throw std::runtime_error("Score tiling changed fresh canonical attention");
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES",std::to_string(64ULL<<20));
     auto snapshot=cache.capture_session(129);const auto expected=append(129,17);
-    cache.reset();cache.release_idle();cache.restore_session(*snapshot,false);same(expected,append(129,17));
+    if(cache.discard_idle_descriptors())throw std::runtime_error("QSA discarded live descriptors");
+    cache.release_idle(true);
+    if(cache.indexer_growth_bytes()!=0)
+        throw std::runtime_error("Idle release freed a live QSA Indexer");
+    cache.reset();cache.release_idle(true);
+    if(cache.indexer_growth_bytes()!=indexer_bytes)
+        throw std::runtime_error("Idle release retained an unused QSA Indexer");
+    cache.discard_idle_descriptors();
+    cache.restore_session(*snapshot,false);same(expected,append(129,17));
+    cache.reset();cache.release_idle();cache.restore_session(*snapshot,false);
+    std::vector<tb::Tensor> eager_rows;
+    for(int token=129;token<146;++token)eager_rows.push_back(append(token,1));
+    const auto eager_expected=tb::cat(eager_rows,0);
+    const auto completed=cache.capture_session(146);
+    cache.reset();cache.release_idle();cache.restore_session(*snapshot,false);
+    {
+        mfq::cuda::DecodeWindow graph(mfq_current_cuda_stream(),false);
+        auto q=tb::empty({1,heads,1,width},f),v=tb::empty({1,1,kh,width},f);
+        auto r=tb::empty({1,1,iw},f),iq_row=tb::empty({1,1,1,iw},f);
+        auto positions=tb::empty({1,1},f.dtype(tb::kInt64)),gate=tb::zeros({1,1,heads,width},f);
+        auto destination=tb::empty({1,heads,width},f);
+        for(int token=129;token<146;++token) {
+            q.copy_(query.narrow(2,token,1));v.copy_(values.narrow(1,token,1));
+            r.copy_(raw.narrow(1,token,1));iq_row.copy_(iq.narrow(1,token,1));
+            positions.copy_(tb::tensor(std::vector<int64_t>{token},f.dtype(tb::kInt64)).reshape({1,1}));
+            cache.prepare_decode(true);
+            if(!graph.valid())graph.capture([&]{cache.forward_pending_graph(q,v,v,iq_row,r,positions,gate,destination,pool);},[]{});
+            graph.run();cache.advance_graph(1);
+            const auto actual=destination.to(tb::kCPU).contiguous();
+            const auto reference=eager_expected.narrow(0,token-129,1).contiguous();
+            for(std::int64_t i=0;i<actual.numel();++i)
+                if(std::abs(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i])>2e-5f)
+                    throw std::runtime_error("Retained single-token graph changed nonzero index selection: bits="+
+                        std::to_string(bits)+" token="+std::to_string(token)+" difference="+
+                        std::to_string(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i]));
+        }
+        const auto replayed=cache.capture_session(146);
+        if(replayed->index.size()!=completed->index.size())throw std::runtime_error("Graph archive lost completed index rows");
+        for(std::size_t i=0;i<completed->index.size();++i)
+            if(*replayed->index[i]->read()!=*completed->index[i]->read())
+                throw std::runtime_error("Retained graph changed exact INT16 index archive");
+    }
     auto older=cache.capture_session(125);cache.truncate(125);const auto expected_older=append(125,4);
     cache.reset();cache.release_idle();cache.restore_session(*older,false);same(expected_older,append(125,4));
+    {
+        setting("TYLOINFER_QSA_CPU_INDEXER","1");
+        mfq::cuda::QsaTqCache host_cache(length,heads,kh,width,1,iw,32,f,false);
+        setting("TYLOINFER_QSA_CPU_INDEXER","0");
+        if(host_cache.indexer_growth_bytes() || !host_cache.device_graph_kind(4))
+            throw std::runtime_error("CPU Indexer must keep its cache in RAM and support graph decode");
+        const auto check=[](const tb::Tensor& actual,const tb::Tensor& reference) {
+            for(std::int64_t i=0;i<actual.numel();++i)
+                if(std::abs(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i])>2e-5f)
+                    throw std::runtime_error("CPU Indexer changed QSA output");
+        };
+        check(append(0,129,&host_cache),expected_initial);
+        host_cache.restore_session(*older,false);
+        check(append(125,4,&host_cache),expected_older);
+        if(!migration_directory.empty()) {
+            setting("TYLOINFER_QSA_TQ_DIRECTORY",migration_directory);
+            for(bool ssd:{false,true}) {
+                mfq::cuda::QsaTqCache migrating(length,heads,kh,width,1,iw,32,f,ssd);
+                migrating.restore_session(*older,false);
+                if(migrating.migrate_indexer_to_ram()!=indexer_bytes || migrating.migrate_indexer_to_ram()!=0)
+                    throw std::runtime_error("QSA Indexer migration reported incorrect released bytes");
+                check(append(125,4,&migrating),expected_older);
+                migrating.restore_session(*older,false);
+                if(migrating.migrate_indexer_to_device(SIZE_MAX) ||
+                    migrating.migrate_indexer_to_device(0)!=indexer_bytes ||
+                    migrating.migrate_indexer_to_device(0) || migrating.indexer_migrated_to_ram())
+                    throw std::runtime_error("QSA Indexer promotion ignored its budget or placement");
+                same(append(125,4,&migrating),expected_older);
+                if(migrating.migrate_indexer_to_ram()!=indexer_bytes)
+                    throw std::runtime_error("Promoted QSA Indexer could not return to RAM");
+                migrating.reset();migrating.release_idle(true);
+                if(migrating.indexer_migrated_to_ram() || migrating.indexer_growth_bytes()!=indexer_bytes)
+                    throw std::runtime_error("Idle QSA retained a temporary CPU Indexer placement");
+                migrating.restore_session(*older,false);
+                same(append(125,4,&migrating),expected_older);
+            }
+            std::cout<<"QSA Indexer migration to RAM with exact INT16 continuation PASS\n";
+        }
+        for(bool task:{false,true}) for(int n:{1,4}) {
+            setting("TYLOINFER_QSA_CPU_INDEXER_GRAPH_TASK",task?"":"0");
+            host_cache.restore_session(*older,false);
+            cache.restore_session(*older,false);
+            const auto reference=append(125,n);
+            const auto positions=tb::arange(125,125+n,f.dtype(tb::kInt64)).reshape({1,n});
+            auto q=query.narrow(2,125,n).contiguous(),v=values.narrow(1,125,n).contiguous();
+            auto r=raw.narrow(1,125,n).contiguous(),iq_rows=iq.narrow(1,125,n).contiguous();
+            auto gate=tb::zeros({1,n,heads,width},f),destination=tb::empty({n,heads,width},f);
+            mfq::cuda::DecodeWindow graph(mfq_current_cuda_stream(),false,true);
+            const auto kind=host_cache.device_graph_kind(n);
+            host_cache.prepare_decode_tokens(n,true,kind&~3);
+            graph.capture([&]{host_cache.forward_pending_graph(q,v,v,iq_rows,r,positions,gate,destination,pool);},[]{});
+            if(graph.segments()!=(task?1u:2u))
+                throw std::runtime_error("CPU Indexer changed the expected graph submission count");
+            graph.run();host_cache.advance_graph(n);
+            check(destination.to(tb::kCPU).contiguous(),reference);
+        }
+        setting("TYLOINFER_QSA_CPU_INDEXER_GRAPH_TASK","0");
+    }
     if(snapshot->kv->blocks.size()!=32 || snapshot->index.size()!=32 || snapshot->tail_keys.size(1)!=1)
         throw std::runtime_error("Packed RAM session omitted its partial tail");
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
@@ -140,8 +265,9 @@ void snapshot_roundtrip(int bits) {
     std::cout<<"QSA RAM packed snapshot, exact nonzero INT16 index and partial/older-tail continuation PASS bits="<<bits<<"\n";
 }
 void pressure(const std::string& directory) {
-    setting("TYLOINFER_QSA_RAM_KV_BITS","16");setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",std::to_string(1<<20));
-    setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(7<<20));setting("TYLOINFER_QSA_TQ_DIRECTORY",directory);
+    constexpr std::size_t ram_budget=3<<20;
+    setting("TYLOINFER_QSA_CACHE_MODE","auto");setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",std::to_string(1<<20));
+    setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(ram_budget));setting("TYLOINFER_QSA_TQ_DIRECTORY",directory);
     constexpr int prompt=8192,heads=6,kh=2,width=63,iw=4;
     const auto f=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32),h=f.dtype(tb::kFloat16);
     mfq::cuda::QsaTqCache cache(prompt+128,heads,kh,width,1,iw,64,f,true);
@@ -163,10 +289,10 @@ void pressure(const std::string& directory) {
     };
     append(0,prompt,false);append(prompt,1,false);cache.wait();
     const auto cold=cache.stats();std::size_t in_ram=0;for(auto n:cold.blocks_per_tier)in_ram+=n;
-    if(!cold.demotions || in_ram>=cold.blocks || cold.resident_bytes>7<<20)
+    if(!cold.demotions || in_ram>=cold.blocks || cold.resident_bytes>ram_budget)
         throw std::runtime_error("Runtime RAM pressure did not quantize and evict to session SSD: demotions="+
             std::to_string(cold.demotions)+" in_ram="+std::to_string(in_ram)+" blocks="+std::to_string(cold.blocks)+" bytes="+std::to_string(cold.resident_bytes));
-    if(cold.resident_bytes>(7<<20)-(7<<20)/64)
+    if(cold.resident_bytes>ram_budget-ram_budget/64)
         throw std::runtime_error("SSD pressure left no batch margin for fresh KV and hot recalls");
     append(prompt+1,1,true);cache.wait();const auto hot=cache.stats();
     if(!hot.promotions || hot.canonical_read_bytes<=cold.canonical_read_bytes)
@@ -220,7 +346,65 @@ void pressure(const std::string& directory) {
     cache.reset();append(0,3,false);cache.wait();
     if(cache.stats().blocks || cache.position()!=3)throw std::runtime_error("RAM/SSD reset retained an old logical block");
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
-    std::cout<<"QSA RAM runtime 8192-token pressure16->8->4, session SSD, changed indexer query, hot promotion and reset PASS\n";
+    std::cout<<"QSA RAM runtime 8192-token INT8 to TQ4 pressure, session SSD, changed indexer query, hot promotion and reset PASS\n";
+}
+void pinned_allocation_recovery() {
+    using namespace mfq::cuda;
+    const auto require=[](bool ok){if(!ok)throw std::runtime_error("Pinned allocation recovery contract failed");};
+    int calls=0,reclaims=0,defers=0;
+    const auto fail=[]() -> int {throw std::runtime_error("CUDA pinned allocation failed: injected");};
+    const auto reclaim=[&](std::size_t n){require(n==4096);++reclaims;return n;};
+    const auto defer=[&](std::size_t n){require(n==4096);++defers;};
+    const auto once=[&]{if(++calls==1)return fail();return 17;};
+    require(allocate_with_pinned_recovery(4096,true,once,reclaim,defer)==17);
+    require(calls==2 && reclaims==1 && defers==0);
+    calls=0;bool deferred=false;
+    try{allocate_with_pinned_recovery(4096,false,once,reclaim,defer);}
+    catch(const DeferredPinnedAllocation& error){deferred=error.bytes==4096;}
+    require(deferred && calls==1 && reclaims==1 && defers==1);
+    calls=0;bool rejected=false;
+    try{allocate_with_pinned_recovery(4096,true,once,[](auto){return 0;},defer);}
+    catch(const std::runtime_error&){rejected=true;}
+    require(rejected && calls==1);
+    int failures=0;rejected=false;
+    try{allocate_with_pinned_recovery(4096,true,[&]() -> int {++failures;return fail();},reclaim,defer);}
+    catch(const std::runtime_error&){rejected=true;}
+    require(rejected && failures==2 && reclaims==2);
+    rejected=false;
+    try{allocate_with_pinned_recovery(4096,true,[]() -> int {throw std::runtime_error("unrelated failure");},reclaim,defer);}
+    catch(const std::runtime_error&){rejected=true;}
+    require(rejected && reclaims==2 && defers==1);
+    std::cout<<"Pinned allocation single retry/deferred codec/no progress/unrelated error PASS\n";
+}
+void pinned_scope_lifetime() {
+    using namespace mfq::cuda;
+    const auto require=[](bool ok){if(!ok)throw std::runtime_error("Pinned scope ownership contract failed");};
+    const auto device=mfq_current_cuda_device();const auto context=default_context(device);
+    const auto stream=context->stream().get();
+    const auto initial=pinned_memory_budget_stats().live_bytes;
+    {
+        HostBuffer packet(1024,true);
+        auto tensor=tb::empty({2048},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+        require(pinned_memory_budget_stats().live_bytes==initial+3072);
+    }
+    require(pinned_memory_budget_stats().live_bytes==initial);
+    require(pinned_headroom_shortage(70,100,20,10)==0);
+    require(pinned_headroom_shortage(90,100,20,10)==20);
+    require(pinned_headroom_shortage(110,100,20,10)==40);
+    require(pinned_headroom_shortage(0,0,SIZE_MAX,1)==SIZE_MAX);
+    int calls=0;require(!pinned_allocation_scope_active());
+    {
+        PinnedAllocationScope outer(device,stream,[&](std::size_t n){
+            ++calls;require(reclaim_pinned_allocation(n)==0);return n;
+        });
+        require(pinned_allocation_scope_active() && reclaim_pinned_allocation(7)==7 && calls==1);
+        {PinnedReclaimPause locked;require(reclaim_pinned_allocation(7)==0 && calls==1);}
+        std::thread worker([&]{require(!pinned_allocation_scope_active() && reclaim_pinned_allocation(7)==0);});worker.join();
+        {PinnedAllocationScope nested(device,stream,[](std::size_t n){return 2*n;});require(reclaim_pinned_allocation(7)==14);}
+        require(reclaim_pinned_allocation(7)==7 && calls==2);
+    }
+    require(!pinned_allocation_scope_active() && reclaim_pinned_allocation(7)==0);
+    std::cout<<"Required pinned scope: thread isolation/cache pause/no recursive reclaim/nested restoration PASS\n";
 }
 void reclaimer_lifetime() {
     using namespace mfq::cuda;
@@ -262,6 +446,15 @@ void reclaimer_lifetime() {
     require(reservation1==std::vector<std::size_t>{10} && reservation2==reservation1);
     require(reserve_qsa_ram_budget(device,stream,0)==0 && reservation1.back()==0 && reservation2.back()==0);
     r1.reset();r2.reset();require(reserve_qsa_ram_budget(device,stream,7)==0);
+    std::size_t pinned_bytes=0;
+    require(!register_qsa_pinned_reclaimer(device,stream,{}));
+    auto pinned=register_qsa_pinned_reclaimer(device,stream,[&](std::size_t n){
+        require(std::this_thread::get_id()==caller);pinned_bytes+=n;return n;
+    });
+    require(reclaim_qsa_pinned(device+1,stream,19)==0 && pinned_bytes==0);
+    require(reclaim_qsa_pinned(device,stream,19)==19 && pinned_bytes==19);
+    require(reclaim_qsa_ram_capacity(device,stream,19)==0 && pinned_bytes==19);
+    pinned.reset();require(reclaim_qsa_pinned(device,stream,19)==0);
     std::cout<<"RAM prefix/expert reclamation priority, foreground execution, lifetime, isolation and callback re-entry PASS\n";
 }
 void combined_ram_caps(const std::string& directory) {
@@ -387,6 +580,11 @@ void prefill_layer_bytes(const std::string& directory) {
     if(mfq::cuda::tensor_host_peak_bytes.load()>host_before+(32ULL<<10))
         throw std::runtime_error("Repeated prefill staging must reuse pinned transfer packets");
 #endif
+    if(!cache.stage_prefill(blocks,0,&*repeated) || reads!=2*(blocks-2))
+        throw std::runtime_error("Unchanged SSD-backed KV was read twice during prefill");
+    cache.restore(state,true);
+    if(cache.stage_prefill(blocks,0,&*repeated))
+        throw std::runtime_error("Prefill reused GPU staging after the backing session changed");
     cache.truncate(0); // The submitted staging must outlive all original owners.
     auto payload=stage->payload.to(tb::kCPU),views=stage->views.to(tb::kCPU);
     auto repeated_payload=repeated->payload.to(tb::kCPU),repeated_views=repeated->views.to(tb::kCPU);
@@ -597,7 +795,8 @@ void graph_source_transaction() {
     std::cout<<"SSD Graph publication, exact rollback after cancellation, generation/count rejection and safe masks PASS\n";
 }
 void ram_pressure_retained_graph() {
-    setting("TYLOINFER_QSA_RAM_KV_BITS","16");setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
+    setting("TYLOINFER_QSA_CACHE_MODE","auto");
+    setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
     setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",std::to_string(1<<20));
     constexpr int prompt=8192,heads=6,kh=2,width=63,iw=4,n=4;
     const auto f=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32),h=f.dtype(tb::kFloat16);
@@ -611,6 +810,9 @@ void ram_pressure_retained_graph() {
         cache.forward(q,values,values,iq,raw,position,pool,false,gate);cache.wait();
     };
     prefill();
+    const auto initial=cache.ram_memory();
+    if(!initial || initial->tokens[1]!=prompt || initial->tokens[0] || initial->tokens[2] || initial->tokens[3])
+        throw std::runtime_error("Auto QSA did not start with INT8 KV");
     auto q=tb::zeros({1,heads,n,width},h),kv=tb::full({1,n,kh,width},.03125,f);
     auto iq=tb::zeros({1,n,1,iw},f),raw=tb::zeros({1,n,iw},f);
     auto position=tb::zeros({1,n},f.dtype(tb::kInt64)),gate=tb::zeros({1,n,heads,width},h),out=tb::empty({n,heads,width},h);
@@ -620,12 +822,12 @@ void ram_pressure_retained_graph() {
         const auto start=cache.position();
         position.copy_(tb::arange(start,start+n,position.options()).reshape({1,n}));
         if(iteration==1) {
-            setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(9<<20));cache.wait();
+            setting("TYLOINFER_QSA_RAM_BUDGET_BYTES",std::to_string(6<<20));cache.wait();
             const auto usage=cache.stats();
             const auto state=cache.capture_session(start);std::array<std::size_t,4> tiers{};
             for(const auto& block:state->kv->blocks)++tiers[unsigned(block.tier)];
-            if(!tiers[0] || !tiers[1] || !tiers[2] || tiers[3] || usage.resident_bytes>9<<20)
-                throw std::runtime_error("RAM-only pressure did not retain three encoded tiers without SSD");
+            if(tiers[0] || !tiers[2] || tiers[3] || tiers[1]*10<state->kv->blocks.size() || usage.resident_bytes>6<<20)
+                throw std::runtime_error("RAM-only pressure did not retain its INT8 floor and TQ4 without SSD");
         }
         cache.prepare_decode_tokens(n,true);
         if(!window.valid())window.capture([&]{cache.forward_pending_graph(q,kv,kv,iq,raw,position,gate,out,pool);},[]{});
@@ -635,7 +837,7 @@ void ram_pressure_retained_graph() {
             throw std::runtime_error("Retained RAM Graph lost its dynamic compact layout after quantization");
     }
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
-    std::cout<<"RAM-only16/8/4 pressure, no SSD, retained M4 Graph across slot shrink and idle metadata release PASS\n";
+    std::cout<<"RAM-only INT8/TQ4 pressure, no SSD, retained M4 Graph across slot shrink and idle metadata release PASS\n";
 }
 
 void restore_reservation_and_idle_release() {
@@ -815,20 +1017,34 @@ void ssd_kv_preserves_expert_ram(const std::string& directory) {
         ram.truncate(0);ram.release_idle();
     }
     cache.truncate(0);cache.release_idle();
+    {
+        auto fixed_live=tb::zeros({65,int64_t(sizeof(tq::TqBlockView))},options);
+        mfq::cuda::QsaRamCache fixed(65,rows,16,4,options,fixed_live,false,"",encoded_fixture,false);
+        const auto one_block=fixed.fixed_prefill_ram_reservation(1);
+        fixed.restore(ram_state,false);fixed.wait();
+        if(!one_block || fixed.fixed_prefill_ram_reservation(64)!=0 ||
+                fixed.fixed_prefill_ram_reservation(65)!=one_block)
+            throw std::runtime_error("Fixed RAM KV prefill reserved memory for resident prefix blocks");
+    }
     setting("TYLOINFER_KV_RAM_LIMIT_BYTES","");
     std::cout<<"SSD KV restore/growth retains RAM experts, exact cold read and mixed RAM-only reservation PASS\n";
 }
 
-void shared_stage_admission_lifetime(const std::string& directory) {
+void shared_stage_admission_lifetime(const std::string& directory,bool shared_cache=false,bool spare_vram=false) {
     namespace tq=tyloinfer::qsa;
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");setting("TYLOINFER_KV_RAM_LIMIT_BYTES","");
-    setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES","0");
+    setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES",(shared_cache || spare_vram)?"":"0");
     constexpr int rows=19,blocks=4;const auto part=((2*rows+(rows+1)/2+(3*rows+7)/8+3)&~std::size_t(3))+std::size_t(rows)*128;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
     auto first_live=tb::zeros({blocks,int64_t(sizeof(tq::TqBlockView))},options),second_live=tb::zeros_like(first_live);
     const auto codec=[](const auto&,const auto&)->std::vector<tq::MicroblockImage>{throw std::runtime_error("Unexpected codec in shared-stage lifetime test");};
-    mfq::cuda::QsaRamCache first(blocks,rows,blocks,16,options,first_live,true,directory+"/first",codec);
-    mfq::cuda::QsaRamCache second(blocks,rows,blocks,16,options,second_live,true,directory+"/second",codec);
+    mfq::cuda::QsaRamCache first(blocks,rows,blocks,16,options,first_live,true,directory+"/first",codec,true,false,spare_vram);
+    mfq::cuda::QsaRamCache second(blocks,rows,blocks,16,options,second_live,true,directory+"/second",codec,true,false,spare_vram);
+    if(shared_cache || spare_vram) {
+        first.prepare_prefill_stage(1);
+        if(first.memory().shared_gpu_cache)throw std::runtime_error("QSA prefill allocated the shared decode cache");
+        first.release_prefill_stage();
+    }
     auto batch_calls=std::make_shared<std::size_t>(0);
     const auto state=[&](std::uint8_t byte) {
         tq::RamKvSnapshot result;
@@ -851,27 +1067,65 @@ void shared_stage_admission_lifetime(const std::string& directory) {
     auto host=tb::zeros({blocks,int64_t(sizeof(tq::SelectedBlock))},options.device(tb::kCPU));
     for(int id=0;id<blocks;++id)host.data_ptr<tq::SelectedBlock>()[id]={id,15};
     auto selected=host.to(options);first.prepare();second.prepare();first.prepare_graph_task(100);second.prepare_graph_task(100);
+    if(spare_vram && first.memory().shared_gpu_cache)
+        throw std::runtime_error("Dense QSA cache claimed GPU memory before decode workspace was ready");
+    if(shared_cache && (!first.memory().shared_gpu_cache ||
+        first.memory().shared_gpu_cache!=second.memory().shared_gpu_cache ||
+        first.memory().shared_gpu_cache>mfq::cuda::qsa_shared_vram_cache_default))
+        throw std::runtime_error("Shared QSA cache multiplied or exceeded its total GPU budget");
+    if(shared_cache) {
+        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+        const auto bytes=first.memory().shared_gpu_cache;
+        if(first.release_shared_device_cache()!=bytes || first.memory().shared_gpu_cache ||
+            second.memory().shared_gpu_cache || second.release_shared_device_cache())
+            throw std::runtime_error("Releasing QSA recall scratch retained a shared cache participant");
+        first.prepare();second.prepare();
+        if(!first.memory().shared_gpu_cache || first.memory().shared_gpu_cache!=second.memory().shared_gpu_cache)
+            throw std::runtime_error("QSA decode did not reacquire the shared cache after prefill");
+    }
     mfq::cuda::DecodeWindow graph(mfq_current_cuda_stream());
-    graph.capture([&]{first.stage_graph_task(selected,1,blocks,first_live,{},0);second.stage_graph_task(selected,1,blocks,second_live,{},0);},[]{});
+    bool delay_host=false;
+    graph.capture([&]{
+        graph.enroll({&delay_host,[]{},[&]{if(delay_host)std::this_thread::sleep_for(std::chrono::milliseconds(20));},{},{}});
+        first.stage_graph_task(selected,1,blocks,first_live,{},0);second.stage_graph_task(selected,1,blocks,second_live,{},0);
+    },[]{});
     if(graph.segments()!=1)throw std::runtime_error("Shared-stage test added a graph boundary");
-    for(int replay=0;replay<2;++replay) {
-        first.restore(state(43),true);second.restore(state(117),true);
+    if(spare_vram) {
+        first.activate_shared_cache();second.activate_shared_cache();
+        const auto allocated=first.memory().shared_gpu_cache;
+        if(allocated<=mfq::cuda::qsa_shared_vram_cache_default || allocated!=second.memory().shared_gpu_cache ||
+                first.release_shared_device_cache(true)!=allocated || second.memory().shared_gpu_cache)
+            throw std::runtime_error("Dense QSA cache failed to lend spare GPU memory to the model");
+        mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+    }
+    for(int replay=0;replay<3;++replay) {
+        // Exercise another SSD recall after the shared export is reused.
+        delay_host=replay==2;
+        if(!delay_host)first.restore(state(43),true);
+        second.restore(state(117),true);
         first.prepare_graph_task(100);second.prepare_graph_task(100);
         const auto before=*batch_calls;
         graph.run();
+        if(spare_vram && first.memory().shared_gpu_cache<=mfq::cuda::qsa_shared_vram_cache_default)
+            throw std::runtime_error("Retained CUDA Graph failed to restore the Dense QSA cache");
         if(*batch_calls<=before)throw std::runtime_error("Retained SSD Graph skipped random source batch dispatch");
         for(auto pair:{std::pair{&first,std::uint8_t(43)},std::pair{&second,std::uint8_t(117)}}) {
             auto snapshot=pair.first->snapshot(blocks);
             for(const auto& block:snapshot->blocks) {
-                if(!block.image)throw std::runtime_error("Shared-stage test did not admit its fallback data");
                 const auto image=block.read();
                 if(image.key!=std::vector<std::uint8_t>(part,pair.second) || image.value!=image.key)
-                    throw std::runtime_error("Later layer overwrote deferred RAM KV admission");
+                    throw std::runtime_error("Shared-stage recall changed the retained KV image");
             }
         }
     }
     if(!*batch_calls)throw std::runtime_error("SSD Graph did not dispatch random source batches");
-    std::cout<<"Two QSA layers sharing mapped staging: batch dispatch, fallback lifetime, deferred admission and retained Graph replay PASS\n";
+    if(shared_cache) {
+        const auto before=*batch_calls;
+        first.prepare_graph_task(101);second.prepare_graph_task(101);graph.run();
+        if(*batch_calls!=before)throw std::runtime_error("Shared QSA cache reread already resident versions");
+    }
+    setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES","0");
+    std::cout<<"Two QSA layers sharing mapped staging: batch dispatch, retained KV images and Graph replay PASS\n";
 }
 
 void mixed_prefix_graph(const std::string& directory) {
@@ -929,8 +1183,22 @@ void mixed_prefix_graph(const std::string& directory) {
             auto gate=tb::full({1,n,heads,width},.31,h),out=tb::empty({n,heads,width},h);
             const auto expected=reference.forward(q,keys,keys,index_query,raw_next,next,pool,false,gate).to(tb::kCPU,tb::kFloat32).contiguous();
             if(!actual.graph_task_supported())throw std::runtime_error("Original-precision prefix disabled SSD Graph reads");
-            actual.prepare_decode_tokens(n,true,8);mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
-            window.capture([&]{actual.forward_pending_graph(q,keys,keys,index_query,raw_next,next,gate,out,pool);},[]{});
+            std::unique_ptr<mfq::cuda::QsaTqCache> peer;
+            tb::Tensor peer_gate,peer_out,peer_expected;
+            if(n==1) {
+                peer=std::make_unique<mfq::cuda::QsaTqCache>(256,heads,kh,width,1,iw,256,f,true);
+                peer->restore_session(ssd_state,true);
+                peer_gate=tb::full({1,1,heads,width},-.27,h);peer_out=tb::empty_like(out);
+                reference.reset();reference.restore_session(ram_state,false);
+                peer_expected=reference.forward(q,keys,keys,index_query,raw_next,next,pool,false,peer_gate)
+                    .to(tb::kCPU,tb::kFloat32).contiguous();
+                peer->prepare_decode_tokens(1,true,8,true);
+            }
+            actual.prepare_decode_tokens(n,true,8,n==1);mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+            window.capture([&]{
+                actual.forward_pending_graph(q,keys,keys,index_query,raw_next,next,gate,out,pool);
+                if(peer)peer->forward_pending_graph(q,keys,keys,index_query,raw_next,next,peer_gate,peer_out,pool);
+            },[]{});
             if(window.segments()!=1)throw std::runtime_error("Mixed prefix added a CUDA Graph boundary");
             window.run();actual.advance_graph(n);
             const auto result=out.to(tb::kCPU,tb::kFloat32).contiguous();
@@ -942,6 +1210,16 @@ void mixed_prefix_graph(const std::string& directory) {
             if(maximum>2e-4 || !std::isfinite(error))
                 throw std::runtime_error("Mixed prefix Graph/RAM mismatch M="+std::to_string(n)+" cache="+std::to_string(cache_bytes)+
                     " max="+std::to_string(maximum)+" NMSE="+std::to_string(error/std::max(energy,1e-30)));
+            if(peer) {
+                peer->advance_graph(1);
+                const auto peer_result=peer_out.to(tb::kCPU,tb::kFloat32).contiguous();
+                for(int64_t i=0;i<peer_result.numel();++i) {
+                    const auto delta=peer_result.data_ptr<float>()[i]-peer_expected.data_ptr<float>()[i];
+                    if(!std::isfinite(delta) || std::abs(delta)>2e-4)
+                        throw std::runtime_error("Shared QSA scratch changed the second graph row");
+                }
+                peer->wait();
+            }
             actual.wait();reference.wait();
         }
     }
@@ -991,10 +1269,10 @@ void prefill_loan_lifetime() {
         for(int64_t i=0;i<actual.numel();++i)if(std::abs(actual.data_ptr<float>()[i]-.015625f)>.00001f)
             throw std::runtime_error("QSA workspace loan changed causal attention");
     };
-    append(0,4);cache->wait();
     auto storage=tb::empty({8<<20},f.dtype(tb::kUInt8));
     context->begin_workspace_loan({{storage.data_ptr(),storage.nbytes()}},stream);
     try {
+        append(0,4);cache->wait();
         append(4,33);TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));cache->collect();
         context->suspend_workspace_loan();context->end_workspace_loan();
     }catch(...) {
@@ -1056,10 +1334,68 @@ void long_prefill_operand_reuse() {
     std::cout<<"Long QSA prefill beyond32MiB, multiple score tiles and direct-reference parity PASS max="<<maximum
         <<" direct_ms="<<elapsed[0]<<" staged_ms="<<elapsed[1]<<'\n';
 }
+void selection_hit_visibility() {
+    const auto cuda=tb::TensorOptions().device(tb::kCUDA);
+    const std::array<tyloinfer::qsa::SelectedBlock,6> records{{
+        {0,15},{1,12},{2,15},{2,2},{0,0},{-1,15}}};
+    auto host=tb::empty({int64_t(sizeof(records))},cuda.device(tb::kCPU).dtype(tb::kUInt8));
+    std::memcpy(host.data_ptr(),records.data(),sizeof(records));
+    const auto selected=host.to(cuda.dtype(tb::kUInt8));
+    const auto positions=tb::tensor(std::vector<int64_t>{5,9},cuda.dtype(tb::kInt64));
+    const auto hits=tb::zeros({3},cuda.dtype(tb::kFloat32));
+    TYLOINFER_CUDA_CHECK(cudaError_t(tyloinfer::qsa::tq_observe_selection_hits(selected.data_ptr<tyloinfer::qsa::SelectedBlock>(),
+        positions.data_ptr<int64_t>(),hits.data_ptr<float>(),2,3,mfq_current_cuda_stream())));
+    const auto counts=hits.cpu();
+    const auto* values=counts.data_ptr<float>();
+    if(values[0]!=1.f || values[1]!=0.f || values[2]!=1.f)
+        throw std::runtime_error("QSA hit-only history changed causal selection");
+}
+
 int main(int argc,char** argv)try {
-    reclaimer_lifetime();
+    pinned_allocation_recovery();reclaimer_lifetime();
+    if(argc==2 && std::string_view(argv[1])=="--pinned-recovery-check")return 0;
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices){std::cout<<"SKIP: CUDA unavailable\n";return 77;}
+    selection_hit_visibility();
+    if(argc==3 && std::string_view(argv[1])=="--spare-cache-check") {
+        const auto device=mfq_current_cuda_device();
+        auto context=mfq::cuda::default_context(device);
+        const auto allowance=2*mfq::cuda::qsa_shared_vram_cache_default;
+        if(context->available_memory()<allowance){std::cout<<"SKIP: insufficient CUDA memory for cache growth\n";return 77;}
+        context->begin_graph_pool(mfq_current_cuda_stream());
+        context->set_memory_limit(context->resident_memory_usage()+allowance);
+        const mfq::cuda::QsaRamDecodeBudgetScope budget(device,true);
+        shared_stage_admission_lifetime(argv[2],false,true);
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--pinned-scope-check") {pinned_scope_lifetime();return 0;}
+    if(argc==2 && std::string_view(argv[1])=="--cpu-indexer-graph-check") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        context->begin_graph_pool(mfq_current_cuda_stream());
+        snapshot_roundtrip(16);
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--staging-probe-check") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(mfq_current_cuda_stream());
+        run(16,6,63,0,11,true);
+        std::cout<<"QSA RAM staging diagnostic graph replay and causal parity PASS\n";return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--direct-ram-check") {
+        int mapped=0;TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&mapped,cudaDevAttrCanMapHostMemory,mfq_current_cuda_device()));
+        if(!mapped){std::cout<<"SKIP: mapped host memory unavailable\n";return 77;}
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(mfq_current_cuda_stream());
+        setting("TYLOINFER_TRACE_KERNEL_DISPATCH","1");
+        for(const auto* mode:{"auto","fp16","affine8","tq4"}) {
+            setting("TYLOINFER_QSA_CACHE_MODE",mode);
+            const int bits=std::strcmp(mode,"affine8")==0?8:std::strcmp(mode,"tq4")==0?4:16;
+            run(bits,6,63,0,11,false,true);
+            run(bits,24,256,0,11,false,true);
+        }
+        setting("TYLOINFER_QSA_CACHE_MODE","auto");
+        run(16,6,63,1<<20,11,false,true);
+        run(16,6,63,0,11,true,true);
+        std::cout<<"QSA direct RAM captured attention causal parity, precision modes and staging fallbacks PASS\n";return 0;
+    }
     restore_reservation_and_idle_release();
     ssd_kv_preserves_expert_ram((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"expert-priority").string());
     fragmented_ram_capacity((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"fragmented-capacity").string());
@@ -1070,12 +1406,14 @@ int main(int argc,char** argv)try {
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(mfq_current_cuda_stream());
     graph_capability_is_read_only((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"capability").string());
     shared_stage_admission_lifetime((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"shared-stage").string());
+    shared_stage_admission_lifetime((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"shared-cache").string(),true);
     mixed_prefix_graph((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"mixed-prefix").string());
     graph_source_transaction();
     for(int bits:{16,8,4})for(std::size_t bytes:{std::size_t(0),std::size_t(1)<<20}) {
         run(bits,6,63,bytes);run(bits,24,256,bytes);run(bits,12,257,bytes);
     }
-    for(int bits:{16,8,4})snapshot_roundtrip(bits);
+    const auto migration_directory=std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"indexer-migration";
+    for(int bits:{16,8,4})snapshot_roundtrip(bits,bits==16?migration_directory.string():std::string{});
     ram_pressure_retained_graph();
     pressure(argc>1?argv[1]:(std::filesystem::current_path()/"qsa-ram-runtime-ssd-test-data").string());
     combined_ram_caps((std::filesystem::path(argc>1?argv[1]:"qsa-ram-runtime-ssd-test-data")/"combined-caps").string());

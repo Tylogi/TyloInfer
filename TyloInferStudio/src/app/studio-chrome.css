@@ -1,0 +1,271 @@
+.app-shell.agent-first-shell {
+  --accent: #4176e6;
+  --accent-hover: #3567d2;
+  --accent-ink: #3567c8;
+  --accent-soft: rgb(65 118 230 / 9%);
+  --accent-border: rgb(65 118 230 / 30%);
+  --on-accent: #fff;
+  --sidebar: #f5f6f8;
+  grid-template-columns: 248px minmax(0, 1fr);
+}
+.agent-first-shell .workspace {
+  background: var(--surface);
+}
+.agent-first-shell .studio-session-sidebar {
+  padding: 16px 12px 10px;
+  border-right: 1px solid var(--line-soft);
+  background: var(--sidebar);
+  backdrop-filter: none;
+}
+.studio-brand {
+  display: flex;
+  min-height: 44px;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  padding: 0 10px;
+  color: var(--ink-strong);
+  background: transparent;
+  text-align: left;
+}
+.studio-brand img {
+  width: 25px;
+  height: 25px;
+  border-radius: 7px;
+}
+.studio-brand span {
+  font-size: 18px;
+  font-weight: 550;
+  letter-spacing: -0.025em;
+}
+.studio-new-session {
+  display: flex;
+  min-height: 40px;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 2px 24px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--sidebar-hover);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+.studio-new-session:hover:not(:disabled) {
+  background: var(--surface-active);
+}
+.studio-new-session:disabled {
+  opacity: 0.5;
+}
+.studio-history-label {
+  flex: none;
+  padding: 0 12px 8px;
+  color: var(--muted-light);
+  font-size: 11px;
+}
+.studio-session-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 2px;
+}
+.studio-history-empty {
+  margin: 4px 12px;
+  color: var(--muted-light);
+  font-size: 12px;
+}
+.studio-session-list > button {
+  display: flex;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 3px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+.studio-session-list > button svg {
+  flex: none;
+  color: var(--muted);
+}
+.studio-session-list > button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.studio-session-list > button:hover,
+.studio-session-list > button[aria-current='page'] {
+  color: var(--ink);
+  background: var(--sidebar-hover);
+}
+.studio-sidebar-footer {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  gap: 2px;
+  margin-top: 14px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.studio-engine-trigger {
+  display: flex;
+  width: 100%;
+  flex: none;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+.studio-engine-trigger > span {
+  flex: 1;
+}
+.studio-engine-trigger .studio-engine-triangle {
+  flex: none;
+  width: 0;
+  height: 0;
+  margin-right: 2px;
+  border-right: 4px solid transparent;
+  border-left: 4px solid transparent;
+  border-bottom: 5px solid var(--muted);
+}
+.studio-engine-trigger[aria-expanded='false'] .studio-engine-triangle {
+  transform: rotate(180deg);
+}
+.studio-settings-trigger {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+.studio-engine-trigger:hover,
+.studio-settings-trigger:hover {
+  color: var(--ink);
+  background: var(--sidebar-hover);
+}
+.studio-brand:focus-visible,
+.studio-new-session:focus-visible,
+.studio-session-list button:focus-visible,
+.studio-sidebar-footer button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.studio-inference-navigation {
+  display: grid;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 42dvh;
+  width: 100%;
+  gap: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.studio-inference-navigation[hidden] {
+  display: none;
+}
+.studio-inference-navigation > button {
+  display: flex;
+  min-height: 37px;
+  align-items: center;
+  gap: 11px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink-soft);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+.studio-inference-navigation > button:hover,
+.studio-inference-navigation > button[aria-current='page'] {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+.studio-version-link {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding: 12px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+}
+:root[data-theme='dark'] .agent-first-shell {
+  --sidebar: #1b1b1c;
+  --surface: #212123;
+  --surface-control: #29292b;
+  --surface-subtle: #2c2c2e;
+  --accent: #7aaaff;
+  --accent-hover: #91b8ff;
+  --accent-ink: #9bbfff;
+  --on-accent: #18223a;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] .agent-first-shell {
+    --sidebar: #1b1b1c;
+    --surface: #212123;
+    --surface-control: #29292b;
+    --surface-subtle: #2c2c2e;
+    --accent: #7aaaff;
+    --accent-hover: #91b8ff;
+    --accent-ink: #9bbfff;
+    --on-accent: #18223a;
+  }
+}
+@media (max-width: 980px) and (min-width: 681px) {
+  .app-shell.agent-first-shell {
+    grid-template-columns: 224px minmax(0, 1fr);
+  }
+}
+@media (max-width: 680px) {
+  .app-shell.agent-first-shell {
+    display: block;
+  }
+  .agent-first-shell .studio-session-sidebar {
+    width: min(280px, 88vw);
+  }
+  .agent-first-shell .studio-session-sidebar:not(.open) {
+    box-shadow: none;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .agent-first-shell .mobile-menu-trigger {
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+}

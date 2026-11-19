@@ -158,6 +158,34 @@ void GgufRowTable::read_rows(const std::vector<mfq::ReadSpan>& requests) const {
     }
 }
 
+RowStageResources gguf_row_stage_resources(const std::vector<std::shared_ptr<GgufRowTable>>& tables,
+        const std::vector<std::int64_t>& shape,const tb::Device& device) {
+    if(tables.empty() || !tables[0] || !device.is_cuda())throw std::invalid_argument("Invalid GGUF row workspace");
+    std::uint64_t count=1;std::size_t stride=0;
+    for(const auto size:shape) {
+        if(size<=0 || count>std::uint64_t(INT64_MAX)/std::uint64_t(size))throw std::overflow_error("GGUF row workspace shape");
+        count*=size;
+    }
+    for(const auto& table:tables) {
+        if(!table || table->width()!=tables[0]->width())throw std::invalid_argument("GGUF row workspace widths differ");
+        stride=std::max(stride,std::size_t(table->staged_row_bytes()));
+    }
+    if(stride>SIZE_MAX-7)throw std::overflow_error("GGUF row workspace stride");
+    stride=(stride+7)&~std::size_t(7);
+    if(stride>SIZE_MAX-sizeof(mfq::cuda::gguf::StagedRow) ||
+            count>std::uint64_t(INT64_MAX)/(stride+sizeof(mfq::cuda::gguf::StagedRow)))
+        throw std::overflow_error("GGUF row workspace packet");
+    const auto packet=std::size_t(count)*(stride+sizeof(mfq::cuda::gguf::StagedRow));
+    const auto width=std::uint64_t(tables[0]->width());
+    if(width>SIZE_MAX/2 || count>SIZE_MAX/(2*width))throw std::overflow_error("GGUF row workspace output");
+    const auto output=std::size_t(count)*std::size_t(width)*2;
+    MfqCudaGuard guard(device);int can_map=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&can_map,cudaDevAttrCanMapHostMemory,device.index));
+    const bool mapped=can_map && packet<=16*1024;
+    if(packet>SIZE_MAX/2 || (!mapped && packet>SIZE_MAX-output))throw std::overflow_error("GGUF row workspace total");
+    return {"gguf_ple_rows",count,width,2*packet,packet,output+(mapped?0:packet)};
+}
+
 namespace {
 class GgufRowStage final : public RowStage {
     std::vector<std::shared_ptr<GgufRowTable>> tables_;

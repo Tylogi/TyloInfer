@@ -11,6 +11,7 @@ import {
 describe('Studio 页面路由', () => {
   it.each([
     ['/', 'dashboard', 'overview'],
+    ['/inference', 'dashboard', 'overview'],
     ['/models', 'dashboard', 'models'],
     ['/runtime', 'dashboard', 'connections'],
     ['/resources', 'dashboard', 'cache'],

@@ -201,18 +201,22 @@ bool valid_backing(const RamKvBacking& backing) {
     return backing.source->valid() && backing.offset<=backing.source->bytes &&
         backing.key_bytes+backing.value_bytes<=backing.source->bytes-backing.offset;
 }
-RamKvImage read_backing_view(const RamKvBacking& backing,std::size_t* retained_bytes=nullptr) {
+RamKvImage backing_layout(const RamKvBacking& backing) {
     if(!valid_backing(backing))throw std::runtime_error("Invalid QSA SSD backing");
+    RamKvImage image;
+    image.key_bytes=backing.key_bytes;image.value_bytes=backing.value_bytes;
+    image.key_bits=backing.key_bits;image.value_bits=backing.value_bits;
+    image.key_state_bits=backing.key_state_bits;image.value_state_bits=backing.value_state_bits;
+    return image;
+}
+RamKvImage read_backing_view(const RamKvBacking& backing,std::size_t* retained_bytes=nullptr) {
+    auto image=backing_layout(backing);
     std::shared_ptr<const std::vector<std::uint8_t>> bytes;
     if(backing.source)bytes=std::make_shared<const std::vector<std::uint8_t>>(
         backing.source->read(backing.offset,backing.key_bytes+backing.value_bytes));
     else bytes=backing.store->read(backing.block);
     if(bytes->size()!=backing.key_bytes+backing.value_bytes)throw std::runtime_error("QSA SSD image length changed");
-    RamKvImage image;
     image.owner=bytes;image.key=bytes->data();image.value=bytes->data()+backing.key_bytes;
-    image.key_bytes=backing.key_bytes;image.value_bytes=backing.value_bytes;
-    image.key_bits=backing.key_bits;image.value_bits=backing.value_bits;
-    image.key_state_bits=backing.key_state_bits;image.value_state_bits=backing.value_state_bits;
     if(retained_bytes)*retained_bytes=bytes->capacity();
     return image;
 }
@@ -284,7 +288,13 @@ struct RamKvStore::Impl {
     std::uint64_t serial=0;
     RamKvStoreStats counters;
     std::array<long double,3> precision_bytes{};
+    void account_shared_image(const RamKvImagePtr& image,int direction) {
+        if(!image || !image->shared_prefix_allocation)return;
+        if(direction>0)counters.shared_prefix_ram_bytes+=image->bytes();
+        else counters.shared_prefix_ram_bytes-=image->bytes();
+    }
     void account_precision(const Entry& e,int direction) {
+        account_shared_image(e.image,direction);
         for(unsigned i=0;i<3;++i) {
             const auto bytes=e.image && unsigned(e.tier)==i?e.image->bytes():e.bytes[i];
             precision_bytes[i]+=direction*static_cast<long double>(bytes);
@@ -326,9 +336,56 @@ struct RamKvStore::Impl {
     std::size_t ram_bytes()const {
         return counters.ram_bytes;
     }
-    RamPressurePlan plan(std::size_t budget,const RamPressureConfig& policy)const {
+    RamPressurePlan plan_eviction(std::size_t budget,const RamPressureConfig& policy,bool prefer_backed)const {
+        RamPressurePlan result;
+        result.budget_bytes=budget;result.ram_bytes=counters.ram_bytes;result.tokens=counters.tokens;
+        if(!policy.ssd_enabled || result.fits())return result;
+        const auto floors=prefer_backed && policy.adaptive_precision?ram_precision_floors(4*std::uint64_t(entries.size()),
+            budget,precision_bytes,policy.canonical_tier,policy.quantize_tokens):std::array<std::uint64_t,2>{};
+        result.minimum_fp16=floors[0];result.minimum_affine8=floors[1];
+        const std::array<std::uint64_t,3> minimum{floors[0],floors[1],0};
+        std::array<Lru::const_iterator,3> next{higher_lru[0].begin(),higher_lru[1].begin(),tq4_lru.begin()};
+        std::array<RamPressureAction,3> spill;
+        while(!result.fits()) {
+            std::optional<unsigned> oldest;
+            for(unsigned tier=0;tier<next.size();++tier) {
+                if(result.tokens[tier]<minimum[tier]+4)continue;
+                auto& cursor=next[tier];const auto end=lru_for(tier).end();
+                while(cursor!=end) {
+                    const auto& entry=entries[cursor->second];
+                    if(!prefer_backed || entry.backing) {
+                        if(entry.image.use_count()==1)break;
+                        result.needs_readers=true;
+                    }
+                    ++cursor;
+                }
+                if(cursor!=end && (!oldest || *cursor<*next[*oldest]))oldest=tier;
+            }
+            if(!oldest)break;
+            const auto tier=*oldest;
+            const auto id=(next[tier]++)->second;
+            const auto bytes=entries[id].image->bytes();
+            auto& action=spill[tier];
+            action.from=RamKvTier(tier);action.to=RamKvTier::Ssd;
+            action.blocks.push_back(id);action.tokens+=4;action.saved_bytes+=bytes;
+            result.ram_bytes-=bytes;result.tokens[tier]-=4;result.tokens[3]+=4;
+        }
+        for(auto& action:spill)if(!action.blocks.empty())result.actions.push_back(std::move(action));
+        return result;
+    }
+    RamPressurePlan plan(std::size_t budget,const RamPressureConfig& policy,PressureMode mode=PressureMode::Adaptive)const {
+        if(mode!=PressureMode::Adaptive)return plan_eviction(budget,policy,mode==PressureMode::Backed);
         if(!policy.quantize_tokens || policy.quantize_tokens%4 || unsigned(policy.canonical_tier)>2)
             throw std::invalid_argument("QSA RAM quantization batch must contain complete four-token blocks");
+        if(!policy.adaptive_precision) {
+            std::vector<RamPressureBlock> blocks;blocks.reserve(entries.size());
+            for(std::size_t i=0;i<entries.size();++i) {
+                const auto& e=entries[i];auto sizes=e.bytes;
+                if(e.image && unsigned(e.tier)<3)sizes[unsigned(e.tier)]=e.image->bytes();
+                blocks.push_back({i,e.access,4,e.tier,sizes,e.image && e.image.use_count()!=1});
+            }
+            return plan_ram_pressure(blocks,budget,policy);
+        }
         RamPressurePlan result;result.budget_bytes=budget;result.ram_bytes=counters.ram_bytes;result.tokens=counters.tokens;
         const auto floors=ram_precision_floors(4*std::uint64_t(entries.size()),budget,precision_bytes,policy.canonical_tier,policy.quantize_tokens);
         result.minimum_fp16=floors[0];result.minimum_affine8=floors[1];
@@ -411,16 +468,16 @@ struct RamKvStore::Impl {
         if(!result.fits() && result.tokens[2])result.needs_readers=true;
         return result;
     }
-    RamPressurePlan observed(std::size_t budget,bool changed=false,bool allow_ssd=true)const {
+    RamPressurePlan observed(std::size_t budget,bool changed=false,bool allow_ssd=true,PressureMode mode=PressureMode::Adaptive)const {
         auto policy=config.pressure;policy.ssd_enabled=policy.ssd_enabled && allow_ssd;
-        auto result=plan(budget,policy);
+        auto result=plan(budget,policy,mode);
         // The planner describes possible savings, not completed writes or
         // quantization. Report the bytes currently owned by this store.
         result.actions.clear();result.ram_bytes=ram_bytes();result.tokens=counters.tokens;
         result.needs_readers|=changed;return result;
     }
-    std::shared_ptr<const RamKvBacking> spill(const Entry& e) {
-        if(e.backing)return e.backing;
+    std::shared_ptr<const RamKvBacking> spill(const Entry& e,bool preserve_encoding=false) {
+        if(e.backing && (!preserve_encoding || same_encoding(*e.image,*e.backing)))return e.backing;
         if(!config.pressure.ssd_enabled || !config.session_ssd)
             throw std::runtime_error("QSA RAM exhausted with session SSD KV disabled");
         validate(e.image);
@@ -439,9 +496,9 @@ struct RamKvStore::Impl {
         auto result=allocate(read_backing(backing));validate(result);return result;
     }
     RamKvImagePtr admit_loaded(std::size_t id,const Entry& original,RamKvImagePtr image,std::size_t budget,
-        const RamKvImage* pending=nullptr);
+        const RamKvImage* pending=nullptr,bool evict_cold=true);
     void admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& view,
-        RamKvImagePtr image,std::size_t budget);
+        RamKvImagePtr image,std::size_t budget,bool evict_cold=true);
 };
 RamKvStore::RamKvStore(RamKvStoreConfig c,Allocate a,Encode e,Publish p)
     :RamKvStore(std::move(c),std::move(a),std::move(e),std::move(p),{}){}
@@ -526,22 +583,36 @@ std::size_t RamKvStore::relocate(const Relocate& relocate) {
     }
     if(changes.empty())return 0;
     s.publish(changes);
-    for(const auto& change:changes)s.entries[change.id].image=change.image;
+    for(const auto& change:changes) {
+        s.account_shared_image(change.previous,-1);
+        s.entries[change.id].image=change.image;
+        s.account_shared_image(change.image,1);
+    }
     return changes.size();
 }
 RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
+    return maintain(budget,allow_ssd,PressureMode::Adaptive);
+}
+RamPressurePlan RamKvStore::evict_backed(std::size_t budget) {
+    return maintain(budget,true,PressureMode::Backed);
+}
+RamPressurePlan RamKvStore::spill_preserving_precision(std::size_t budget) {
+    return maintain(budget,true,PressureMode::ExactSpill);
+}
+RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd,PressureMode mode) {
     auto& s=*impl_;std::lock_guard<std::mutex> worker(s.maintenance);
     auto pressure=s.config.pressure;
     pressure.ssd_enabled=pressure.ssd_enabled && allow_ssd;
+    const bool preserve_encoding=mode==PressureMode::ExactSpill;
     for(;;) {
     RamPressurePlan plan;
-    {std::lock_guard<std::mutex> lock(s.mutex);plan=s.plan(budget,pressure);}
+        {std::lock_guard<std::mutex> lock(s.mutex);plan=s.plan(budget,pressure,mode);}
     for(const auto& action:plan.actions) {
         std::vector<Impl::Entry> old;old.reserve(action.blocks.size());
         std::vector<long> references;references.reserve(action.blocks.size());
         {std::lock_guard<std::mutex> lock(s.mutex);
             for(auto id:action.blocks) {
-                if(id>=s.entries.size() || s.entries[id].tier!=action.from)return s.observed(budget,true,allow_ssd);
+                if(id>=s.entries.size() || s.entries[id].tier!=action.from)return s.observed(budget,true,allow_ssd,mode);
                 references.push_back(s.entries[id].image.use_count());
                 old.push_back(s.entries[id]);
             }
@@ -549,7 +620,7 @@ RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
         std::vector<RamKvImagePtr> encoded;
         std::vector<std::shared_ptr<const RamKvBacking>> backings;
         if(action.to==RamKvTier::Ssd) {
-            backings.reserve(old.size());for(const auto& e:old)backings.push_back(s.spill(e));
+            backings.reserve(old.size());for(const auto& e:old)backings.push_back(s.spill(e,preserve_encoding));
         }else {
             std::vector<RamKvImagePtr> input;input.reserve(old.size());for(const auto& e:old)input.push_back(e.image);
             encoded=s.encode(input,action.to);
@@ -565,9 +636,9 @@ RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
             const auto id=action.blocks[i];
             if(id>=s.entries.size() || s.entries[id].generation!=old[i].generation || s.entries[id].access!=old[i].access ||
                s.entries[id].image.use_count()>references[i]+1)
-                return s.observed(budget,true,allow_ssd);
+                return s.observed(budget,true,allow_ssd,mode);
         }
-        if(action.from==RamKvTier::Fp16 || action.from==RamKvTier::Affine8) {
+        if(!preserve_encoding && pressure.adaptive_precision && (action.from==RamKvTier::Fp16 || action.from==RamKvTier::Affine8)) {
             // Appends can raise a protected floor while the codec runs.
             // Check the live population against the same target budget.
             const auto floors=ram_precision_floors(4*std::uint64_t(s.entries.size()),budget,
@@ -575,7 +646,7 @@ RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
             const auto tier=unsigned(action.from);
             const auto minimum=floors[tier];
             if(s.counters.tokens[tier]<minimum || action.tokens>s.counters.tokens[tier]-minimum)
-                return s.observed(budget,true,allow_ssd);
+                return s.observed(budget,true,allow_ssd,mode);
         }
         const auto target_tier=unsigned(action.to);
         Impl::IndexInsert index(s,target_tier<3?old.size():0,std::min(target_tier,2u));
@@ -599,7 +670,7 @@ RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
             if(e.image)s.counters.ram_bytes+=e.image->bytes();
             if(action.to==RamKvTier::Ssd) {
                 e.backing=backings[i];++s.counters.spilled_blocks;
-                if(!old[i].backing)s.counters.ssd_written_bytes+=old[i].image->bytes();
+                if(backings[i]!=old[i].backing)s.counters.ssd_written_bytes+=old[i].image->bytes();
                 else if(old[i].backing->store!=s.config.session_ssd)s.counters.prefix_reused_bytes+=old[i].image->bytes();
             }else ++s.counters.quantized_blocks;
         }
@@ -608,7 +679,7 @@ RamPressurePlan RamKvStore::maintain(std::size_t budget,bool allow_ssd) {
     // Decoding may append new microblocks while a codec batch runs. Apply
     // any remaining feasible actions before declaring protected floors to
     // be the limiting factor. A reader-blocked plan returns for a later retry.
-    if(s.plan(budget,pressure).actions.empty())return s.observed(budget,false,allow_ssd);
+    if(s.plan(budget,pressure,mode).actions.empty())return s.observed(budget,false,allow_ssd,mode);
     }
 }
 RamKvImagePtr RamKvStore::read(std::size_t id,std::size_t budget,bool admit) {
@@ -624,7 +695,7 @@ RamKvImagePtr RamKvStore::read(std::size_t id,std::size_t budget,bool admit) {
     return s.admit_loaded(id,original,std::move(image),budget);
 }
 RamKvImagePtr RamKvStore::Impl::admit_loaded(std::size_t id,const Entry& original,RamKvImagePtr image,std::size_t budget,
-        const RamKvImage* pending) {
+        const RamKvImage* pending,bool evict_cold) {
     auto& s=*this;
     const auto bytes=image?image->bytes():pending->bytes();
     const auto tier=original.backing->tier;
@@ -633,7 +704,7 @@ RamKvImagePtr RamKvStore::Impl::admit_loaded(std::size_t id,const Entry& origina
     {std::lock_guard<std::mutex> lock(s.mutex);
         if(id>=s.entries.size() || s.entries[id].generation!=original.generation || s.entries[id].tier!=RamKvTier::Ssd)return image;
         auto used=s.ram_bytes();
-        if(bytes>budget)return image;
+        if(bytes>budget || (!evict_cold && used>budget-bytes))return image;
         for(const auto& [access,victim]:s.tq4_lru) {
             if(used<=budget-bytes || access>=original.access)break;
             const auto& e=s.entries[victim];if(e.image.use_count()!=1)continue;
@@ -753,7 +824,11 @@ void RamKvStore::read_cpu_into_batch(const std::vector<RamKvReadInto>& requests,
 void RamKvStore::read_packed_cpu_into_batch(const std::vector<RamKvReadInto>& requests,bool sequential) {
     read_cpu_batch(requests,sequential,false);
 }
-void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded) {
+void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded,bool count_reads) {
+    const auto record_reads=[&](std::uint64_t bytes) {
+        if(!count_reads)return;
+        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=bytes;
+    };
     for(const auto& r:requests) {
         if(!r.source || !r.destination)throw std::invalid_argument("Missing QSA batch read destination");
         const auto& s=*r.source;
@@ -769,13 +844,11 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
         std::uint64_t completed=0;
         try {
             if(read_sequential_files(requests,completed,padded)) {
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->counters.ssd_read_bytes+=completed;
+                record_reads(completed);
                 return;
             }
         }catch(...) {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->counters.ssd_read_bytes+=completed;
+            record_reads(completed);
             throw;
         }
     }
@@ -822,7 +895,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r->source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r->destination+extent,r->destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=bytes;
+        record_reads(bytes);
     }
     if(!file_ranges.empty()) {
         mfq::FileRangeReader::read_many(file_ranges);
@@ -830,7 +903,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r.source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r.destination+extent,r.destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=file_bytes;
+        record_reads(file_bytes);
     }
     for(const auto& [store,group]:groups) {
         std::vector<mfq::cache::QsaKvStore::ReadRequest> reads;reads.reserve(group.size());
@@ -844,18 +917,22 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r->source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r->destination+extent,r->destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=bytes;
+        record_reads(bytes);
     }
 }
-void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,std::size_t budget) {
-    impl_->admit_read(id,generation,image,{},budget);
+void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,std::size_t budget,bool evict_cold) {
+    impl_->admit_read(id,generation,image,{},budget,evict_cold);
 }
-void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,RamKvImagePtr image,std::size_t budget) {
-    validate(image);impl_->admit_read(id,generation,*image,image,budget);
+void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,RamKvImagePtr image,std::size_t budget,bool evict_cold) {
+    validate(image);impl_->admit_read(id,generation,*image,image,budget,evict_cold);
 }
 void RamKvStore::Impl::admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,
-        RamKvImagePtr resident,std::size_t budget) {
-    auto& s=*this;std::lock_guard<std::mutex> worker(s.maintenance);Entry original;
+        RamKvImagePtr resident,std::size_t budget,bool evict_cold) {
+    auto& s=*this;
+    std::unique_lock<std::mutex> worker(s.maintenance,std::defer_lock);
+    if(evict_cold)worker.lock();
+    else if(!worker.try_lock())return;
+    Entry original;
     {
         std::lock_guard<std::mutex> lock(s.mutex);
         if(id>=s.entries.size() || s.entries[id].generation!=generation || s.entries[id].tier!=RamKvTier::Ssd)return;
@@ -866,7 +943,7 @@ void RamKvStore::Impl::admit_read(std::size_t id,std::uint64_t generation,const 
     const auto tier=unsigned(original.backing->tier);
     if(tier>2 || image.key_bytes>original.bytes[tier] || image.value_bytes>original.bytes[tier]-image.key_bytes)
         throw std::runtime_error("QSA deferred admission exceeded its RAM image size");
-    s.admit_loaded(id,original,std::move(resident),budget,&image);
+    s.admit_loaded(id,original,std::move(resident),budget,&image,evict_cold);
 }
 bool RamKvStore::graph_reads_supported()const {
     // All stored encodings have immutable CPU byte readers. Device kernels
@@ -913,12 +990,17 @@ std::size_t RamKvStore::release_idle_metadata() {
     const auto bytes=s.entries.capacity()*sizeof(Impl::Entry);
     std::vector<Impl::Entry>().swap(s.entries);return bytes;
 }
+std::size_t RamKvStore::metadata_bytes_per_block() {
+    return sizeof(Impl::Entry)+sizeof(RamKvChange)+sizeof(RamKvImage)+sizeof(RamKvBacking)+
+        sizeof(Impl::Lru::value_type)+8*sizeof(void*);
+}
 RamKvStoreStats RamKvStore::stats()const {
     auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);auto result=s.counters;
     result.blocks=s.entries.size();
     if(s.config.session_ssd)result.session_disk_bytes=s.config.session_ssd->stats().disk_bytes;
-    result.resident_target_bytes=ram_precision_target(result.blocks,s.precision_bytes,
-        s.config.pressure.canonical_tier,s.config.pressure.quantize_tokens);
+    result.resident_target_bytes=s.config.pressure.adaptive_precision?
+        ram_precision_target(result.blocks,s.precision_bytes,s.config.pressure.canonical_tier,s.config.pressure.quantize_tokens):
+        std::size_t(s.precision_bytes[unsigned(s.config.pressure.canonical_tier)]);
     return result;
 }
 MicroblockImage RamKvSnapshotBlock::read()const {
@@ -948,14 +1030,15 @@ void RamKvSnapshot::bind_prefix(std::size_t id,std::shared_ptr<const RamKvBackin
     if(bind_live)bind_live(id,block.generation,backing);
     block.backing=std::move(backing);block.image.reset();
 }
-std::shared_ptr<RamKvSnapshot> RamKvStore::snapshot(std::size_t count)const {
+std::shared_ptr<RamKvSnapshot> RamKvStore::snapshot(std::size_t count,std::size_t first)const {
     auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);
-    if(count>s.entries.size())throw std::out_of_range("QSA snapshot exceeds context");
+    if(first>s.entries.size() || count>s.entries.size()-first)throw std::out_of_range("QSA snapshot exceeds context");
     auto result=std::make_shared<RamKvSnapshot>();result->blocks.reserve(count);
-    for(std::size_t i=0;i<count;++i) {
+    for(std::size_t i=first;i<first+count;++i) {
         const auto& e=s.entries[i];result->blocks.push_back({e.image,e.backing,e.bytes,e.generation,e.access,e.tier});
     }
-    result->bind_live=[weak=std::weak_ptr<Impl>(impl_)](auto id,auto generation,auto backing) {
+    result->bind_live=[weak=std::weak_ptr<Impl>(impl_),first](auto id,auto generation,auto backing) {
+        id+=first;
         if(auto store=weak.lock()) {
             std::lock_guard<std::mutex> lock(store->mutex);
             if(id<store->entries.size() && store->entries[id].generation==generation) {
@@ -976,8 +1059,30 @@ void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borr
 void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,bool reuse_resident,
                          const std::function<void(std::size_t)>& block_read,const RestoreAllocate& allocate_batch,
                          std::size_t append_bytes) {
+    restore_impl(state,budget,borrow_prefix,reuse_resident,block_read,allocate_batch,{},append_bytes);
+}
+void RamKvStore::restore_reserved(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,
+                         const std::function<void(std::size_t)>& block_read,const RestoreReserve& reserve_batch,
+                         std::size_t append_bytes,const std::vector<RamKvImagePtr>* shared_images) {
+    restore_impl(state,budget,borrow_prefix,false,block_read,{},reserve_batch,append_bytes,shared_images);
+}
+void RamKvStore::restore_impl(const RamKvSnapshot& state,std::size_t budget,bool borrow_prefix,bool reuse_resident,
+                         const std::function<void(std::size_t)>& block_read,const RestoreAllocate& allocate_batch,
+                         const RestoreReserve& reserve_batch,std::size_t append_bytes,
+                         const std::vector<RamKvImagePtr>* shared_images) {
     auto& s=*impl_;std::lock_guard<std::mutex> worker(s.maintenance);
+    if(shared_images && shared_images->size()!=state.blocks.size())
+        throw std::invalid_argument("Shared QSA images do not match the restore range");
+    const auto shared=[&](std::size_t id) {
+        return shared_images && bool((*shared_images)[id]);
+    };
     std::vector<RamPressureBlock> metadata;metadata.reserve(state.blocks.size());
+    const bool shares_allocations=shared_images &&
+        std::any_of(shared_images->begin(),shared_images->end(),[](const auto& image) {
+            return image && image->shared_prefix_allocation;
+        });
+    std::vector<RamPressureBlock> unshared;
+    if(shares_allocations)unshared.reserve(state.blocks.size());
     for(std::size_t i=0;i<state.blocks.size();++i) {
         const auto& b=state.blocks[i];auto tier=b.tier;
         if(tier==RamKvTier::Ssd && !s.config.pressure.ssd_enabled) {
@@ -991,15 +1096,28 @@ void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borr
         }
         auto bytes=b.bytes;if(b.image && unsigned(b.tier)<3)bytes[unsigned(b.tier)]=b.image->bytes();
         metadata.push_back({i,b.access,4,tier,bytes,false});
+        if(shares_allocations && (!shared(i) || !(*shared_images)[i]->shared_prefix_allocation))
+            unshared.push_back(metadata.back());
     }
+    // A matching shared image already occupies physical memory. Charging it
+    // again would transcode the borrowed bytes into a new allocation.
+    auto& pressure_blocks=shares_allocations?unshared:metadata;
     const auto preferred=append_bytes<budget?budget-append_bytes:budget;
-    auto plan=plan_ram_pressure(metadata,preferred,s.config.pressure);
+    auto plan=plan_ram_pressure(pressure_blocks,preferred,s.config.pressure);
     // Resolve a soft append margin before truncating entries or reading data.
     // A valid checkpoint must not fail solely because of this preference.
     if(plan.fits())budget=preferred;
-    else if(preferred!=budget)plan=plan_ram_pressure(metadata,budget,s.config.pressure);
+    else if(preferred!=budget)plan=plan_ram_pressure(pressure_blocks,budget,s.config.pressure);
+    if(!plan.fits() && borrow_prefix && s.config.pressure.ssd_enabled) {
+        // The checkpoint already holds the original encodings. Under a
+        // tighter budget, leave cold blocks in that file at their precision.
+        auto exact=s.config.pressure;
+        exact.adaptive_precision=false;
+        for(auto& block:pressure_blocks)block.pinned=!state.blocks[block.id].backing;
+        plan=plan_ram_pressure(pressure_blocks,budget,exact);
+    }
     if(!plan.fits())throw std::runtime_error("QSA prefix cannot fit the RAM budget and protected precision floors");
-    for(const auto& action:plan.actions)for(auto id:action.blocks)metadata[id].tier=action.to;
+    for(const auto& action:plan.actions)for(auto id:action.blocks)metadata[pressure_blocks[id].id].tier=action.to;
     truncate(0);
     {std::lock_guard<std::mutex> lock(s.mutex);s.config.prefix_enabled=borrow_prefix;}
     // Sparse conversions may span many SSD-only blocks. Bound source bytes
@@ -1022,8 +1140,8 @@ void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borr
     std::size_t maximum_source=0;
     for(std::size_t id=0;id<metadata.size();++id)
         maximum_source=std::max({maximum_source,metadata[id].bytes[0],source_bytes(state.blocks[id])});
-    constexpr std::size_t metadata_charge=sizeof(Impl::Entry)+sizeof(RamKvChange)+2*sizeof(RamKvImagePtr)+
-        sizeof(Impl::Lru::value_type)+4*sizeof(void*);
+    const std::size_t metadata_charge=sizeof(Impl::Entry)+sizeof(RamKvChange)+2*sizeof(RamKvImagePtr)+
+        sizeof(Impl::Lru::value_type)+4*sizeof(void*)+(reserve_batch?sizeof(RamKvReadInto):0);
     if(maximum_source>std::numeric_limits<std::size_t>::max()-metadata_charge ||
             batch>std::numeric_limits<std::size_t>::max()/(maximum_source+metadata_charge))
         throw std::overflow_error("QSA restore staging size overflow");
@@ -1036,7 +1154,7 @@ void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borr
             const auto& src=state.blocks[end];const auto target=metadata[end].tier;
             const bool keep=src.backing && (borrow_prefix || src.backing->store==s.config.session_ssd);
             const bool read=target!=RamKvTier::Ssd || !keep;
-            const auto charge=metadata_charge+(read?source_bytes(src):0);
+            const auto charge=metadata_charge+(read && !shared(end)?source_bytes(src):0);
             if(full && charge>staging_limit-staged)break;
             staged+=charge;
             if(read) {
@@ -1052,26 +1170,50 @@ void RamKvStore::restore(const RamKvSnapshot& state,std::size_t budget,bool borr
         // This lets a pinned allocator reserve a shared slab without reserving
         // the entire prefix, or any blocks which remain SSD-only.
         std::map<std::pair<std::size_t,std::size_t>,std::size_t> pending;
-        if(allocate_batch)for(std::size_t j=0;j<count;++j) {
+        if(allocate_batch || reserve_batch)for(std::size_t j=0;j<count;++j) {
             const auto& src=state.blocks[begin+j];
             const bool keep=src.backing && (borrow_prefix || src.backing->store==s.config.session_ssd);
-            if((metadata[begin+j].tier==RamKvTier::Ssd && keep) || (reuse_resident && src.image))continue;
+            if((metadata[begin+j].tier==RamKvTier::Ssd && keep) || (reuse_resident && src.image) ||
+                    shared(begin+j))continue;
             if(src.image)++pending[{src.image->key_bytes,src.image->value_bytes}];
             else if(src.backing)++pending[{src.backing->key_bytes,src.backing->value_bytes}];
         }
+        std::vector<RamKvReadInto> reads;
+        if(reserve_batch)reads.reserve(count);
         for(std::size_t j=0;j<count;++j) {
             const auto& src=state.blocks[begin+j];
             const bool keep=src.backing && (borrow_prefix || src.backing->store==s.config.session_ssd);
             if(keep)backing[j]=src.backing;
             if(metadata[begin+j].tier!=RamKvTier::Ssd || !backing[j]) {
-                if(reuse_resident && src.image)images[j]=src.image;
-                else {
+                if(shared(begin+j))images[j]=(*shared_images)[begin+j];
+                else if(reuse_resident && src.image)images[j]=src.image;
+                else if(reserve_batch) {
+                    const auto layout=src.image?*src.image:backing_layout(*src.backing);
+                    auto storage=reserve_batch(layout,pending.at({layout.key_bytes,layout.value_bytes})--);
+                    validate(storage);
+                    if(layout.key_bytes>SIZE_MAX-15)throw std::overflow_error("QSA restore key alignment overflow");
+                    const auto extent=(layout.key_bytes+15)&~std::size_t(15);
+                    const auto key=reinterpret_cast<std::uintptr_t>(storage->key);
+                    const auto value=reinterpret_cast<std::uintptr_t>(storage->value);
+                    if(storage->key_bytes!=layout.key_bytes || storage->value_bytes!=layout.value_bytes ||
+                            storage->key_bits!=layout.key_bits || storage->value_bits!=layout.value_bits ||
+                            storage->key_state_bits!=layout.key_state_bits || storage->value_state_bits!=layout.value_state_bits ||
+                            value<key || value-key!=extent || layout.value_bytes>SIZE_MAX-extent)
+                        throw std::invalid_argument("QSA restore storage does not match the encoded layout");
+                    reads.push_back({&src,const_cast<std::uint8_t*>(storage->key),extent+layout.value_bytes});
+                    images[j]=std::move(storage);
+                } else {
                     const auto image=src.read();
                     images[j]=allocate_batch?allocate_batch(image,pending.at({image.key.size(),image.value.size()})--):s.allocate(image);
                 }
                 validate(images[j]);
             }
-            if(block_read)block_read(begin+j);
+            if(!reserve_batch && block_read)block_read(begin+j);
+        }
+        if(reserve_batch) {
+            // Restoration I/O is separate from the decode recall counters.
+            if(!reads.empty())read_cpu_batch(reads,false,true,false);
+            if(block_read)for(std::size_t j=0;j<count;++j)block_read(begin+j);
         }
         for(unsigned tier=0;tier<3;++tier) {
             std::vector<RamKvImagePtr> source;std::vector<std::size_t> ids;

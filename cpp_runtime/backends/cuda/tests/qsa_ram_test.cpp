@@ -255,7 +255,7 @@ void selected_hit_protection(int& cases) {
     ++cases;
 }
 
-void split_staging(int queries,int cache_sets,bool unaligned,int& cases) {
+void split_staging(int queries,int cache_sets,bool unaligned,int& cases,bool late_cache=false) {
     constexpr int capacity=37,count=32,slot=256;
     const int total=queries*count;
     Pinned payload(capacity*slot);
@@ -274,6 +274,8 @@ void split_staging(int queries,int cache_sets,bool unaligned,int& cases) {
     Device<tq::RamCacheSlot> slots(cache_sets*tq::ram_cache_ways);
     Device<std::uint64_t> copied(1),hits(1),frame(1);
     tq::RamStageCache cache{slots.p,locks.p,frame.p,cached.p,std::size_t(cache_sets)*tq::ram_cache_ways*slot,slot,cache_sets};
+    Device<tq::RamStageCache> device_cache(1);
+    if(late_cache)device_cache.put({{}});
     Graph graph;
     if(cache_sets)check(cudaError_t(tq::tq_reset_ram_stage_cache(cache,graph.stream)));
     for(int id=0;id<tq::ram_cache_ways;++id)selected[id]={id,15};selections.put(selected);
@@ -293,13 +295,15 @@ void split_staging(int queries,int cache_sets,bool unaligned,int& cases) {
     for(int at=0;at<total;++at)selected[at]={(at%17==0?-1:(at*7+at/count)%capacity),unsigned(at%13==0?0:1u<<(at%4))};
     selections.put(selected);
     const auto step=[&](tq::RamStageStep phase){check(cudaError_t(tq::tq_stage_ram_selected_step(sources.p,capacity,selections.p,queries,count,
-        first.p,output.p,arena.p,total*slot,slot,cache,phase,copied.p,hits.p,graph.stream)));};
+        first.p,output.p,arena.p,total*slot,slot,late_cache?tq::RamStageCache{}:cache,phase,copied.p,hits.p,
+        graph.stream,late_cache?device_cache.p:nullptr)));};
     // Both phases and source publication also work inside a captured graph.
     check(cudaStreamBeginCapture(graph.stream,cudaStreamCaptureModeThreadLocal));
     step(tq::RamStageStep::Available);
     check(cudaMemcpyAsync(sources.p,patch.p,capacity*sizeof(tq::RamBlockView),cudaMemcpyDeviceToDevice,graph.stream));
     step(tq::RamStageStep::Hydrated);
     check(cudaStreamEndCapture(graph.stream,&graph.graph));check(cudaGraphInstantiate(&graph.exec,graph.graph,0));
+    if(late_cache && cache_sets)device_cache.put({cache});
     check(cudaGraphLaunch(graph.exec,graph.stream));check(cudaStreamSynchronize(graph.stream));
     std::vector<tq::TqBlockView> views(total);std::vector<std::uint8_t> transient(total*slot),hot(cache_sets*tq::ram_cache_ways*slot);
     check(cudaMemcpy(views.data(),output.p,views.size()*sizeof(views[0]),cudaMemcpyDeviceToHost));
@@ -590,18 +594,159 @@ void changing_cache_layout(int queries,int& cases) {
     ++cases;
 }
 
-int main()try {
+void selected_metadata(int& cases) {
+    constexpr int capacity=7,queries=2,count=5,total=queries*count;
+    Device<tq::RamBlockView> source(capacity);
+    Device<tq::SelectedBlock> selected(total);
+    Device<tq::RamSelectedRecord> output(total);
+    Device<tq::TqBlockView> direct(total);
+    Pinned payload(1024);Graph graph;
+    std::vector<tq::SelectedBlock> ids{{0,15},{1,7},{0,1},{-1,15},{capacity,15},
+        {2,0},{3,15},{4,3},{5,15},{6,15}};
+    selected.put(ids);
+    check(cudaStreamBeginCapture(graph.stream,cudaStreamCaptureModeThreadLocal));
+    check(cudaError_t(tq::tq_export_ram_selected(source.p,capacity,selected.p,queries,count,output.p,graph.stream)));
+    check(cudaError_t(tq::tq_resolve_ram_selected(source.p,capacity,selected.p,queries,count,direct.p,128,graph.stream)));
+    check(cudaStreamEndCapture(graph.stream,&graph.graph));check(cudaGraphInstantiate(&graph.exec,graph.graph,0));
+    for(int replay=0;replay<3;++replay) {
+        std::vector<tq::RamBlockView> records(capacity);
+        for(int id=0;id<capacity;++id) {
+            auto& r=records[id];
+            r.image={payload.mapped+id*64+replay,payload.mapped+512+id*64+replay,
+                unsigned(id%3==0?0:id%3==1?254:4),unsigned(id%2?254:0)};
+            r.key_bytes=17+id;r.value_bytes=31+id;r.generation=id==6?tq::ram_uncached_generation:replay+1;
+        }
+        source.put(records);check(cudaGraphLaunch(graph.exec,graph.stream));check(cudaStreamSynchronize(graph.stream));
+        std::vector<tq::RamSelectedRecord> actual(total);
+        std::vector<tq::TqBlockView> resolved(total);
+        check(cudaMemcpy(actual.data(),output.p,actual.size()*sizeof(actual[0]),cudaMemcpyDeviceToHost));
+        check(cudaMemcpy(resolved.data(),direct.p,resolved.size()*sizeof(resolved[0]),cudaMemcpyDeviceToHost));
+        for(int at=0;at<total;++at) {
+            const auto& r=actual[at];const auto s=ids[at];
+            if(r.selected.id!=s.id || r.selected.token_mask!=s.token_mask)throw std::runtime_error("Selection diagnostic changed an ID or mask");
+            const auto expected=s.id>=0 && s.id<capacity && s.token_mask?records[s.id]:tq::RamBlockView{};
+            if(r.source.image.key!=expected.image.key || r.source.image.value!=expected.image.value ||
+                r.source.image.key_bits!=expected.image.key_bits || r.source.image.value_bits!=expected.image.value_bits ||
+                r.source.key_bytes!=expected.key_bytes || r.source.value_bytes!=expected.value_bytes || r.source.generation!=expected.generation)
+                throw std::runtime_error("Selection diagnostic used a stale or invalid source descriptor");
+            const auto& view=resolved[at];
+            if(view.key!=expected.image.key || view.value!=expected.image.value ||
+                view.key_bits!=expected.image.key_bits || view.value_bits!=expected.image.value_bits)
+                throw std::runtime_error("Direct RAM resolution retained a stale image, mask or precision");
+        }
+        ++cases;
+    }
+    if(tq::tq_export_ram_selected(source.p,capacity,selected.p,INT_MAX,2,output.p,graph.stream)!=cudaErrorInvalidValue ||
+        tq::tq_export_ram_selected(source.p,capacity,selected.p,queries,count,nullptr,graph.stream)!=cudaErrorInvalidValue ||
+        tq::tq_export_ram_selected(nullptr,capacity,nullptr,0,count,nullptr,graph.stream)!=cudaSuccess)
+        throw std::runtime_error("Selection diagnostic accepted invalid geometry");
+    ++cases;
+    if(tq::tq_resolve_ram_selected(source.p,capacity,selected.p,INT_MAX,2,direct.p,128,graph.stream)!=cudaErrorInvalidValue ||
+        tq::tq_resolve_ram_selected(source.p,capacity,selected.p,queries,count,nullptr,128,graph.stream)!=cudaErrorInvalidValue ||
+        tq::tq_resolve_ram_selected(source.p,capacity,selected.p,queries,count,direct.p,127,graph.stream)!=cudaErrorInvalidValue ||
+        tq::tq_resolve_ram_selected(nullptr,capacity,nullptr,0,count,nullptr,0,graph.stream)!=cudaSuccess)
+        throw std::runtime_error("Direct RAM resolution accepted invalid geometry");
+    ++cases;
+    std::puts("QSA RAM selected metadata and direct views: bounds, masks, precision and graph replay PASS");
+}
+
+void shared_cyclic_cache(int& cases) {
+    constexpr int count=8,stride=128;
+    Pinned a(count*stride),b(count*stride);
+    std::vector<tq::RamBlockView> ah(count),bh(count);
+    std::vector<tq::SelectedBlock> ids(count);
+    for(int i=0;i<count;++i) {
+        std::memset(a.host+i*stride,17+i,stride);std::memset(b.host+i*stride,91+i,stride);
+        ah[i]={{a.mapped+i*stride,a.mapped+i*stride+64,0,0},64,64,1};
+        bh[i]={{b.mapped+i*stride,b.mapped+i*stride+64,0,0},64,64,1};ids[i]={i,15};
+    }
+    Device<tq::RamBlockView> sa(count),sb(count);sa.put(ah);sb.put(bh);
+    Device<tq::SelectedBlock> selected(count);selected.put(ids);
+    Device<unsigned> first(count),locks(1);Device<tq::RamCacheSlot> slots(count);
+    Device<std::uint64_t> frame(1),fa(2),fb(2),ca(1),cb(1),ha(1),hb(1);
+    Device<std::uint8_t> payload(count*stride),ta(count*stride),tb(count*stride);
+    Device<tq::TqBlockView> va(count),vb(count);
+    tq::RamStageCache cache{slots.p,locks.p,frame.p,payload.p,count*stride,stride,1};
+    auto ac=cache,bc=cache;ac.owner=1;bc.owner=2;ac.window_frames=fa.p;bc.window_frames=fb.p;
+    ac.expensive_only=bc.expensive_only=true;
+    Graph graph;
+    const auto body=[&] {
+        check(cudaError_t(tq::tq_stage_ram_selected_cached(sa.p,count,selected.p,1,count,first.p,va.p,ta.p,count*stride,stride,ac,ca.p,ha.p,graph.stream)));
+        check(cudaError_t(tq::tq_stage_ram_selected_cached(sb.p,count,selected.p,1,count,first.p,vb.p,tb.p,count*stride,stride,bc,cb.p,hb.p,graph.stream)));
+    };
+    check(cudaError_t(tq::tq_reset_ram_stage_cache(cache,graph.stream)));fa.put({0,0});fb.put({0,0});
+    body();check(cudaStreamSynchronize(graph.stream));
+    check(cudaError_t(tq::tq_reset_ram_stage_cache(cache,graph.stream)));fa.put({0,0});fb.put({0,0});
+    check(cudaStreamSynchronize(graph.stream));
+    check(cudaStreamBeginCapture(graph.stream,cudaStreamCaptureModeThreadLocal));body();
+    check(cudaStreamEndCapture(graph.stream,&graph.graph));check(cudaGraphInstantiate(&graph.exec,graph.graph,0));
+    for(int step=0;step<4;++step) {
+        check(cudaGraphLaunch(graph.exec,graph.stream));check(cudaStreamSynchronize(graph.stream));
+        std::uint64_t copied_a=0,copied_b=0;
+        check(cudaMemcpy(&copied_a,ca.p,8,cudaMemcpyDeviceToHost));check(cudaMemcpy(&copied_b,cb.p,8,cudaMemcpyDeviceToHost));
+        if(step && copied_a+copied_b>count*stride)throw std::runtime_error("Shared cyclic KV working set evicted every reused owner");
+        for(int owner=step?0:1;owner<2;++owner) {
+            std::vector<tq::TqBlockView> views(count);
+            check(cudaMemcpy(views.data(),owner?vb.p:va.p,count*sizeof(views[0]),cudaMemcpyDeviceToHost));
+            for(int i=0;i<count;++i) {
+                std::uint8_t bytes[128];check(cudaMemcpy(bytes,views[i].key,64,cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(bytes+64,views[i].value,64,cudaMemcpyDeviceToHost));
+                if(!std::all_of(std::begin(bytes),std::end(bytes),[&](auto value){return value==(owner?91:17)+i;}))
+                    throw std::runtime_error("Shared KV cache mixed equal IDs and generations from independent owners");
+            }
+        }
+    }
+    ++cases;std::puts("Shared KV cache: independent owners, bounded cyclic working set and retained Graph reuse PASS");
+}
+
+void compact_prefill_device_append(int& cases) {
+    constexpr std::size_t stride=64;
+    constexpr int selections=6;
+    Device<std::uint8_t> append(128),scratch(selections*stride);
+    Pinned archived(stride);
+    std::memset(archived.host,0x74,stride);
+    Device<tq::RamBlockView> source(2);
+    source.put({
+        {{archived.mapped,archived.mapped+32,254,254},17,23,1},
+        {{append.p,append.p+48,0,0},40,48,tq::ram_uncached_generation}
+    });
+    Device<tq::SelectedBlock> selected(selections);
+    selected.put({{0,15},{1,1},{0,3},{1,2},{-1,0},{1,0}});
+    Device<tq::TqBlockView> views(selections);
+    Device<std::uint32_t> first(2);
+    Device<std::uint64_t> copied(1);
+    Graph graph;
+    check(cudaError_t(tq::tq_stage_ram_selected(source.p,2,selected.p,2,3,first.p,views.p,scratch.p,
+        selections*stride,stride,copied.p,graph.stream,true)));
+    check(cudaStreamSynchronize(graph.stream));
+    std::vector<tq::TqBlockView> actual(selections);
+    check(cudaMemcpy(actual.data(),views.p,actual.size()*sizeof(actual[0]),cudaMemcpyDeviceToHost));
+    std::uint64_t transferred=0;
+    check(cudaMemcpy(&transferred,copied.p,sizeof(transferred),cudaMemcpyDeviceToHost));
+    if(transferred!=40 || actual[0].key!=actual[2].key || actual[0].key_bits!=254 ||
+            actual[1].key!=append.p || actual[3].value!=append.p+48 ||
+            actual[4].key || actual[5].key)
+        throw std::runtime_error("Compact Q8 stage did not preserve its FP16 device append");
+    ++cases;
+}
+
+int main(int argc,char** argv)try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices){std::puts("SKIP: CUDA unavailable");return 77;}
     int device=0,mapped=0;check(cudaGetDevice(&device));check(cudaDeviceGetAttribute(&mapped,cudaDevAttrCanMapHostMemory,device));
     if(!mapped){std::puts("SKIP: mapped host memory unavailable");return 77;}
     int cases=0;
+    compact_prefill_device_append(cases);
+    shared_cyclic_cache(cases);
+    if(argc==2 && std::strcmp(argv[1],"--selected-metadata-check")==0){selected_metadata(cases);return 0;}
     for(int capacity:{64,65536})for(int count:{1,33,513})for(int queries:{1,2,3,4,5,6,7,8})
         for(bool unaligned:{false,true})for(int cache_sets:{0,1,64})run(queries,count,capacity,unaligned,cache_sets,cases);
+    selected_metadata(cases);
     publication(cases);
     selected_hit_protection(cases);
     for(int queries:{1,2,3,4,5,6,7,8})for(int sets:{0,1,7})for(bool unaligned:{false,true})
         split_staging(queries,sets,unaligned,cases);
+    for(int queries:{1,4,8})for(int sets:{0,1,7})split_staging(queries,sets,true,cases,true);
     for(int queries:{1,2,3,4,5,6,7,8})mixed_tier_lru(queries,cases);
     for(int queries:{1,2,3,4,5,6,7,8})mixed_slot_groups(queries,cases);
     contiguous_publication(cases);

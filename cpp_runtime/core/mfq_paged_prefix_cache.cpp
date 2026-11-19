@@ -1089,22 +1089,28 @@ public:
 
     std::uint64_t trim_hot(std::uint64_t target_bytes) {
         std::unique_lock<std::mutex> lock(mutex_);
+        const auto before = hot_bytes_;
         const auto released = trim_hot_locked(target_bytes);
         sync_metrics_locked();
         lock.unlock();
-        if (config_.spill_hot_on_eviction) flush();
-        return released;
+        if (!config_.spill_hot_on_eviction) return released;
+        flush();
+        lock.lock();
+        return before > hot_bytes_ ? before - hot_bytes_ : 0;
     }
 
     std::uint64_t set_hot_limit(std::uint64_t max_bytes) {
         std::unique_lock<std::mutex> lock(mutex_);
         config_.max_hot_bytes = max_bytes;
         metrics_.hot_pressure_bytes = 0;
+        const auto before = hot_bytes_;
         const auto released = trim_hot_locked(max_bytes);
         sync_metrics_locked();
         lock.unlock();
-        if (config_.spill_hot_on_eviction) flush();
-        return released;
+        if (!config_.spill_hot_on_eviction) return released;
+        flush();
+        lock.lock();
+        return before > hot_bytes_ ? before - hot_bytes_ : 0;
     }
 
     void flush() {
@@ -1194,6 +1200,9 @@ public:
         for (const auto& [hash, entry] : pending_) if (!disk_.count(hash) && !hot_.count(hash)) ++result.blocks;
         result.pending_writes = pending_.size();
         result.pending_bytes = pending_write_bytes_;
+        result.deferred_writes = deferred_.size();
+        result.dirty_bytes = 0;
+        for (const auto& [hash, request] : deferred_) result.dirty_bytes += request.payload->size();
         result.pending_max_bytes = config_.max_pending_bytes;
         result.resident_bytes = hot_bytes_;
         for (const auto& [hash, entry] : hot_) result.resident_bytes += entry.payload->capacity() - entry.payload->size();
@@ -1480,6 +1489,16 @@ private:
             }
         } else if (!success) {
             ++metrics_.failed_writes;
+            // A failed spill must not discard the only checkpoint copy. Keep
+            // dirty pages above the optional RAM limit until an explicit retry.
+            if (config_.spill_hot_on_eviction && request.epoch == cache_epoch_ && !clearing_) {
+                deferred_.try_emplace(request.hash, request);
+                if (hot_.find(request.hash) == hot_.end()) {
+                    hot_.emplace(request.hash, HotEntry{request.payload, ++clock_});
+                    hot_bytes_ += request.payload->size();
+                }
+                metrics_.hot_pressure_bytes = std::max(metrics_.hot_pressure_bytes, hot_bytes_);
+            }
         } else {
             std::error_code error;
             const auto path = path_for(request.hash);

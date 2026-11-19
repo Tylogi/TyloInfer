@@ -2,11 +2,11 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['en', 'zh-CN'] as const) {
-  test(`overview has one divided appearance control and Tools starts expanded (${language})`, async ({ page }, testInfo) => {
+  test(`overview keeps appearance controls and inference navigation opens on demand (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language, preserveSettings: true });
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto('/');
+    await page.goto('/inference');
     const controls = page.locator('#dashboard-overview > .screen-header .appearance-controls');
     await expect(controls).toHaveCount(1);
     await expect(controls.getByRole('button')).toHaveCount(6);
@@ -40,12 +40,13 @@ for (const language of ['en', 'zh-CN'] as const) {
     await expect(controls.getByRole('button', { name: 'Automatic appearance', exact: true })).toHaveAttribute('aria-pressed', 'true');
     const sidebar = page.locator('#studio-sidebar');
     if (testInfo.project.name === 'mobile') await page.getByRole('button', { name: 'Open sidebar', exact: true }).click();
-    const tools = sidebar.getByRole('button', { name: 'Tools', exact: true });
-    await expect(tools).toHaveAttribute('aria-expanded', 'true');
+    const engine = sidebar.getByRole('button', { name: 'Inference engine', exact: true });
+    await expect(engine).toHaveAttribute('aria-expanded', 'true');
     await expect(sidebar.getByRole('button', { name: 'Downloads', exact: true })).toBeVisible();
-    await tools.click();
-    await expect(tools).toHaveAttribute('aria-expanded', 'false');
-    await expect(sidebar.getByRole('button', { name: 'Downloads', exact: true })).toHaveCount(0);
+    await engine.click();
+    await expect(engine).toHaveAttribute('aria-expanded', 'false');
+    await expect(sidebar.getByRole('button', { name: 'Downloads', exact: true })).toBeHidden();
+    await engine.click();
     await sidebar.getByRole('button', { name: 'Models', exact: true }).click();
     await expect(page.locator('.appearance-controls')).toHaveCount(0);
     expect(errors).toEqual([]);

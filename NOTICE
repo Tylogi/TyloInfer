@@ -2,6 +2,21 @@ MFQ
 ===
 
 MFQ's original code is licensed under the Apache License 2.0 in `LICENSE`.
+
+LiquidAI d1 text compatibility and optional reference
+----------------------------------------------------
+The text prompt/readout compatibility in tyloinfer/runtime/d1_reference.py,
+reused by the native CUDA and managed System One adapters, is adapted from
+LiquidAI/d1-2B prompt.py and api.py at revision
+ a6bce774e6dde338dcc3036ceb5d91f78bf4c19e, with a modified text-only API and
+independent local weight loading. The optional PyTorch reference remains
+separate from native serving.
+Source: https://huggingface.co/LiquidAI/d1-2B
+License: LFM Open License v1.0 (LICENSES/LiquidAI-d1-LFM-Open-License.txt).
+This license has a commercial annual-revenue threshold; it is not Apache-2.0.
+The LFM3 operator reference follows HuggingFace's modeling_lfm3.py carried in
+that snapshot. Copyright 2026 The HuggingFace Team. All rights reserved.
+License: Apache License 2.0 (LICENSE).
 The following integrated components retain their original license terms.
 
 zip

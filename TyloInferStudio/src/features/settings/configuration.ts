@@ -10,6 +10,10 @@ export type PresetName = "precise" | "balanced" | "creative" | "custom";
 export interface GenerationSettings {
   language: UiLanguage;
   theme: UiTheme;
+  fontSize: number;
+  codeFontSize: number;
+  textFontFamily: string;
+  codeFontFamily: string;
   inheritModelDefaults: boolean;
   systemPrompt: string;
   maxTokens: number;
@@ -35,6 +39,10 @@ export const SETTINGS_KEY = "tyloinfer.studio.generation.v1";
 export const DEFAULT_SETTINGS: GenerationSettings = {
   language: "system",
   theme: "system",
+  fontSize: 14,
+  codeFontSize: 11,
+  textFontFamily: "",
+  codeFontFamily: "",
   inheritModelDefaults: true,
   systemPrompt: "",
   maxTokens: 4096,
@@ -124,6 +132,7 @@ export function loadSettings(): GenerationSettings {
     if (!['system', 'light', 'dark'].includes(settings.theme)) settings.theme = DEFAULT_SETTINGS.theme;
     if (!['precise', 'balanced', 'creative', 'custom'].includes(settings.preset)) settings.preset = DEFAULT_SETTINGS.preset;
     for (const [key, minimum, maximum, integer] of [
+      ['fontSize', 10, 22, true], ['codeFontSize', 10, 16, true],
       ['maxTokens', 1, 65536, true], ['temperature', 0, 2, false], ['topP', 0.05, 1, false],
       ['topK', 0, 1024, true], ['repetitionPenalty', 0.5, 2, false],
       ['presencePenalty', -2, 2, false], ['frequencyPenalty', -2, 2, false],

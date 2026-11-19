@@ -81,7 +81,7 @@ void WeightMemoryLedger::observe_ple(const std::shared_ptr<void>& owner,std::siz
 std::size_t WeightMemoryLedger::resident_bytes(int device) const {
     std::size_t bytes=0;
     for(const auto& weak:weights_)if(auto storage=weak.lock())
-        if(device < 0 || storage->device.index == device)bytes+=storage->bytes;
+        if(!storage->mapped_host && (device < 0 || storage->device.index == device))bytes+=storage->bytes;
     return bytes;
 }
 std::size_t WeightMemoryLedger::ple_bytes() const {
@@ -161,7 +161,7 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
 std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
     void* pointer = nullptr;
     if (bytes != 0) {
-        const auto result=cudaHostAlloc(&pointer,bytes,cudaHostAllocDefault);
+        const auto result=allocate_pinned_host(&pointer,bytes,cudaHostAllocDefault,"tensor");
         if(pinned_allocation_rejected(result)) {
             // Allocation rejection is recoverable. Do not leave the driver's
             // last error for an unrelated kernel launch or state restoration.
@@ -175,7 +175,7 @@ std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
     charge_tensor_host_bytes(bytes);
     auto owner = std::shared_ptr<void>(pointer, [bytes](void* value) {
         if (value != nullptr) {
-            (void)cudaFreeHost(value);
+            (void)release_pinned_host(value,bytes);
         }
         tensor_host_bytes.fetch_sub(bytes);
     });
@@ -513,6 +513,7 @@ void dispatch_convert(Tensor& destination, const Tensor& source, cudaStream_t st
 }
 
 cudaMemcpyKind copy_kind(const Tensor& destination, const Tensor& source) {
+    if(destination.is_mapped_host() || source.is_mapped_host())return cudaMemcpyDefault;
     if (destination.is_cuda() && source.is_cuda()) return cudaMemcpyDeviceToDevice;
     if (destination.is_cuda() && source.is_cpu()) return cudaMemcpyHostToDevice;
     if (destination.is_cpu() && source.is_cuda()) return cudaMemcpyDeviceToHost;
@@ -637,7 +638,7 @@ void fill_cuda(Tensor& destination, double value) {
     if (destination.numel() == 0) {
         return;
     }
-    if (value == 0.0 && destination.is_contiguous()) {
+    if (value == 0.0 && destination.is_contiguous() && !destination.is_mapped_host()) {
         TYLOINFER_NATIVE_CUDA_CHECK(cudaMemsetAsync(
             destination.data_ptr(), 0, destination.nbytes(), stream.stream()));
         return;

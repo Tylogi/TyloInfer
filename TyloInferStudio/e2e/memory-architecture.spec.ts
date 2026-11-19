@@ -31,7 +31,7 @@ for (const architecture of ['discrete', 'unified'] as const) {
     await page.route('**/api/v1/runtime/memory-policy', route => route.fulfill({ json: {
       total_limit_bytes: null, model_limit_bytes: null, prefix_limit_bytes: null, effective_total_limit_bytes: null,
     } }));
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.locator('.memory-tier')).toHaveCount(separate ? 8 : 5);
     await expect(page.getByText(separate ? '显存常驻权重和缓冲区' : '常驻专家与稠密权重', { exact: true })).toBeVisible();
     if (separate) {

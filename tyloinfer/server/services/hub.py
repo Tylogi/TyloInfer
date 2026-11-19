@@ -974,6 +974,17 @@ class HubCatalog:
         provider, repo_id, revision = resolve_hub_reference(reference, fallback_provider)
         return await self.info(provider, repo_id, revision, profile=profile)
 
+    def _official_snapshot(self, profile: HubSystemProfile, *, refreshing: bool) -> OfficialModelList:
+        models = [self._official_model(spec, profile) for spec in self._official_specs()]
+        models.sort(key=lambda model: model.published_at or model.updated_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return OfficialModelList(system=profile, data=models, refreshing=refreshing)
+
+    async def official_local(self, *, profile: HubSystemProfile | None = None) -> OfficialModelList:
+        """Project loaded catalog state without refreshing metadata or touching the cache."""
+        profile = profile or system_profile()
+        refreshing = self._refresh_task is not None and not self._refresh_task.done()
+        return self._official_snapshot(profile, refreshing=refreshing)
+
     async def official(
         self, *, profile: HubSystemProfile | None = None, refresh: bool = False
     ) -> OfficialModelList:
@@ -988,9 +999,7 @@ class HubCatalog:
             refreshing = True
         elif not refreshing:
             refreshing = self._start_detail_refresh(profile)
-        models = [self._official_model(spec, profile) for spec in self._official_specs()]
-        models.sort(key=lambda model: model.published_at or model.updated_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-        return OfficialModelList(system=profile, data=models, refreshing=refreshing)
+        return self._official_snapshot(profile, refreshing=refreshing)
 
     async def _refresh_official_cache(
         self, profile: HubSystemProfile

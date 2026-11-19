@@ -23,6 +23,17 @@ int main() {
     const auto maximum=std::numeric_limits<std::size_t>::max();
     assert(prefill_budget_add(maximum-100,101)==maximum);
     assert(select_prefill_chunk(8192,8192,maximum,maximum,row)==0);
+    const PrefillWorkspace workspace{fixed,row};
+    const auto attention=[&](int64_t rows) {
+        return workspace.bytes(rows,std::size_t(std::min<int64_t>(rows,512))*row);
+    };
+    assert(select_prefill_chunk(8192,8192,memory(4608),attention,false)==4096);
+    assert(select_prefill_chunk(8192,8192,memory(256),attention,true)==128);
+    assert(select_prefill_chunk(8192,8192,memory(256),attention,false)==0);
+    assert(!prefill_layer_major_saves_transfers(16384,0,4096,32768,655360));
+    assert(!prefill_layer_major_saves_transfers(16384,0,8192,32768,1));
+    assert(prefill_layer_major_saves_transfers(262144,0,4096,32768,655360));
+    assert(!prefill_layer_major_saves_transfers(4096,262144,4096,32768,655360));
     for(int rows=0;rows<10000;++rows) {
         const auto result=select_prefill_chunk(8192,8192,memory(rows),fixed,row);
         assert(result>=0 && result<=8192 && result<=rows);

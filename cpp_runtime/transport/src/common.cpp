@@ -1094,6 +1094,8 @@ json request_metric_values_json(
         const MfqSamplingParams & sampling) {
     return {
         {"prefill_tokens", values.prefill_tokens},
+        {"cached_tokens", values.cached_tokens},
+        {"prefix_restore_ms", values.prefix_restore_ms},
         {"ttft_ms", values.ttft_ms},
         {"prefill_ms", values.prefill_ms},
         {"prefill_tps", values.prefill_tps},
@@ -1131,6 +1133,8 @@ RequestMetricValues request_metric_values(
         const CompletionResult & result, const RequestMetrics & metrics) {
     const auto finished = RequestMetrics::Clock::now();
     RequestMetricValues values;
+    values.cached_tokens=metrics.cached_tokens;
+    values.prefix_restore_ms=metrics.prefix_restore_ms;
     values.prefill_tokens = metrics.saw_prefill
         ? metrics.prefill_tokens
         : 0;
@@ -1182,6 +1186,8 @@ void log_request_metrics(const std::string & id, bool chat, bool stream,
          << " stream=" << (stream ? 1 : 0)
          << " prompt_tokens=" << prompt_tokens
          << " prefill_tokens=" << values.prefill_tokens
+         << " cached_tokens=" << values.cached_tokens
+         << " prefix_restore_ms=" << values.prefix_restore_ms
          << " completion_tokens=" << result.completion_tokens
          << " max_tokens=" << sampling.max_tokens
          << " ttft_ms=" << values.ttft_ms
@@ -1239,6 +1245,8 @@ void RuntimeRequestMetrics::complete(
         {"stream", stream},
         {"prompt_tokens", prompt_tokens},
         {"prefill_tokens", values.prefill_tokens},
+        {"cached_tokens", values.cached_tokens},
+        {"prefix_restore_ms", values.prefix_restore_ms},
         {"completion_tokens", result.completion_tokens},
         {"ttft_ms", values.ttft_ms},
         {"prefill_ms", values.prefill_ms},
@@ -1325,10 +1333,11 @@ void ActiveRequest::complete(
     completed_ = true;
 }
 
-json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
+json usage_json(size_t prompt_tokens, int32_t completion_tokens, size_t cached_tokens) {
     return {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", completion_tokens},
+        {"prompt_tokens_details", {{"cached_tokens",std::min(cached_tokens,prompt_tokens)}}},
         {"total_tokens", prompt_tokens + static_cast<size_t>(completion_tokens)},
     };
 }

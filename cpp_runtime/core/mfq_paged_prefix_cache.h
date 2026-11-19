@@ -82,6 +82,8 @@ struct PagedPrefixCacheMetrics {
     std::uint64_t hot_bytes = 0;
     std::uint64_t pending_writes = 0;
     std::uint64_t pending_bytes = 0;
+    std::uint64_t deferred_writes = 0;
+    std::uint64_t dirty_bytes = 0;
     std::uint64_t resident_bytes = 0;
     std::uint64_t pending_max_bytes = 0;
     std::uint64_t hot_pressure_bytes = 0;

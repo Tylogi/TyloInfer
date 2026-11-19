@@ -299,6 +299,47 @@ void run_benchmark() {
     std::filesystem::remove_all(root);
 }
 
+void check_failed_spill_retry() {
+    using namespace mfq::cache;
+    const auto root = temporary_directory();
+    PagedPrefixCacheConfig config{root, "failed-spill-retry", 4, 4096, 4096, 8};
+    config.spill_hot_on_eviction = true;
+    config.min_disk_free_bytes = 0;
+    const std::vector<std::int64_t> tokens{11, 12, 13, 14};
+    BlockHash block{};
+    {
+        PagedPrefixCache cache(config);
+        block = cache.block_hash({}, tokens.data(), tokens.size());
+        const auto blocked_parent = root / block_hash_hex(cache.compatibility_hash()) /
+            block_hash_hex(block).substr(0, 2);
+        std::ofstream blocker(blocked_parent, std::ios::binary);
+        blocker << "block parent creation";
+        blocker.close();
+        cache.store({}, tokens.data(), tokens.size(), payload({7, 8, 9}));
+        require(cache.metrics().deferred_writes == 1, "dirty RAM checkpoint was not exposed");
+        require(cache.set_hot_limit(0) == 0, "failed spill claimed released checkpoint bytes");
+        auto stats = cache.metrics();
+        require(stats.failed_writes == 1 && stats.pending_writes == 0 &&
+            stats.deferred_writes == 1 && stats.dirty_bytes == 3 && stats.hot_bytes == 3,
+            "failed spill discarded its only checkpoint copy");
+        const auto retained = cache.load(block);
+        require(retained && *retained == std::vector<std::uint8_t>({7, 8, 9}),
+            "failed spill was not recoverable from RAM");
+        std::filesystem::remove(blocked_parent);
+        require(cache.set_hot_limit(0) == 3, "explicit spill retry did not release saved bytes");
+        stats = cache.metrics();
+        require(stats.disk_blocks == 1 && stats.deferred_writes == 0 && stats.dirty_bytes == 0,
+            "spill retry did not durably publish the checkpoint");
+    }
+    {
+        PagedPrefixCache restarted(config);
+        const auto loaded = restarted.load(block);
+        require(loaded && *loaded == std::vector<std::uint8_t>({7, 8, 9}),
+            "retried checkpoint did not survive restart");
+    }
+    std::filesystem::remove_all(root);
+    std::cout << "failed_spill_retry PASS retained_on_failure=1 retry=1 restart=1\n";
+}
 } // namespace
 
 int main() try {
@@ -306,6 +347,7 @@ int main() try {
     check_read_window();
     check_ancestry_eviction();
     check_deferred_replacement();
+    check_failed_spill_retry();
     const auto inspect_root = temporary_directory();
     require(block_hash_hex(sha256(""))=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "SHA-256 empty known-answer mismatch");

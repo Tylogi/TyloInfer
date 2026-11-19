@@ -17,7 +17,9 @@ describe('业务职责边界', () => {
     for (const route of ['models', 'runtime', 'resources', 'logs', 'model-hub']) {
       expect(app).toContain(`path="${route}"`);
     }
-    expect(app).not.toMatch(/AgentProvider|AgentPage|EvaluationsPage/);
+    expect(app).toContain('path="inference"');
+    expect(app).toContain('<Navigate to="/inference" replace />');
+    expect(app).not.toMatch(/AgentProvider|AgentWorkspace|EvaluationsPage/);
     expect(app).not.toContain('QuantizationPage');
     expect(app).not.toContain('ApplicationsPage');
     expect(app).not.toContain('SettingsRoute');

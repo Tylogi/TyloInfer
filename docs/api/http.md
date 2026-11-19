@@ -343,6 +343,26 @@ Status merges the local component state with runtime state (`active`,
 job. Activation enables the realtime voice path and returns `501` when no
 managed runtime or component manager is configured.
 
+### 2.11 Agent workbench
+
+| Method | Path | Request | Success |
+|---|---|---|---|
+| `GET` | `/api/v1/agent/capabilities` | — | `200 Object` |
+| `GET` | `/api/v1/agent/settings` | — | `200 Object` |
+| `PATCH` | `/api/v1/agent/settings/{namespace}` | `UpdateAgentSettingsRequest` | `200 Object` |
+| `GET` | `/api/v1/agent/sessions` | — | `200 Object` |
+| `POST` | `/api/v1/agent/sessions` | `CreateAgentSessionRequest` | `201 Object` |
+| `GET` | `/api/v1/agent/sessions/{session_id}` | — | `200 Object` |
+| `POST` | `/api/v1/agent/sessions/{session_id}/runs` | `CreateAgentRunRequest` | `202 Object` |
+| `GET` | `/api/v1/agent/runs/{run_id}` | — | `200 Object` |
+| `POST` | `/api/v1/agent/runs/{run_id}/cancel` | — | `200 Object` |
+| `GET` | `/api/v1/agent/runs/{run_id}/events` | — | `200` SSE |
+
+These routes require the `admin` scope when authentication is enabled. Agent
+sessions and events use separate storage; existing inference sessions and APIs
+are unchanged. The optional DSH runtime must be available before starting a run.
+See the [Agent workbench guide](agent.md) for execution, replay, and cancellation.
+
 ## 3. Session and response workflow
 
 ### 3.1 Create a session
@@ -541,6 +561,26 @@ The response is `202 OperationAccepted`. Track the returned operation through
 the jobs API and inspect active instances through
 `GET /api/v1/runtime/instances`.
 
+For supported CUDA decision models, `ModelLoadRequest.jev_weights` accepts
+`"stream"` (default) or `"vram"`. Streaming keeps layer weights in RAM, with two
+largest-layer-sized GPU buffers plus resident output normalization and trained
+readout weights where present. Embedding/output tables normally attempt mapped
+RAM placement when eligible, but may use device tables if mapping is unavailable
+or the layout is ineligible, increasing VRAM use. Explicit mapping overrides may
+report failure instead of falling back. VRAM mode keeps the weights on the GPU,
+using more VRAM and avoiding layer-weight streaming transfers. Execution workspaces
+and other allocations are additional. This is not a general expert-cache setting;
+it is forwarded only for CUDA artifacts marked `structured_decisions`.
+
+```json
+{"model":"DECISION_MODEL_ID","jev_weights":"stream"}
+```
+
+Send this body to the same `/api/v1/models/load` endpoint and wait for the
+instance to become `ready`. Use [the decision endpoint](#82-structured-decisions)
+only with a supported decision model. For equivalent startup loading, see
+[`--jev-weights`](../cli/serve.md#jev-decision-model-weight-placement).
+
 Pinning and idle TTL can be changed on a resident instance without reloading
 it. The updated policy is also retained for later request-driven reloads.
 
@@ -649,6 +689,7 @@ header selects Anthropic, as does serving on the configured Anthropic port
 | `GET` | `/v1/models` | Anthropic | `200 Object`, paginated Anthropic list shape |
 | `GET` | `/v1/models/{model_id}` | Anthropic | `200 Object`; `404` unknown id |
 | `POST` | `/v1/chat/completions` | OpenAI | `200` JSON or `text/event-stream` |
+| `POST` | `/v1/systemone` | Structured decisions | `200` JSON, `object: "structured_decision"` |
 | `POST` | `/v1/messages` | Anthropic | `200` JSON or `text/event-stream` |
 | `POST` | `/v1/messages/count_tokens` | Anthropic | always `501` |
 
@@ -656,7 +697,125 @@ When an API credential is configured, `/v1` requests authenticate like
 `/api/v1` and require the `inference` scope; Anthropic clients may send the
 credential as `x-api-key`. The `model` field is resolved through the server
 model-alias table before routing. Streaming requests are validated before the
-stream opens, and retryable backend failures set `Retry-After: 1`.
+stream opens. Retryable chat-completion backend failures with HTTP `429` or
+`503` set `Retry-After: 1`; do not assume every compatibility route sets it.
 Token counting is not supported, so `count_tokens` always answers `501`.
 Errors use the error envelope of the selected protocol, not the common
 `error` envelope.
+
+### 8.1 Request-local MTP control
+
+For `POST /v1/chat/completions`, the optional `X-TyloInfer-MTP` header accepts
+`on` or `off`. It supplies `enable_mtp` only when that field is absent from the
+JSON body. An explicit body value always wins, including `false` with an `on`
+header or `true` with an `off` header. Other header values are ignored. When
+neither sets the value, the chat parser defaults `enable_mtp` to `true`.
+This applies to streaming and non-streaming chat requests, not to
+`/v1/systemone`. It permits speculation rather than guaranteeing it runs;
+compatible weights, backend support and scheduling are still required.
+
+### 8.2 Structured decisions
+
+`POST /v1/systemone` returns one JSON decision result, not a chat completion or
+SSE stream. It requires a model with a supported native decision implementation.
+A model appearing in `/v1/models`, or this route being present, does not by itself
+establish decision capability. The CUDA d1 text adapter uses this same route and
+the existing managed model lifecycle; see [d1 setup and limitations](../cli/d1-native.md#managed-serving).
+
+The managed runtime must be ready and idle. Readiness is checked first: a runtime
+in `BUSY` state (including an active chat request) or otherwise not `READY`
+returns `409 model_not_ready`. If it is still `READY` but has active requests,
+queued requests or another control lease, it returns `409 runtime_busy`.
+Increasing `--max-requests-per-runtime` does not make decision reads concurrent. A disconnected caller does not immediately free
+a native decision operation that is still executing.
+
+#### Request
+
+| Field | Contract |
+|---|---|
+| `model` | Required nonempty model ID or configured alias. The native parser limits it to 512 bytes. |
+| `state` | Required JSON value. Strings are used directly; other values are serialized as JSON. The resulting text is limited to 262144 bytes. |
+| `questions` | Required object with 1–64 named questions. Names must be nonempty and at most 256 bytes. |
+| `instructions` | Optional shared instruction string, at most 65536 bytes. |
+| `chat_template_kwargs` | Optional object, serialized size at most 16384 bytes; a `chat_template` override is rejected. |
+| `cache_salt` | Optional string, at most 256 bytes. It does not override the exclusive-runtime requirement. |
+| `joint` | Omit or set to `false`; `true` is rejected by the current native parser. |
+
+Each question accepts only `type`, optional `instructions` (at most 65536 bytes),
+and `criteria`. The supported types are:
+
+| `type` | `criteria` | Answer |
+|---|---|---|
+| `choice` | Object with 1–255 nonempty option names (at most 512 bytes each). Values are descriptions (strings up to 16384 bytes) or `null`. | `choice`: winning option name. |
+| `noul` | Omit, use `null`, or supply an object with only `true` and `false` keys, whose values are descriptions (strings up to 16384 bytes) or `null`. | `noul`: probability of the yes/true label. |
+| `score` | Array of 2–10 nonempty level descriptions (at most 512 bytes each). | `score`: model-defined readout in the zero-based level range; `legend` maps indices to descriptions. |
+
+Score readout belongs to the model, not the HTTP interface. D3 retains its
+probability-weighted mean; d1 retains its official median level. No request-side
+readout selector is needed. The common validator checks structure, finite values,
+legal ranges and probability distributions, without recomputing a model's score.
+The d1 text adapter rejects nonempty `chat_template_kwargs`, media, typed
+extraction and multiple-choice selection; it does not support chat generation.
+
+The constructed prompt for each question must also fit within 262144 bytes.
+The current CUDA decision path checks each tokenized prompt against the model's
+context and, when declared, its decision-model input-token limit. The sum of all
+question prompt lengths must not exceed 1,048,576 tokens, counting the shared
+state in each prompt rather than only once. These are validation ceilings, not
+recommended request sizes or a guarantee that a request fits available memory.
+Unknown fields are rejected by the native parser.
+Public requests cannot set `full_vocabulary` or `prefix_cache`, even to `false`.
+Chat generation parameters such as `messages`, `stream`, `max_tokens` and
+`enable_mtp` are not decision fields.
+
+Save this body as `decision-request.json`, replacing `DECISION_MODEL_ID` with a
+supported model ID or alias:
+
+```json
+{
+  "model": "DECISION_MODEL_ID",
+  "state": {"color": "blue"},
+  "questions": {
+    "color": {
+      "type": "choice",
+      "instructions": "Select the color stated in the input.",
+      "criteria": {"blue": null, "green": null}
+    }
+  }
+}
+```
+
+```shell
+curl --fail-with-body http://127.0.0.1:8090/v1/systemone \
+  -H 'Content-Type: application/json' --data-binary '@decision-request.json'
+```
+
+This example assumes local authentication is disabled. Otherwise add the Bearer
+credential as described above. In PowerShell use `curl.exe` and put the command
+on one line. `--fail-with-body` requires curl 7.76 or newer.
+
+#### Response and errors
+
+Success is HTTP `200` with `object: "structured_decision"`, `id`, `created`,
+`model`, `answers`, `usage` and `diagnostics`. `answers` is keyed by question name;
+each answer includes its `type`, the type-specific value above, `probabilities`
+and `confidence`. Choice probabilities use option names; noul uses `yes`/`no`;
+score uses zero-based index strings. `usage` reports input tokens, zero output
+tokens and cached input tokens. Per-question diagnostics include `label_mass`,
+`argmax_is_label`, `prefill_ms` and `prefill_tps`; unavailable label diagnostics
+may be `null`, with `normalization: "labels"` for label-only normalization.
+These diagnostics are not generated chat tokens.
+
+Aliases resolve to the canonical model for execution; the response `model`
+preserves the ID or alias supplied by the caller.
+
+| Status | Meaning |
+|---|---|
+| `400` | Malformed JSON, missing model, invalid decision fields, unsupported switches or question contract. |
+| `401` / `403` | Authentication failure or insufficient scope, as for other `/v1` requests. |
+| `409` | `runtime_busy` or `model_not_ready`; wait for the runtime to be ready and idle before retrying. |
+| `501` | `decisions_unavailable`: the selected backend cannot provide decision reads. |
+
+Other model-loading or backend errors retain their backend status. Decision
+errors use the OpenAI-style `error` object, not an `answers` result. This route
+does not set a `Retry-After` header for busy errors.

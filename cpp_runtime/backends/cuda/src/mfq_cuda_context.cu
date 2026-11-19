@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <cstdlib>
 #include <iostream>
@@ -29,7 +30,76 @@
 #endif
 
 namespace mfq::cuda {
-namespace {thread_local unsigned nonblocking_allocations=0;}
+namespace {
+thread_local unsigned nonblocking_allocations=0,pinned_reclaim_pauses=0;
+thread_local const PinnedAllocationScope* pinned_scope=nullptr;
+thread_local bool pinned_reclaim_running=false;
+std::atomic<std::size_t> pinned_live{0},pinned_proven{SIZE_MAX};
+}
+PinnedAllocationScope::PinnedAllocationScope(int device,cudaStream_t stream,
+        std::function<std::size_t(std::size_t)> reclaim)
+    :previous_(pinned_scope),device_(device),stream_(stream),reclaim_(std::move(reclaim)) {pinned_scope=this;}
+PinnedAllocationScope::~PinnedAllocationScope(){pinned_scope=previous_;}
+PinnedReclaimPause::PinnedReclaimPause(){++pinned_reclaim_pauses;}
+PinnedReclaimPause::~PinnedReclaimPause(){--pinned_reclaim_pauses;}
+bool pinned_allocation_scope_active()noexcept{return pinned_scope!=nullptr;}
+std::size_t reclaim_pinned_allocation(std::size_t bytes) {
+    if(!bytes || !pinned_scope || pinned_reclaim_pauses || pinned_reclaim_running || !pinned_scope->reclaim_)return 0;
+    DeviceGuard guard(pinned_scope->device_);cudaStreamCaptureStatus capture;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(pinned_scope->stream_,&capture));
+    if(capture!=cudaStreamCaptureStatusNone)return 0;
+    struct Running {Running(){pinned_reclaim_running=true;}~Running(){pinned_reclaim_running=false;}} running;
+    return pinned_scope->reclaim_(bytes);
+}
+cudaError_t allocate_pinned_host(void** destination,std::size_t bytes,unsigned flags,const char* role) {
+    auto result=cudaHostAlloc(destination,bytes,flags);
+    const auto charge=[&] {
+        const auto live=pinned_live.fetch_add(bytes)+bytes;
+        auto prior=pinned_proven.load();
+        while(prior!=SIZE_MAX && prior<live && !pinned_proven.compare_exchange_weak(prior,live)){}
+    };
+    if(result==cudaSuccess){charge();return result;}
+    if(!pinned_allocation_rejected(result))return result;
+    pinned_proven.store(pinned_live.load());
+    (void)cudaGetLastError();
+    const auto released=reclaim_pinned_allocation(bytes);
+    if(!released)return result;
+    std::fprintf(stderr,"native_required_pinned_recovery role=%s requested_bytes=%zu released_bytes=%zu allocation_only=1\n",
+        role,bytes,released);
+    result=cudaHostAlloc(destination,bytes,flags);
+    if(result==cudaSuccess)charge();
+    return result;
+}
+cudaError_t release_pinned_host(void* pointer,std::size_t bytes)noexcept {
+    const auto result=cudaFreeHost(pointer);
+    if(result==cudaSuccess)pinned_live.fetch_sub(bytes);
+    return result;
+}
+PinnedMemoryBudgetStats pinned_memory_budget_stats()noexcept {
+    const auto proven=pinned_proven.load();
+    return {pinned_live.load(),proven==SIZE_MAX?0:proven,proven!=SIZE_MAX};
+}
+std::size_t pinned_headroom_shortage(std::size_t live,std::size_t budget,
+        std::size_t required,std::size_t margin)noexcept {
+    const auto goal=required>SIZE_MAX-margin?SIZE_MAX:required+margin;
+    if(live<=budget) {const auto free=budget-live;return goal>free?goal-free:0;}
+    const auto excess=live-budget;return goal>SIZE_MAX-excess?SIZE_MAX:goal+excess;
+}
+void reserve_pinned_workspace(std::size_t required,std::size_t margin,
+        const std::function<std::size_t(std::size_t)>& reclaim) {
+    const auto before=pinned_memory_budget_stats();std::size_t released=0;
+    if(before.proven) {
+        const auto shortage=pinned_headroom_shortage(before.live_bytes,before.proven_bytes,required,margin);
+        if(shortage && reclaim) {const PinnedReclaimPause boundary;released=reclaim(shortage);}
+        const auto after=pinned_memory_budget_stats();
+        if(pinned_headroom_shortage(after.live_bytes,after.proven_bytes,required,margin))
+            throw MfqResourceExhausted("CUDA pinned allocation failed: required_headroom="+std::to_string(required)+
+                " safety_margin="+std::to_string(margin)+" live_bytes="+std::to_string(after.live_bytes)+
+                " proven_budget="+std::to_string(after.proven_bytes)+" before_state_advance=1");
+    }
+    std::fprintf(stderr,"native_pinned_workspace_admission required_bytes=%zu safety_margin_bytes=%zu live_bytes=%zu proven_budget_bytes=%zu budget_known=%d optional_released_bytes=%zu before_state_advance=1\n",
+        required,margin,pinned_live.load(),before.proven_bytes,int(before.proven),released);
+}
 NonblockingAllocationScope::NonblockingAllocationScope(){++nonblocking_allocations;}
 NonblockingAllocationScope::~NonblockingAllocationScope(){--nonblocking_allocations;}
 std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device) {
@@ -82,7 +152,21 @@ void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t 
     record_gpu_timestamp_kernel<<<1,1,0,stream>>>(timestamps,index);
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
 }
-namespace { thread_local bool resident_allocations=false,routed_weight_allocations=false; }
+namespace {
+thread_local bool resident_allocations=false,routed_weight_allocations=false,dense_weight_allocations=false;
+thread_local bool prefill_allocations=false,isolated_prefill_allocations=false;
+thread_local std::optional<RequestStateAllocationScope::Kind> request_state_allocations;
+}
+PrefillAllocationScope::PrefillAllocationScope(bool enabled,bool reuse_ordinary_pool) noexcept
+    :previous_(prefill_allocations),previous_isolation_(isolated_prefill_allocations) {
+    prefill_allocations=enabled;
+    isolated_prefill_allocations=enabled && !reuse_ordinary_pool;
+}
+PrefillAllocationScope::~PrefillAllocationScope() noexcept {
+    prefill_allocations=previous_;
+    isolated_prefill_allocations=previous_isolation_;
+}
+bool PrefillAllocationScope::active() noexcept {return prefill_allocations;}
 ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
     :previous_(resident_allocations) {resident_allocations=enabled;}
 void ResidentAllocationScope::finish() noexcept {
@@ -91,6 +175,14 @@ void ResidentAllocationScope::finish() noexcept {
 RoutedWeightAllocationScope::RoutedWeightAllocationScope(bool enabled) noexcept
     :resident_(enabled),previous_(routed_weight_allocations) {routed_weight_allocations=enabled;}
 RoutedWeightAllocationScope::~RoutedWeightAllocationScope() noexcept {routed_weight_allocations=previous_;}
+DenseWeightAllocationScope::DenseWeightAllocationScope() noexcept
+    :previous_(dense_weight_allocations) {dense_weight_allocations=true;}
+DenseWeightAllocationScope::~DenseWeightAllocationScope() noexcept {dense_weight_allocations=previous_;}
+RequestStateAllocationScope::RequestStateAllocationScope(bool enabled,Kind kind) noexcept
+    :resident_(enabled),previous_(request_state_allocations) {
+    request_state_allocations=enabled?std::optional(kind):std::nullopt;
+}
+RequestStateAllocationScope::~RequestStateAllocationScope() noexcept {request_state_allocations=previous_;}
 
 struct AllocationBudget {
     std::mutex graph_memory_mutex;
@@ -103,6 +195,10 @@ struct AllocationBudget {
     std::size_t shared_graph_pool_users=0;
     cudaMemPool_t resident_memory_pool=nullptr;
     cudaMemPool_t routed_weight_memory_pool=nullptr;
+    cudaMemPool_t dense_weight_memory_pool=nullptr;
+    cudaMemPool_t prefill_memory_pool=nullptr;
+    cudaMemPool_t request_state_memory_pool=nullptr;
+    cudaMemPool_t indexer_memory_pool=nullptr;
     std::size_t limit = 0;
     std::atomic<std::size_t> allocated{},peak{};
 #ifdef _WIN32
@@ -802,13 +898,27 @@ std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
     return {used,reserved};
 }
 
-std::size_t Context::reusable_workspace_bytes() const {
-    if(!pool_)return 0;
-    DeviceGuard guard(device_);
+static std::size_t reusable_pool_bytes(cudaMemPool_t pool) {
+    if(!pool)return 0;
     std::uint64_t used=0,reserved=0;
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&used));
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&used));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
     return reserved>used?std::size_t(reserved-used):0;
+}
+
+std::size_t Context::reusable_workspace_bytes() const {
+    DeviceGuard guard(device_);
+    if(isolated_prefill_allocations) {
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        return reusable_pool_bytes(allocation_budget_->prefill_memory_pool);
+    }
+    return reusable_pool_bytes(pool_);
+}
+
+std::size_t Context::reusable_dense_weight_bytes() const {
+    DeviceGuard guard(device_);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    return reusable_pool_bytes(allocation_budget_->dense_weight_memory_pool);
 }
 
 void Context::trim_pool_pages() const {
@@ -865,6 +975,19 @@ void Context::reclaim_idle_memory() {
     // Trimming unused pages leaves live graph-pool allocations untouched.
     TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
     trim_pool_pages();
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_POOLS");trace && trace[0]=='1') {
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        std::fprintf(stderr,
+            "cuda_pool_idle_bytes workspace=%zu prefill=%zu dense=%zu resident=%zu recurrence=%zu indexer=%zu routed=%zu graph=%zu\n",
+            reusable_pool_bytes(pool_),
+            reusable_pool_bytes(allocation_budget_->prefill_memory_pool),
+            reusable_pool_bytes(allocation_budget_->dense_weight_memory_pool),
+            reusable_pool_bytes(allocation_budget_->resident_memory_pool),
+            reusable_pool_bytes(allocation_budget_->request_state_memory_pool),
+            reusable_pool_bytes(allocation_budget_->indexer_memory_pool),
+            reusable_pool_bytes(allocation_budget_->routed_weight_memory_pool),
+            reusable_pool_bytes(allocation_budget_->shared_graph_memory_pool));
+    }
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1') {
         std::lock_guard lock(graph_pool_mutex_);
         std::size_t cached=0,blocks=0;
@@ -902,10 +1025,13 @@ void Context::check_memory_limit(std::size_t additional) const {
     }
     if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
         const auto [pool_used,pool_reserved]=pool_memory_stats();
-        throw MfqResourceExhausted("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
+        const auto limit=allocation_budget_->limit;
+        const auto excess=usage>limit?usage-limit:0;
+        const auto shortfall=excess?excess+std::min(additional,SIZE_MAX-excess):additional-(limit-usage);
+        throw CudaMemoryLimitExceeded("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
             " requested="+std::to_string(additional)+" limit="+std::to_string(allocation_budget_->limit)+
             " owned="+std::to_string(memory_stats().allocated)+" pool_used="+std::to_string(pool_used)+
-            " pool_reserved="+std::to_string(pool_reserved));
+            " pool_reserved="+std::to_string(pool_reserved),shortfall);
     }
 }
 
@@ -1083,12 +1209,15 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     void* pointer = nullptr;
     const bool async=async_allocations_;
-    if(async && resident_allocations && !pooled_allocation) {
-        // Pack the many small recurrent tensors into their own pages instead
-        // of paying cudaMalloc's WDDM allocation granularity for every layer.
+    if(async && (resident_allocations || isolated_prefill_allocations) && !pooled_allocation) {
+        // Indexer and recurrent state move independently. Keeping their pages
+        // separate lets either pool shrink while the other remains live.
         std::lock_guard lock(allocation_budget_->graph_memory_mutex);
-        auto& memory=routed_weight_allocations?allocation_budget_->routed_weight_memory_pool:
-            allocation_budget_->resident_memory_pool;
+        auto& memory=!resident_allocations?allocation_budget_->prefill_memory_pool:
+            routed_weight_allocations?allocation_budget_->routed_weight_memory_pool:
+            dense_weight_allocations?allocation_budget_->dense_weight_memory_pool:
+            request_state_allocations==RequestStateAllocationScope::Kind::Indexer?allocation_budget_->indexer_memory_pool:
+            request_state_allocations?allocation_budget_->request_state_memory_pool:allocation_budget_->resident_memory_pool;
         if(!memory) {
             cudaMemPoolProps properties{};
             properties.allocType=cudaMemAllocationTypePinned;
@@ -1110,11 +1239,14 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
         }
         allocation_pool=memory;
     }
-    bool verify_pool_reuse=false;
+    bool verify_pool_reuse=false,verify_request_state=false;
     if(allocation_budget_->limit) {
         cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
         TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream,&capture));
         if(capture==cudaStreamCaptureStatusNone) {
+            // Request-state pools can grow by more than the allocation. Check
+            // that growth before handing the tensor to admission or restore.
+            verify_request_state=request_state_allocations && async && allocation_pool;
             const auto usage=local_memory_usage();
             if(async && allocation_pool && usage<=allocation_budget_->limit &&
                     bytes>allocation_budget_->limit-usage) {
@@ -1144,7 +1276,7 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             throw MfqResourceExhausted("CUDA allocation failed: requested="+std::to_string(bytes)+
                 " allocated="+std::to_string(memory_stats().allocated));
         TYLOINFER_NATIVE_CUDA_CHECK(result);
-        if(verify_pool_reuse)check_memory_limit();
+        if(verify_pool_reuse || verify_request_state)check_memory_limit();
         if(pooled_allocation) {
             std::lock_guard lock(graph_pool_mutex_);
             graph_allocation_sizes_.emplace(pointer,bytes);
@@ -1156,7 +1288,14 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             graph_allocation_sizes_.erase(pointer);
             graph_pools_.at(allocation_stream).owned.erase(pointer);
         }
-        if(pointer) {if(async_allocations_)(void)cudaFreeAsync(pointer,allocation_stream);else (void)cudaFree(pointer);}
+        if(pointer) {
+            if(async_allocations_)(void)cudaFreeAsync(pointer,allocation_stream);else (void)cudaFree(pointer);
+            if(verify_request_state && !nonblocking_allocations) {
+                // Retire the failed allocation before the caller retries it in RAM.
+                if(cudaStreamSynchronize(allocation_stream)==cudaSuccess)
+                    (void)cudaMemPoolTrimTo(allocation_pool,0);
+            }
+        }
         allocation_budget_->release(bytes);throw;
     }
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
@@ -1266,6 +1405,13 @@ void Context::begin_graph_pool(cudaStream_t stream,bool share_existing) {
         // weights. Keep its backing pages separate so retiring a window can
         // return all of them despite live allocations in the default pool.
         DeviceGuard guard(device_);
+        // Tight budgets can have more already charged space in the ordinary
+        // pool than free device pages. The graph still owns its allocations.
+        if(reusable_pool_bytes(pool_)>available_memory()) {
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1')
+                std::fprintf(stderr,"cuda_graph_workspace_pool reuse_ordinary=1\n");
+            return;
+        }
         cudaMemPoolProps properties{};
         properties.allocType=cudaMemAllocationTypePinned;
         properties.location.type=cudaMemLocationTypeDevice;
@@ -1443,7 +1589,7 @@ HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
         return;
     }
     const auto flags = mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
-    const auto allocation=cudaHostAlloc(&data_,bytes_,flags);
+    const auto allocation=allocate_pinned_host(&data_,bytes_,flags,"host_buffer");
     if(pinned_allocation_rejected(allocation)) {
         (void)cudaGetLastError();
         data_=nullptr;
@@ -1472,7 +1618,7 @@ HostBuffer& HostBuffer::operator=(HostBuffer&& other) noexcept {
 
 void HostBuffer::reset() noexcept {
     if (data_ != nullptr) {
-        (void)cudaFreeHost(data_);
+        (void)release_pinned_host(data_,bytes_);
     }
     data_ = nullptr;
     bytes_ = 0;

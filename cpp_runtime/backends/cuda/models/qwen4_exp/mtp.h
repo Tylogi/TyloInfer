@@ -45,6 +45,9 @@ struct Qwen4ExpMtp final : MtpModule {
     static std::optional<Qwen4ExpMtp> load_if_present(CudaExecutionContext &execution,
                                                       const mfq::ModelSource &file,
                                                       const mfq::models::qwen4_exp::Config &main);
+    std::unique_ptr<Qwen4ExpMtp> fork_empty() const;
+    Tensor prime_prompt(const MtpTarget&,const Tensor& hidden,const Tensor& ids,const Tensor& previous);
+    MtpStep batch_graph(const MtpTarget&,const Tensor& hidden,const Tensor& ids,bool history_only=false);
 
     void reset(int64_t next_batch = 1) override;
 

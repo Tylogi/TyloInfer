@@ -210,6 +210,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             auto chunk =
                 next_prefill_chunk(ops.size(input_ids, 1), offset, prefill_chunk_size);
             if(checkpoint>offset)chunk.count=std::min(chunk.count,checkpoint-offset);
+            if constexpr (requires { ops.prefill_chunk(chunk); }) chunk=ops.prefill_chunk(chunk);
             chunk.last=chunk.offset+chunk.count==ops.size(input_ids,1);
             auto step = [&] {
                 PrefillActivity activity;

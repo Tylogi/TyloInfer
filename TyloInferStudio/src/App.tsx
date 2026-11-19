@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react';
-import { Route, Routes } from 'react-router';
+import { Navigate, Route, Routes } from 'react-router';
 import { StudioUpdateProvider } from './features/settings/UpdateManager';
 import { RuntimeProvider } from './app/RuntimeProvider';
 import { StudioShell } from './app/StudioShell';
@@ -48,7 +48,8 @@ export default function App() {
         >
           <Routes>
             <Route element={<StudioShell />}>
-              <Route index element={<OverviewPage />} />
+              <Route index element={<Navigate to="/inference" replace />} />
+              <Route path="inference" element={<OverviewPage />} />
               <Route path="models" element={<ModelsPage />} />
               <Route path="runtime" element={<ConnectionsPage />} />
               <Route path="resources" element={<CachePage />} />

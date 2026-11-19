@@ -3,6 +3,7 @@
 
 #include "cuda_execution.h"
 #include "mfq_cuda_attention_ops.h"
+#include "mfq_cuda_resident_allocations.h"
 
 #include <algorithm>
 #include <array>
@@ -296,6 +297,10 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& valu
     std::lock_guard lock(prepared_mutex_);
     auto& cached = prepared_[value.get_device()];
     if (!cached.frequencies.defined()) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        // These tensors are shared by prefill and decode for this device.
+        const mfq::cuda::ResidentAllocationScope parameter_storage;
+#endif
         Prepared next;
         auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
         next.frequencies = tb::pow(tb::full({pairs}, base_, value.options().dtype(tb::kFloat32)),

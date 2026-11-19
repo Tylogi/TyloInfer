@@ -936,7 +936,7 @@ int run_mfq_http_transport(
                 add_request_runtime_metrics(performance, metrics);
                 set_json(res, runtime_generation_result(
                     id, created, config.model_name, result,
-                    usage_json(completion->prompt_tokens, result.completion_tokens),
+                    usage_json(completion->prompt_tokens, result.completion_tokens, metrics.cached_tokens),
                     std::move(performance)));
                 return;
             }
@@ -991,7 +991,7 @@ int run_mfq_http_transport(
                             auto usage = runtime_generation_event(
                                 "usage", id, created, config.model_name);
                             usage["usage"] = usage_json(
-                                completion->prompt_tokens, result.completion_tokens);
+                                completion->prompt_tokens, result.completion_tokens, metrics.cached_tokens);
                             if (!write_sse(sink, usage)) return false;
                         }
                         static constexpr char done[] = "data: [DONE]\n\n";

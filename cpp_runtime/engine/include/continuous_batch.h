@@ -124,6 +124,9 @@ template <class Ops> class ContinuousBatch {
 
   public:
     bool empty() const noexcept { return requests.empty(); }
+    template<class Cache> void set_prefix_cache(Cache& cache) {
+        if constexpr(requires { operations.set_prefix_cache(cache); })operations.set_prefix_cache(cache);
+    }
     void invalidate_runtime_policy() {
         if constexpr (requires { operations.invalidate_runtime_policy(); }) operations.invalidate_runtime_policy();
     }
@@ -148,12 +151,23 @@ template <class Ops> class ContinuousBatch {
         ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
         SequenceOps ops{*this, *work};
         int64_t reused = 0, prefix = 0;
-        if constexpr (requires { operations.prepare(work->request); })
+        if constexpr (requires { operations.prepare(work->request); }) {
+            const auto started=Clock::now();
             reused = operations.prepare(work->request);
+            work->request->prefill_offset = reused;
+            output.metrics.cached_tokens=reused;
+            if(reused)output.metrics.prefix_restore_ms=
+                std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+        }
         if constexpr (requires { operations.prefix_tokens(work->request); })
             prefix = operations.prefix_tokens(work->request);
         auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);
-        while (auto step = sequence.next()) co_yield std::move(step);
+        while (auto step = sequence.next()) {
+            if constexpr(requires { operations.commit_prefix(work->request); })
+                if(step.value && std::holds_alternative<PrefillProgress>(*step.value) && !output.stopped())
+                    operations.commit_prefix(work->request);
+            co_yield std::move(step);
+        }
         cleanup.finish();
     }
 

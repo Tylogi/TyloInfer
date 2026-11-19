@@ -8,7 +8,7 @@ import { formatBytes } from '../../app/formatters';
 
 type DirectoryDialogState = Pick<ReturnType<typeof useModelCatalog>, 'modelBrowser' | 'modelBrowserOpen' | 'modelBrowserError' | 'modelBrowserLoading' | 'modelFilesMode' | 'setModelBrowserOpen' | 'modelBrowserTriggerRef' | 'busy' | 'jumpToModelDirectory' | 'openModelDirectory' | 'modelDirectoryPath' | 'setModelDirectoryPath' | 'registerCurrentModelDirectory' | 'openCurrentDirectory'>;
 
-export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDialogState; title?: string }) {
+export function ModelDirectoryDialog({ catalog, title, navigation = 'path', showNativeOpen = true }: { catalog: DirectoryDialogState; title?: string; navigation?: 'path' | 'id'; showNativeOpen?: boolean }) {
   const { tr } = useSettings();
   const {
     modelBrowser,
@@ -49,14 +49,15 @@ export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDia
         </button>
         <input
           aria-label={tr('当前目录', 'Current directory')}
+          readOnly={navigation === 'id'}
           onChange={(event) => setModelDirectoryPath(event.target.value)}
           placeholder={tr('输入服务器上的完整目录', 'Enter a full directory on the server')}
           spellCheck={false}
           value={modelDirectoryPath}
         />
-        <button disabled={busy || !modelDirectoryPath.trim()} type="submit">
+        {navigation === 'path' && <button disabled={busy || !modelDirectoryPath.trim()} type="submit">
           {tr('前往', 'Go')}
-        </button>
+        </button>}
         {modelBrowser?.current_id && <span>{modelBrowser.model_file_count} {tr('个模型', 'models')}</span>}
       </form>
       <div className="model-browser-list">
@@ -84,10 +85,10 @@ export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDia
         )}
       </div>
       <footer>
-        <button className="model-browser-open-finder" disabled={busy || !modelBrowser?.current_id || !(modelBrowser.can_open_directory ?? modelBrowser.can_open_in_finder) || Boolean(modelBrowserError)}
+        {showNativeOpen && <button className="model-browser-open-finder" disabled={busy || !modelBrowser?.current_id || !(modelBrowser.can_open_directory ?? modelBrowser.can_open_in_finder) || Boolean(modelBrowserError)}
           onClick={() => void openCurrentDirectory()} type="button">
           <Icon name="folder" size={13} />{modelBrowser?.can_open_in_finder ? tr('在访达中打开', 'Open in Finder') : tr('在文件管理器中打开', 'Open in file manager')}
-        </button>
+        </button>}
         <button onClick={() => setModelBrowserOpen(false)} type="button">
           {tr('取消', 'Cancel')}
         </button>

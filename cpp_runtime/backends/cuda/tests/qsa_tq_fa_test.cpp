@@ -104,6 +104,12 @@ void check_prefill_graph() {
   const auto expected=read_graph_output(sparse);const auto history=read_graph_history(sparse);
   clear_graph_history(sparse,stream);ck(cudaError_t(graph.run(a)));ck(cudaStreamSynchronize(stream));
   assert_graph_equal(expected,read_graph_output(sparse));assert_graph_history(history,sparse);
+  auto hits_only=a;hits_only.mass=hits_only.logmass=hits_only.norm=nullptr;
+  clear_graph_history(sparse,stream);ck(cudaError_t(graph.run(hits_only)));ck(cudaStreamSynchronize(stream));
+  assert_graph_equal(expected,read_graph_output(sparse));
+  const auto counts=read_graph_history(sparse);
+  for(int i=0;i<sparse.blocks;++i)if(counts.hits[i]!=history.hits[i] || counts.mass[i]!=0.f)
+   throw std::runtime_error("Hit-only attention changed block counts or wrote mass");
   sparse.positions.put(std::vector<int64_t>(sparse.queries,-1));ck(cudaDeviceSynchronize());
   clear_graph_history(sparse,stream);ck(cudaError_t(graph.run(a)));ck(cudaStreamSynchronize(stream));
   const auto empty=read_graph_output(sparse);const auto empty_history=read_graph_history(sparse);

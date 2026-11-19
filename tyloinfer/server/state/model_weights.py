@@ -7,7 +7,14 @@ from tyloinfer.formats.compat import canonical_dtype
 def jev_weight_memory(tensors: dict, config: dict, *, trained_readout: bool) -> dict[str, int] | None:
     layers: dict[str, int] = {}
     tables = resident = 0
+    d1 = config.get('architectures') == ['D1Model']
     for name, record in tensors.items():
+        if d1:
+            name = name.removeprefix('model.language_model.')
+            name = re.sub(r'^layers\.(\d+)\.', r'model.block.\1.', name)
+            name = re.sub(r'^blk\.(\d+)\.', r'model.block.\1.', name)
+            name = {'embed_tokens.weight': 'model.token_embedding.weight', 'token_embd.weight': 'model.token_embedding.weight',
+                    'embedding_norm.weight': 'model.output_norm.weight', 'output_norm.weight': 'model.output_norm.weight'}.get(name, name)
         layer = re.match(r'^model\.block\.(\d+)\.', name)
         table = name in {'model.token_embedding.weight', 'model.output.weight'}
         if not layer and not table and name != 'model.output_norm.weight':
@@ -16,7 +23,9 @@ def jev_weight_memory(tensors: dict, config: dict, *, trained_readout: bool) -> 
         shape, dtype = record.get('shape'), record.get('dtype')
         if shape and dtype in {'BF16', 'F16', 'F32'}:
             size = math.prod(shape) * (4 if dtype == 'F32' else 2)
-            if 'norm' in name or layer and '.linear_attention.' in name and name.rsplit('.', 1)[-1] in {'a', 'dt_bias'}:
+            if d1:
+                size = math.prod(shape) * 2
+            elif 'norm' in name or layer and '.linear_attention.' in name and name.rsplit('.', 1)[-1] in {'a', 'dt_bias'}:
                 size = math.prod(shape) * 4
         if layer:
             key = layer[1]

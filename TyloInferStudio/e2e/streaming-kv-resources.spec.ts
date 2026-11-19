@@ -34,7 +34,7 @@ for (const language of ['zh-CN', 'en'] as const) {
           kv_read_bytes_per_second: samples === 1 ? 2 ** 20 : 3 * 2 ** 20,
           kv_write_bytes_per_second: 2 * 2 ** 20 })) } });
     });
-    await page.goto('/');
+    await page.goto('/inference');
     const overview = page.locator('[data-tier="ssd-kv"]');
     await expect(overview).toContainText(zh ? 'SSD 流式 KV' : 'SSD-streamed KV');
     await expect(overview).toContainText('4 GiB');
@@ -67,7 +67,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     await page.goto('/versions');
     await expect(page.locator('.model-context-settings')).toHaveCount(0);
     await expect(page.getByText(zh ? '上下文' : 'Context', { exact: true })).toHaveCount(0);
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.getByRole('group', { name: zh ? '明暗' : 'Appearance', exact: true })).toBeVisible();
     expect(state.requests.filter(request => /^(POST|PUT|DELETE) /.test(request))).toEqual([]);
   });

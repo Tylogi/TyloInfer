@@ -4,10 +4,12 @@
 #include "gguf_rotation.h"
 #include "gguf_row_correction.h"
 #include "quant_linear.h"
+#include "runtime/decode_window.h"
 #include "runtime/prefill_projection_plan.h"
 #include "mfq_weight_memory.h"
 #include "tyloinfer/runtime.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_process_memory.h"
 #include "../../kernels/gguf.h"
 #include "../../kernels/gguf_m1_residual.h"
 #include "../../kernels/gguf_compact.h"
@@ -775,7 +777,8 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
         const bool fast_prefill=((fast_setting && fast_setting[0]=='1') ||
             ((!fast_setting || fast_setting[0]=='a') && tokens>=512 && allow_mmq)) &&
             mfq::cuda::gguf::grouped_f16_available(packed.get_device());
-        const auto mmq_rows=fast_prefill?0:prefill_weight_rows(out,row_bytes,128,packed.get_device());
+        constexpr std::int64_t mmq_alignment=128;
+        auto mmq_rows=fast_prefill?0:prefill_weight_rows(out,row_bytes,mmq_alignment,packed.get_device());
         const auto final_rows=mmq_rows>0?out%mmq_rows:0;
         if(allow_mmq && (!mmq_setting || mmq_setting[0]!='0') && mmq_rows>0 && tokens<=INT_MAX && neuron_len<=INT_MAX &&
                 (dtype==tb::kFloat16 || dtype==tb::kFloat32) && mmq::fits(type,mmq_rows,packed.get_device()) &&
@@ -792,8 +795,34 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
             auto activation=tb::empty({std::int64_t(mmq::activation_bytes(tokens,neuron_len))},packed.options());
             mmq::quantize(input_float.data_ptr<float>(),nullptr,activation.data_ptr(),int(type),neuron_len,tokens,mfq_current_cuda_stream());
             auto result=output_dtype==tb::kFloat32?output:tb::empty({tokens,out},packed.options().dtype(tb::kFloat32));
-            const auto guard_bytes=std::size_t(128)*ggml_type_size(type);
-            auto weight=tb::empty({std::int64_t(mmq_rows*row_bytes+guard_bytes)},packed.options());
+            const auto guard_bytes=std::size_t(mmq_alignment)*ggml_type_size(type);
+            tb::Tensor weight;
+            for(;;) {
+                const auto bytes=mmq_rows*row_bytes+guard_bytes;
+                try {weight=tb::empty({std::int64_t(bytes)},packed.options());break;}
+                catch(const MfqResourceExhausted& error) {
+                    if(mmq_rows<=1 || mfq::cuda::DecodeWindow::recording())throw;
+                    cudaStreamCaptureStatus capture{};
+                    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
+                    if(capture!=cudaStreamCaptureStatusNone)throw;
+                    // Reusable pool pages may be fragmented. Retry the one
+                    // temporary weight tile before submitting any MMQ dots.
+                    const auto* residency=dynamic_cast<const mfq::cuda::CudaMemoryLimitExceeded*>(&error);
+                    const auto shortfall=residency?residency->shortfall():bytes/2;
+                    const auto reduction=std::max<std::uint64_t>(1,shortfall/row_bytes+(shortfall%row_bytes!=0));
+                    auto next=mmq_rows-std::int64_t(std::min<std::uint64_t>(mmq_rows-1,reduction));
+                    if(next>=mmq_alignment)next=next/mmq_alignment*mmq_alignment;
+                    if(!mmq::fits(type,next,packed.get_device()) ||
+                            (out%next && !mmq::fits(type,out%next,packed.get_device())))throw;
+                    if(std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH"))
+                        std::fprintf(stderr,"native_gguf_mmq_tile_retry format=%d tokens=%lld rows=%lld tile_before=%lld tile_after=%lld shortfall=%zu\n",
+                            int(type),static_cast<long long>(tokens),static_cast<long long>(out),
+                            static_cast<long long>(mmq_rows),static_cast<long long>(next),shortfall);
+                    (void)cudaGetLastError();
+                    mfq::cuda::default_context(packed.get_device())->reclaim_idle_memory();
+                    mmq_rows=next;
+                }
+            }
             for(const auto& tensor:{input_float,exponents,activation,result,weight})if(tensor.defined())mfq_cuda_record_stream(tensor,stream);
             mmq::Context context;
             for(std::int64_t begin=0;begin<out;begin+=mmq_rows) {
@@ -827,38 +856,63 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
         x = x.to(half ? tb::kFloat16 : tb::kFloat32).contiguous();
         const auto cached_exponents=fast_prefill && scaled_half?prefill_cached_exponents(*this):tb::Tensor{};
         const bool fused_scaled=cached_exponents.defined();
+        tb::Tensor scaled_x,x_exponents;
+        const bool pack_input=scaled_half && !(fast_prefill && GgufPrefillInputScope::lookup(x,scaled_x,x_exponents));
+        if(pack_input) {
+            // Size weight tiles after allocating the inputs shared by every tile.
+            scaled_x=tb::empty(x.sizes(),x.options().dtype(tb::kFloat16));
+            x_exponents=tb::empty({tokens},x.options().dtype(tb::kInt32));
+        }
         // Include both decoded and optional scaled source images. Direct BLAS
         // output removes the tile result and its strided copy for tensor cores.
         const auto workspace_row_bytes=std::uint64_t(neuron_len)*(half || fused_scaled?2:4)+
             (scaled_half && !fused_scaled?std::uint64_t(neuron_len)*2:0)+(!half && !scaled_half?std::uint64_t(tokens)*4:0)+(fast_prefill?std::uint64_t(tokens)*2:0);
-        const auto tile_rows=prefill_weight_rows(out,workspace_row_bytes,32,packed.get_device(),true);
+        auto tile_rows=prefill_weight_rows(out,workspace_row_bytes,32,packed.get_device(),true);
         cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
         TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
-        const bool pipelined=tile_rows<out && capture==cudaStreamCaptureStatusNone;
+        bool pipelined=tile_rows<out && capture==cudaStreamCaptureStatusNone;
+        tb::Tensor tile[2],scaled_weight[2],weight_exponents[2],tile_output,residual_workspace;
+        const auto context=mfq::cuda::default_context(packed.get_device());
+        for(;;) {
+            try {
+                if(fast_prefill && !half)tile_output=tb::empty({tokens,tile_rows},x.options().dtype(tb::kFloat16));
+                for(int i=0;i<(pipelined?2:1);++i) {
+                    tile[i]=tb::empty({tile_rows,neuron_len},x.options().dtype(fused_scaled?tb::kFloat16:x.scalar_type()));
+                    if(scaled_half && !fused_scaled) {
+                        scaled_weight[i]=tb::empty({tile_rows,neuron_len},x.options().dtype(tb::kFloat16));
+                        weight_exponents[i]=tb::empty({tile_rows},x.options().dtype(tb::kInt32));
+                    }
+                }
+                break;
+            } catch(const MfqResourceExhausted&) {
+                if(capture!=cudaStreamCaptureStatusNone || mfq::cuda::DecodeWindow::recording() ||
+                        (!pipelined && tile_rows==1))throw;
+                // The live pool can be fragmented even when its reusable bytes
+                // cover the estimate. Retry before submitting any projection.
+                tile_output={};
+                for(int i=0;i<2;++i) {tile[i]={};scaled_weight[i]={};weight_exponents[i]={};}
+                (void)cudaGetLastError();
+                context->reclaim_idle_memory();
+                if(pipelined)pipelined=false;
+                else tile_rows=tile_rows>=64?tile_rows/64*32:tile_rows/2;
+            }
+        }
         const auto decoder=pipelined?mfq::cuda::stream_from_pool(false,packed.get_device()):stream;
         const int buffers=pipelined?2:1;
-        tb::Tensor tile[2],scaled_weight[2],weight_exponents[2],scaled_x,x_exponents,residual_workspace;
-        auto tile_output=fast_prefill && !half?tb::empty({tokens,tile_rows},x.options().dtype(tb::kFloat16)):tb::Tensor{};
         if(tile_output.defined())mfq_cuda_record_stream(tile_output,stream);
         const auto pack_half=fast_prefill?mfq::cuda::gguf::pack_scaled_f16_unit:mfq::cuda::gguf::pack_scaled_f16;
         std::optional<mfq::cuda::Event> ready[2],consumed[2];
         for(int i=0;i<buffers;++i) {
-            tile[i]=tb::empty({tile_rows,neuron_len},x.options().dtype(fused_scaled?tb::kFloat16:x.scalar_type()));
             mfq_cuda_record_stream(tile[i],stream);mfq_cuda_record_stream(tile[i],decoder);
             if(scaled_half && !fused_scaled) {
-                scaled_weight[i]=tb::empty({tile_rows,neuron_len},x.options().dtype(tb::kFloat16));
-                weight_exponents[i]=tb::empty({tile_rows},x.options().dtype(tb::kInt32));
                 for(const auto& tensor:{scaled_weight[i],weight_exponents[i]}) {
                     mfq_cuda_record_stream(tensor,stream);mfq_cuda_record_stream(tensor,decoder);
                 }
             }
             if(pipelined){ready[i].emplace();consumed[i].emplace();}
         }
-        const auto context=mfq::cuda::default_context(packed.get_device());
         auto& blas=context->blas(mfq_current_cuda_stream());
-        if(scaled_half && !(fast_prefill && GgufPrefillInputScope::lookup(x,scaled_x,x_exponents))) {
-            scaled_x=tb::empty(x.sizes(),x.options().dtype(tb::kFloat16));
-            x_exponents=tb::empty({tokens},x.options().dtype(tb::kInt32));
+        if(pack_input) {
             for(const auto& tensor:{scaled_x,x_exponents})mfq_cuda_record_stream(tensor,stream);
             pack_half(x.data_ptr<float>(),scaled_x.data_ptr(),x_exponents.data_ptr<std::int32_t>(),
                 tokens,neuron_len,mfq_current_cuda_stream());

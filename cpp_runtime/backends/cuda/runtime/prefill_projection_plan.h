@@ -12,6 +12,13 @@ inline const char* prefill_tensorcore_setting() {
     return value?value:std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
 }
 
+inline std::size_t available_prefill_workspace(const Context& context) {
+    const auto physical=context.available_memory(),reusable=context.reusable_workspace_bytes();
+    const auto available=physical>SIZE_MAX-reusable?SIZE_MAX:physical+reusable;
+    const auto loan=context.workspace_available();
+    return available>SIZE_MAX-loan?SIZE_MAX:available+loan;
+}
+
 // Decode complete matrices when live workspace permits it. Captures retain
 // the tile selected during warmup, independently of the encoded row format.
 inline std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_per_row,
@@ -26,10 +33,7 @@ inline std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_pe
         if(const auto found=prepared.find(key);found!=prepared.end())return found->second;
         return std::min(rows,alignment);
     }
-    const auto physical=context->available_memory(),reusable=context->reusable_workspace_bytes();
-    const auto available=physical>SIZE_MAX-reusable?SIZE_MAX:physical+reusable;
-    const auto loan=context->workspace_available();
-    const auto budget=available>SIZE_MAX-loan?SIZE_MAX:available+loan;
+    const auto budget=available_prefill_workspace(*context);
     auto count=std::min<std::uint64_t>(rows,(budget/2)/bytes_per_row);
     if(count<std::uint64_t(rows) && double_buffer)count/=2;
     const auto selected=count>=std::uint64_t(rows)?rows:count>=std::uint64_t(alignment)?

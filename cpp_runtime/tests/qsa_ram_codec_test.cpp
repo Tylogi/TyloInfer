@@ -25,6 +25,9 @@ int main()try {
     const auto before=first.bytes();const auto affine=first.image({8,8});
     require(first.bytes()==before,"Affine8 encoding retained a trellis fit");
     require(affine.key_bits==affine8_tag && affine.value_bits==affine8_tag,"FP16 was not demoted to Affine8");
+    require(encode_cpu_qsa_affine8(source.key.data(),source.key.size(),rows)==affine.key &&
+        encode_cpu_qsa_affine8(source.value.data(),source.value.size(),rows)==affine.value,
+        "Direct FP16 conversion changed the Affine8 bytes");
     for(const auto* data:{&affine.key,&affine.value}) {
         require(data->size()==header+rows*256,"Affine8 row storage differs");
         double error=0,energy=0;
@@ -62,6 +65,8 @@ int main()try {
     auto invalid=source;invalid.key[0]=0;invalid.key[1]=0x7e;
     bool rejected=false;try{CpuTqBlockFitter bad(invalid,rows,1);}catch(const std::invalid_argument&){rejected=true;}
     require(rejected,"A non-finite FP16 source was accepted");
+    rejected=false;try{(void)encode_cpu_qsa_affine8(invalid.key.data(),invalid.key.size(),rows);}catch(const std::invalid_argument&){rejected=true;}
+    require(rejected,"Direct FP16 conversion accepted a non-finite source");
     std::puts("QSA CPU FP16 -> Affine8 -> TQ4 storage, scalar error bound, zero rows and finite-input validation PASS");
     return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}

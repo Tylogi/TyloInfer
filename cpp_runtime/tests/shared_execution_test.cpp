@@ -116,6 +116,38 @@ void batch_test() {
         if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
+void batch_prefix_cursor_test() {
+    struct CachedOps : BatchOps {
+        int& snapshots;
+        explicit CachedOps(int& value):snapshots(value) {}
+        std::size_t prepare(const std::shared_ptr<Request>& request) {
+            return request->id=="hot" ? 3 : 0;
+        }
+        std::size_t prefix_tokens(const std::shared_ptr<Request>&) const { return 3; }
+        void commit_prefix(const std::shared_ptr<Request>& request) {
+            if(request->prefill_offset==3)++snapshots;
+        }
+    };
+    int snapshots=0;
+    BatchExecution<CachedOps> ops(snapshots);
+    RequestExecutor executor(2);
+    std::map<std::string,InferenceMetrics> finished;
+    const auto drain=[&] {
+        for(int ticks=0;ticks<40 && !executor.empty();++ticks) {
+            const auto result=executor.step({"cold","hot"},ops);
+            for(const auto& event:result.events) {
+                assert(!std::holds_alternative<Failed>(event.data));
+                if(const auto* done=std::get_if<Completed>(&event.data))finished[event.id]=done->metrics;
+            }
+        }
+        assert(executor.empty());
+    };
+    executor.admit(batch_request("cold"),nullptr,batch_info(),ops);drain();
+    assert(snapshots==1 && finished["cold"].cached_tokens==0 && finished["cold"].prefill_tokens==5);
+    executor.admit(batch_request("hot"),nullptr,batch_info(),ops);drain();
+    assert(snapshots==1 && finished["hot"].cached_tokens==3 && finished["hot"].prefill_tokens==2);
+}
+
 void packed_prefill_plain_sample_test() {
     struct PackedOps : BatchOps {
         std::vector<std::vector<std::string>>& groups;
@@ -2052,6 +2084,7 @@ int main() {
     predictor_flow_test();
     nemotron_predictor_flow_test();
     batch_test();
+    batch_prefix_cursor_test();
     packed_prefill_plain_sample_test();
     batch_failure_test();
     batch_recoverable_failure_test();

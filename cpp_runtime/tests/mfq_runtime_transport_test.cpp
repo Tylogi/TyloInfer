@@ -120,9 +120,17 @@ void test_decode_timing() {
     metrics.first_token = now - 70ms;
     metrics.last_token = now - 20ms;
     metrics.saw_token = true;
+    metrics.cached_tokens=3;
+    metrics.prefix_restore_ms=2.5;
     InferenceResult result;
     result.completion_tokens = 6;
     const auto values = mfq::transport_detail::request_metric_values(result, metrics);
+    assert(values.cached_tokens==3 && values.prefix_restore_ms==2.5);
+    const auto serialized=mfq::transport_detail::request_metric_values_json(values,{});
+    assert(serialized["cached_tokens"]==3 && serialized["prefix_restore_ms"]==2.5);
+    const auto usage=mfq::transport_detail::usage_json(7,6,3);
+    assert(usage["prompt_tokens_details"]["cached_tokens"]==3 && usage["total_tokens"]==13);
+    assert(mfq::transport_detail::usage_json(7,6,99)["prompt_tokens_details"]["cached_tokens"]==7);
     assert(std::abs(values.ttft_ms - 10.0) < 1e-12);
     assert(std::abs(values.decode_ms - 50.0) < 1e-12);
     assert(std::abs(values.decode_tps - 100.0) < 1e-12);

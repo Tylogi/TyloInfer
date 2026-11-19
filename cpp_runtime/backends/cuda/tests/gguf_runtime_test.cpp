@@ -1,4 +1,6 @@
 #include "float_projection.h"
+#include "runtime/required_workspace.h"
+#include "runtime/row_packet_prefetch.h"
 #include "gguf_weight.h"
 #include "tyloinfer/gguf_model_source.h"
 #include "gguf_cpu.h"
@@ -704,7 +706,35 @@ void run_decode_dma() {
     }
     dma.synchronize();
     require(dma.copies()==3*count,"Decode DMA copy accounting omitted a phase or packet");
-    std::cout<<"GGUF decode DMA bytes/tails/empty phases/multiple packets/preflight rejection PASS stream_signals="
+    ready[0]=ready[1]=0;
+    dma.submit_phase(nullptr,0,0,false,ready,ready_device);
+    require(ready[0]==1 && !ready[1],"Empty Gate/Up submission published Down readiness");
+    dma.submit_phase(nullptr,0,0,true,ready+1,ready_device+1);
+    require(ready[1]==1,"Empty Down submission did not publish its readiness");
+    const std::array<mfq::cuda::MoeMappedCopyDescriptor,2> phased{{
+        {reinterpret_cast<std::uint64_t>(target.data_ptr()),reinterpret_cast<std::uint64_t>(mapped),0,stride},
+        {reinterpret_cast<std::uint64_t>(target.data_ptr())+stride,reinterpret_cast<std::uint64_t>(mapped)+stride,stride,stride}}};
+    ready[0]=ready[1]=0;
+    dma.submit_phase(phased.data(),1,stride,false,ready,ready_device);
+    dma.synchronize();
+    require(ready[0]==1 && !ready[1],"Gate/Up could not complete independently of Down preparation");
+    auto early=target.cpu();
+    require(std::memcmp(early.data_ptr(),bytes,stride)==0,"Early Gate/Up phase changed compressed bytes");
+    dma.submit_phase(phased.data()+1,1,stride,true,ready+1,ready_device+1);
+    dma.synchronize();
+    auto completed=target.cpu();
+    require(ready[1]==1 && std::memcmp(completed.data_ptr(),bytes,2*stride)==0,
+        "Separated Down submission changed compressed bytes or lost completion");
+    for(const bool down:{false,true}) {
+        const std::array<mfq::cuda::MoeMappedCopyDescriptor,2> invalid{phased[down?1:0],phased[down?0:1]};
+        ready[0]=ready[1]=0;const auto copied=dma.bytes();bool rejected=false;
+        try{dma.submit_phase(invalid.data(),invalid.size(),stride,down,ready+(down?1:0),ready_device+(down?1:0));}
+        catch(const std::invalid_argument&){rejected=true;}
+        require(rejected && !ready[0] && !ready[1] && copied==dma.bytes(),
+            "Invalid independent phase partially submitted or published completion");
+    }
+    require(dma.copies()==3*count+2,"Independent decode DMA phases changed copy accounting");
+    std::cout<<"GGUF decode DMA bytes/tails/empty phases/multiple packets/independent phases/preflight rejection PASS stream_signals="
         <<dma.signals()<<" batches="<<dma.batches()<<'\n';
 }
 void run_prefill_arena_reuse() {
@@ -1832,6 +1862,10 @@ void run_slot_transition_ram_coverage() {
     for(int expert=0;expert<5;++expert){ids.fill_(expert);graph.run();check_moe(output,banks,x,ids,scales);}
     reclaim_gguf_expert_duplicates(cache,1);
     require(metric("ssd_expert_payload_bytes")==0,"Slot transition fixture does not initially cover every expert");
+    const auto reads_before_budget_update=source.read_calls();
+    restore_gguf_decode_workspace(cache,0,0,false);
+    require(metric("gguf_strata_slot_cache_bytes")==0 && source.read_calls()==reads_before_budget_update,
+        "Budget update rebuilt existing expert residency");
     restore_gguf_decode_workspace(cache,0,0);
     require(metric("gguf_strata_slot_cache_bytes")==2*expert_bytes,"Slot transition did not seed the fixed arena");
     require(metric("ssd_expert_payload_bytes")==0,
@@ -2340,6 +2374,36 @@ void run_pinned_hole_under_pressure() {
         source.read_calls()==reads,
         "Pinned interval reuse changed the result or reread an already resident expert");
     std::cout<<"GGUF physical pressure reuses pinned holes without unique eviction or SSD reread PASS\n";
+}
+void run_critical_pinned_reclaim() {
+    ScopedSnapshot snapshot("0");
+    ScopedSnapshot slots("0","TYLOINFER_GGUF_STRATA_CACHE");
+    Source source;source.add("pin-source",{8,256,256},GGML_TYPE_Q4_0);
+    CudaExecutionContext execution;
+    execution.config.moe_host_cache_bytes=8ULL<<20;
+    execution.config.moe_device_cache_bytes=0;
+    auto bank=std::make_shared<GgufRoutedWeight>(execution,source,"pin-source");
+    auto x=tb::full({1,1,256},.001,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+    auto ids=tb::zeros({1,1},x.options().dtype(tb::kInt64));
+    auto expected=bank->forward(x,ids).cpu();
+    const auto metric=[&](const char* name) {
+        for(const auto& [key,value]:gguf_expert_memory_metrics(execution.gguf_expert_cache))
+            if(key==name)return std::size_t(value);
+        throw std::runtime_error("Missing pinned reclaim metric");
+    };
+    const auto before=metric("ram_expert_pinned_reserved_bytes");
+    require(before>0,"Pinned reclaim fixture has no pinned arena");
+    require(reclaim_gguf_expert_pinned(execution.gguf_expert_cache,0)==0,
+        "Zero pinned request discarded expert RAM");
+    const auto released=reclaim_gguf_expert_pinned(execution.gguf_expert_cache,4096);
+    require(released>0 && released==before-metric("ram_expert_pinned_reserved_bytes"),
+        "Critical pinned reclaim did not return physical locked pages");
+    const auto actual=bank->forward(x,ids).cpu();
+    require(actual.nbytes()==expected.nbytes() && std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.nbytes())==0,
+        "Pinned reclaim changed expert bytes after source reload");
+    require(metric("ram_expert_pinned_reserved_bytes")==before-released,
+        "Optional expert cache immediately reclaimed critical pinned quota");
+    std::cout<<"GGUF critical pinned quota: actual arena release/no repinning/source reload parity PASS\n";
 }
 void run_pinned_interval_compaction() {
     auto arena=std::make_shared<MoePinnedExpertArena>(1024);
@@ -4849,6 +4913,59 @@ void run_admission_failure_and_lifetime() {
     }
     require(observed.expired(),"GGUF asynchronous admission retained a destroyed model cache");
 }
+void run_required_workspace_lifecycle() {
+    using mfq::cuda::RequiredWorkspaceLease;
+    const auto device=tb::Device(tb::kCUDA,mfq_current_cuda_device());
+    Source source;source.enable_parallel_reads();source.add("lease-table",{11,160},GGML_TYPE_IQ4_NL);
+    auto table=std::make_shared<GgufRowTable>(source,"lease-table");
+    const auto plan=gguf_row_stage_resources({table},{1,8192,16},device);
+    require(plan.pinned_bytes==14680064 && plan.host_bytes==29360128 && plan.gpu_bytes==56623104,
+        "GGUF packed-row workspace plan omitted packet/prefetch/output or changed geometry");
+    std::array<std::weak_ptr<RowStage>,4> observed;
+    const auto baseline=mfq::cuda::tensor_host_bytes.load();
+    {
+        std::array<std::unique_ptr<RequiredWorkspaceLease>,4> leases;
+        for(unsigned row=0;row<4;++row) {
+            leases[row]=std::make_unique<RequiredWorkspaceLease>(device.index,mfq_current_cuda_stream());
+            observed[row]=leases[row]->acquire(plan,[&]{return make_gguf_row_stage({table},11,{1,8192,16},device);});
+        }
+        require(mfq::cuda::tensor_host_bytes.load()==baseline+4*plan.pinned_bytes,
+            "Four required packet owners did not account for independent pinned storage");
+        leases[1].reset();require(observed[1].expired(),"Cancelled row workspace retained its owner");
+        require(mfq::cuda::tensor_host_bytes.load()==baseline+3*plan.pinned_bytes,
+            "Cancellation did not return exact owned pinned bytes");
+        bool rejected=false;std::thread other([&] {
+            try{leases[0]->acquire(plan,[]() -> std::shared_ptr<RowStage> {
+                throw std::runtime_error("Off-thread factory was called");
+            });}catch(const std::logic_error&){rejected=true;}
+        });other.join();require(rejected,"Required workspace admitted a non-owning thread");
+    }
+    for(const auto& stage:observed)require(stage.expired(),"Retired required workspace leaked a stage");
+    require(mfq::cuda::tensor_host_bytes.load()==baseline,"Required workspace retirement leaked locked storage");
+    {
+        Source failing;failing.enable_parallel_reads();failing.add("failed-table",{11,160},GGML_TYPE_IQ4_NL);
+        auto input_table=std::make_shared<GgufRowTable>(failing,"failed-table");
+        std::weak_ptr<RowStage> failed_owner;
+        try {
+            RequiredWorkspaceLease lease(device.index,mfq_current_cuda_stream());
+            const auto small=gguf_row_stage_resources({input_table},{17},device);
+            auto stage=lease.acquire(small,[&]{return make_gguf_row_stage({input_table},11,{17},device);});
+            failed_owner=stage;failing.fail_next_read(true);
+            stage->prefetch(std::vector<int64_t>(17,3),{17});
+            stage->upload(std::vector<int64_t>(17,3),{17});
+            throw std::logic_error("Expected row source failure was not reported");
+        }catch(const std::runtime_error& error) {
+            require(std::string(error.what())=="fixture single read failure","Workspace replaced a background source failure");
+        }
+        require(failed_owner.expired(),"Failed background row read retained workspace ownership");
+        RequiredWorkspaceLease recovered(device.index,mfq_current_cuda_stream());
+        const auto small=gguf_row_stage_resources({input_table},{17},device);
+        auto stage=recovered.acquire(small,[&]{return make_gguf_row_stage({input_table},11,{17},device);});
+        stage->upload(std::vector<int64_t>(17,4),{17});stage->decode();
+        require(stage->output().cpu().numel()==17*160,"Row workspace did not recover after cancellation/failure");
+    }
+    std::cout<<"Required workspace: exact IQ4_NL geometry/four owners/thread boundary/cancellation/failure/recovery PASS\n";
+}
 void run_row_prefetch() {
     const auto device=tb::Device(tb::kCUDA,mfq_current_cuda_device());
     for(bool batched:{false,true}) {
@@ -4862,6 +4979,25 @@ void run_row_prefetch() {
             for(int row=0;row<count;++row)for(int k=0;k<256;++k)
                 require(values.data_ptr<float>()[row*256+k]==float(mfq_half(expected.data_ptr<float>()[(ids[row]%11)*256+k])),
                     "GGUF asynchronous PLE changed shard, duplicate or row ordering");
+        }
+        std::array<std::shared_ptr<RowStage>,4> stages;
+        std::array<std::vector<int64_t>,4> grouped_ids;
+        for(int row=0;row<4;++row) {
+            stages[row]=make_gguf_row_stage({table,table},11,{1,17},device);
+            for(int i=0;i<17;++i)grouped_ids[row].push_back((row+7*i)%22);
+        }
+        {
+            mfq::cuda::RowPacketPrefetch::Group reads;
+            for(int row=0;row<4;++row)reads.start([&,row] {
+                require(stages[row]->prefetch(grouped_ids[row],{1,17}),"Grouped PLE rejected an independent reader");
+            });
+            for(int row=0;row<4;++row) {
+                reads.wait(row);stages[row]->upload_graph(grouped_ids[row],{1,17});stages[row]->decode();
+                const auto values=stages[row]->output().to(tb::kFloat32).cpu();
+                for(int i=0;i<17;++i)for(int k=0;k<256;++k)
+                    require(values.data_ptr<float>()[i*256+k]==float(mfq_half(expected.data_ptr<float>()[(grouped_ids[row][i]%11)*256+k])),
+                        "Grouped PLE changed an independent packet or row order");
+            }
         }
         const auto reads=source.read_calls();
         {auto cancelled=prefetch_gguf_shards({table},11,{0,1,1},{3},device);}
@@ -4882,6 +5018,17 @@ void run_row_prefetch() {
     require(rejected,"PLE I/O did not run on its CPU worker or swallowed its error");
     collect=prefetch_gguf_shards({table},11,{7,1,7},{3},device);
     require(collect().numel()==3*256,"Asynchronous PLE could not recover after a read failure");
+    std::atomic<unsigned> finished=0;bool group_failed=false;
+    mfq::cuda::RowPacketPrefetch failed_packet,finished_packet;
+    try {
+        mfq::cuda::RowPacketPrefetch::Group reads;
+        reads.start([&]{failed_packet.start({0},{1},1,[](void*) -> std::size_t {
+            throw std::runtime_error("grouped fixture failure");
+        });});
+        reads.start([&]{finished_packet.start({1},{1},1,[&](void*) -> std::size_t {++finished;return 0;});});
+        reads.wait(0);
+    }catch(const std::runtime_error& error){group_failed=std::string(error.what())=="grouped fixture failure";}
+    require(group_failed && finished==1,"Failed grouped PLE did not propagate or join its remaining readers");
     std::cout<<"GGUF asynchronous PLE shard/duplicate/tail ordering, cancellation, background failure and retry PASS\n";
 }
 void run() {
@@ -5846,6 +5993,10 @@ int main(int argc,char** argv) {
     if(argc==2 && std::strcmp(argv[1],"--mmq-schedule-check")==0) {
         try{run_mmq_moe();run_mmq_moe(true);
             std::cout<<"GGUF MMQ unequal expert counts/multiple groups/tail/mixed+joined reference PASS\n";return 0;}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc==2 && std::strcmp(argv[1],"--pinned-workspace-check")==0) {
+        try{run_critical_pinned_reclaim();run_required_workspace_lifecycle();run_row_prefetch();return 0;}
         catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     }
     if(argc==2 && std::strcmp(argv[1],"--expert-image-check")==0) {

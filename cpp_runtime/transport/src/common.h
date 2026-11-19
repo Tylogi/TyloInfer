@@ -48,6 +48,8 @@ using MfqModelCapabilityProfile = MfqModelCapabilities;
 
 struct RequestMetricValues {
     size_t prefill_tokens = 0;
+    size_t cached_tokens = 0;
+    double prefix_restore_ms = 0.0;
     double generation_ms = 0.0;
     double ttft_ms = 0.0;
     double prefill_ms = 0.0;
@@ -156,7 +158,7 @@ void log_request_metrics(
     const MfqSamplingParams & sampling,
     const CompletionResult & result,
     const RequestMetricValues & values);
-json usage_json(size_t prompt_tokens, int32_t completion_tokens);
+json usage_json(size_t prompt_tokens, int32_t completion_tokens, size_t cached_tokens = 0);
 json runtime_generation_event(
     const std::string & event,
     const std::string & request_id,

@@ -97,6 +97,7 @@ std::size_t gguf_expert_host_minimum_bytes(const std::shared_ptr<GgufExpertCache
 void resize_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&,std::size_t bytes);
 std::size_t reserve_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&, std::size_t bytes);
 std::size_t reclaim_gguf_expert_duplicates(const std::shared_ptr<GgufExpertCache>&,std::size_t bytes);
+std::size_t reclaim_gguf_expert_pinned(const std::shared_ptr<GgufExpertCache>&,std::size_t bytes);
 // Keep an available-RAM allowance for growing live KV. Zero returns the loan.
 std::size_t share_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&,std::size_t free_bytes);
 std::vector<std::pair<std::string, double>> gguf_expert_memory_metrics(const std::shared_ptr<GgufExpertCache>&);
@@ -107,7 +108,7 @@ void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>&, std:
 // from graph/KV storage which is already allocated. No estimate preserves the
 // conservative allowance used while graphs are still being prepared.
 void restore_gguf_decode_workspace(const std::shared_ptr<GgufExpertCache>&, std::size_t growth_bytes = 0,
-    std::optional<std::size_t> transient_bytes = {});
+    std::optional<std::size_t> transient_bytes = {}, bool rebalance_cache = true);
 void restore_gguf_decode_workspace_after_capture(const std::shared_ptr<GgufExpertCache>&);
 void begin_gguf_speculative_routes(const std::shared_ptr<GgufExpertCache>&,int rows);
 void commit_gguf_speculative_routes(const std::shared_ptr<GgufExpertCache>&,int rows);
@@ -192,6 +193,8 @@ public:
     mfq_tensor_backend::Tensor lookup(mfq_tensor_backend::Tensor ids) const;
 };
 
+RowStageResources gguf_row_stage_resources(const std::vector<std::shared_ptr<GgufRowTable>>&,
+    const std::vector<std::int64_t>& shape,const mfq_tensor_backend::Device& device);
 std::shared_ptr<RowStage> make_gguf_row_stage(const std::vector<std::shared_ptr<GgufRowTable>>&,
     std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
     const mfq_tensor_backend::Device& device);

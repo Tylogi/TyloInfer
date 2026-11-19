@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+d1-reference = [
+    "torch>=2.5.0",
+    "safetensors>=0.4.0",
+]
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",

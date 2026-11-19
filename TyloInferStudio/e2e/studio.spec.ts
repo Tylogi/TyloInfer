@@ -6,19 +6,19 @@ import { openModelSettings } from './modelSettings';
 for (const language of ['zh', 'en'] as const) {
   test(`compact tool navigation keeps labels aligned (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language: language === 'zh' ? 'zh-CN' : 'en' });
-    await page.goto('/');
+    await page.goto('/inference');
     await expect(page.locator('main h1')).toBeVisible();
     if (testInfo.project.name === 'mobile') {
       await page.getByRole('button', { name: language === 'zh' ? '打开侧栏' : 'Open sidebar' }).click();
     }
     const sidebar = page.locator('#studio-sidebar');
     await expect(sidebar).toBeVisible();
-    const tools = sidebar.locator('nav > section').filter({ has: page.getByText(language === 'zh' ? '工具' : 'Tools', { exact: true }) });
-    await expect(tools.getByRole('button', { name: language === 'zh' ? '工具' : 'Tools', exact: true })).toHaveAttribute('aria-expanded', 'true');
-    await expect(tools.locator('.sidebar-nav-items button')).toHaveText(language === 'zh'
-      ? ['分析', '下载', '日志'] : ['Analysis', 'Downloads', 'Logs']);
-    expect((await sidebar.boundingBox())!.width).toBeCloseTo(200, 3);
-    for (const button of await tools.locator('button').all()) {
+    const engine = sidebar.getByRole('button', { name: language === 'zh' ? '推理引擎' : 'Inference engine', exact: true });
+    await expect(engine).toHaveAttribute('aria-expanded', 'true');
+    await expect(sidebar.getByRole('button', { name: language === 'zh' ? '新建会话' : 'New session', exact: true })).toHaveCount(0);
+    await expect(sidebar.getByRole('button', { name: language === 'zh' ? '分析' : 'Analysis', exact: true })).toBeVisible();
+    expect((await sidebar.boundingBox())!.width).toBeCloseTo(testInfo.project.name === 'mobile' ? 280 : 248, 3);
+    for (const button of await sidebar.locator('button').all()) {
       expect(await button.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -188,7 +188,7 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   } }));
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  await page.goto('/');
+  await page.goto('/inference');
   await expect(page.locator('.runtime-hero-actions [data-model-vendor="qwen"]')).toBeVisible();
   const heroMark = await page.locator('.runtime-hero-actions .model-vendor-mark').boundingBox();
   const heroButton = await page.locator('.runtime-hero-actions button').first().boundingBox();
@@ -351,7 +351,7 @@ test('运行资源按模型分段，各槽使用统一中性色，端点包含 v
     runtime_state: 'ready', model: 'Resource Model 1', instance_id: 'resource-1',
     runtime_memory_budget_bytes: 32 * 2 ** 30, runtime_memory_effective_budget_bytes: 20 * 2 ** 30,
   } }));
-  await page.goto('/');
+  await page.goto('/inference');
   await expect(page.getByText('Resource overview', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Runtime resources', exact: true })).toBeVisible();
   await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
@@ -379,8 +379,9 @@ test('运行资源按模型分段，各槽使用统一中性色，端点包含 v
   await expect(page.locator('[data-tier="weights"] .memory-tier-heading > span')).toHaveText('10 GiB / 20 GiB');
   await expect(page.locator('[data-tier="kv"] .memory-tier-heading > span')).toHaveText('10 MiB / 10 GiB');
   await expect(page.getByText(/Colors show each model/)).toHaveCount(0);
+  const serviceOrigin = new URL(page.url()).origin;
   await expect(page.locator('.overview-endpoint-panel code')).toHaveText([
-    'http://127.0.0.1:8090/v1', 'http://127.0.0.1:8091/v1/messages',
+    `${serviceOrigin}/v1`, 'http://127.0.0.1:8091/v1/messages', `${serviceOrigin}/v1/systemone`,
   ]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
@@ -412,7 +413,7 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
     id: 'artifact', name: 'Loading Model', architecture: 'qwen35', loadable: true,
     total_bytes: 1024, shard_count: 1,
   }] } }));
-  await page.goto('/');
+  await page.goto('/inference');
   await expect(page.locator('.runtime-hero progress')).toHaveAttribute('value', '0.25');
   advance();
   await expect(page.locator('.runtime-hero progress')).toHaveAttribute('value', '0.75');
@@ -432,7 +433,7 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
   await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
     runtime_state: 'ready', model: 'Known Model', runtime_memory_effective_budget_bytes: 4 * 2 ** 30,
   } }));
-  await page.goto('/');
+  await page.goto('/inference');
   await expect(page.locator('[data-tier="weights"] .memory-tier-heading > span')).toHaveText('≥ 1 GiB / 4 GiB');
   await expect(page.locator('[data-tier="weights"] .memory-tier-notice')).toContainText('Unknown Model');
   await expect(page.locator('[data-tier="weights"] .memory-tier-track > span')).toHaveCount(1);
@@ -456,7 +457,7 @@ for (const kind of ['model.load', 'download.modelscope']) {
         runtime_state: 'loading', model: 'Loading Model', instance_id: 'loading',
       } }));
     }
-    const path = loading ? '/' : '/model-hub';
+    const path = loading ? '/inference' : '/model-hub';
     await page.goto(path);
     if (!loading) await page.locator('.download-circle').click();
     const progress = () => page.locator(loading ? '.runtime-hero progress' : '.download-queue-item progress');
@@ -477,7 +478,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   const state = await mockStudioServer(page);
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  await page.goto('/');
+  await page.goto('/inference');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
   for (const path of ['sessions', 'datasets', 'datasets/catalog', 'evaluations', 'evaluations/tools', 'models', 'runtime/logs', 'runtime/profiles', 'cluster/nodes']) {
     expect(state.requests).not.toContain(`GET /api/v1/${path}`);
@@ -559,8 +560,8 @@ test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo)
   await expect(addModel).toBeFocused();
   if (testInfo.project.name === 'mobile')
     await page.getByRole('button', { name: 'Open sidebar', exact: true }).click();
-  await page.getByRole('button', { name: 'Overview', exact: true }).click();
-  await expect(page).toHaveURL('/');
+  await page.locator('#studio-sidebar').getByRole('button', { name: 'Overview', exact: true }).click();
+  await expect(page).toHaveURL('/inference');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
   await expect(page.locator('.sidebar')).not.toHaveClass(/open/);
   await expect(page.getByRole('main')).toBeVisible();
@@ -573,10 +574,10 @@ test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo)
 
 test('明暗主题的页面内容保持在工作区内且可滚动访问', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
-  const routes = [['/', 'Overview'], ['/models', 'Models'], ['/runtime', 'Service'],
+  const routes = [['/inference', 'Overview'], ['/models', 'Models'], ['/runtime', 'Service'],
     ['/model-hub', 'Model downloads']] as const;
   for (const theme of ['light', 'dark']) {
-    await page.goto('/');
+    await page.goto('/inference');
     await page.locator('#dashboard-overview .appearance-controls').getByRole('button', { name: theme === 'light' ? 'Light' : 'Dark', exact: true }).click();
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     for (const [path, title] of routes) {

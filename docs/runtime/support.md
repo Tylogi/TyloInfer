@@ -76,9 +76,11 @@ the backbone from loading.
 The default CUDA worker is a native C++/CUDA runtime with no Python, PyTorch,
 ATen, or LibTorch dependency during inference. It supports one-GPU execution
 and explicit tensor/expert-parallel device groups; multi-rank deployments still
-require physical validation. Packed NINTv2, VQ-family, dense,
-routed-MoE, attention, recurrent-state, and
-sampling kernels are selected through the shared model graph and backend plan.
+require physical validation. Supported GGUF, TQ, floating-point/FP8/MX,
+dense, routed-MoE, attention, recurrent-state, and sampling kernels are selected
+through the shared model graph and backend plan. Legacy NINTv2 and VQ-family
+operators require the explicit compatibility build described above; they are
+not part of the default worker.
 
 ### Apple silicon and Metal
 

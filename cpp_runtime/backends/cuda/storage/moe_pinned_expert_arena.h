@@ -21,7 +21,11 @@ class MoePinnedExpertArena {
         Free free;
         Fits fits;
         std::size_t used=0;
-        explicit State(std::size_t bytes):storage(bytes,true) {
+        static mfq::cuda::HostBuffer optional_storage(std::size_t bytes) {
+            const mfq::cuda::PinnedReclaimPause optional;
+            return mfq::cuda::HostBuffer(bytes,true);
+        }
+        explicit State(std::size_t bytes):storage(optional_storage(bytes)) {
             TYLOINFER_NATIVE_CUDA_CHECK(cudaHostGetDevicePointer(&mapped,storage.data(),0));
             free.emplace(0,bytes);fits.emplace(bytes,0);mfq::cuda::charge_tensor_host_bytes(bytes);
         }

@@ -7,6 +7,7 @@
 #include "transport.h"
 #include "mtp_limits.h"
 #include "nlohmann/json.hpp"
+#include "runtime/qsa_cache_layout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -234,6 +235,10 @@ int execute_runtime(RuntimeCommandOptions options) {
                 {"config", nlohmann::json::parse(source->model_config_json())},
                 {"paths", nlohmann::json::array()}, {"tensors", nlohmann::json::object()}};
             result["structured_decisions"] = bool(mfq::decision_model_spec(*source));
+            const auto& config=result["config"];
+            const auto& text=config.contains("text_config")?config["text_config"]:config;
+            if(text.value("model_type",std::string{}).starts_with("qwen4_exp"))
+                result["qsa_cache_layout"] = nlohmann::json::parse(mfq::cuda::qsa_cache_layout_json());
             for (const auto& path : source->source_paths()) {
                 const auto value = path.generic_u8string();
                 result["paths"].push_back(std::string(value.begin(), value.end()));

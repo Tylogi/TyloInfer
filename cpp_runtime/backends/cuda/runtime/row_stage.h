@@ -3,6 +3,12 @@
 #include <cstdint>
 #include <vector>
 
+struct RowStageResources {
+    const char* role="table_rows";
+    std::uint64_t rows=0,width=0;
+    std::size_t host_bytes=0,pinned_bytes=0,gpu_bytes=0;
+};
+
 // A prepared table-row transfer. Encodings stay in their own loader; graph
 // consumers use stable output storage and never allocate inside upload/decode.
 class RowStage {

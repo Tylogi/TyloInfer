@@ -24,6 +24,26 @@ __global__ void publish_append(RamBlockView* destination,const TqBlockView* live
     if((k!=0 && k!=254) || (v!=0 && v!=254)){asm volatile("trap;");return;}
     destination[id]={image,k?affine8_bytes:fp16_bytes,v?affine8_bytes:fp16_bytes,ram_uncached_generation};
 }
+__global__ void export_selected_records(const RamBlockView* source,int capacity,
+        const SelectedBlock* selected,int count,RamSelectedRecord* output) {
+    const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at>=count)return;
+    const auto s=selected[at];
+    output[at]={s,s.id>=0 && s.id<capacity && s.token_mask?source[s.id]:RamBlockView{}};
+}
+__global__ void resolve_selected_images(const RamBlockView* source,int capacity,
+        const SelectedBlock* selected,int count,TqBlockView* output,std::size_t stride) {
+    const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at>=count)return;
+    const auto s=selected[at];
+    if(s.id<0 || s.id>=capacity || !s.token_mask){output[at]={};return;}
+    const auto record=source[s.id];
+    const auto key_extent=(std::uint64_t(record.key_bytes)+15u)&~std::uint64_t(15u);
+    if(key_extent+record.value_bytes>stride || !record.image.key || !record.image.value) {
+        asm volatile("trap;");return;
+    }
+    output[at]=record.image;
+}
 __global__ void mark_first_use(const SelectedBlock* selected,std::uint32_t* first,
                               int count,int capacity,std::uint64_t* frame=nullptr) {
     const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
@@ -58,12 +78,20 @@ template<bool Dynamic=false> __global__ void initialize_staging(std::uint32_t* f
     if constexpr(Dynamic)cache=*device_cache;
     const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if(at<capacity)first[at]=UINT_MAX;
-    if(at<cache.sets)cache.locks[at]=0;
+    if constexpr(Dynamic) {
+        for(auto set=at;set<cache.sets;set+=std::int64_t(gridDim.x)*blockDim.x)cache.locks[set]=0;
+    } else if(at<cache.sets)cache.locks[at]=0;
     if(!at) {
-        if(cache.frame)++*cache.frame;
+            if(cache.frame)++*cache.frame;
+        if(cache.window_frames && cache.frame){cache.window_frames[0]=cache.window_frames[1];cache.window_frames[1]=*cache.frame;}
         if(copied)*copied=0;
         if(hits)*hits=0;
     }
+}
+
+__global__ void reset_stage_locks(const RamStageCache* cache) {
+    for(auto set=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;set<cache->sets;set+=std::int64_t(gridDim.x)*blockDim.x)
+        cache->locks[set]=0;
 }
 
 template<bool Resume=false,bool Dynamic=false> __global__ void bucket_cached_hits(const RamBlockView* source,
@@ -73,6 +101,10 @@ template<bool Resume=false,bool Dynamic=false> __global__ void bucket_cached_hit
     const int lane=threadIdx.x&31;
     const auto at=std::int64_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;if(at>=count)return;
     const auto s=selected[at];if(s.id<0 || s.id>=capacity || !s.token_mask)return;
+    if constexpr(Dynamic)if(!cache.sets) {
+        if(!Resume && !lane)atomicMin(first+s.id,unsigned(at));
+        return;
+    }
     unsigned claimed=0;
     if(!lane) {
         if constexpr(Resume)claimed=first[s.id]==unsigned(at) && !output[at].key;
@@ -81,12 +113,13 @@ template<bool Resume=false,bool Dynamic=false> __global__ void bucket_cached_hit
     if(!__shfl_sync(0xffffffff,claimed,0))return;
     const auto record=source[s.id];const auto extent=(std::size_t(record.key_bytes)+15u)&~std::size_t(15u);
     if(extent+record.value_bytes>stride){asm volatile("trap;");return;}
-    const int set=int(ram_cache_set(unsigned(s.id),unsigned(cache.sets))),base=set*ram_cache_ways;
+    const int set=int(ram_cache_set(unsigned(s.id),unsigned(cache.sets),cache.owner)),base=set*ram_cache_ways;
     bool match=false;
     if(record.generation!=ram_uncached_generation && lane<ram_cache_ways) {
         const auto id=__ldcg(&cache.slots[base+lane].id);
         const auto generation=__ldcg(reinterpret_cast<const unsigned long long*>(&cache.slots[base+lane].generation));
-        match=id==s.id && generation==record.generation;
+        const auto owner=__ldcg(reinterpret_cast<const unsigned long long*>(&cache.slots[base+lane].owner));
+        match=id==s.id && generation==record.generation && owner==cache.owner;
     }
     const unsigned found=__ballot_sync(0xffffffff,match);
     if(found) {
@@ -104,14 +137,18 @@ template<bool Resume=false,bool Dynamic=false> __global__ void bucket_cached_hit
 
 __device__ int reserve_cache_slot(const RamStageCache& cache,int set,std::uint64_t frame,int width) {
     const int lane=threadIdx.x&31,base=set*ram_cache_ways;
-    int id=-1,slot=-1;unsigned long long generation=0,last=0;
+    int id=-1,slot=-1;unsigned long long generation=0,last=0,namespace_id=0;
     if(lane<ram_cache_ways) {
         id=__ldcg(&cache.slots[base+lane].id);
         last=__ldcg(reinterpret_cast<const unsigned long long*>(&cache.slots[base+lane].last_frame));
     }
     // The preceding hit bucket marks every selected owner with this frame.
     // Newly copied images use the same frame, including across SSD hydration.
-    const bool eligible=lane<ram_cache_ways && last!=frame;
+    // A shared cache must retain reuse across intervening model layers.
+    // Admission bypasses recent owners until they go unused for a complete
+    // local window, preventing a cyclic working set from evicting itself.
+    const auto recent=cache.expensive_only && cache.window_frames?cache.window_frames[0]:0;
+    const bool eligible=lane<ram_cache_ways && last!=frame && (!recent || last<recent);
     const unsigned empty=__ballot_sync(0xffffffff,eligible && id<0);
     if(width>1) {
         const unsigned available=__ballot_sync(0xffffffff,eligible);
@@ -152,13 +189,16 @@ __device__ int reserve_cache_slot(const RamStageCache& cache,int set,std::uint64
     if(slot>=0) {
         if(lane<ram_cache_ways)
             generation=__ldcg(reinterpret_cast<const unsigned long long*>(&cache.slots[base+lane].generation));
+        if(lane<ram_cache_ways)
+            namespace_id=__ldcg(reinterpret_cast<const unsigned long long*>(&cache.slots[base+lane].owner));
         // Evict an overlapping image as a whole. Leaving one of its other
         // ways behind would let a later lookup mistake a fragment for a hit.
         bool victim=false;
         for(int at=0;at<width;++at) {
             const int owner=__shfl_sync(0xffffffff,id,slot-base+at);
             const auto version=__shfl_sync(0xffffffff,generation,slot-base+at);
-            victim|=owner>=0 && id==owner && generation==version;
+            const auto identity=__shfl_sync(0xffffffff,namespace_id,slot-base+at);
+            victim|=owner>=0 && id==owner && generation==version && namespace_id==identity;
         }
         if(lane<ram_cache_ways && victim)cache.slots[base+lane]=RamCacheSlot{};
         __syncwarp();
@@ -166,11 +206,19 @@ __device__ int reserve_cache_slot(const RamStageCache& cache,int set,std::uint64
     return slot;
 }
 
-template<bool AllowMissing=false,bool Dynamic=false> __global__ void stage_cache_misses(const RamBlockView* source,const SelectedBlock* selected,
+template<int Step,bool DeviceAppends=false> __device__ void stage_selected_impl(const RamBlockView*,const SelectedBlock*,
+    const std::uint32_t*,TqBlockView*,std::uint8_t*,std::size_t,int,int,std::uint64_t*);
+
+template<bool AllowMissing=false,bool Dynamic=false,bool Split=false> __global__ void stage_cache_misses(const RamBlockView* source,const SelectedBlock* selected,
         TqBlockView* output,std::uint8_t* arena,
         std::size_t stride,RamStageCache cache,
-        std::uint64_t* copied,const RamStageCache* device_cache=nullptr) {
+        std::uint64_t* copied,const RamStageCache* device_cache=nullptr,
+        const std::uint32_t* first=nullptr,int count=0,int capacity=0) {
     if constexpr(Dynamic)cache=*device_cache;
+    if constexpr(Split)if(!cache.sets) {
+        stage_selected_impl<AllowMissing?1:2>(source,selected,first,output,arena,stride,count,capacity,copied);
+        return;
+    }
     const auto frame=*cache.frame;
     __shared__ RamBlockView record;
     __shared__ TqBlockView destination;
@@ -192,6 +240,7 @@ template<bool AllowMissing=false,bool Dynamic=false> __global__ void stage_cache
                 int width=1;
                 while(width<ram_cache_ways && extent+local_record.value_bytes>cache.slot_bytes*width)width*=2;
                 if(local_record.image.key && local_record.image.value &&
+                        (!AllowMissing || !cache.expensive_only) &&
                         local_record.generation!=ram_uncached_generation && extent+local_record.value_bytes<=cache.slot_bytes*width)
                     chosen=reserve_cache_slot(cache,int(set),frame,width);
                 if(!threadIdx.x) {
@@ -216,7 +265,7 @@ template<bool AllowMissing=false,bool Dynamic=false> __global__ void stage_cache
             if(!threadIdx.x) {
                 output[at]=destination;
                 if(destination.key) {
-                    if(slot>=0)for(int way=0;way<slot_width;++way)cache.slots[slot+way]={s.id,record.generation,frame};
+                    if(slot>=0)for(int way=0;way<slot_width;++way)cache.slots[slot+way]={s.id,record.generation,frame,cache.owner};
                     if(copied)atomicAdd(reinterpret_cast<unsigned long long*>(copied),
                         static_cast<unsigned long long>(record.key_bytes)+record.value_bytes);
                 }
@@ -235,9 +284,9 @@ __global__ void collect_missing(const RamBlockView* source,const SelectedBlock* 
     const auto s=selected[at];if(s.id<0 || s.id>=capacity || !s.token_mask || first[s.id]!=unsigned(at))return;
     const auto record=source[s.id];if(record.image.key && record.image.value)return;
     if(cache.sets && record.generation!=ram_uncached_generation) {
-        const int base=int(ram_cache_set(unsigned(s.id),unsigned(cache.sets)))*ram_cache_ways;
+        const int base=int(ram_cache_set(unsigned(s.id),unsigned(cache.sets),cache.owner))*ram_cache_ways;
         for(int way=0;way<ram_cache_ways;++way)
-            if(cache.slots[base+way].id==s.id && cache.slots[base+way].generation==record.generation)return;
+            if(cache.slots[base+way].id==s.id && cache.slots[base+way].generation==record.generation && cache.slots[base+way].owner==cache.owner)return;
     }
     missing[atomicAdd(missing_count,1)]=s.id;
 }
@@ -257,7 +306,7 @@ bool valid_cache(const RamStageCache& c) {
         c.payload_bytes>=c.slot_bytes*std::size_t(c.sets)*ram_cache_ways;
 }
 
-template<int Step=0> __global__ void stage_selected(const RamBlockView* source,const SelectedBlock* selected,
+template<int Step,bool DeviceAppends> __device__ void stage_selected_impl(const RamBlockView* source,const SelectedBlock* selected,
         const std::uint32_t* first,TqBlockView* output,std::uint8_t* arena,
         std::size_t stride,int count,int capacity,std::uint64_t* bytes) {
     for(std::int64_t at=blockIdx.x;at<count;at+=gridDim.x) {
@@ -268,6 +317,11 @@ template<int Step=0> __global__ void stage_selected(const RamBlockView* source,c
         }
         if constexpr(Step==2)if(output[at].key)continue;
         const auto record=source[s.id];
+        if constexpr(DeviceAppends)if(record.generation==ram_uncached_generation &&
+                record.image.key && record.image.value) {
+            if(!threadIdx.x)output[at]=record.image;
+            continue;
+        }
         const std::size_t key_extent=(std::size_t(record.key_bytes)+15u)&~std::size_t(15u);
         if constexpr(Step==1)if(!record.image.key || !record.image.value) {
             if(!threadIdx.x)output[at]={};continue;
@@ -290,6 +344,12 @@ template<int Step=0> __global__ void stage_selected(const RamBlockView* source,c
     }
 }
 
+template<int Step=0,bool DeviceAppends=false> __global__ void stage_selected(const RamBlockView* source,const SelectedBlock* selected,
+        const std::uint32_t* first,TqBlockView* output,std::uint8_t* arena,
+        std::size_t stride,int count,int capacity,std::uint64_t* bytes) {
+    stage_selected_impl<Step,DeviceAppends>(source,selected,first,output,arena,stride,count,capacity,bytes);
+}
+
 int staging_ctas(int count,int* result) {
     // Bound outstanding PCIe reads using the actual GPU's resources.
     // Cache the query on each worker; a device change refreshes it.
@@ -304,11 +364,33 @@ int staging_ctas(int count,int* result) {
 }
 }
 
+int tq_export_ram_selected(const RamBlockView* sources,int capacity,
+        const SelectedBlock* selected,int queries,int count,RamSelectedRecord* output,cudaStream_t stream) {
+    if(queries<0 || count<0 || capacity<0)return cudaErrorInvalidValue;
+    if(!queries || !count)return cudaSuccess;
+    if(!sources || !selected || !output || !capacity || queries>INT_MAX/count)return cudaErrorInvalidValue;
+    const int total=queries*count;
+    export_selected_records<<<unsigned((std::int64_t(total)+255)/256),256,0,stream>>>(sources,capacity,selected,total,output);
+    return cudaGetLastError();
+}
+
+int tq_resolve_ram_selected(const RamBlockView* sources,int capacity,
+        const SelectedBlock* selected,int queries,int count,TqBlockView* output,
+        std::size_t stride,cudaStream_t stream) {
+    if(queries<0 || count<0 || capacity<0)return cudaErrorInvalidValue;
+    if(!queries || !count)return cudaSuccess;
+    if(!sources || !selected || !output || !capacity || !stride || (stride&15u) || queries>INT_MAX/count)
+        return cudaErrorInvalidValue;
+    const int total=queries*count;
+    resolve_selected_images<<<unsigned((std::int64_t(total)+255)/256),256,0,stream>>>(sources,capacity,selected,total,output,stride);
+    return cudaGetLastError();
+}
+
 int tq_stage_ram_selected(const RamBlockView* sources,int capacity,
         const SelectedBlock* selected,int queries,int count,
         std::uint32_t* first,TqBlockView* output,void* arena,
         std::size_t arena_bytes,std::size_t stride,
-        std::uint64_t* copied_bytes,cudaStream_t stream) {
+        std::uint64_t* copied_bytes,cudaStream_t stream,bool device_appends) {
     if(queries<0 || count<0 || capacity<0)return cudaErrorInvalidValue;
     if(!queries || !count)return cudaSuccess;
     if(!sources || !selected || !first || !output || !arena || !capacity ||
@@ -326,8 +408,11 @@ int tq_stage_ram_selected(const RamBlockView* sources,int capacity,
     }
     mark_first_use<<<unsigned((std::int64_t(total)+255)/256),256,0,stream>>>(selected,first,total,capacity);
     error=cudaGetLastError();if(error!=cudaSuccess)return error;
-    stage_selected<><<<ctas,128,0,stream>>>(sources,selected,first,output,
-        static_cast<std::uint8_t*>(arena),stride,total,capacity,copied_bytes);
+    auto* scratch=static_cast<std::uint8_t*>(arena);
+    if(device_appends)stage_selected<0,true><<<ctas,128,0,stream>>>(sources,selected,first,output,
+        scratch,stride,total,capacity,copied_bytes);
+    else stage_selected<><<<ctas,128,0,stream>>>(sources,selected,first,output,
+        scratch,stride,total,capacity,copied_bytes);
     return cudaGetLastError();
 }
 
@@ -375,11 +460,37 @@ int tq_collect_ram_missing(const RamBlockView* sources,int capacity,const Select
     return cudaGetLastError();
 }
 
+__global__ void publish_indexer_request(const float* query,const std::int64_t* positions,std::size_t elements,
+        int queries,float* mapped_query,std::int64_t* mapped_positions,std::uint32_t* mapped_ready) {
+    for(std::size_t i=threadIdx.x;i<elements;i+=blockDim.x)mapped_query[i]=query[i];
+    for(int i=threadIdx.x;i<queries;i+=blockDim.x)mapped_positions[i]=positions[i];
+    __threadfence_system();
+    __syncthreads();
+    if(!threadIdx.x) {
+        *reinterpret_cast<volatile std::uint32_t*>(mapped_ready)=1;
+        __threadfence_system();
+    }
+}
+
+int tq_publish_indexer_request(const float* query,const std::int64_t* positions,std::size_t elements,
+        int queries,float* mapped_query,std::int64_t* mapped_positions,std::uint32_t* mapped_ready,cudaStream_t stream) {
+    publish_indexer_request<<<1,128,0,stream>>>(query,positions,elements,queries,mapped_query,mapped_positions,mapped_ready);
+    return cudaGetLastError();
+}
+
 __global__ void export_selection(const std::int32_t* missing,const SelectedBlock* selected,
         std::int32_t* host_missing,SelectedBlock* host_selected,int count) {
     const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if(!at || (at<=missing[0] && at<=count))host_missing[at]=missing[at];
     if(at<count)host_selected[at]=selected[at];
+}
+__global__ void notify_graph_selection(const std::int32_t* missing,std::uint32_t* control) {
+    auto* visible=reinterpret_cast<volatile std::uint32_t*>(control);
+    if(!missing[0]) {
+        visible[RamGraphImages]=0;visible[RamGraphReady]=1;
+        __threadfence_system();visible[RamGraphRequest]=RamGraphDeviceReady;
+    }else {__threadfence_system();visible[RamGraphRequest]=RamGraphHostRead;}
+    __threadfence_system();
 }
 __global__ void publish_graph_images(RamBlockView* sources,int capacity,const std::int32_t* ids,
         const RamBlockView* images,std::uint32_t* control,RamBlockView* backup,std::uint32_t* saved,int maximum) {
@@ -474,12 +585,15 @@ int tq_stage_ram_selected_cached(const RamBlockView* sources,int capacity,
 }
 
 int tq_export_ram_selection(const std::int32_t* missing,const SelectedBlock* selected,
-        std::int32_t* mapped_missing,SelectedBlock* mapped_selected,int queries,int count,cudaStream_t stream) {
+        std::int32_t* mapped_missing,SelectedBlock* mapped_selected,int queries,int count,cudaStream_t stream,
+        std::uint32_t* graph_control) {
     if(queries<0 || count<0 || (count && queries>INT_MAX/count))return cudaErrorInvalidValue;
     if(!queries || !count)return cudaSuccess;
     if(!missing || !selected || !mapped_missing || !mapped_selected)return cudaErrorInvalidValue;
     const auto total=queries*count;
     export_selection<<<unsigned((std::int64_t(total)+256)/256),256,0,stream>>>(missing,selected,mapped_missing,mapped_selected,total);
+    auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+    if(graph_control)notify_graph_selection<<<1,1,0,stream>>>(missing,graph_control);
     return cudaGetLastError();
 }
 int tq_publish_ram_graph(RamBlockView* sources,int capacity,const std::int32_t* ids,
@@ -503,7 +617,8 @@ int tq_restore_ram_graph(RamBlockView* sources,const std::int32_t* ids,const Ram
 int tq_stage_ram_selected_step(const RamBlockView* sources,int capacity,
         const SelectedBlock* selected,int queries,int count,std::uint32_t* first,
         TqBlockView* output,void* arena,std::size_t arena_bytes,std::size_t stride,
-        const RamStageCache& cache,RamStageStep step,std::uint64_t* copied,std::uint64_t* hits,cudaStream_t stream) {
+        const RamStageCache& cache,RamStageStep step,std::uint64_t* copied,std::uint64_t* hits,cudaStream_t stream,
+        const RamStageCache* device_cache) {
     if(queries<0 || count<0 || capacity<0 || (step!=RamStageStep::Available && step!=RamStageStep::Hydrated))return cudaErrorInvalidValue;
     if(!queries || !count)return cudaSuccess;
     if(!sources || !selected || !first || !output || !arena || !capacity || !stride ||
@@ -512,8 +627,24 @@ int tq_stage_ram_selected_step(const RamBlockView* sources,int capacity,
     const int total=queries*count;
     if(stride>std::numeric_limits<std::size_t>::max()/std::size_t(total) || arena_bytes<std::size_t(total)*stride)return cudaErrorInvalidValue;
     const bool resume=step==RamStageStep::Hydrated;
-    int ctas=0;auto error=staging_ctas(cache.sets?cache.sets:total,&ctas);
+    int ctas=0;auto error=staging_ctas(!device_cache && cache.sets?cache.sets:total,&ctas);
     if(error!=cudaSuccess)return error;
+    const auto groups=unsigned((std::int64_t(total)+7)/8);
+    const auto select_grid=unsigned((std::int64_t(total)+255)/256);
+    if(device_cache) {
+        if(resume)reset_stage_locks<<<select_grid,256,0,stream>>>(device_cache);
+        else initialize_staging<true><<<unsigned((std::int64_t(capacity)+255)/256),256,0,stream>>>(first,capacity,{},copied,hits,device_cache);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        if(resume)bucket_cached_hits<true,true><<<groups,256,0,stream>>>(sources,selected,first,output,total,capacity,stride,{},hits,device_cache);
+        else bucket_cached_hits<false,true><<<groups,256,0,stream>>>(sources,selected,first,output,total,capacity,stride,{},hits,device_cache);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        auto* bytes=static_cast<std::uint8_t*>(arena);
+        if(resume)stage_cache_misses<false,true,true><<<ctas,512,0,stream>>>(sources,selected,output,bytes,stride,{},copied,device_cache,first,total,capacity);
+        else stage_cache_misses<true,true,true><<<ctas,512,0,stream>>>(sources,selected,output,bytes,stride,{},copied,device_cache,first,total,capacity);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        resolve_cached_views<<<select_grid,256,0,stream>>>(selected,first,output,total,capacity);
+        return cudaGetLastError();
+    }
     if(!resume) {
         initialize_staging<><<<unsigned((std::int64_t(std::max(capacity,cache.sets))+255)/256),256,0,stream>>>(first,capacity,cache,copied,hits);
         error=cudaGetLastError();if(error!=cudaSuccess)return error;
