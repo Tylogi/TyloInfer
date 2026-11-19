@@ -375,39 +375,61 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
     auto& graphs = *request->graphs;
     const auto tokens = row.ids.size(1), start = request->position();
     const auto written = tokens + depth - 1;
-    if (start <= 0 || written > graphs.capacity - start ||
+    if (start <= 0 || !request->positions[0] || written > graphs.capacity - start ||
         graphs.stream.stream() != cuda::current_stream(device.index).stream()) co_return;
-    const auto owners = predictor_graph_storage(*this, *request);
-    const auto ready = [&](int64_t width, ScalarType type, MtpStepMode mode) -> PredictorGraphs::Cell* {
-        const auto found = graphs.cells.find({width, type, mode, 0});
-        return found != graphs.cells.end() && found->second->window.valid() &&
-            found->second->window.matches(owners) ? found->second.get() : nullptr;
-    };
-    auto* first = ready(tokens, row.hidden.scalar_type(), tokens > 1 ? MtpStepMode::tail : MtpStepMode::full);
-    if (!first) co_return;
-    auto* next = ready(1, first->output.chain_hidden.scalar_type(), MtpStepMode::full);
-    if (!next || next->output.chain_hidden.scalar_type() != first->output.chain_hidden.scalar_type()) co_return;
-
     auto& qsa = *layers.front()->qsa;
     auto& cache = *request->layer_states.front()->qsa;
     ::tyloi::ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
-    graph.admit(written, graphs.capacity, true);
-    auto growth = graph.growth();
+    const bool pending = !graph.eligible();
+    if (pending && !graph.eligible(true)) co_return;
+    std::array<PredictorGraphs::Cell*, engine::mtp::kMaximumReportedDraftDepth> chain{};
+    auto type = row.hidden.scalar_type();
+    for (int index = 0; index < depth; ++index) {
+        const auto width = index == 0 ? tokens : 1;
+        const auto mode = width > 1 ? MtpStepMode::tail : MtpStepMode::full;
+        auto [kind, storage] = graph.pending(width, index == 0 ? 0 : tokens + index - 1);
+        if (pending && !kind) co_return;
+        const auto found = graphs.cells.find({width, type, mode, kind});
+        if (found == graphs.cells.end() || !found->second->window.valid() ||
+            !found->second->window.matches(predictor_graph_storage(*this, *request, std::move(storage)))) co_return;
+        chain[index] = found->second.get();
+        type = chain[index]->output.chain_hidden.scalar_type();
+    }
+
+    std::vector<std::pair<Device, std::size_t>> growth;
+    if (!pending) {
+        graph.admit(written, graphs.capacity, true);
+        growth = graph.growth();
+    }
     add_growth(growth, device, graphs.history_growth(*request, written));
+    add_growth(growth, device, std::size_t(depth + 1) * sizeof(int64_t));
     if (!growth.empty())
         co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
-    graph.materialize();
-    graph.prepare(0, request->positions[0]);
+    if (!pending) {
+        graph.materialize();
+        graph.prepare(0, request->positions[0]);
+    }
 
     auto packet = ::tyloi::ops::empty({1, depth + 1}, row.ids.options());
     ::tyloi::ops::copy_into(::tyloi::ops::slice(packet, 1, 0, 1), ::tyloi::ops::slice(row.ids, 1, tokens - 1, tokens));
     for (int index = 0; index < depth; ++index) {
-        auto& cell = index == 0 ? *first : *next;
+        auto& cell = *chain[index];
+        const auto width = cell.ids.size(1);
+        if (pending) {
+            ::tyloi::ops::Qsa::Graph step({{{{&qsa, &cache}}, request->position(), config.maximum, 0}}, false);
+            step.admit(width, graphs.capacity, true);
+            if (auto bytes = step.growth(); !bytes.empty())
+                co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(bytes)};
+            step.materialize();
+            step.prepare(0, request->positions[0]);
+            if (!cell.window.matches(predictor_graph_storage(*this, *request, step.storage())))
+                throw std::logic_error("MTP pending graph storage changed during draft");
+        }
         PredictorGraphs::prepare(cell, row, request->position());
         auto positions = graphs.positions(*request, cell);
         cell.window.set_compact_sampling(false, "predictor", 1);
-        if (!cell.window.enqueue_if_device_only()) cell.window.run();
-        graphs.advance(*request, std::move(positions), cell.ids.size(1));
+        if (pending || !cell.window.enqueue_if_device_only()) cell.window.run();
+        graphs.advance(*request, std::move(positions), width, width > 1 ? 1 : -1);
         row.ids = ::tyloi::ops::reshape(cell.greedy, {1, 1});
         row.hidden = cell.output.chain_hidden;
         ::tyloi::ops::copy_into(::tyloi::ops::slice(packet, 1, index + 1, index + 2), row.ids);

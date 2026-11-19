@@ -348,6 +348,7 @@ bool Qsa::Graph::reusable() const { return false; }
 bool Qsa::Graph::warmup_supported() const { return false; }
 void Qsa::Graph::admit(std::int64_t, std::int64_t, bool) { throw std::logic_error("Metal QSA does not support graphs"); }
 int Qsa::Graph::pending_kind() const { return 0; }
+std::pair<int, std::vector<Tensor>> Qsa::Graph::pending(std::int64_t, std::int64_t) const { return {}; }
 std::vector<std::pair<Device, std::size_t>> Qsa::Graph::growth() const {
     throw std::logic_error("Metal QSA does not support graphs");
 }

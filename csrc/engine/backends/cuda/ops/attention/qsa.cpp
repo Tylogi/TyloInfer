@@ -1602,12 +1602,21 @@ const std::vector<Qsa::Graph::Row>& Qsa::Graph::rows() const {
     return impl_->rows;
 }
 std::vector<Tensor> Qsa::Graph::storage() const {
+    return impl_->pending ? pending(impl_->tokens).second : std::vector<Tensor>{};
+}
+std::pair<int, std::vector<Tensor>> Qsa::Graph::pending(std::int64_t tokens, std::int64_t offset) const {
+    if (impl_->independent || impl_->requests.size() != 1) return {};
+    int kind = 0;
     std::vector<Tensor> result;
-    if (impl_->pending)
-        for (const auto& layer : impl_->requests.front().layers)
-            for (auto& tensor : layer.second->impl_->cache.adaptive->graph_tensors(impl_->tokens))
-                if (tensor.defined()) result.emplace_back(std::move(tensor));
-    return result;
+    for (const auto& layer : impl_->requests.front().layers) {
+        const auto& cache = layer.second->impl_->cache.adaptive;
+        if (!cache) return {};
+        const auto value = cache->device_graph_kind(tokens, offset);
+        if (value < 1 || value > 3 || (kind && kind != value)) return {};
+        kind = value;
+        for (auto& tensor : cache->graph_tensors(tokens, kind)) result.emplace_back(std::move(tensor));
+    }
+    return {kind, std::move(result)};
 }
 void Qsa::Graph::prepare(std::size_t request_index, std::size_t qsa_index, const Tensor& positions) const {
     if (!impl_->admitted || !impl_->laid_out || !impl_->materialized)

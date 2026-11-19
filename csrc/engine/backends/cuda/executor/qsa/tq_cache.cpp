@@ -1184,9 +1184,10 @@ void QsaTqCache::release_prefill_workspace() {
     }
 }
 
-int QsaTqCache::device_graph_kind(int64_t tokens)const{
-    if(tokens<1 || tokens>8 || tokens>impl_->maximum-impl_->tokens)return 0;
-    const int kind=tokens==1?(impl_->tokens%4==3?2:1):3;
+int QsaTqCache::device_graph_kind(int64_t tokens,int64_t offset)const{
+    const auto available=impl_->maximum-impl_->tokens;
+    if(tokens<1 || tokens>8 || offset<0 || offset>available || tokens>available-offset)return 0;
+    const int kind=tokens==1?((impl_->tokens+offset)%4==3?2:1):3;
     return kind+(impl_->ram && !impl_->ram->graph_safe()?4:0);
 }
 bool QsaTqCache::pending_supported()const{return !impl_->ssd_cache && (!impl_->ram || impl_->ram->graph_safe());}
@@ -1222,12 +1223,16 @@ std::vector<std::pair<tyloi::Device,std::size_t>> QsaTqCache::graph_growth(int64
         const auto slots=std::size_t(s.interval/4),slot=std::size_t(s.tokens/4)%slots;
         if(!s.canonical_slab.defined() || !slot || slot+blocks>slots)gpu+=2*s.canonical_bytes*slots;
     }
+    const auto end=s.tokens+queries;
+    if((s.byte_budget || s.ram) && end/s.interval!=s.tokens/s.interval &&
+            (!s.history_transfer.host.defined() || s.history_transfer.host.numel()<2*(end/4)))
+        host+=2*(end/4)*sizeof(float);
     std::vector<std::pair<tyloi::Device,std::size_t>> result;
     if(gpu)result.emplace_back(s.ks.device(),gpu);
     if(host)result.emplace_back(tyloi::Device{tyloi::DeviceType::cpu,0},host);
     return result;
 }
-std::vector<QsaTqCache::Tensor> QsaTqCache::graph_tensors(int64_t queries)const {
+std::vector<QsaTqCache::Tensor> QsaTqCache::graph_tensors(int64_t queries,int kind)const {
     if(queries<1 || queries>8)return {};
     const auto& s=*impl_;
     const auto& a=queries==1?s.pending_attention:s.batch_attention.at(std::size_t(queries-2));
@@ -1238,14 +1243,14 @@ std::vector<QsaTqCache::Tensor> QsaTqCache::graph_tensors(int64_t queries)const 
             &a.ranked,&a.rotated,&a.partial,&a.stats,&a.logmass,&a.norm})add(*t);
     if(queries==1) {
         add(s.pending_k);add(s.pending_v);
-        if(s.tokens%4==3){add(s.pending_modes_k);add(s.pending_modes_v);}
+        if(kind==2){add(s.pending_modes_k);add(s.pending_modes_v);}
     }else {
         const auto& b=s.batch_append.at(std::size_t(queries-2));
         for(const auto* t:{&s.seed_k,&s.seed_v,&s.seed_index,&s.seed_rotated_k,&s.seed_rotated_v,
                 &b.key,&b.value,&b.index,&b.modes_key,&b.modes_value,&b.fp16_key,&b.fp16_value,
                 &b.rotated_key,&b.rotated_value,&b.packed})add(*t);
     }
-    if(queries>1 || s.tokens%4==3) {
+    if(queries>1 || kind==2) {
         add(s.graph_first_position);add(s.graph_destination);add(s.graph_archive_host);
         if(!s.graph_archive_mapped)add(s.graph_archive);
     }

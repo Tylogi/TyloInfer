@@ -97,6 +97,8 @@ public:
         void admit(std::int64_t tokens = 1, std::int64_t previous_capacity = 0, bool hidden = false);
         /** Pending append identity for the admitted window, or zero for dense caches. */
         int pending_kind() const;
+        /** Inspect a pending append and its captured storage before advancing the cache. */
+        std::pair<int, std::vector<Tensor>> pending(std::int64_t tokens, std::int64_t offset = 0) const;
         /** Report per-device backing required by this plan without allocating it. */
         std::vector<std::pair<Device, std::size_t>> growth() const;
         /** Materialize the managed backing after its growth has been admitted. */
