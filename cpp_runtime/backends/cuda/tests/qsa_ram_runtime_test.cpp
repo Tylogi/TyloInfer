@@ -82,6 +82,34 @@ void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=
         },[]{});
         graph.run();cache.advance_graph(1);verify(destination,token,1);
     }
+    mfq::cuda::DecodeWindow history(mfq_current_cuda_stream());
+    for(int i=0;i<7;++i,++token) {
+        v.copy_(values.narrow(1,token,1));
+        positions.copy_(tb::tensor(std::vector<int64_t>{token},positions.options()).reshape({1,1}));
+        cache.prepare_decode(true);
+        if(!history.valid())history.capture([&] {
+            cache.forward_pending_graph({},v,v,{},raw,positions,{}, {},pool,positions.unsqueeze(0)+rotary_axes);
+        },[]{});
+        if(history.segments()!=1)throw std::runtime_error("RAM history append introduced a host boundary");
+        history.run();cache.advance_graph(1);
+        if(cache.position()!=token+1)throw std::runtime_error("RAM history append changed the cache position");
+    }
+    mfq::cuda::DecodeWindow history_batch(mfq_current_cuda_stream());
+    auto batch_positions=tb::empty({1,3},positions.options());
+    auto batch_values=tb::empty({1,3,kh,width},f),batch_raw=tb::zeros({1,3,iw},f);
+    for(int i=0;i<4;++i) {
+        batch_values.copy_(values.narrow(1,token,3));
+        batch_positions.copy_(tb::arange(token,token+3,positions.options()).reshape({1,3}));
+        cache.prepare_decode_tokens(3,true);
+        if(!history_batch.valid())history_batch.capture([&] {
+            cache.forward_pending_graph({},batch_values,batch_values,{},batch_raw,batch_positions,{},{},
+                pool,batch_positions.unsqueeze(0)+rotary_axes);
+        },[]{});
+        if(history_batch.segments()!=1)throw std::runtime_error("RAM history batch introduced a host boundary");
+        history_batch.run();cache.advance_graph(3);token+=3;
+        if(cache.position()!=token)throw std::runtime_error("RAM history batch changed the cache position");
+    }
+    append(token,1);++token;
     cache.wait();const auto before=cache.stats();
     const auto memory=cache.ram_memory();
     if(!memory || memory->payload!=before.resident_bytes || memory->allocated<memory->payload || memory->disk)

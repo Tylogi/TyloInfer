@@ -1652,11 +1652,13 @@ class Qsa {
         if(adaptive_) {
             TYLOINFER_RUNTIME_CHECK(!query_tail,"adaptive QSA uses complete verification rows");
             auto p=prepared?*prepared:history_only?project_history(execution,hidden,positions):project(execution,hidden,positions,true,{},{},{},std::move(projections));
-            if(!history_only && adaptive_->pending_graph_enabled()) {
-                auto buffer=tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
+            if(adaptive_->pending_graph_enabled()) {
+                auto buffer=history_only?Tensor{}:tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
                     hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
                 auto output=adaptive_->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,buffer,
-                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions).to(hidden.scalar_type());
+                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions);
+                if(history_only)return {};
+                output=output.to(hidden.scalar_type());
                 return project_output?w_.output(execution,output):output;
             }
             auto* window=DecodeWindow::recording();

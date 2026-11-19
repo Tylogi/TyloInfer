@@ -62,6 +62,7 @@ public:
     void advance_graph(int64_t tokens);
     void activate_graph_cache();
     std::size_t release_shared_device_cache(bool spare_only=false);
+    // An empty output appends history without index search or attention.
     Tensor forward_pending_graph(const Tensor& query,const Tensor& key,const Tensor& value,const Tensor& iq,
         const Tensor& raw_index,const Tensor& cache_positions,const Tensor& gate,Tensor output,
         const Pool& pool={},const Tensor& absolute_positions={});

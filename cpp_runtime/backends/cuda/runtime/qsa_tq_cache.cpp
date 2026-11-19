@@ -901,14 +901,14 @@ struct QsaTqCache::Impl {
         const tb::Tensor& raw,const tb::Tensor& positions,const tb::Tensor& gate,tb::Tensor output,
         const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions) {
         const int n=int(key.size(1));
-        if(!pending_graph || !batch_prepared || n!=graph_queries || !output.defined() || !pool)
+        if(!pending_graph || !batch_prepared || n!=graph_queries || !pool)
             throw std::logic_error("QSA batch graph was not prepared");
         const auto convert=[](const tb::Tensor& x) {
             auto y=(x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)?x:x.to(tb::kFloat32);
             return y.stride(y.dim()-1)==1?y:y.contiguous();
         };
-        auto k=convert(key),v=convert(value),r=convert(raw),q=convert(query),g=convert(gate);
-        auto& a=graph_workspace(n);auto& batch=batch_append.at(std::size_t(n-2));
+        auto k=convert(key),v=convert(value),r=convert(raw);
+        auto& batch=batch_append.at(std::size_t(n-2));
         const int staged=int(batch.key.size(1)),blocks=staged/4;
         check(tq::tq_stage_graph_batch(k.data_ptr(),v.data_ptr(),r.data_ptr(),k.scalar_type()==tb::kFloat16,v.scalar_type()==tb::kFloat16,r.scalar_type()==tb::kFloat16,
             seeded_tail(),positions.data_ptr<int64_t>(),batch.key.data_ptr<float>(),batch.value.data_ptr<float>(),batch.index.data_ptr<float>(),
@@ -941,6 +941,9 @@ struct QsaTqCache::Impl {
             n,kv_heads,width,padded,index_width,int(canonical_bytes),graph_destination_slots(),bool(ram)};
         check(tq::tq_publish_graph_batch(publication,mfq_current_cuda_stream()));
         if(!graph_archive_mapped)check(cudaMemcpyAsync(graph_archive_host.data_ptr(),graph_archive.data_ptr(),graph_archive.numel(),cudaMemcpyDeviceToHost,mfq_current_cuda_stream()));
+        if(!output.defined())return {};
+        auto q=convert(query),g=convert(gate);
+        auto& a=graph_workspace(n);
         const int count=(budget+6)/4;
         auto selected=select_graph_indexer(iq.to(tb::kFloat32).contiguous(),positions,n,a);
         cudaStreamCaptureStatus status;check(cudaStreamIsCapturing(mfq_current_cuda_stream(),&status));const bool observe=status!=cudaStreamCaptureStatusNone;
@@ -956,22 +959,26 @@ struct QsaTqCache::Impl {
         const tb::Tensor& raw,const tb::Tensor& positions,const tb::Tensor& gate,tb::Tensor output,
         const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions) {
         if(key.size(1)>1)return forward_pending_batch(query,key,value,iq,raw,positions,gate,std::move(output),pool,absolute_positions);
-        if(!pending_graph || key.size(1)!=1 || !output.defined())throw std::logic_error("QSA device graph was not prepared");
+        if(!pending_graph || key.size(1)!=1)throw std::logic_error("QSA device graph was not prepared");
         const auto mark=[](const char* phase){if(auto* window=DecodeWindow::recording())window->mark_current(phase);};
         mark("qsa_cache_begin");
         const auto convert=[](const tb::Tensor& x) {
             auto y=(x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)?x:x.to(tb::kFloat32);
             return y.stride(y.dim()-1)==1?y:y.contiguous();
         };
-        auto k=convert(key),v=convert(value),r=convert(raw),q=convert(query),g=convert(gate);
+        auto k=convert(key),v=convert(value),r=convert(raw);
+        const bool attend=output.defined();
+        auto q=attend?convert(query):Tensor{};
         auto& a=pending_attention;
-        const tq::PendingQuery prepared_query{q.data_ptr(),a.rotated.data_ptr<float>(),heads,q.stride(1),q.scalar_type()==tb::kFloat16};
+        const tq::PendingQuery prepared_query=attend?
+            tq::PendingQuery{q.data_ptr(),a.rotated.data_ptr<float>(),heads,q.stride(1),q.scalar_type()==tb::kFloat16}:
+            tq::PendingQuery{};
         check(tq::tq_append_pending(k.data_ptr(),v.data_ptr(),r.data_ptr(),k.scalar_type()==tb::kFloat16,v.scalar_type()==tb::kFloat16,r.scalar_type()==tb::kFloat16,
             positions.data_ptr<int64_t>(),tail_storage_k.data_ptr<float>(),tail_storage_v.data_ptr<float>(),tail_storage_index.data_ptr<float>(),
             rotated_tail_k.data_ptr<float>(),rotated_tail_v.data_ptr<float>(),
             ks.data_ptr<float>(),vs.data_ptr<float>(),pending_k.data_ptr<std::uint16_t>(),pending_v.data_ptr<std::uint16_t>(),views.data_ptr<tq::TqBlockView>(),
             kv_heads,width,padded,index_width,k.stride(2),v.stride(2),mfq_current_cuda_stream(),
-            pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),&prepared_query));
+            pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),attend?&prepared_query:nullptr));
         {
             if(!pool)throw std::logic_error("complete QSA graph requires indexer pooling");
             check(tq::tq_finalize_pending(pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),tail_storage_index.data_ptr<float>(),
@@ -990,6 +997,8 @@ struct QsaTqCache::Impl {
                 1,index_width,0,positions.data_ptr<int64_t>(),mfq_current_cuda_stream(),true));
             if(!graph_archive_mapped)check(cudaMemcpyAsync(graph_archive_host.data_ptr(),graph_archive.data_ptr(),graph_archive.numel(),cudaMemcpyDeviceToHost,mfq_current_cuda_stream()));
         }
+        if(!attend)return {};
+        auto g=convert(gate);
         const int columns=budget+3,count=(columns+3)/4,parts=a.parts;
         mark("qsa_cache_append_end");
         auto blocks=select_graph_indexer(iq.to(tb::kFloat32).contiguous(),positions,1,a,true);

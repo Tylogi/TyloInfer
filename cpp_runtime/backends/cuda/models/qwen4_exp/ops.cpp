@@ -1163,7 +1163,8 @@ struct Qwen4MtpGraph {
         const bool scalar_chain=history_only && scalar_history && tokens>1;
         // RAM QSA archive publication reads completed GPU work. Queued chains
         // retain their device-only resident path until that commit is deferred.
-        int pending_qsa=!(history_only || history_tail || queued)?block.qsa->pending_device_graph_kind(tokens):0;
+        int pending_qsa=!(history_tail || queued)?block.qsa->pending_device_graph_kind(tokens):0;
+        if(history_only && (scalar_chain || pending_qsa>=4))pending_qsa=0;
         if(pending_qsa>=4 && block.qsa->pending_graph_task_supported())pending_qsa=(pending_qsa&3)+8;
         const auto key=std::make_tuple(int(tokens),int(hidden.scalar_type()),history_only?(scalar_chain?2:1):(history_tail?3:0),pending_qsa);
         auto& owner=cells[key];
