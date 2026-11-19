@@ -598,8 +598,6 @@ set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(TYLOINFER_CUDA_INSTANTIATION_SOURCES
     ${TYLOINFER_CUDA_ROOT}/engine/cuda_engine.cpp
     ${TYLOINFER_CUDA_ROOT}/engine/generation.cpp
-    ${TYLOINFER_CUDA_ROOT}/storage/text_session_cache.cpp
-    ${TYLOINFER_CUDA_ROOT}/storage/qsa_ram_session.cpp
     ${TYLOINFER_CUDA_ROOT}/storage/deepseek_v41_paged_session.cpp
     ${TYLOINFER_CUDA_ROOT}/engine/mtp.cpp
     ${TYLOINFER_CUDA_ROOT}/engine/cuda_batching.cpp

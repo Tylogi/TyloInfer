@@ -85,6 +85,8 @@ bool SessionOps::paged_media(const Snapshot& state) {
 
 bool SessionOps::checkpoint_needs_update(
     const SessionBlockPayload& payload, const Snapshot& state) {
+    if (state.kind() == TextSessionStateKind::Qwen4)
+        return tyloi::models::qwen4_exp::checkpoint_needs_update(payload, state);
     if (state.kind() != TextSessionStateKind::DeepseekV41) return false;
     return tyloi::models::deepseek_v41::checkpoint_needs_update(payload, state);
 }
@@ -108,7 +110,7 @@ size_t paged_payload_tokens(const SessionBlockPayload& payload) {
     constexpr std::array<uint8_t,8> deepseek_magic{'M','F','Q','C','U','D','3',0};
     const auto version=reader.scalar<uint32_t>("version");
     if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic) ||
-        (version!=1 && !(magic==qwen4_magic && version==2)))
+        (version!=1 && !(magic==qwen4_magic && (version==2 || version==3))))
         throw CudaSessionStateError("invalid CUDA prefix block header");
     (void)reader.scalar<uint32_t>("start");return reader.scalar<uint32_t>("count");
 }

@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+namespace tyloi::state::qsa { struct Session; }
+
 namespace tyloi::ops {
 
 /** Immutable projection and normalization weights for pooled sparse attention. */
@@ -93,8 +95,8 @@ public:
         std::unique_ptr<Impl> impl_;
     };
 
-    /** Own the three numerical tensors in a session snapshot. */
-    struct Snapshot { Tensor keys, values, index; };
+    /** Own the attention state in a session snapshot. */
+    struct Snapshot { Tensor keys, values, index; std::shared_ptr<const tyloi::state::qsa::Session> ram; };
 
     /** Construct attention from its immutable weights and geometry. */
     Qsa(QsaWeights weights, QsaConfig config);
@@ -128,6 +130,8 @@ public:
     bool supports_session(const State&) const;
     /** Validate a snapshot against the request and target device. */
     void validate_session(const State&, const Snapshot&, std::int64_t count, Device device) const;
+    /** Hold the RAM target until all restored layers are hydrated. */
+    std::shared_ptr<void> reserve_session(State&, const tyloi::state::qsa::Session&) const;
     /** Estimate fresh backing needed by a staged session restore. */
     std::size_t fresh_session_growth(const State&, std::int64_t count) const;
     /** Stage a validated snapshot into an independent request state. */

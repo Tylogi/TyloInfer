@@ -153,6 +153,11 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
             }
             graph = root->graph();
             auto kv_key = cuda_kv_quantization_tag();
+            const auto architecture = source->architecture();
+            if (architecture == "qwen4_exp" || architecture == "qwen4") {
+                if (const auto bits = env_size("TYLOINFER_QSA_RAM_KV_BITS", 0); bits)
+                    kv_key += ";qsa-ram-session-v3=" + std::to_string(bits);
+            }
             if (const auto* draft = dynamic_cast<const models::dflash2::Draft*>(model->predictor()))
                 kv_key += draft->cache_key;
             sessions = models::make_sessions(*source, config.session_cache, config.prefix_cache,

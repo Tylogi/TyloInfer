@@ -1,7 +1,7 @@
 #include "engine/backends/cuda/kernels/attention/qsa/ram.h"
 #include "engine/backends/cuda/executor/qsa/tq_cache.h"
 #include "engine/backends/cuda/executor/qsa/ram_cache.h"
-#include "engine/backends/cuda/executor/qsa/session.h"
+#include "engine/state/kv/qsa/session.h"
 #include "engine/backends/cuda/kernels/attention/qsa/tq_fa.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/executor/graph/window.h"
@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <mutex>
 #include <map>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 
@@ -180,7 +181,7 @@ struct QsaTqCache::Impl {
     std::unique_ptr<QsaRamCache> ram;
     int ram_bits=0;
     std::shared_ptr<tyloi::cache::QsaKvStore> raw_index_store;
-    std::vector<std::shared_ptr<QsaIndexArchive>> index_archive;
+    std::vector<std::shared_ptr<state::qsa::IndexArchive>> index_archive;
     std::vector<std::shared_ptr<ImageBatch>> owners;
     std::vector<Retired> retired;
     std::vector<Upload> uploads;
@@ -272,7 +273,7 @@ struct QsaTqCache::Impl {
     }
     std::size_t index_archive_bytes()const {return std::size_t(index_width)*8+(ram?std::size_t(index_width+2)*2:0);}
     void save_index(std::vector<std::uint8_t> bytes) {
-        auto image=std::make_shared<QsaIndexArchive>();
+        auto image=std::make_shared<state::qsa::IndexArchive>();
         if(ssd_cache){image->store=raw_index_store;image->block=raw_index_store->write(std::move(bytes));}
         else {
             auto resident=std::make_unique<const std::vector<std::uint8_t>>(std::move(bytes));
@@ -1090,9 +1091,9 @@ void QsaTqCache::release_idle(){
     impl_->drain();
     // These are CPU ownership/index records. Retained CUDA graphs reference
     // their unchanged device tensors and independent immutable image leases.
-    const auto bytes=impl_->index_archive.capacity()*sizeof(std::shared_ptr<QsaIndexArchive>)+
+    const auto bytes=impl_->index_archive.capacity()*sizeof(std::shared_ptr<state::qsa::IndexArchive>)+
         impl_->owners.capacity()*sizeof(std::shared_ptr<Impl::ImageBatch>);
-    std::vector<std::shared_ptr<QsaIndexArchive>>().swap(impl_->index_archive);
+    std::vector<std::shared_ptr<state::qsa::IndexArchive>>().swap(impl_->index_archive);
     std::vector<std::shared_ptr<Impl::ImageBatch>>().swap(impl_->owners);
     if(bytes && tyloi::cuda::env_lookup("TYLOINFER_TRACE_QSA_TQ"))std::fprintf(stderr,
         "native_qsa_tq_idle_metadata actual_match=1 released_bytes=%zu\n",bytes);
@@ -1286,11 +1287,11 @@ std::uint64_t QsaTqCache::ssd_read_bytes()const {
     return (impl_->ram?impl_->ram->stats():impl_->cache->stats()).canonical_read_bytes;
 }
 bool QsaTqCache::supports_session()const{return bool(impl_->ram);}
-std::shared_ptr<QsaTqSession> QsaTqCache::capture_session(std::int64_t count) {
+std::shared_ptr<state::qsa::Session> QsaTqCache::capture_session(std::int64_t count) {
     auto& s=*impl_;
     if(!s.ram || count<=0 || count>s.tokens)throw std::invalid_argument("Invalid RAM QSA session boundary");
     wait();const auto complete=std::size_t(count/4);const auto remainder=count%4;
-    auto state=std::make_shared<QsaTqSession>();state->tokens=count;state->heads=s.heads;state->kv_heads=s.kv_heads;
+    auto state=std::make_shared<state::qsa::Session>();state->tokens=count;state->heads=s.heads;state->kv_heads=s.kv_heads;
     state->width=s.width;state->padded=s.padded;state->index_width=s.index_width;state->ram_bits=s.ram_bits;
     state->kv=s.ram->snapshot(complete);state->index.assign(s.index_archive.begin(),s.index_archive.begin()+complete);
     const auto host=[](const Tensor& input){return input.to(::tyloi::kCPU).contiguous();};
@@ -1316,26 +1317,78 @@ std::shared_ptr<QsaTqSession> QsaTqCache::capture_session(std::int64_t count) {
     std::memcpy(raw.data_ptr(),index->data(),8*s.index_width);
     state->tail_index=raw.to(::tyloi::kFloat32).narrow(1,0,remainder).contiguous();return state;
 }
-std::shared_ptr<void> QsaTqCache::reserve_session_restore(const QsaTqSession& state) {
+std::size_t QsaTqCache::fresh_session_growth() const {
     const auto& s=*impl_;
-    if(!s.ram || state.tokens<=0 || state.tokens>s.maximum || state.heads!=s.heads || state.kv_heads!=s.kv_heads ||
-            state.width!=s.width || state.padded!=s.padded || state.index_width!=s.index_width || state.ram_bits!=s.ram_bits ||
-            !state.kv || state.kv->blocks.size()!=std::size_t(state.tokens/4) || state.index.size()!=state.kv->blocks.size())
-        throw std::invalid_argument("Incompatible RAM QSA session geometry");
-    return s.ram->reserve_restore(*state.kv);
+    std::size_t bytes=0;
+    const auto add=[&](const Tensor& tensor) {
+        if(!tensor.defined())return;
+        const auto size=std::size_t(tensor.numel())*tensor.element_size();
+        if(bytes>std::numeric_limits<std::size_t>::max()-size)
+            throw std::overflow_error("QSA session allocation size overflow");
+        bytes+=size;
+    };
+    for(const auto* tensor:{&s.ks,&s.vs,&s.relative,&s.views,&s.index_codes,&s.index_scales,&s.index_zero,
+            &s.hits,&s.mass,&s.tail_storage_k,&s.tail_storage_v,&s.tail_storage_index,
+            &s.rotated_tail_k,&s.rotated_tail_v,&s.pending_modes_k,&s.pending_modes_v,&s.pending_k,&s.pending_v})add(*tensor);
+    if(s.ram)for(const auto& tensor:s.ram->resident_tensors())add(tensor);
+    return bytes;
 }
-void QsaTqCache::restore_session(const QsaTqSession& state,bool borrow_prefix) {
-    auto& s=*impl_;const auto count=state.tokens,remainder=count%4;
-    if(!s.ram || count<=0 || count>s.maximum || state.heads!=s.heads || state.kv_heads!=s.kv_heads ||
+std::size_t QsaTqCache::session_bytes(std::int64_t count) const {
+    const auto& s=*impl_;
+    if(!s.ram || count<=0 || count>s.tokens)return 0;
+    const auto blocks=std::size_t(count/4);
+    const auto per_block=2*std::size_t(s.rows)*512+s.index_archive_bytes()+
+        sizeof(tq::RamKvSnapshotBlock)+sizeof(state::qsa::IndexArchive)+sizeof(std::shared_ptr<state::qsa::IndexArchive>);
+    if(blocks && per_block>std::numeric_limits<std::size_t>::max()/blocks)
+        throw std::overflow_error("QSA session size overflow");
+    const auto payload=blocks*per_block;
+    if(payload>std::numeric_limits<std::size_t>::max()-sizeof(state::qsa::Session))
+        throw std::overflow_error("QSA session size overflow");
+    const auto bytes=payload+sizeof(state::qsa::Session);
+    const auto tail=std::size_t(count%4)*(2*std::size_t(s.kv_heads)*s.width+s.index_width)*sizeof(float);
+    if(bytes>std::numeric_limits<std::size_t>::max()-tail)throw std::overflow_error("QSA session size overflow");
+    return bytes+tail;
+}
+void QsaTqCache::validate_session(const state::qsa::Session& state,std::int64_t count) const {
+    const auto& s=*impl_;
+    if(!s.ram || count<=0 || state.tokens!=count || count>s.maximum || state.heads!=s.heads || state.kv_heads!=s.kv_heads ||
             state.width!=s.width || state.padded!=s.padded || state.index_width!=s.index_width || state.ram_bits!=s.ram_bits ||
             !state.kv || state.kv->blocks.size()!=std::size_t(count/4) || state.index.size()!=state.kv->blocks.size())
         throw std::invalid_argument("Incompatible RAM QSA session geometry");
-    if(remainder)for(const auto* tail:{&state.tail_keys,&state.tail_values,&state.tail_index})
-        if(!tail->defined() || tail->size(0)!=1 || tail->size(1)!=remainder || tail->scalar_type()!=::tyloi::kFloat32)
-            throw std::invalid_argument("Incompatible RAM QSA session tail");
-    if(remainder && (state.tail_keys.dim()!=4 || state.tail_keys.size(2)!=s.kv_heads || state.tail_keys.size(3)!=s.width ||
-            state.tail_values.sizes()!=state.tail_keys.sizes() || state.tail_index.dim()!=3 || state.tail_index.size(2)!=s.index_width))
-        throw std::invalid_argument("Incompatible RAM QSA session tail width");
+    for(const auto& index:state.index) {
+        if(!index)throw std::runtime_error("Missing QSA snapshot index archive");
+        if(index->resident) {
+            if(index->resident->size()!=s.index_archive_bytes())
+                throw std::runtime_error("Incompatible QSA snapshot index archive length");
+        } else if(index->source) {
+            if(index->bytes!=s.index_archive_bytes())
+                throw std::runtime_error("Incompatible QSA snapshot index archive length");
+            index->source->validate(index->offset,index->bytes);
+        } else if(!index->store || !index->block ||
+                tyloi::cache::QsaKvStore::block_bytes(index->block)!=s.index_archive_bytes()) {
+            throw std::runtime_error("Incompatible QSA snapshot index archive backing");
+        }
+    }
+    const auto remainder=count%4;
+    if(remainder && (!state.tail_keys.defined() || !state.tail_values.defined() || !state.tail_index.defined() ||
+            state.tail_keys.dim()!=4 || state.tail_values.dim()!=4 || state.tail_index.dim()!=3 ||
+            state.tail_keys.size(0)!=1 || state.tail_keys.size(1)!=remainder || state.tail_keys.size(2)!=s.kv_heads ||
+            state.tail_keys.size(3)!=s.width || state.tail_values.sizes()!=state.tail_keys.sizes() ||
+            state.tail_index.size(0)!=1 || state.tail_index.size(1)!=remainder || state.tail_index.size(2)!=s.index_width ||
+            state.tail_keys.scalar_type()!=::tyloi::kFloat32 || state.tail_values.scalar_type()!=::tyloi::kFloat32 ||
+            state.tail_index.scalar_type()!=::tyloi::kFloat32 ||
+            state.tail_keys.device()!=::tyloi::Device(::tyloi::kCPU) ||
+            state.tail_values.device()!=::tyloi::Device(::tyloi::kCPU) ||
+            state.tail_index.device()!=::tyloi::Device(::tyloi::kCPU)))
+        throw std::invalid_argument("Incompatible RAM QSA session tail");
+}
+std::shared_ptr<void> QsaTqCache::reserve_session_restore(const state::qsa::Session& state) {
+    validate_session(state,state.tokens);
+    return impl_->ram->reserve_restore(*state.kv);
+}
+void QsaTqCache::restore_session(const state::qsa::Session& state,bool borrow_prefix) {
+    validate_session(state,state.tokens);
+    auto& s=*impl_;const auto count=state.tokens,remainder=count%4;
     s.truncate(0);
     try {
         const auto stride=std::size_t(s.index_width+2)*2;
@@ -1375,9 +1428,12 @@ void QsaTqCache::restore_session(const QsaTqSession& state,bool borrow_prefix) {
         flush();
         s.tokens=count;s.pending_graph=false;s.graph_image.reset();s.hits.zero_();s.mass.zero_();
         if(remainder) {
-            s.tail_k=state.tail_keys.to(s.options.dtype(::tyloi::kFloat32)).contiguous();
-            s.tail_v=state.tail_values.to(s.options.dtype(::tyloi::kFloat32)).contiguous();
-            s.tail_index=state.tail_index.to(s.options.dtype(::tyloi::kFloat32)).contiguous();
+            s.tail_k=s.tail_storage_k.narrow(1,0,remainder);
+            s.tail_v=s.tail_storage_v.narrow(1,0,remainder);
+            s.tail_index=s.tail_storage_index.narrow(1,0,remainder);
+            s.tail_k.copy_(state.tail_keys);
+            s.tail_v.copy_(state.tail_values);
+            s.tail_index.copy_(state.tail_index);
             check(tq::tq_prepare_modes(s.tail_k.data_ptr(),s.tail_v.data_ptr(),false,s.ks.data_ptr<float>(),s.vs.data_ptr<float>(),
                 s.pending_modes_k.data_ptr<float>(),s.pending_modes_v.data_ptr<float>(),s.pending_k.data_ptr<std::uint16_t>(),s.pending_v.data_ptr<std::uint16_t>(),
                 int(remainder),s.kv_heads,s.width,s.padded,mfq_current_cuda_stream(),s.rotated_tail_k.data_ptr<float>(),s.rotated_tail_v.data_ptr<float>()));

@@ -63,12 +63,14 @@ public:
 
     void raw(void* destination, size_t size, const char* name);
     /** Read a host tensor and its original accelerator index. */
-    std::pair<::tyloi::Tensor, int> tensor();
+    std::pair<::tyloi::Tensor, int> tensor() { return tensor(false); }
+    void skip_tensor() { (void)tensor(true); }
     ::tyloi::Device tensor_device() const noexcept { return tensor_device_; }
     void expect_end() const;
+    size_t remaining() const;
 
 private:
-    size_t remaining() const;
+    std::pair<::tyloi::Tensor, int> tensor(bool skip);
 
     const uint8_t* cursor_;
     const uint8_t* end_;

@@ -9,6 +9,7 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/executor/qsa/tq_cache.h"
+#include "engine/state/kv/qsa/session.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/ops/qwen4_exp.h"
@@ -242,11 +243,19 @@ class QsaCore {
         return bytes;
     }
     bool supports_session(const State& request) const {
-        return !request.adaptive && !request.offload && !(request.memory && request.memory->offload);
+        return request.adaptive ? request.adaptive->supports_session() :
+            !request.offload && !(request.memory && request.memory->offload);
     }
     /** Validate a QSA snapshot against this layer's cache geometry and device. */
     void validate_session(const State& request, const ::tyloi::ops::Qsa::Snapshot& state,
                           int64_t count, tyloi::Device device) const {
+        if(request.adaptive) {
+            TYLOINFER_RUNTIME_CHECK(state.ram && !state.keys.defined() && !state.values.defined() && !state.index.defined() &&
+                device==c_.device, "incompatible Qwen4 QSA RAM session state");
+            request.adaptive->validate_session(*state.ram,count);
+            return;
+        }
+        TYLOINFER_RUNTIME_CHECK(!state.ram, "incompatible Qwen4 QSA session state");
         const auto check = [&](const tyloi::Tensor& tensor, int64_t width, tyloi::ScalarType type) {
             return tensor.defined() && tensor.representation<DenseTensor>() && tensor.device()==device &&
                 tensor.scalar_type()==type && tensor.dim()==3 && tensor.size(0)==1 &&
@@ -259,6 +268,7 @@ class QsaCore {
     }
     /** Estimate fresh unmanaged sequence backing; managed allocation has its own admission. */
     std::size_t fresh_session_growth(const State& current, int64_t count) const {
+        if (current.adaptive) return current.adaptive->fresh_session_growth();
         if (current.memory && !current.offload) {
             TYLOINFER_RUNTIME_CHECK(managed_memory(current), "Qwen4 managed session storage is not ready");
             return 0;
@@ -274,6 +284,11 @@ class QsaCore {
     /** Stage a snapshot into independently owned sequence or managed KV storage. */
     void stage_session(State& request, const ::tyloi::ops::Qsa::Snapshot& saved,
                        int64_t count, tyloi::Device device) {
+        if (request.adaptive) {
+            TYLOINFER_RUNTIME_CHECK(device==c_.device, "QSA restore target differs from layer device");
+            restore_session(request,saved,count);
+            return;
+        }
         if (managed_memory(request)) { restore_session(request,saved,count); return; }
         const auto stage = [&](SequenceCache& cache, const ::tyloi::Tensor& source) {
             int64_t capacity=std::min<int64_t>(16,c_.maximum);
@@ -290,13 +305,23 @@ class QsaCore {
         stage(request.index,saved.index);
     }
     std::size_t session_bytes(const State& request,int64_t count) const {
-        if(count<=0 || request.adaptive)return 0;
+        if(count<=0)return 0;
+        if(request.adaptive)return request.adaptive->session_bytes(count);
         return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+
             c_.index_width*request.index.storage().element_size());
     }
     void capture_session(const State& request,::tyloi::ops::Qsa::Snapshot& state,int64_t count,std::size_t& bytes) const {
-        TYLOINFER_RUNTIME_CHECK(!request.adaptive && !request.offload && count>0 && count<=position(request),
+        TYLOINFER_RUNTIME_CHECK(supports_session(request) && count>0 && count<=position(request),
             "invalid Qwen4 QSA session boundary");
+        if(request.adaptive) {
+            state.keys={};state.values={};state.index={};
+            state.ram=request.adaptive->capture_session(count);
+            const auto captured=state.ram->resident_bytes();
+            if(bytes>std::numeric_limits<std::size_t>::max()-captured)throw std::overflow_error("QSA session size overflow");
+            bytes+=captured;
+            return;
+        }
+        state.ram.reset();
         const auto save=[&](const DenseTensor& tensor) {
             auto saved=std::make_shared<DenseTensor>(tensor.contiguous().clone());bytes+=std::size_t(saved->numel())*saved->element_size();return saved;
         };
@@ -314,6 +339,12 @@ class QsaCore {
         state.index=save(request.index.storage().dense().narrow(1,0,count));
     }
     void restore_session(State& request,const ::tyloi::ops::Qsa::Snapshot& state,int64_t count) {
+        if(request.adaptive) {
+            validate_session(request,state,count,c_.device);
+            ResidentAllocationScope resident;
+            request.adaptive->restore_session(*state.ram,false);
+            return;
+        }
         const auto* keys=state.keys.representation<DenseTensor>();
         const auto* values=state.values.representation<DenseTensor>();
         const auto* index=state.index.representation<DenseTensor>();
@@ -1179,6 +1210,12 @@ std::size_t Qsa::graph_growth_bytes(const State& state, std::int64_t capacity) c
 bool Qsa::supports_session(const State& state) const { return impl_->core.supports_session(state.impl_->cache); }
 void Qsa::validate_session(const State& state, const Snapshot& snapshot, std::int64_t count, Device device) const {
     impl_->core.validate_session(state.impl_->cache, snapshot, count, device);
+}
+std::shared_ptr<void> Qsa::reserve_session(State& state, const tyloi::state::qsa::Session& snapshot) const {
+    std::optional<MfqCudaGuard> guard;
+    if (impl_->device.is_cuda()) guard.emplace(impl_->device);
+    TYLOINFER_RUNTIME_CHECK(state.impl_->cache.adaptive, "incompatible Qwen4 QSA RAM session state");
+    return state.impl_->cache.adaptive->reserve_session_restore(snapshot);
 }
 std::size_t Qsa::fresh_session_growth(const State& state, std::int64_t count) const {
     return impl_->core.fresh_session_growth(state.impl_->cache, count);

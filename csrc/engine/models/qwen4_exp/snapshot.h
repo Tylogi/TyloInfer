@@ -8,6 +8,8 @@
 #include <optional>
 #include <vector>
 
+namespace tyloi::state::qsa { struct Session; }
+
 namespace tyloi::models::qwen4_exp {
 
 struct LayerSnapshot {
@@ -17,6 +19,7 @@ struct LayerSnapshot {
     std::array<std::optional<::tyloi::Device>, 6> devices{};
     int64_t ple_batch = 0;
     std::vector<int64_t> ple_tokens;
+    std::shared_ptr<const tyloi::state::qsa::Session> ram;
 
     template <class Visit>
     void tensors(const Visit& visit) const {

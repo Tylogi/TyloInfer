@@ -1,13 +1,13 @@
 #pragma once
-#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/tensor/tensor.h"
 #include "engine/state/kv/qsa/ram_store.h"
 #include <stdexcept>
 #include <cstring>
 
-namespace tyloi::cuda {
+namespace tyloi::state::qsa {
 // A serialized model worker owns updates to these small immutable archives.
 // Prefix persistence can replace their backing without retaining a RAM copy.
-struct QsaIndexArchive {
+struct IndexArchive {
     std::shared_ptr<const std::vector<std::uint8_t>> resident;
     std::shared_ptr<tyloi::cache::QsaKvStore> store;
     tyloi::cache::QsaKvStore::BlockPtr block;
@@ -39,19 +39,18 @@ struct QsaIndexArchive {
         resident.reset();block.reset();store.reset();
     }
 };
-struct QsaTqSession {
+struct Session {
     std::int64_t tokens=0;
     int heads=0,kv_heads=0,width=0,padded=0,index_width=0,ram_bits=0;
     std::shared_ptr<tyloinfer::qsa::RamKvSnapshot> kv;
-    std::vector<std::shared_ptr<QsaIndexArchive>> index;
-    bool durable_prefix=false,borrow_prefix=false;
+    std::vector<std::shared_ptr<IndexArchive>> index;
     ::tyloi::DenseTensor tail_keys,tail_values,tail_index;
     std::size_t resident_bytes()const {
-        std::size_t bytes=sizeof(*this)+index.size()*sizeof(QsaIndexArchive);
+        std::size_t bytes=sizeof(*this)+index.size()*sizeof(IndexArchive);
         if(kv)for(const auto& b:kv->blocks){bytes+=sizeof(b);if(b.image)bytes+=b.image->bytes();}
         for(const auto& b:index)if(b && b->resident)bytes+=b->resident->size();
         for(const auto* t:{&tail_keys,&tail_values,&tail_index})if(t->defined())bytes+=std::size_t(t->numel())*t->element_size();
         return bytes;
     }
 };
-} // namespace tyloi::cuda
+} // namespace tyloi::state::qsa

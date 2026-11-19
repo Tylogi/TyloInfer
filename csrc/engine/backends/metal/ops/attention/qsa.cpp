@@ -163,11 +163,14 @@ void Qsa::validate_session(const State&, const Snapshot& snapshot, std::int64_t 
         return value.defined() && !value.is_encoded() && value.device() == device && value.scalar_type() == type &&
             value.dim() == 3 && value.size(0) == 1 && value.size(1) == count && value.size(2) == width;
     };
-    if (count <= 0 || count > impl_->config.maximum ||
+    if (snapshot.ram || count <= 0 || count > impl_->config.maximum ||
         !check(snapshot.keys, impl_->config.kv_heads * impl_->key_width, impl_->cache_type) ||
         !check(snapshot.values, impl_->config.kv_heads * impl_->value_width, impl_->cache_type) ||
         !check(snapshot.index, impl_->config.index_width, kFloat16))
         throw std::invalid_argument("incompatible Metal QSA session state");
+}
+std::shared_ptr<void> Qsa::reserve_session(State&, const tyloi::state::qsa::Session&) const {
+    throw std::logic_error("Metal QSA does not support RAM session state");
 }
 std::size_t Qsa::fresh_session_growth(const State& state, std::int64_t count) const {
     auto result = allocation_bytes(state, 1, count, true);

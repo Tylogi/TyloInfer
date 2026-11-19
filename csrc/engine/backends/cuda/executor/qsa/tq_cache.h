@@ -5,8 +5,9 @@
 #include <functional>
 #include <memory>
 
+namespace tyloi::state::qsa { struct Session; }
+
 namespace tyloi::cuda {
-struct QsaTqSession;
 // Experimental adaptive QSA placement. Ordinary cache modes remain unchanged.
 bool qsa_tq_cache_enabled();
 class QsaTqCache {
@@ -50,9 +51,12 @@ public:
     QsaRamWorkspaceProgress reclaim_shared_host_workspace();
     std::vector<Tensor> resident_tensors()const;
     bool supports_session()const;
-    std::shared_ptr<QsaTqSession> capture_session(std::int64_t tokens);
-    std::shared_ptr<void> reserve_session_restore(const QsaTqSession& state);
-    void restore_session(const QsaTqSession& state,bool borrow_prefix);
+    std::size_t fresh_session_growth() const;
+    std::size_t session_bytes(std::int64_t count) const;
+    void validate_session(const tyloi::state::qsa::Session& state, std::int64_t count) const;
+    std::shared_ptr<tyloi::state::qsa::Session> capture_session(std::int64_t tokens);
+    std::shared_ptr<void> reserve_session_restore(const tyloi::state::qsa::Session& state);
+    void restore_session(const tyloi::state::qsa::Session& state,bool borrow_prefix);
 private:
     struct Impl;std::unique_ptr<Impl> impl_;
 };

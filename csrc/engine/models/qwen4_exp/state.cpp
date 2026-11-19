@@ -171,6 +171,7 @@ tyloi::models::qwen4_exp::LayerSnapshot capture_layer_session(
         snapshot.keys = std::move(attention.keys);
         snapshot.values = std::move(attention.values);
         snapshot.index = std::move(attention.index);
+        snapshot.ram = std::move(attention.ram);
     }
     if (layer.gdn) {
         snapshot.convolution = save(state.gdn.conv);
@@ -226,17 +227,17 @@ void validate_layer_session(const Layer& layer, const LayerState& current,
     };
     if (layer.qsa) {
         try {
-            if (!session_device_matches(saved.keys, saved.devices[0], device) ||
+            if (!saved.ram && (!session_device_matches(saved.keys, saved.devices[0], device) ||
                 !session_device_matches(saved.values, saved.devices[1], device) ||
                 !session_device_matches(saved.index, saved.devices[2], device) ||
-                saved.keys.device() != saved.values.device() || saved.keys.device() != saved.index.device())
+                saved.keys.device() != saved.values.device() || saved.keys.device() != saved.index.device()))
                 throw CudaSessionStateError("incompatible Qwen4 QSA session device");
-            layer.qsa->validate_session(*current.qsa, {saved.keys, saved.values, saved.index},
-                position, saved.keys.device());
+            layer.qsa->validate_session(*current.qsa, {saved.keys, saved.values, saved.index, saved.ram},
+                position, saved.ram ? device : saved.keys.device());
         } catch (const std::exception&) {
             throw CudaSessionStateError("incompatible Qwen4 QSA session state");
         }
-    } else if (saved.keys || saved.values || saved.index) {
+    } else if (saved.keys || saved.values || saved.index || saved.ram) {
         throw CudaSessionStateError("unexpected Qwen4 QSA session state");
     }
     if (layer.gdn) {
@@ -272,7 +273,7 @@ void stage_layer_session(const Layer& layer, LayerState& target,
     const auto device = layer.device;
     tyloi::ops::DeviceScope scope(device);
     if (layer.qsa)
-        layer.qsa->stage_session(*target.qsa, {saved.keys, saved.values, saved.index}, position, device);
+        layer.qsa->stage_session(*target.qsa, {saved.keys, saved.values, saved.index, saved.ram}, position, device);
     if (layer.gdn) {
         stage_session_tensor(target.gdn.conv, saved.convolution, device);
         stage_session_tensor(target.gdn.recurrent, saved.recurrent, device);
@@ -281,6 +282,16 @@ void stage_layer_session(const Layer& layer, LayerState& target,
         stage_session_tensor(target.ple.conv, saved.ple_convolution, device);
         layer.ple->restore_graph_context(target.ple, {saved.ple_batch, saved.ple_tokens});
     }
+}
+
+static std::vector<std::shared_ptr<void>> reserve_ram_sessions(const std::vector<std::unique_ptr<Layer>>& layers,
+        std::vector<std::unique_ptr<LayerState>>& target, const std::vector<LayerSnapshot>& saved) {
+    std::vector<std::shared_ptr<void>> reservations;
+    for (std::size_t i = 0; i < saved.size(); ++i) {
+        if (saved[i].ram)
+            reservations.push_back(layers[i]->qsa->reserve_session(*target[i]->qsa, *saved[i].ram));
+    }
+    return reservations;
 }
 
 tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models::Mtp* mtp) {
@@ -627,6 +638,7 @@ public:
         for (const auto& layer : model_.layers)
             candidate_->layers.push_back(std::make_unique<LayerState>(*layer));
         const auto& saved = std::get<tyloi::models::qwen4_exp::Snapshot>(snapshot_.payload);
+        const auto reservations = reserve_ram_sessions(model_.layers, candidate_->layers, saved.layers);
         for (std::size_t i = 0; i < saved.layers.size(); ++i)
             stage_layer_session(*model_.layers[i], *candidate_->layers[i], saved.layers[i], snapshot_.cache_pos);
         stage_session_tensor(candidate_->positions, saved.positions, model_.device);
@@ -695,7 +707,7 @@ public:
                 validate_layer_session(*model_.layers[i], *state_.layer_states[i], saved->layers[i], length);
             else {
                 const auto& layer = saved->layers[i];
-                if (layer.keys || layer.values || layer.index || layer.convolution || layer.recurrent ||
+                if (layer.keys || layer.values || layer.index || layer.ram || layer.convolution || layer.recurrent ||
                     layer.ple_convolution || layer.ple_batch || !layer.ple_tokens.empty())
                     throw CudaSessionStateError("unexpected empty Qwen4 predictor layer state");
             }
@@ -725,6 +737,7 @@ public:
         for (const auto& layer : model_.layers)
             candidate_->layer_states.push_back(std::make_unique<LayerState>(*layer));
         const auto& saved = std::get<tyloi::models::qwen4_exp::MtpSnapshot>(snapshot_.payload);
+        const auto reservations = reserve_ram_sessions(model_.layers, candidate_->layer_states, saved.layers);
         if (saved.hidden_device)
             stage_session_tensor(hidden_, snapshot_.last_target_hidden, model_.device);
         else hidden_ = snapshot_.last_target_hidden;

@@ -41,6 +41,7 @@ add_library(mfq-engine STATIC
     models/session/paged.cpp
     models/session/state.cpp
     models/qwen4_exp/session_codec.cpp
+    models/qwen4_exp/ram_session.cpp
     models/deepseek_v41/session_codec.cpp
     models/deepseek_v4/input.cpp
     models/minicpmo45/input.cpp
