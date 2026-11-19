@@ -37,6 +37,7 @@ int tq_snapshot_blocks(const std::uint64_t* table,const SelectedBlock* selected,
 // final four-token block and padded channel dimensions are zero-filled.
 // Optional rotated outputs are [ceil(tokens/4)*4,heads,padded_width], allowing
 // subsequent single-token appends to reuse rotations of the incomplete tail.
+// Float modes can be omitted when both FP16 pending images are requested.
 int tq_prepare_modes(const void* keys,const void* values,bool fp16,
     const float* key_signs,const float* value_signs,float* key_modes,float* value_modes,
     std::uint16_t* pending_keys,std::uint16_t* pending_values,
@@ -46,9 +47,16 @@ int tq_prepare_modes(const void* keys,const void* values,bool fp16,
 // Canonical images are independent per four-token block and per K/V kind.
 // R=heads*4*(padded_width/256); bytes per image=align4(3*R)+256*R.
 // Layout: FP16 scales[R], INT8 zero points[R], alignment, INT8 codes[R,256].
+struct Affine8Pending {
+    std::uint16_t* keys;
+    std::uint16_t* values;
+    float* rotated_keys;
+    float* rotated_values;
+};
 int tq_prepare_affine8(const void* keys,const void* values,bool fp16,
     const float* key_signs,const float* value_signs,std::uint8_t* key_images,
-    std::uint8_t* value_images,int tokens,int heads,int width,int padded_width,cudaStream_t stream);
+    std::uint8_t* value_images,int tokens,int heads,int width,int padded_width,cudaStream_t stream,
+    const Affine8Pending* pending=nullptr);
 
 // Unpack H4/RHT modes to [blocks, heads, 4, padded_width] for each K/V kind.
 int tq_decode_modes(const TqBlockView* blocks,float* keys,float* values,
@@ -95,10 +103,17 @@ struct PendingTail {
 // Preserve a replay's committed four-token prefix across capture warmups.
 int tq_copy_pending_tail(PendingTail source,PendingTail destination,int heads,int width,
     int padded_width,int index_width,cudaStream_t stream);
+struct GraphPoolStarts {
+    const void* absolute;
+    std::int64_t* output;
+    int axes;
+    bool int32_positions;
+};
 int tq_stage_graph_batch(const void* keys,const void* values,const void* index,bool key_fp16,bool value_fp16,bool index_fp16,
     PendingTail previous,const std::int64_t* position,float* staged_keys,float* staged_values,float* staged_index,
     int tokens,int staged_tokens,int heads,int width,int index_width,std::int64_t key_token_stride,std::int64_t key_head_stride,
-    std::int64_t value_token_stride,std::int64_t value_head_stride,std::int64_t index_token_stride,cudaStream_t stream);
+    std::int64_t value_token_stride,std::int64_t value_head_stride,std::int64_t index_token_stride,cudaStream_t stream,
+    const GraphPoolStarts* pool=nullptr);
 struct PendingBatchPublication {
     const std::int64_t* position;
     const std::uint8_t* keys;

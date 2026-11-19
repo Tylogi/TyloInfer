@@ -83,12 +83,24 @@ __global__ void group_selected(const int32_t* tokens,SelectedBlock* blocks,int c
 __device__ float read_input(const void* x,bool fp16,int64_t at) {
     return fp16?__half2float(reinterpret_cast<const half*>(x)[at]):reinterpret_cast<const float*>(x)[at];
 }
-__global__ void stage_append(const void* keys,const void* values,const void* index,bool kh,bool vh,bool ih,
+template<bool PoolStarts=false> __global__ void stage_append(const void* keys,const void* values,const void* index,bool kh,bool vh,bool ih,
     const float* old_k,const float* old_v,const float* old_i,float* k,float* v,float* raw,
     int tokens,int prior,int heads,int width,int iw,int64_t kt,int64_t ks,int64_t vt,int64_t vs,int64_t it,
-    const int64_t* position=nullptr,int staged=0) {
+    const int64_t* position=nullptr,int staged=0,GraphPoolStarts pool={}) {
     if(position)prior=int(*position&3);
     const int64_t at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x,channels=int64_t(heads)*width,cols=2*channels+iw;
+    if constexpr(PoolStarts) {
+        const int blocks=staged/4;
+        if(at<int64_t(pool.axes)*blocks) {
+            const auto begin=(at/blocks)*tokens;
+            const auto end=begin+tokens-1;
+            const auto first=pool.int32_positions?int64_t(static_cast<const int32_t*>(pool.absolute)[begin]):
+                static_cast<const int64_t*>(pool.absolute)[begin];
+            const auto last=pool.int32_positions?int64_t(static_cast<const int32_t*>(pool.absolute)[end]):
+                static_cast<const int64_t*>(pool.absolute)[end];
+            pool.output[at]=min(first-prior+(at%blocks)*4,last);
+        }
+    }
     if(at>=int64_t(position?staged:tokens+prior)*cols)return;
     const auto row=at/cols,col=at%cols;
     if(row>=tokens+prior) {
@@ -316,7 +328,8 @@ template<int W,bool F16> __global__ void prepare_modes(const void* keys,const vo
     for(int mode=0;mode<4;++mode) {
         const auto at=((int64_t(block)*heads+head)*4+mode)*W+d;
         const auto value=work[mode*W+d]*rsqrtf(float(W));
-        output[at]=value;if(pending)pending[at]=__float2half_rn(value);
+        if(output)output[at]=value;
+        if(pending)pending[at]=__float2half_rn(value);
     }
     if(auto* rotated=kind?rotated_v:rotated_k)for(int t=0;t<4;++t) {
         float value=0;
@@ -555,9 +568,9 @@ __device__ int row_bits(const uint8_t* data,int rows,int row,int uniform) {
     return 1+(code&7);
 }
 
-template<int W,bool F16> __global__ void prepare_affine8(const void* keys,const void* values,
+template<int W,bool F16,bool Pending> __global__ void prepare_affine8(const void* keys,const void* values,
     const float* ks,const float* vs,uint8_t* key_images,uint8_t* value_images,
-    int tokens,int heads,int width) {
+    int tokens,int heads,int width,Affine8Pending pending) {
     const int d=threadIdx.x,head=blockIdx.x,block=blockIdx.y,kind=blockIdx.z;
     const auto* input=kind?values:keys;
     const auto* signs=kind?vs:ks;
@@ -585,8 +598,21 @@ template<int W,bool F16> __global__ void prepare_affine8(const void* keys,const 
         }
     }
     const int ring=d/256,lane=d&31,warp=d/32;
+    if constexpr(Pending) {
+        auto* rotated=kind?pending.rotated_values:pending.rotated_keys;
+        for(int t=0;t<4;++t) {
+            // Pending rows keep the original FP32 inverse H4 order.
+            float value=0;
+            for(int m=0;m<4;++m)value+=((__popc(unsigned(t&m))&1)?-.5f:.5f)*y[m];
+            rotated[((int64_t(block)*4+t)*heads+head)*W+d]=value*rsqrtf(float(W));
+        }
+    }
     for(int m=0;m<4;++m) {
         y[m]*=rsqrtf(float(W));
+        if constexpr(Pending) {
+            auto* modes=reinterpret_cast<half*>(kind?pending.values:pending.keys);
+            modes[((int64_t(block)*heads+head)*4+m)*W+d]=__float2half_rn(y[m]);
+        }
         const float lo=warp_min(fminf(y[m],0.f)),hi=warp_max(fmaxf(y[m],0.f));
         if(!lane){ranges[m*64+warp]=lo;ranges[m*64+32+warp]=hi;}
     }
@@ -1195,7 +1221,8 @@ int tq_snapshot_blocks(const uint64_t* table,const SelectedBlock* selected,TqBlo
 int tq_prepare_modes(const void* keys,const void* values,bool fp16,const float* ks,const float* vs,
     float* km,float* vm,uint16_t* pending_k,uint16_t* pending_v,
     int tokens,int heads,int width,int padded,cudaStream_t stream,float* rotated_k,float* rotated_v) {
-    if(!keys || !values || !ks || !vs || !km || !vm || tokens<=0 || heads<=0 || width<=0 || width>padded)
+    if(!keys || !values || !ks || !vs || ((!km || !vm) && (!pending_k || !pending_v)) ||
+        tokens<=0 || heads<=0 || width<=0 || width>padded)
         return int(cudaErrorInvalidValue);
 #define PREPARE(W,F) prepare_modes<W,F><<<dim3(heads,(tokens+3)/4,2),W,0,stream>>>(keys,values,ks,vs,km,vm,reinterpret_cast<half*>(pending_k),reinterpret_cast<half*>(pending_v),tokens,heads,width,rotated_k,rotated_v)
     if(fp16) {switch(padded){case 256:PREPARE(256,true);break;case 512:PREPARE(512,true);break;case 1024:PREPARE(1024,true);break;default:return int(cudaErrorInvalidValue);}}
@@ -1205,14 +1232,27 @@ int tq_prepare_modes(const void* keys,const void* values,bool fp16,const float* 
 }
 
 int tq_prepare_affine8(const void* keys,const void* values,bool fp16,const float* ks,const float* vs,
-    uint8_t* ki,uint8_t* vi,int tokens,int heads,int width,int padded,cudaStream_t stream) {
+    uint8_t* ki,uint8_t* vi,int tokens,int heads,int width,int padded,cudaStream_t stream,const Affine8Pending* pending) {
     if(!keys || !values || !ks || !vs || !ki || !vi || tokens<=0 || heads<=0 || width<=0 || width>padded)
         return int(cudaErrorInvalidValue);
-#define AFFINE(W,F) prepare_affine8<W,F><<<dim3(heads,(tokens+3)/4,2),W,0,stream>>>(keys,values,ks,vs,ki,vi,tokens,heads,width)
+    if(pending && (!pending->keys || !pending->values || !pending->rotated_keys || !pending->rotated_values))
+        return int(cudaErrorInvalidValue);
+#define AFFINE(W,F) do { \
+    const dim3 grid(heads,(tokens+3)/4,2); \
+    if(pending)prepare_affine8<W,F,true><<<grid,W,0,stream>>>(keys,values,ks,vs,ki,vi,tokens,heads,width,*pending); \
+    else prepare_affine8<W,F,false><<<grid,W,0,stream>>>(keys,values,ks,vs,ki,vi,tokens,heads,width,{}); \
+} while(false)
     if(fp16){switch(padded){case 256:AFFINE(256,true);break;case 512:AFFINE(512,true);break;case 1024:AFFINE(1024,true);break;default:return int(cudaErrorInvalidValue);}}
     else {switch(padded){case 256:AFFINE(256,false);break;case 512:AFFINE(512,false);break;case 1024:AFFINE(1024,false);break;default:return int(cudaErrorInvalidValue);}}
 #undef AFFINE
-    return int(cudaGetLastError());
+    const auto status=cudaGetLastError();
+    if(pending && status==cudaSuccess)if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "native_qsa_affine8_pending actual_match=1 tokens=%d heads=%d width=%d padded=%d fused_rotation=1\n",
+            tokens,heads,width,padded);
+    }
+    return int(status);
 }
 
 int tq_decode_modes(const TqBlockView* blocks,float* keys,float* values,const uint16_t* relative,
@@ -1311,7 +1351,7 @@ int tq_stage_append(const void* keys,const void* values,const void* index,bool k
     if(!keys || !values || !index || !k || !v || !raw || tokens<=0 || prior<0 || prior>3 || heads<=0 || width<=0 || iw<=0 ||
        (prior && (!old_k || !old_v || !old_i)))return int(cudaErrorInvalidValue);
     const auto total=int64_t(tokens+prior)*(int64_t(2)*heads*width+iw);
-    stage_append<<<unsigned((total+255)/256),256,0,stream>>>(keys,values,index,kh,vh,ih,old_k,old_v,old_i,k,v,raw,tokens,prior,heads,width,iw,kt,ks,vt,vs,it);
+    stage_append<><<<unsigned((total+255)/256),256,0,stream>>>(keys,values,index,kh,vh,ih,old_k,old_v,old_i,k,v,raw,tokens,prior,heads,width,iw,kt,ks,vt,vs,it);
     return int(cudaGetLastError());
 }
 int tq_commit_tail(const float* k,const float* v,const float* raw,float* out_k,float* out_v,float* out_i,
@@ -1348,14 +1388,27 @@ int tq_copy_pending_tail(PendingTail source,PendingTail destination,int heads,in
 }
 int tq_stage_graph_batch(const void* keys,const void* values,const void* index,bool kh,bool vh,bool ih,
     PendingTail previous,const int64_t* position,float* k,float* v,float* raw,int tokens,int staged,int heads,int width,int iw,
-    int64_t kt,int64_t ks,int64_t vt,int64_t vs,int64_t it,cudaStream_t stream) {
+    int64_t kt,int64_t ks,int64_t vt,int64_t vs,int64_t it,cudaStream_t stream,const GraphPoolStarts* pool) {
     if(!keys || !values || !index || !position || !previous.key || !previous.value || !previous.index || !k || !v || !raw ||
        tokens<1 || tokens>8 || staged<(tokens+3+3)/4*4 || heads<=0 || width<=0 || iw<=0 || kt<=0 || ks<=0 || vt<=0 || vs<=0 || it<=0)
         return int(cudaErrorInvalidValue);
-    const auto total=int64_t(staged)*(2LL*heads*width+iw);
+    if(pool && (!pool->absolute || !pool->output || pool->axes<1 || staged%4))return int(cudaErrorInvalidValue);
+    const auto data_elements=int64_t(staged)*(int64_t(2)*heads*width+iw);
+    const auto total=pool?std::max(data_elements,int64_t(pool->axes)*(staged/4)):data_elements;
     if((total+255)/256>INT_MAX)return int(cudaErrorInvalidValue);
-    stage_append<<<unsigned((total+255)/256),256,0,stream>>>(keys,values,index,kh,vh,ih,previous.key,previous.value,previous.index,k,v,raw,
-        tokens,0,heads,width,iw,kt,ks,vt,vs,it,position,staged);return int(cudaGetLastError());
+    const auto grid=unsigned((total+255)/256);
+    if(pool)stage_append<true><<<grid,256,0,stream>>>(keys,values,index,kh,vh,ih,previous.key,previous.value,previous.index,k,v,raw,
+        tokens,0,heads,width,iw,kt,ks,vt,vs,it,position,staged,*pool);
+    else stage_append<><<<grid,256,0,stream>>>(keys,values,index,kh,vh,ih,previous.key,previous.value,previous.index,k,v,raw,
+        tokens,0,heads,width,iw,kt,ks,vt,vs,it,position,staged);
+    const auto status=cudaGetLastError();
+    if(pool && status==cudaSuccess)if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "native_qsa_batch_pool_starts actual_match=1 tokens=%d axes=%d int32_positions=%d\n",
+            tokens,pool->axes,int(pool->int32_positions));
+    }
+    return int(status);
 }
 int tq_publish_graph_batch(const PendingBatchPublication& b,cudaStream_t stream) {
     if(!b.position || !b.keys || !b.values || !b.fp16_keys || !b.fp16_values || !b.raw_keys || !b.raw_values || !b.raw_index ||

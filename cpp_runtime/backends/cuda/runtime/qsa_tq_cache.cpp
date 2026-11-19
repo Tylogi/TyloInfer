@@ -249,7 +249,7 @@ struct QsaTqCache::Impl {
     cudaStream_t pending_attention_stream=nullptr;
     std::array<AttentionWorkspace,7> batch_attention;
     struct BatchAppendWorkspace {
-        tb::Tensor key,value,index,modes_key,modes_value,fp16_key,fp16_value,rotated_key,rotated_value,packed;
+        tb::Tensor key,value,index,fp16_key,fp16_value,rotated_key,rotated_value,packed;
     };
     std::array<BatchAppendWorkspace,7> batch_append;
     AttentionWorkspace& graph_workspace(int queries) {
@@ -912,26 +912,41 @@ struct QsaTqCache::Impl {
         auto k=convert(key),v=convert(value),r=convert(raw);
         auto& batch=batch_append.at(std::size_t(n-2));
         const int staged=int(batch.key.size(1)),blocks=staged/4;
+        auto absolute=absolute_positions.defined()?absolute_positions:positions;
+        if(absolute.dim()==1)absolute=absolute.reshape({1,n});
+        tb::Tensor starts;
+        tq::GraphPoolStarts pool_starts{};
+        if(absolute.is_cuda() && absolute.device()==positions.device() && absolute.is_contiguous() &&
+                absolute.dim()>0 && absolute.size(-1)==n && absolute.numel()>=n && absolute.numel()/n<=INT_MAX &&
+                (absolute.scalar_type()==tb::kInt64 || absolute.scalar_type()==tb::kInt32)) {
+            auto shape=absolute.sizes().vec();shape.back()=blocks;
+            starts=tb::empty(shape,positions.options());
+            pool_starts={absolute.data_ptr(),starts.data_ptr<int64_t>(),int(absolute.numel()/n),absolute.scalar_type()==tb::kInt32};
+        }
         check(tq::tq_stage_graph_batch(k.data_ptr(),v.data_ptr(),r.data_ptr(),k.scalar_type()==tb::kFloat16,v.scalar_type()==tb::kFloat16,r.scalar_type()==tb::kFloat16,
             seeded_tail(),positions.data_ptr<int64_t>(),batch.key.data_ptr<float>(),batch.value.data_ptr<float>(),batch.index.data_ptr<float>(),
-            n,staged,kv_heads,width,index_width,k.stride(1),k.stride(2),v.stride(1),v.stride(2),r.stride(1),mfq_current_cuda_stream()));
-        check(tq::tq_prepare_modes(batch.key.data_ptr(),batch.value.data_ptr(),false,ks.data_ptr<float>(),vs.data_ptr<float>(),
-            batch.modes_key.data_ptr<float>(),batch.modes_value.data_ptr<float>(),batch.fp16_key.data_ptr<std::uint16_t>(),batch.fp16_value.data_ptr<std::uint16_t>(),
-            staged,kv_heads,width,padded,mfq_current_cuda_stream(),batch.rotated_key.data_ptr<float>(),batch.rotated_value.data_ptr<float>()));
-        const auto* canonical_k=reinterpret_cast<const std::uint8_t*>(batch.fp16_key.data_ptr());
-        const auto* canonical_v=reinterpret_cast<const std::uint8_t*>(batch.fp16_value.data_ptr());
+            n,staged,kv_heads,width,index_width,k.stride(1),k.stride(2),v.stride(1),v.stride(2),r.stride(1),
+            mfq_current_cuda_stream(),starts.defined()?&pool_starts:nullptr));
+        const tq::Affine8Pending pending{batch.fp16_key.data_ptr<std::uint16_t>(),batch.fp16_value.data_ptr<std::uint16_t>(),
+            batch.rotated_key.data_ptr<float>(),batch.rotated_value.data_ptr<float>()};
+        const auto* canonical_k=reinterpret_cast<const std::uint8_t*>(pending.keys);
+        const auto* canonical_v=reinterpret_cast<const std::uint8_t*>(pending.values);
         if(ram_bits!=16) {
             auto* packed=batch.packed.data_ptr<std::uint8_t>();
             check(tq::tq_prepare_affine8(batch.key.data_ptr(),batch.value.data_ptr(),false,ks.data_ptr<float>(),vs.data_ptr<float>(),
-                packed,packed+blocks*canonical_bytes,staged,kv_heads,width,padded,mfq_current_cuda_stream()));
+                packed,packed+blocks*canonical_bytes,staged,kv_heads,width,padded,mfq_current_cuda_stream(),&pending));
             canonical_k=packed;canonical_v=packed+blocks*canonical_bytes;
+        } else {
+            check(tq::tq_prepare_modes(batch.key.data_ptr(),batch.value.data_ptr(),false,ks.data_ptr<float>(),vs.data_ptr<float>(),
+                nullptr,nullptr,pending.keys,pending.values,staged,kv_heads,width,padded,mfq_current_cuda_stream(),
+                pending.rotated_keys,pending.rotated_values));
         }
-        auto absolute=absolute_positions.defined()?absolute_positions:positions;
-        if(absolute.dim()==1)absolute=absolute.reshape({1,n});
-        auto first=absolute.narrow(-1,0,1)-positions.reshape({-1}).narrow(0,0,1).remainder(4);
-        auto starts=tb::arange(blocks,positions.options())*4+first;
-        auto last=absolute.narrow(-1,n-1,1);
-        starts=tb::where(starts<=last,starts,last);
+        if(!starts.defined()) {
+            auto first=absolute.narrow(-1,0,1)-positions.reshape({-1}).narrow(0,0,1).remainder(4);
+            starts=tb::arange(blocks,positions.options())*4+first;
+            auto last=absolute.narrow(-1,n-1,1);
+            starts=tb::where(starts<=last,starts,last);
+        }
         auto pooled=pool(batch.index,starts).to(tb::kFloat32).contiguous();
         check(tq::indexer_affine16_append_batch(pooled.data_ptr<float>(),device_index.codes,device_index.scales,
             device_index.zero,positions.data_ptr<int64_t>(),blocks,index_width,capacity,mfq_current_cuda_stream()));
@@ -1872,7 +1887,6 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
                 const auto f=impl_->options.dtype(tb::kFloat32),h=impl_->options.dtype(tb::kFloat16);
                 batch.key=tb::empty({1,staged,impl_->kv_heads,impl_->width},f);batch.value=tb::empty_like(batch.key);
                 batch.index=tb::empty({1,staged,impl_->index_width},f);
-                batch.modes_key=tb::empty({blocks,impl_->rows,256},f);batch.modes_value=tb::empty_like(batch.modes_key);
                 batch.fp16_key=tb::empty({blocks,impl_->rows,256},h);batch.fp16_value=tb::empty_like(batch.fp16_key);
                 batch.rotated_key=tb::empty({staged,impl_->kv_heads,impl_->padded},f);batch.rotated_value=tb::empty_like(batch.rotated_key);
                 if(impl_->ram_bits!=16)batch.packed=tb::empty({int64_t(2*blocks*impl_->canonical_bytes)},impl_->options.dtype(tb::kUInt8));

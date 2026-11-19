@@ -14,6 +14,51 @@
 #include <memory>
 
 namespace tb=mfq_tensor_backend;
+void check_affine8_pending() {
+    namespace tq=tyloinfer::qsa;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    const auto stream=mfq_current_cuda_stream();
+    const auto check=[](int status) {
+        if(status)throw std::runtime_error(cudaGetErrorString(cudaError_t(status)));
+    };
+    const auto same_bytes=[](const tb::Tensor& a,const tb::Tensor& b) {
+        const auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
+        if(x.nbytes()!=y.nbytes() || std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes()))
+            throw std::runtime_error("Fused QSA Affine8 append changed a pending image");
+    };
+    int cases=0;
+    for(int padded:{256,512,1024})for(int tokens:{3,4,7})for(bool half:{false,true}) {
+        const int heads=3,width=padded-17,blocks=(tokens+3)/4,rows=heads*4*(padded/256);
+        auto host=tb::empty({tokens,heads,width},options.device(tb::kCPU));
+        auto host_values=tb::empty_like(host);
+        for(int64_t i=0;i<host.numel();++i) {
+            host.data_ptr<float>()[i]=std::sin(float(i)*.137f);
+            host_values.data_ptr<float>()[i]=std::cos(float(i)*.173f);
+        }
+        const auto dtype=half?tb::kFloat16:tb::kFloat32;
+        auto keys=host.to(tb::kCUDA,dtype),values=host_values.to(tb::kCUDA,dtype);
+        auto ks=tb::ones({padded},options),vs=ks*-1.f;
+        auto key_modes=tb::empty({blocks,rows,256},options),value_modes=tb::empty_like(key_modes);
+        auto pk=tb::empty(key_modes.sizes(),options.dtype(tb::kFloat16)),pv=tb::empty_like(pk);
+        auto rk=tb::empty({blocks*4,heads,padded},options),rv=tb::empty_like(rk);
+        auto fk=tb::empty_like(pk),fv=tb::empty_like(pv),frk=tb::empty_like(rk),frv=tb::empty_like(rv);
+        auto ak=tb::empty({blocks*((3*rows+3)&~3)+blocks*rows*256},options.dtype(tb::kUInt8));
+        auto av=tb::empty_like(ak),fak=tb::empty_like(ak),fav=tb::empty_like(av);
+        const tq::Affine8Pending pending{fk.data_ptr<std::uint16_t>(),fv.data_ptr<std::uint16_t>(),
+            frk.data_ptr<float>(),frv.data_ptr<float>()};
+        check(tq::tq_prepare_modes(keys.data_ptr(),values.data_ptr(),half,ks.data_ptr<float>(),vs.data_ptr<float>(),
+            key_modes.data_ptr<float>(),value_modes.data_ptr<float>(),pk.data_ptr<std::uint16_t>(),pv.data_ptr<std::uint16_t>(),
+            tokens,heads,width,padded,stream,rk.data_ptr<float>(),rv.data_ptr<float>()));
+        check(tq::tq_prepare_affine8(keys.data_ptr(),values.data_ptr(),half,ks.data_ptr<float>(),vs.data_ptr<float>(),
+            ak.data_ptr<std::uint8_t>(),av.data_ptr<std::uint8_t>(),tokens,heads,width,padded,stream));
+        check(tq::tq_prepare_affine8(keys.data_ptr(),values.data_ptr(),half,ks.data_ptr<float>(),vs.data_ptr<float>(),
+            fak.data_ptr<std::uint8_t>(),fav.data_ptr<std::uint8_t>(),tokens,heads,width,padded,stream,&pending));
+        same_bytes(ak,fak);same_bytes(av,fav);same_bytes(pk,fk);same_bytes(pv,fv);same_bytes(rk,frk);same_bytes(rv,frv);
+        ++cases;
+    }
+    std::cerr<<"QSA fused Affine8 and pending append byte parity PASS cases="<<cases<<'\n';
+}
+
 void check_attention_partitions() {
     namespace tq=tyloinfer::qsa;
     int cases=0;
@@ -314,7 +359,7 @@ void check_pending_graph(int heads,int width,bool ssd=true,bool wrap=false,bool 
     std::cerr<<"adaptive QSA single-segment graph reuse, archive boundaries, rollback and reset PASS heads="
              <<heads<<" width="<<width<<" replays="<<replays<<'\n';
 }
-void check_batch_graph(int heads,int width,int bits) {
+void check_batch_graph(int heads,int width,int bits,bool int32_positions=false) {
     const auto* saved=std::getenv("TYLOINFER_QSA_RAM_KV_BITS");const std::string previous=saved?saved:"";
     const auto setting=[](const std::string& value) {
 #ifdef _WIN32
@@ -338,7 +383,7 @@ void check_batch_graph(int heads,int width,int bits) {
     for(int n=1;n<=8;++n) {
         auto& x=inputs[n];x.q=tb::zeros({1,heads,n,width},h);x.k=tb::zeros({1,n,kh,width},h);x.v=tb::zeros_like(x.k);
         x.iq=tb::zeros({1,n,3,iw},f);x.raw=tb::zeros({1,n,iw},f);x.positions=tb::zeros({1,n},f.dtype(tb::kInt64));
-        x.absolute=tb::zeros({3,1,n},f.dtype(tb::kInt64));
+        x.absolute=tb::zeros({3,1,n},f.dtype(int32_positions?tb::kInt32:tb::kInt64));
         x.gate=tb::full({1,n,heads,width},.7,h);x.out=tb::empty({1,n,heads*width},h);
     }
     int position=0,replays=0;
@@ -581,6 +626,7 @@ int main(int argc,char** argv)try {
         std::cerr<<"adaptive QSA attention-only checks PASS\n";
         return 0;
     }
+    check_affine8_pending();
     check_attention_partitions();check_mass_observation();check_selected_blocks();check_packed_decode_windows();
     check_async_history();
     check(6,17);check(10,257);check(10,257,true,true);check(24,256,true,true);
@@ -591,7 +637,7 @@ int main(int argc,char** argv)try {
     check_pending_graph(24,257,false,false,true);
     check_batch_graph(6,17,16);
     check_batch_graph(24,256,16);
-    check_batch_graph(10,257,8);
+    check_batch_graph(10,257,8,true);
     check_batch_graph(6,17,4);
     check_batch_graph(20,257,8);
     check_batch_graph(48,256,4);
