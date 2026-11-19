@@ -149,6 +149,7 @@ struct QsaTqCache::Impl {
     bool batch_prepared=false;
     ::tyloi::DenseTensor seed_k,seed_v,seed_index,seed_rotated_k,seed_rotated_v;
     ::tyloi::DenseTensor graph_destination,graph_archive,graph_archive_host;
+    ::tyloi::DenseTensor graph_first_position;
     std::uint8_t* graph_archive_mapped=nullptr;
     std::shared_ptr<ImageBatch> graph_image;
     ::tyloi::DenseTensor canonical_slab;
@@ -567,10 +568,13 @@ struct QsaTqCache::Impl {
         }
         auto absolute=absolute_positions.defined()?absolute_positions:positions;
         if(absolute.dim()==1)absolute=absolute.reshape({1,n});
-        auto first=absolute.narrow(-1,0,1)-positions.reshape({-1}).narrow(0,0,1).remainder(4);
-        auto starts=::tyloi::cuda::arange(blocks,positions.options())*4+first;
+        auto phase=positions.reshape({-1}).narrow(0,0,1).remainder(4);
+        auto block_ids=::tyloi::cuda::arange(blocks,positions.options());
+        auto starts=block_ids*4+(absolute.narrow(-1,0,1)-phase);
         auto last=absolute.narrow(-1,n-1,1);
         starts=::tyloi::cuda::where(starts<=last,starts,last);
+        auto first=starts.narrow(-1,0,1);
+        first.copy_(::tyloi::cuda::where(graph_first_position.narrow(0,1,1)>0,graph_first_position.narrow(0,0,1),first));
         auto pooled=pool(batch.index,starts).to(::tyloi::kFloat32).contiguous();
         check(tq::indexer_affine16_append_batch(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>(),index_scales.data_ptr<std::uint16_t>(),
             index_zero.data_ptr<std::int16_t>(),positions.data_ptr<int64_t>(),blocks,index_width,capacity,mfq_current_cuda_stream()));
@@ -623,6 +627,7 @@ struct QsaTqCache::Impl {
             auto starts=absolute_positions.defined()?absolute_positions:positions;
             if(starts.dim()==1)starts=starts.reshape({1,1});
             starts=starts-3;
+            starts=::tyloi::cuda::where(graph_first_position.narrow(0,1,1)>0,graph_first_position.narrow(0,0,1),starts);
             auto pooled=pool(tail_storage_index,starts).to(::tyloi::kFloat32).contiguous();
             check(tq::indexer_affine16_append(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>(),index_scales.data_ptr<std::uint16_t>(),
                 index_zero.data_ptr<std::int16_t>(),positions.data_ptr<int64_t>(),index_width,mfq_current_cuda_stream()));
@@ -1150,6 +1155,69 @@ int QsaTqCache::device_graph_kind(int64_t tokens)const{
     const int kind=tokens==1?(impl_->tokens%4==3?2:1):3;
     return kind+(impl_->ram && !impl_->ram->graph_safe()?4:0);
 }
+bool QsaTqCache::pending_supported()const{return !impl_->ssd_cache && (!impl_->ram || impl_->ram->graph_safe());}
+std::vector<std::pair<tyloi::Device,std::size_t>> QsaTqCache::graph_growth(int64_t queries)const {
+    if(!pending_supported() || !device_graph_kind(queries))return {};
+    const auto& s=*impl_;
+    const auto& a=queries==1?s.pending_attention:s.batch_attention.at(std::size_t(queries-2));
+    const int parts=a.parts>0?a.parts:tq::tq_attention_partitions(int(queries),s.heads,s.kv_heads,s.padded,(s.budget+6)/4,false,true);
+    const auto q=std::size_t(queries),p=std::size_t(s.capacity),count=std::size_t((s.budget+6)/4);
+    std::size_t gpu=0,host=0;
+    if(a.queries<queries || a.pools<s.capacity || a.parts!=parts) {
+        gpu+=tq::indexer_affine16_score_scratch(int(queries),s.index_heads,s.index_width)+q*p*4+
+            q*count*sizeof(tq::SelectedBlock)+q*s.heads*s.padded*4+q*s.heads*parts*s.padded*4+
+            q*s.heads*parts*2*4+q*s.heads*count*4+q*s.heads*4;
+    }
+    if(!s.graph_first_position.defined())gpu+=2*sizeof(std::int64_t);
+    if(queries>1) {
+        const auto& b=s.batch_append.at(std::size_t(queries-2));
+        if(!b.key.defined()) {
+            const auto staged=std::size_t((queries+6)/4*4),blocks=staged/4;
+            gpu+=staged*(2ULL*s.kv_heads*s.width+s.index_width)*4+blocks*s.rows*256*12ULL+
+                staged*2ULL*s.kv_heads*s.padded*4+(s.ram_bits!=16?2*blocks*s.canonical_bytes:0);
+        }
+        if(!s.seed_k.defined())gpu+=s.tail_storage_k.nbytes()+s.tail_storage_v.nbytes()+s.tail_storage_index.nbytes()+
+            s.rotated_tail_k.nbytes()+s.rotated_tail_v.nbytes();
+    }
+    const auto blocks=(s.tokens%4+queries)/4;
+    if(blocks || queries>1) {
+        if(!s.graph_destination.defined()) {
+            const auto archive=2*(2*s.canonical_bytes+s.index_archive_bytes());
+            gpu+=sizeof(tq::TqBlockView)*(s.interval/4)+archive;host+=archive;
+        }
+        const auto slots=std::size_t(s.interval/4),slot=std::size_t(s.tokens/4)%slots;
+        if(!s.canonical_slab.defined() || !slot || slot+blocks>slots)gpu+=2*s.canonical_bytes*slots;
+    }
+    std::vector<std::pair<tyloi::Device,std::size_t>> result;
+    if(gpu)result.emplace_back(s.ks.device(),gpu);
+    if(host)result.emplace_back(tyloi::Device{tyloi::DeviceType::cpu,0},host);
+    return result;
+}
+std::vector<QsaTqCache::Tensor> QsaTqCache::graph_tensors(int64_t queries)const {
+    if(queries<1 || queries>8)return {};
+    const auto& s=*impl_;
+    const auto& a=queries==1?s.pending_attention:s.batch_attention.at(std::size_t(queries-2));
+    std::vector<Tensor> tensors;
+    const auto add=[&](const Tensor& t){if(t.defined())tensors.push_back(t);};
+    for(const auto* t:{&s.ks,&s.vs,&s.relative,&s.views,&s.index_codes,&s.index_scales,&s.index_zero,&s.hits,&s.mass,
+            &s.tail_storage_k,&s.tail_storage_v,&s.tail_storage_index,&s.rotated_tail_k,&s.rotated_tail_v,
+            &a.ranked,&a.rotated,&a.partial,&a.stats,&a.logmass,&a.norm})add(*t);
+    if(queries==1) {
+        add(s.pending_k);add(s.pending_v);
+        if(s.tokens%4==3){add(s.pending_modes_k);add(s.pending_modes_v);}
+    }else {
+        const auto& b=s.batch_append.at(std::size_t(queries-2));
+        for(const auto* t:{&s.seed_k,&s.seed_v,&s.seed_index,&s.seed_rotated_k,&s.seed_rotated_v,
+                &b.key,&b.value,&b.index,&b.modes_key,&b.modes_value,&b.fp16_key,&b.fp16_value,
+                &b.rotated_key,&b.rotated_value,&b.packed})add(*t);
+    }
+    if(queries>1 || s.tokens%4==3) {
+        add(s.graph_first_position);add(s.graph_destination);add(s.graph_archive_host);
+        if(!s.graph_archive_mapped)add(s.graph_archive);
+    }
+    if(s.ram){auto stage=s.ram->graph_tensors();tensors.insert(tensors.end(),stage.begin(),stage.end());}
+    return tensors;
+}
 bool QsaTqCache::pending_graph_enabled()const{return impl_->pending_graph;}
 bool QsaTqCache::graph_task_supported()const {
     // All stored encodings have immutable readers. Capability does not depend
@@ -1158,7 +1226,7 @@ bool QsaTqCache::graph_task_supported()const {
     return impl_->ram && impl_->ram->graph_task_supported();
 }
 void QsaTqCache::prepare_decode(bool allow_pending){prepare_decode_tokens(1,allow_pending);}
-void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int host_mode){
+void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int host_mode,const Tensor& history){
     impl_->cancel_batch_warmup();
     impl_->finish_history();
     const bool prefill=impl_->prefill_attention.queries>0 || !impl_->append_small;
@@ -1176,6 +1244,14 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
     impl_->graph_complete=impl_->graph_blocks!=0;
     if(impl_->pending_graph) {
         ResidentAllocationScope resident;
+        if(!impl_->graph_first_position.defined())impl_->graph_first_position=::tyloi::cuda::zeros({2},impl_->options.dtype(::tyloi::kInt64));
+        const auto prior=impl_->tokens%4;
+        if(history.defined() && prior) {
+            if(history.scalar_type()!=::tyloi::kInt64 || history.numel()<impl_->tokens || history.device()!=impl_->ks.device())
+                throw std::invalid_argument("QSA graph history position geometry mismatch");
+            impl_->graph_first_position.narrow(0,0,1).copy_(history.reshape({-1}).narrow(0,impl_->tokens-prior,1));
+            impl_->graph_first_position.narrow(0,1,1).fill_(1);
+        }else impl_->graph_first_position.narrow(0,1,1).zero_();
         // This arena belongs to one fixed cache geometry and CUDA device.
         // Keep its plan across token replays, avoiding a device query per layer.
         auto& scratch=impl_->graph_workspace(int(queries));
@@ -1231,7 +1307,6 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
             impl_->graph_image->payload=queries>1?impl_->canonical_slab:
                 impl_->canonical_slab.narrow(0,int64_t(2*impl_->canonical_bytes*slot),int64_t(2*impl_->canonical_bytes));
         }
-        const auto prior=impl_->tokens%4;
         if(prior) {
             if(impl_->tail_k.data_ptr()!=impl_->tail_storage_k.data_ptr())impl_->tail_storage_k.narrow(1,0,prior).copy_(impl_->tail_k);
             if(impl_->tail_v.data_ptr()!=impl_->tail_storage_v.data_ptr())impl_->tail_storage_v.narrow(1,0,prior).copy_(impl_->tail_v);

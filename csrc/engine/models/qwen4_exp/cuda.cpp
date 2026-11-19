@@ -110,7 +110,7 @@ tyloi::ops::Residual::Result graph_attention(const qwen4_exp::Layer& weights, qw
 } // namespace
 
 static bool streamed_decode_graphs() {
-    return tyloi::ops::Qsa::Graph({}, false).eligible();
+    return tyloi::ops::Qsa::Graph({}, false).eligible(true);
 }
 static ::tyloi::DenseTensor join_request_outputs(
         const std::vector<::tyloi::DenseTensor>& outputs,int64_t axis) {
@@ -515,7 +515,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         }
     };
     DecodeStream stream;
-    std::map<std::tuple<int,int,int,bool,bool>,std::unique_ptr<Cell>> cells;
+    std::map<std::tuple<int,int,int,bool,bool,int>,std::unique_ptr<Cell>> cells;
     // Verification widths execute serially and commit/rollback before the next
     // window. Their snapshots can share stable allocations across graph shapes.
     std::vector<GraphCheckpoint> shared_checkpoints;
@@ -559,7 +559,8 @@ struct Qwen4DecodeGraph final : DecodeGraph {
             const auto prefix = std::string("cuda_graph_profile_target_rows_") +
                 std::to_string(std::get<0>(key)) + "_kind_" + std::to_string(std::get<1>(key)) +
                 "_confirmed_" + std::to_string(std::get<2>(key)) +
-                (std::get<3>(key) ? "_raw" : "") + (std::get<4>(key) ? "_verify_" : "_");
+                (std::get<3>(key) ? "_raw" : "") + (std::get<4>(key) ? "_verify" : "") +
+                (std::get<5>(key) ? "_pending_" + std::to_string(std::get<5>(key)) : "") + "_";
             append_graph_profile_metrics(cell->window, prefix, result);
         }
         result.emplace_back("decode_graph_count", double(cells.size()));
@@ -578,7 +579,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
     }
 
     tyloi::StepSequence<tyloi::models::Decoded> run(const qwen4_exp::Model& model,
-            tyloi::models::Input input, tyloi::models::DecodeOptions options) {
+            tyloi::models::Input input, tyloi::models::DecodeOptions options, tyloi::ops::Qsa::Graph graph) {
         auto ids=model.device_ids(input.ids).dense();
         const auto tokens=static_cast<int>(ids.size(1));
         const auto confirmed=static_cast<int>(input.confirmed);
@@ -617,8 +618,6 @@ struct Qwen4DecodeGraph final : DecodeGraph {
             }
             return result;
         };
-        tyloi::ops::Qsa::Graph graph({{qsa, request.cache_pos, model.max_position_embeddings(),
-                                      request.decode_reserve_until}}, false);
         graph.admit(tokens, kv_capacity, want_raw);
         co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, graph.growth()};
         graph.materialize();
@@ -631,7 +630,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         kv_capacity = graph.rows().front().capacity;
         co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit,nullptr,growth(kv_capacity)};
         const auto observed=[&] {
-            std::vector<::tyloi::Tensor> result;
+            auto result=graph.storage();
             for(std::size_t i=0;i<model.layers.size();++i) {
                 auto& layer=*request.layers[i];const auto& weights=*model.layers[i];
                 for(auto* tensor:layer.graph_state(weights))result.push_back(*tensor);
@@ -639,7 +638,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
             }
             return result;
         };
-        auto& owner=cells[{tokens,kind,confirmed,!tap_layers.empty() || (want_raw && kind<3),verify}];
+        auto& owner=cells[{tokens,kind,confirmed,!tap_layers.empty() || (want_raw && kind<3),verify,graph.pending_kind()}];
         if(owner && owner->window.valid() && !owner->window.matches(observed()))owner.reset();
         if(!owner) {
             const Device device = model.device;
@@ -819,7 +818,8 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                 } catch(...) {recording.reset();restore();throw;}
                 ++request.decode_graph_captures;
                 std::cerr<<"runtime_qwen4_graph_capture role=target rows="<<tokens<<" kind="<<kind
-                    <<" confirmed="<<confirmed<<" segments="<<cell.window.segments()<<" count="<<request.decode_graph_captures
+                    <<" confirmed="<<confirmed<<" qsa_pending_device="<<graph.pending_kind()
+                    <<" segments="<<cell.window.segments()<<" count="<<request.decode_graph_captures
                     <<" ms="<<cell.window.capture_ms()<<'\n';
             }
             cell.window.run();cell.used_kinds|=1u<<result_kind;
@@ -887,11 +887,15 @@ tyloi::StepSequence<tyloi::models::Decoded> qwen4_exp::Model::decode(
         if(block->device != device || ((hidden || options.routed) && (!routed_graph_supported(block->ffn) ||
             (block->ple && !block->ple->graph_supported())))) co_return;
     TYLOINFER_RUNTIME_CHECK(state.cache_pos+ids.size(1)<=max_position_embeddings(),"MFQ window exceeds context");
-    state.decode_reserve_until=options.reserve_until;
+    std::vector<std::pair<const tyloi::ops::Qsa*,tyloi::ops::Qsa::State*>> qsa;
+    for(std::size_t i=0;i<layers.size();++i)
+        if(auto* attention=layers[i]->qsa.get())qsa.emplace_back(attention,state.layers[i]->qsa.get());
+    tyloi::ops::Qsa::Graph attention({{std::move(qsa),state.cache_pos,max_position_embeddings(),options.reserve_until}},false);
+    if(!attention.eligible(true))co_return;
     if(!state.graph_registry)state.graph_registry=std::make_unique<Qwen4DecodeGraph>(*this,state);
     graph = dynamic_cast<Qwen4DecodeGraph*>(state.graph_registry.get());
     if (!graph) throw std::logic_error("Qwen4 state has a different graph implementation");
-    auto job=graph->run(*this,std::move(input),options);
+    auto job=graph->run(*this,std::move(input),options,std::move(attention));
     while(auto step=job.next()) co_yield std::move(step);
 }
 

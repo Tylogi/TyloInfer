@@ -88,13 +88,15 @@ public:
         Graph(const Graph&) = delete;
         Graph& operator=(const Graph&) = delete;
         /** Report graph eligibility under the active execution policy. */
-        bool eligible() const;
+        bool eligible(bool allow_pending = false) const;
         /** Report whether a single-request graph has reusable managed backing. */
         bool reusable() const;
         /** Report whether startup warmup has eligible managed attention backing. */
         bool warmup_supported() const;
         /** Plan the window without allocating backend backing. */
         void admit(std::int64_t tokens = 1, std::int64_t previous_capacity = 0, bool hidden = false);
+        /** Pending append identity for the admitted window, or zero for dense caches. */
+        int pending_kind() const;
         /** Report per-device backing required by this plan without allocating it. */
         std::vector<std::pair<Device, std::size_t>> growth() const;
         /** Materialize the managed backing after its growth has been admitted. */
@@ -105,6 +107,8 @@ public:
         void layout();
         /** Return the planned capacity and QSA growth for each request. */
         const std::vector<Row>& rows() const;
+        /** Owning handles for fixed pending cache storage referenced by capture. */
+        std::vector<Tensor> storage() const;
         /** Prepare one attention layer at its original execution boundary. */
         void prepare(std::size_t request_index, std::size_t qsa_index, const Tensor& positions) const;
         /** Prepare all attention layers of a request in order. */
@@ -170,7 +174,8 @@ public:
     /** Reset the request cache and graph views. */
     void reset(State&) const;
     /** Prepare graph cache storage and pooled positions. */
-    void prepare_graph(State&, const Tensor& positions, std::int64_t capacity) const;
+    void prepare_graph(State&, const Tensor& positions, std::int64_t capacity,
+        std::int64_t pending_tokens = 0) const;
     /** Advance the request after a graph replay. */
     void advance_graph(State&, std::int64_t tokens) const;
     /** Truncate request cache to the accepted prefix. */

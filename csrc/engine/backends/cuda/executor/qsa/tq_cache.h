@@ -32,9 +32,12 @@ public:
     // staging boundaries; a model applies it to all its QSA layers so the
     // captured boundary count remains stable as individual layers spill.
     int device_graph_kind(int64_t tokens) const;
+    bool pending_supported() const;
+    std::vector<std::pair<tyloi::Device,std::size_t>> graph_growth(int64_t tokens) const;
+    std::vector<Tensor> graph_tensors(int64_t tokens) const;
     bool pending_graph_enabled() const;
     void prepare_decode(bool allow_pending_graph=false);
-    void prepare_decode_tokens(int64_t tokens,bool allow_pending_graph=false,int host_mode=0);
+    void prepare_decode_tokens(int64_t tokens,bool allow_pending_graph=false,int host_mode=0,const Tensor& history={});
     bool graph_task_supported()const;
     void advance_graph(int64_t tokens);
     Tensor forward_pending_graph(const Tensor& query,const Tensor& key,const Tensor& value,const Tensor& iq,

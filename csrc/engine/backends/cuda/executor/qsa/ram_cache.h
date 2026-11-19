@@ -36,6 +36,8 @@ public:
     // Reserve each worker first; pass one live cache per worker.
     static void prepare_workspace(std::span<QsaRamCache* const> pools,std::size_t bytes);
     void prepare();
+    static std::pair<std::size_t,std::size_t> graph_growth(std::span<QsaRamCache* const> caches);
+    std::vector<Tensor> graph_tensors() const;
     Tensor prepared_views()const;
     bool collect_graph_selection(const Tensor& selected,int queries,int count);
     bool graph_task_supported()const;

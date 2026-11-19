@@ -235,6 +235,7 @@ class QsaCore {
             std::size_t(position(request))), std::size_t(c_.kv_heads)), key + value);
     }
     std::size_t graph_growth_bytes(const State& request,int64_t capacity) const {
+        if(request.adaptive)return 0;
         if(managed_memory(request))return request.memory->growth_bytes(capacity);
         if (request.graph_keys.defined()) return 0;
         auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
@@ -404,8 +405,13 @@ class QsaCore {
         if(managed_memory(request)){request.memory->hot.reset();activate_memory(request);return;}
         request.graph_keys={};request.graph_values={};request.graph_pooled={};request.graph_index={};
     }
-    void prepare_graph(State& request,const DenseTensor& full_positions, int64_t capacity) {
-        TYLOINFER_RUNTIME_CHECK(!request.adaptive, "adaptive QSA requires eager execution");
+    void prepare_graph(State& request,const DenseTensor& full_positions, int64_t capacity,int64_t pending_tokens) {
+        if(request.adaptive) {
+            TYLOINFER_RUNTIME_CHECK(pending_tokens>0 && request.adaptive->pending_supported(),
+                "adaptive QSA requires an admitted pending graph");
+            request.adaptive->prepare_decode_tokens(pending_tokens,true,0,full_positions);
+            return;
+        }
         activate_memory(request);
         TYLOINFER_RUNTIME_CHECK(!request.offload || managed_memory(request), "streamed QSA graphs require a resident indexer");
         if(managed_memory(request)) {
@@ -448,6 +454,18 @@ class QsaCore {
     DenseTensor forward_graph(State& request,const DenseTensor& hidden,
                          const DenseTensor& positions,const DenseTensor& cache_positions,
                          std::vector<DenseTensor> projections={},bool project_output=true,bool history_only=false) {
+        if(request.adaptive) {
+            TYLOINFER_RUNTIME_CHECK(!history_only && hidden.size(0)==1 && request.adaptive->pending_graph_enabled(),
+                "adaptive QSA requires a complete pending graph window");
+            auto p=project(hidden,positions,true,{},{},{},std::move(projections));
+            auto output=::tyloi::cuda::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
+                hidden.scalar_type()==::tyloi::kFloat16 ? ::tyloi::kFloat16 : ::tyloi::kFloat32));
+            output=request.adaptive->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,
+                std::move(output),[this](const DenseTensor& raw,const DenseTensor& starts) {
+                    return pool_index(raw,starts);
+                },positions).to(hidden.scalar_type());
+            return project_output?this->project_output(output):output;
+        }
         const auto mark=[](const char* phase) {
             if(auto* window=DecodeWindow::recording())window->mark_current(phase);
         };
@@ -603,6 +621,11 @@ class QsaCore {
         return finish(std::move(gated));
     }
     void advance_graph(State& request,int64_t tokens) {
+        if(request.adaptive) {
+            MfqCudaGuard guard(c_.device);
+            request.adaptive->advance_graph(tokens);
+            return;
+        }
         if(!request.offload){request.keys.advance_fixed(tokens);request.values.advance_fixed(tokens);}
         request.index.advance_fixed(tokens);
     }
@@ -840,6 +863,11 @@ class QsaCore {
     DenseTensor encode_key(const DenseTensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.key_bits(),false):x.to(::tyloi::kFloat16); }
     DenseTensor encode_value(const DenseTensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.value_bits(),true):x.to(::tyloi::kFloat16); }
     struct Projection {DenseTensor gate,query,key,value,iq,raw;bool cache_written=false;};
+    DenseTensor pool_index(const DenseTensor& raw,const DenseTensor& starts) {
+        auto pooled=raw.reshape({1,raw.size(1)/c_.pool,c_.pool,c_.index_width}).mean(2);
+        pooled=project_norm(pooled,w_->index_key_norm.dense());
+        return rotary_->forward(pooled.unsqueeze(1),starts).squeeze(1);
+    }
     DenseTensor forward_adaptive(QsaTqCache& cache,const DenseTensor& hidden,const DenseTensor& positions,
             const DenseTensor& full_positions,const std::vector<DenseTensor>& projections,
             bool project_output,bool history_only) {
@@ -851,11 +879,7 @@ class QsaCore {
         const auto type=hidden.scalar_type()==::tyloi::kFloat16 ? ::tyloi::kFloat16 : ::tyloi::kFloat32;
         auto output=history_only ? DenseTensor{} : ::tyloi::cuda::empty({1,tokens,c_.heads*c_.width},
             hidden.options().dtype(type));
-        const auto pool=[&](const DenseTensor& raw,const DenseTensor& starts) {
-            auto pooled=raw.reshape({1,raw.size(1)/c_.pool,c_.pool,c_.index_width}).mean(2);
-            pooled=project_norm(pooled,w_->index_key_norm.dense());
-            return rotary_->forward(pooled.unsqueeze(1),starts).squeeze(1);
-        };
+        const auto pool=[this](const DenseTensor& raw,const DenseTensor& starts) { return pool_index(raw,starts); };
         try {
             for (int64_t begin=0;begin<tokens;begin+=rows) {
                 const auto count=std::min(rows,tokens-begin);
@@ -1310,13 +1334,13 @@ void Qsa::reset(State& state) const {
     state.impl_->failed_trace.clear();
     state.impl_->failed_output = {};
 }
-void Qsa::prepare_graph(State& state, const Tensor& positions, std::int64_t capacity) const {
+void Qsa::prepare_graph(State& state, const Tensor& positions, std::int64_t capacity, std::int64_t pending_tokens) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->device.is_cuda()) guard.emplace(impl_->device);
     if (positions.defined() && !positions.representation<DenseTensor>())
         throw std::invalid_argument("QSA positions must be dense");
     impl_->core.prepare_graph(state.impl_->cache,
-        positions.representation<DenseTensor>() ? positions.dense() : DenseTensor{}, capacity);
+        positions.representation<DenseTensor>() ? positions.dense() : DenseTensor{}, capacity, pending_tokens);
 }
 void Qsa::advance_graph(State& state, std::int64_t tokens) const { impl_->core.advance_graph(state.impl_->cache, tokens); }
 void Qsa::truncate(State& state, std::int64_t keep) const { impl_->core.truncate(state.impl_->cache, keep); }
@@ -1370,6 +1394,7 @@ struct Qsa::Graph::Impl {
     std::vector<Row> rows;
     bool independent, admitted = false, materialized = false, clear = false, hidden = false, laid_out = false;
     std::int64_t tokens = 0, required = 0;
+    int pending = 0;
     std::shared_ptr<cuda::KvMemoryManager> manager;
     std::vector<std::pair<Device, std::size_t>> unmanaged_growth;
     Impl(std::vector<Request> values, bool batch)
@@ -1380,11 +1405,15 @@ Qsa::Graph::Graph(std::vector<Request> requests, bool independent)
 Qsa::Graph::~Graph() = default;
 Qsa::Graph::Graph(Graph&&) noexcept = default;
 Qsa::Graph& Qsa::Graph::operator=(Graph&&) noexcept = default;
-bool Qsa::Graph::eligible() const {
-    if (cuda::qsa_tq_cache_enabled()) return false;
-    for (const auto& request : impl_->requests)
-        for (const auto& layer : request.layers)
-            if (layer.second->impl_->cache.adaptive) return false;
+bool Qsa::Graph::eligible(bool allow_pending) const {
+    bool pending = impl_->requests.empty() && cuda::qsa_tq_cache_enabled(), ordinary = false;
+    for (const auto& request : impl_->requests) for (const auto& layer : request.layers) {
+        if (const auto& cache = layer.second->impl_->cache.adaptive) {
+            if (!cache->pending_supported()) return false;
+            pending = true;
+        } else ordinary = true;
+    }
+    if (pending) return allow_pending && !ordinary && !impl_->independent && mfq_cuda_graph_capture_supported();
     auto& executor = cuda::Executor::current();
     const auto offload = executor.kv_offload();
     if (offload) {
@@ -1430,7 +1459,27 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         auto capacity = previous_capacity;
         if (!request.layers.empty()) {
             const auto& first = request.layers.front();
-            if (first.first->graph_capacity(*first.second)) {
+            if (first.second->impl_->cache.adaptive) {
+                capacity = request.maximum;
+                std::vector<cuda::QsaRamCache*> ram;
+                for (const auto& layer : request.layers) {
+                    const auto& cache = layer.second->impl_->cache.adaptive;
+                    TYLOINFER_RUNTIME_CHECK(cache && cache->pending_supported() && cache->position()==request.position,
+                        "incompatible adaptive QSA graph state");
+                    const auto kind = cache->device_graph_kind(tokens);
+                    TYLOINFER_RUNTIME_CHECK(kind>0 && kind<4 && (!plan.pending || plan.pending==kind),
+                        "invalid adaptive QSA graph append");
+                    plan.pending = kind;
+                    for (const auto& growth : cache->graph_growth(tokens))
+                        plan.unmanaged_growth.push_back(growth);
+                    if (auto* staging = cache->ram()) ram.push_back(staging);
+                }
+                if (!ram.empty()) {
+                    const auto [gpu, host] = cuda::QsaRamCache::graph_growth(ram);
+                    if (gpu) plan.unmanaged_growth.emplace_back(first.first->impl_->device, gpu);
+                    if (host) plan.unmanaged_growth.emplace_back(Device(kCPU), host);
+                }
+            } else if (first.first->graph_capacity(*first.second)) {
                 plan.manager = cuda::Executor::current().kv_memory();
                 capacity = first.first->graph_capacity(*first.second);
             }
@@ -1442,6 +1491,10 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
     plan.hidden = hidden;
     plan.admitted = true;
     plan.laid_out = !plan.independent && !plan.clear;
+}
+int Qsa::Graph::pending_kind() const {
+    if (!impl_->admitted) throw std::logic_error("QSA graph is not admitted");
+    return impl_->pending;
 }
 std::vector<std::pair<Device, std::size_t>> Qsa::Graph::growth() const {
     const auto& plan = *impl_;
@@ -1532,12 +1585,21 @@ const std::vector<Qsa::Graph::Row>& Qsa::Graph::rows() const {
     if (!impl_->admitted) throw std::logic_error("QSA graph plan is not admitted");
     return impl_->rows;
 }
+std::vector<Tensor> Qsa::Graph::storage() const {
+    std::vector<Tensor> result;
+    if (impl_->pending)
+        for (const auto& layer : impl_->requests.front().layers)
+            for (auto& tensor : layer.second->impl_->cache.adaptive->graph_tensors(impl_->tokens))
+                if (tensor.defined()) result.emplace_back(std::move(tensor));
+    return result;
+}
 void Qsa::Graph::prepare(std::size_t request_index, std::size_t qsa_index, const Tensor& positions) const {
     if (!impl_->admitted || !impl_->laid_out || !impl_->materialized)
         throw std::logic_error("QSA graph layout is not materialized");
     const auto& request = impl_->requests.at(request_index);
     const auto& layer = request.layers.at(qsa_index);
-    layer.first->prepare_graph(*layer.second, positions, impl_->rows.at(request_index).capacity);
+    layer.first->prepare_graph(*layer.second, positions, impl_->rows.at(request_index).capacity,
+        impl_->pending ? impl_->tokens : 0);
 }
 void Qsa::Graph::prepare(std::size_t request_index, const Tensor& positions) const {
     const auto& request = impl_->requests.at(request_index);

@@ -222,7 +222,7 @@ void Qsa::reset(State& state) const { state.impl_ = std::make_unique<State::Impl
 void Qsa::truncate(State& state, std::int64_t keep) const {
     state.impl_->keys.truncate(keep); state.impl_->values.truncate(keep); state.impl_->index.truncate(keep);
 }
-void Qsa::prepare_graph(State&, const Tensor&, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
+void Qsa::prepare_graph(State&, const Tensor&, std::int64_t, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
 void Qsa::advance_graph(State&, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
 std::vector<Tensor> Qsa::project_inputs(const Tensor& input) const {
     auto result = project_group(input, impl_->weights.input_projection);
@@ -343,10 +343,11 @@ Qsa::Graph::Graph(std::vector<Request>, bool) : impl_(std::make_unique<Impl>()) 
 Qsa::Graph::~Graph() = default;
 Qsa::Graph::Graph(Graph&&) noexcept = default;
 Qsa::Graph& Qsa::Graph::operator=(Graph&&) noexcept = default;
-bool Qsa::Graph::eligible() const { return false; }
+bool Qsa::Graph::eligible(bool) const { return false; }
 bool Qsa::Graph::reusable() const { return false; }
 bool Qsa::Graph::warmup_supported() const { return false; }
 void Qsa::Graph::admit(std::int64_t, std::int64_t, bool) { throw std::logic_error("Metal QSA does not support graphs"); }
+int Qsa::Graph::pending_kind() const { return 0; }
 std::vector<std::pair<Device, std::size_t>> Qsa::Graph::growth() const {
     throw std::logic_error("Metal QSA does not support graphs");
 }
@@ -354,6 +355,7 @@ void Qsa::Graph::materialize() { throw std::logic_error("Metal QSA does not supp
 bool Qsa::Graph::clear_required() const { return false; }
 void Qsa::Graph::layout() { throw std::logic_error("Metal QSA does not support graphs"); }
 const std::vector<Qsa::Graph::Row>& Qsa::Graph::rows() const { throw std::logic_error("Metal QSA does not support graphs"); }
+std::vector<Tensor> Qsa::Graph::storage() const { return {}; }
 void Qsa::Graph::prepare(std::size_t, std::size_t, const Tensor&) const { throw std::logic_error("Metal QSA does not support graphs"); }
 void Qsa::Graph::prepare(std::size_t, const Tensor&) const { throw std::logic_error("Metal QSA does not support graphs"); }
 } // namespace tyloi::ops

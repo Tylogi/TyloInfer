@@ -113,7 +113,6 @@ public:
     std::unique_ptr<DecodeGraph> graph_registry;
     bool reuse_decode_graphs = false;
     std::uint64_t decode_graph_captures = 0;
-    std::int64_t decode_reserve_until = 0;
     bool speculative_prefix_retention = false;
 
 private:

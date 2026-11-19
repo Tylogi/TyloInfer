@@ -21,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <tuple>
 
@@ -541,11 +542,14 @@ struct StageArena {
     std::size_t stride=0,host_bytes=0;
     ~StageArena(){if(host_bytes)pinned_account->physical.fetch_sub(host_bytes);}
 };
+using StageKey=std::tuple<int,cudaStream_t,int,int,std::size_t>;
+auto& stage_arenas() {
+    static thread_local std::map<StageKey,std::weak_ptr<StageArena>> arenas;
+    return arenas;
+}
 std::shared_ptr<StageArena> arena_for(int device,cudaStream_t stream,int capacity,int count,std::size_t stride,const ::tyloi::TensorOptions& options,
         const std::shared_ptr<RamAccount>& pinned_account) {
-    using Key=std::tuple<int,cudaStream_t,int,int,std::size_t>;
-    static thread_local std::map<Key,std::weak_ptr<StageArena>> arenas;
-    auto& weak=arenas[{device,stream,capacity,count,stride}];auto arena=weak.lock();
+    auto& weak=stage_arenas()[{device,stream,capacity,count,stride}];auto arena=weak.lock();
     if(!arena) {
         ResidentAllocationScope resident;
         arena=std::make_shared<StageArena>();arena->stride=stride;arena->pinned_account=pinned_account;
@@ -1117,6 +1121,32 @@ void QsaRamCache::prepare() {
     auto& s=*impl_;if(!s.arena)s.arena=arena_for(s.device,mfq_current_cuda_stream(),s.capacity,s.count,2*s.fp16_bytes,s.options,s.worker->pool_account);
     s.drain();s.configure_cache(s.store->stats().tokens[3]!=0);
     s.prepared_revision=s.publication_revision;
+}
+std::pair<std::size_t,std::size_t> QsaRamCache::graph_growth(std::span<QsaRamCache* const> caches) {
+    const auto stream=mfq_current_cuda_stream();
+    const auto& arenas=stage_arenas();
+    std::set<StageKey> pending;
+    std::size_t gpu=0,host=0;
+    for(const auto* cache:caches) {
+        const auto& s=*cache->impl_;
+        if(s.arena)continue;
+        const StageKey key{s.device,stream,s.capacity,s.count,2*s.fp16_bytes};
+        const auto existing=arenas.find(key);
+        if((existing!=arenas.end() && !existing->second.expired()) || !pending.insert(key).second)continue;
+        const auto selected=std::size_t(8)*s.count;
+        const auto missing=(1+selected)*sizeof(std::int32_t);
+        gpu+=selected*2*s.fp16_bytes+std::size_t(s.capacity)*sizeof(std::int32_t)+missing+selected*sizeof(tq::TqBlockView);
+        host+=missing+2*selected*sizeof(tq::SelectedBlock);
+    }
+    return {gpu,host};
+}
+std::vector<QsaRamCache::Tensor> QsaRamCache::graph_tensors() const {
+    const auto& s=*impl_;
+    std::vector<Tensor> tensors;
+    const auto add=[&](const Tensor& t){if(t.defined())tensors.push_back(t);};
+    for(const auto* t:{&s.sources,&s.cache_slots,&s.cache_locks,&s.cache_frame,&s.cache_payload,&s.cache_parameters})add(*t);
+    if(s.arena)for(const auto* t:{&s.arena->payload,&s.arena->first,&s.arena->views})add(*t);
+    return tensors;
 }
 QsaRamCache::Tensor QsaRamCache::prepared_views()const {
     if(!impl_->arena)throw std::logic_error("QSA RAM staging arena was not prepared");
