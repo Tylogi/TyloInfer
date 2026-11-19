@@ -1316,14 +1316,14 @@ struct Qwen4MtpGraph {
             if(found==cells.end() || !found->second || !found->second->window.can_enqueue_device_only())return nullptr;
             return found->second.get();
         };
-        const auto* chain_option=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
-        const bool history_tail=history>1 && (!chain_option || chain_option[0]!='0') &&
+        const bool history_chain=predictor.history_chain_enabled();
+        const bool history_tail=history>1 && history_chain &&
             !predictor.layers[0]->gdn && !predictor.layers[0]->ple && predictor.layers[0]->qsa->supports_history_tail_graph();
         auto* first=ready(history_tail?history:1,hidden.scalar_type(),history_tail?3:0);
         if(!first || !first->multi.defined())return {};
         auto* next=ready(1,first->multi.scalar_type(),0);
         if(!next || !next->multi.defined() || next->multi.scalar_type()!=first->multi.scalar_type())return {};
-        const bool scalar_history=prefix>1 && (!chain_option || chain_option[0]!='0');
+        const bool scalar_history=prefix>1 && history_chain;
         for(int64_t offset=0;!history_tail && offset<prefix;) {
             const auto rows=scalar_history?std::min<int64_t>(4,prefix-offset):int64_t(1);
             if(!ready(rows,hidden.scalar_type(),scalar_history && rows>1?2:1))return {};
@@ -1618,11 +1618,18 @@ MtpStep Qwen4ExpMtp::batch_graph(const MtpTarget& target,const Tensor& hidden,co
 bool Qwen4ExpMtp::supports_graph_window(int64_t tokens) const {
     if(!execution || layers.size()!=1 || !layers[0]->qsa || tokens<1 || tokens>8 ||
             execution->kl_mmq.mode!=KlMmqMode::Default || !streamed_decode_graphs(*execution))return false;
+    if(!config.experts)return layers[0]->tq_graph_ffn;
     const bool row_banks=bool(execution->tq_expert_cache || execution->gguf_expert_cache);
     if(row_banks)return layers[0]->tq_graph_ffn &&
         (!execution->tq_expert_cache || tq_graph_supports_tokens(tokens));
     return execution->config.moe_pipeline && execution->config.moe_two_stage_ffn &&
         execution->moe_expert_cache && layers[0]->prefetch;
+}
+
+bool Qwen4ExpMtp::history_chain_enabled() const {
+    const auto* setting=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
+    // Dense predictors keep the same per-row history order as eager priming.
+    return config.experts && (!setting || setting[0]!='0');
 }
 
 MtpStep Qwen4ExpMtp::step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) {
@@ -1673,8 +1680,7 @@ void Qwen4ExpMtp::history_step(const MtpTarget& target,Tensor hidden,Tensor ids,
 
 std::optional<MtpStep> Qwen4ExpMtp::history_tail_step(const MtpTarget& target,Tensor hidden,Tensor ids,Tensor positions) {
     const auto graph=mfq::cuda::runtime_options::mtp_predictor_graph();
-    const auto* history=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
-    if(!reuse_decode_graphs || (graph && !*graph) || (history && history[0]=='0') || batch!=1 ||
+    if(!reuse_decode_graphs || (graph && !*graph) || !history_chain_enabled() || batch!=1 ||
         ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<2 || !supports_graph_window(ids.size(1)) ||
         layers[0]->gdn || layers[0]->ple || !layers[0]->qsa->supports_history_tail_graph() ||
         hidden.dim()!=3 || hidden.size(0)!=1 || hidden.size(1)!=ids.size(1) ||
@@ -2889,8 +2895,7 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
             predictor->trim_cache_to(16);
             predictor->history_step(target,raw.narrow(1,0,rows),ids.narrow(1,0,rows));
         }
-        const auto* chain_option=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
-        const bool history_chain=!chain_option || chain_option[0]!='0';
+        const bool history_chain=predictor->history_chain_enabled();
         const auto* chain_check=std::getenv("TYLOINFER_VERIFY_MTP_HISTORY_CHAIN");
         const bool verify_chain=chain_check && chain_check[0]=='1' && predictor->layers[0]->qsa->supports_session();
         if(history_chain)for(int rows=2;rows<=std::min(4,verification_rows-1);++rows) {

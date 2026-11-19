@@ -60,6 +60,7 @@ struct Qwen4ExpMtp final : MtpModule {
     Tensor forward(const MtpTarget &target, Tensor hidden, Tensor ids) override;
     Tensor logits_for(const MtpTarget &target, Tensor hidden) const;
     bool supports_graph_window(int64_t tokens) const;
+    bool history_chain_enabled() const;
 
     MtpStep step(const MtpTarget &target, Tensor hidden, Tensor ids) override;
     MtpStep step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) override;

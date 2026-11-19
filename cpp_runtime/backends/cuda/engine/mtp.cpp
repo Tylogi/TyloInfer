@@ -687,8 +687,7 @@ template <class Model> struct CudaMtpOps {
 #endif
         // Earlier teacher-forced rows contribute only predictor attention KV.
         // Their FFN/readout has no consumer; draft from the final row alone.
-        const auto* chain_option=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
-        if(prefix>1 && (!chain_option || chain_option[0]!='0')) {
+        if(prefix>1 && predictor->history_chain_enabled()) {
           predictor_history_step(hidden.narrow(1,0,prefix),ids.narrow(1,0,prefix),
               positions.defined()?positions.narrow(-1,0,prefix):Tensor{},true);
           static bool reported=false;
