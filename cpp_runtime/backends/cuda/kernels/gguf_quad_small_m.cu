@@ -69,18 +69,7 @@ template<int Tokens,class Index>__device__ __forceinline__ PackedRowCodes load_r
 
 #include "gguf_quad_small_m_extra.cuh"
 
-// Reuse the same sign expansion across rows, fragments and tokens. Keep
-// the magnitude selectors compressed; the extra shared table is 512/1024 B.
-template<int F>constexpr unsigned SignCount=F==GGML_TYPE_IQ2_XXS || F==GGML_TYPE_IQ2_XS?128:F==GGML_TYPE_IQ2_S?256:0;
-template<int F>__device__ __forceinline__ void stage_sign_selectors(int tid) {
- extern __shared__ unsigned quad_codebook[];
- for(unsigned i=tid;i<SignCount<F>;i+=128) {
-  unsigned signs=i;if constexpr(F!=GGML_TYPE_IQ2_S)signs|=(__popc(signs)&1u)<<7;
-  unsigned pairs=(signs|(signs<<4))&0x0f0fu;
-  pairs=(pairs|(pairs<<2))&0x3333u;
-  quad_codebook[GridCount<F>+i]=iq_grid_byte_perm<true>(0x44400400u,0u,pairs);
- }
-}
+template<int F>constexpr unsigned SignWords=QuadIqDot<F,0,true>::SignWords;
 
 // The host selects this aligned specialization once. Each packet contains
 // the same coordinate word for four adjacent queries.
@@ -91,7 +80,7 @@ template<int F,int Rows,int Tokens,bool PositionMajor,class Index,bool VectorTok
 __device__ __forceinline__ void quad_small_m_body(QuadProjection p,int columns,const void* input,bool half_output,unsigned tile) {
  if constexpr(GridCount<F>!=0){
   stage_global_grid<F,0>(threadIdx.y*32+threadIdx.x);
-  stage_sign_selectors<F>(threadIdx.y*32+threadIdx.x);__syncthreads();
+  QuadIqDot<F,0,true>::stage_signs(threadIdx.y*32+threadIdx.x);__syncthreads();
  }
  constexpr int W=1,Offset=0,Capacity=Tokens==2?2:4;
  const auto* packed=static_cast<const uint8_t*>(p.projection.packed);const int rows=int(p.projection.rows);void* output=p.projection.output;
@@ -384,7 +373,7 @@ void matvec_quad_small_m(const QuadProjection& p,int64_t columns,const void* inp
                     else return quad_small_m_kernel<F,Rows,M,PositionMajor,uint64_t>;
                 }();
                 const unsigned shared_bytes=(F==GGML_TYPE_IQ1_S
-                    ? Iq1SSequentialGridCount : GridCount<F>+SignCount<F>)*4;
+                    ? Iq1SSequentialGridCount : GridCount<F>+SignWords<F>)*4;
                 function<<<unsigned((p.projection.rows+Outputs-1)/Outputs),dim3(32,4),shared_bytes,stream>>>(p,int(columns),input,half_output);
                 if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,"gguf_quad_small_m",
                     reinterpret_cast<const void*>(function),"format="+std::to_string(F)+" M="+std::to_string(M)+
@@ -452,8 +441,8 @@ void launch_small_m_pair(const QuadProjection& a,const QuadProjection& b,
         constexpr unsigned b_rows=B==GGML_TYPE_IQ3_S?8:16;
         const unsigned split=unsigned((a.projection.rows+a_rows-1)/a_rows);
         const unsigned total=split+unsigned((b.projection.rows+b_rows-1)/b_rows);
-        constexpr unsigned a_shared=A==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<A>+SignCount<A>;
-        constexpr unsigned b_shared=B==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<B>+SignCount<B>;
+        constexpr unsigned a_shared=A==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<A>+SignWords<A>;
+        constexpr unsigned b_shared=B==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<B>+SignWords<B>;
         constexpr unsigned shared=4*(a_shared>b_shared?a_shared:b_shared);
         const auto fn=pair_m2_kernel<A,B>;
         fn<<<total,dim3(32,4),shared,stream>>>(a,b,columns,input,half_output,split);
@@ -574,8 +563,8 @@ void matvec_quad_pair_small_m(const QuadProjection* projections,size_t count,int
     const unsigned split=unsigned((projections[0].projection.rows+15)/16);
     const unsigned total=split+unsigned((projections[1].projection.rows+15)/16);
     const auto launch=[&]<int A,int B,int M,bool Narrow>() {
-        constexpr unsigned sa=A==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<A>+SignCount<A>;
-        constexpr unsigned sb=B==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<B>+SignCount<B>;
+        constexpr unsigned sa=A==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<A>+SignWords<A>;
+        constexpr unsigned sb=B==GGML_TYPE_IQ1_S?Iq1SSequentialGridCount:GridCount<B>+SignWords<B>;
         constexpr unsigned bytes=4*(sa>sb?sa:sb);
         const auto fn=typed_packet_pair<A,B,M,Narrow>;
         fn<<<total,dim3(32,4),bytes,stream>>>(projections[0],projections[1],int(columns),native,interleaved,half_output,split);

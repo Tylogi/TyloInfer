@@ -8,6 +8,22 @@ template<bool Medium,int Offset>struct QuadIq1Dot:PreparedIq1M1<Medium,true> {
 
 template<int F,int Offset,bool CachedSigns=false>struct QuadIqDot {
     static constexpr int GridCount=F==GGML_TYPE_IQ2_XXS||F==GGML_TYPE_IQ3_XXS?256:F==GGML_TYPE_IQ2_XS||F==GGML_TYPE_IQ3_S?512:1024;
+    static constexpr unsigned SignPatterns=F==GGML_TYPE_IQ2_XXS || F==GGML_TYPE_IQ2_XS || F==GGML_TYPE_IQ3_XXS?128:F==GGML_TYPE_IQ2_S?256:0;
+    static constexpr unsigned SignWords=SignPatterns*(F==GGML_TYPE_IQ3_XXS?2:1);
+    __device__ static void stage_signs(unsigned tid) {
+        extern __shared__ unsigned quad_codebook[];
+        for(unsigned i=tid;i<SignPatterns;i+=128) {
+            const unsigned signs=F==GGML_TYPE_IQ2_S?i:i|((__popc(i)&1u)<<7);
+            if constexpr(F==GGML_TYPE_IQ3_XXS) {
+                quad_codebook[Offset+GridCount+2*i]=iq_nibble_sign_mask(signs&15u);
+                quad_codebook[Offset+GridCount+2*i+1]=iq_nibble_sign_mask(signs>>4);
+            } else {
+                unsigned pairs=(signs|(signs<<4))&0x0f0fu;
+                pairs=(pairs|(pairs<<2))&0x3333u;
+                quad_codebook[Offset+GridCount+i]=iq_grid_byte_perm<true>(0x44400400u,0u,pairs);
+            }
+        }
+    }
     __device__ static unsigned grid_at(unsigned i){extern __shared__ unsigned quad_codebook[];return quad_codebook[Offset+i];}
     // IQ2 magnitudes use selector nibbles 0..2; their sign adds bit 2.
     // IQ3 magnitude selectors are 0..7. Bit 3 is always clear, so raw
@@ -28,7 +44,18 @@ template<int F,int Offset,bool CachedSigns=false>struct QuadIqDot {
         else if constexpr(F==GGML_TYPE_IQ2_S){const unsigned code=((w.codes.x>>(8*J))&255)|(((w.meta>>24)<<(8-2*J))&768);return decode_iq2(grid_at(code),(w.signs>>(8*J))&255);}
         else {
             const unsigned codes=(J<2?w.codes.x:w.codes.y)>>(16*(J%2));unsigned a,b,sign;
-            if constexpr(F==GGML_TYPE_IQ3_XXS){sign=(w.signs>>(7*J))&127;sign|=(__popc(sign)&1u)<<7;a=magnitude(codes&255);b=magnitude((codes>>8)&255);const auto lo=iq_nibble_sign_mask(sign&15),hi=iq_nibble_sign_mask(sign>>4);return make_int2((a^lo)+(lo&0x01010101u),(b^hi)+(hi&0x01010101u));}
+            if constexpr(F==GGML_TYPE_IQ3_XXS) {
+                sign=(w.signs>>(7*J))&127;
+                a=magnitude(codes&255);b=magnitude((codes>>8)&255);
+                unsigned lo,hi;
+                if constexpr(CachedSigns) {
+                    lo=grid_at(GridCount+2*sign);hi=grid_at(GridCount+2*sign+1);
+                } else {
+                    sign|=(__popc(sign)&1u)<<7;
+                    lo=iq_nibble_sign_mask(sign&15);hi=iq_nibble_sign_mask(sign>>4);
+                }
+                return make_int2((a^lo)+(lo&0x01010101u),(b^hi)+(hi&0x01010101u));
+            }
             else {sign=(w.signs>>(8*J))&255;const unsigned high=w.meta>>24;a=magnitude((codes&255)|((high<<(8-2*J))&256));b=magnitude(((codes>>8)&255)|((high<<(7-2*J))&256));return make_int2(a^(iq_nibble_sign_mask(sign&15)&0xfefefefeu),b^(iq_nibble_sign_mask(sign>>4)&0xfefefefeu));}
         }
     }

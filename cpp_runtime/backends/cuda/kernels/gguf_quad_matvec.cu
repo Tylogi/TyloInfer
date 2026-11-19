@@ -79,7 +79,7 @@ template<bool M,int Rows,int W,int Offset,bool Aligned,bool Half,class Index,cla
 template<int F,int Rows,int W,int Offset,bool Aligned,bool Half,class Index,class Store=M1ProjectionStore>__device__ __forceinline__ void global_iq_body(QuadProjection p,int columns,const void* input,unsigned tile,Store store={}){
  const auto* packed=static_cast<const uint8_t*>(p.projection.packed);const int rows=int(p.projection.rows);void* output=p.projection.output;
 
- using D=QuadIqDot<F,Offset>;const unsigned lane=threadIdx.x,warp=threadIdx.y;
+ using D=QuadIqDot<F,Offset,true>;const unsigned lane=threadIdx.x,warp=threadIdx.y;
  const unsigned row=(tile*(4/W)+warp/W)*Rows;
  const Index source_row=Index(row)+Index(p.row_begin),quad=source_row/4,pair=(source_row%4)/2,blocks=Index(columns/256),groups=blocks*8;
  const Index total=(Index(p.storage_rows)/4)*blocks;
@@ -122,6 +122,7 @@ template<int F,int Rows,int W,int Offset,bool Aligned,bool Half,class Index,clas
 
 template<int F>constexpr bool IsIq1=F==GGML_TYPE_IQ1_S||F==GGML_TYPE_IQ1_M;
 template<int F>constexpr unsigned GridCount=F==GGML_TYPE_IQ1_S?1024:F==GGML_TYPE_IQ1_M?2048:F==GGML_TYPE_IQ2_XXS||F==GGML_TYPE_IQ3_XXS?256:F==GGML_TYPE_IQ2_XS||F==GGML_TYPE_IQ3_S?512:F==GGML_TYPE_IQ2_S?1024:0;
+template<int F>constexpr unsigned GridWords=GridCount<F>+QuadIqDot<F,0,true>::SignWords;
 // Transfer four shared codebook words per lane. IQ1 tables already expose
 // 16-byte alignment; the other source representations retain their natural
 // alignment and widen only their shared stores.
@@ -145,6 +146,7 @@ template<int F,int Offset,int Threads=128>__device__ __forceinline__ void stage_
   }
   quad_codebook_vectors[(Offset+i)/4]=value;
  }
+ QuadIqDot<F,Offset,true>::stage_signs(tid);
 }
 struct QuadResidualStore {
     const half* residual;
@@ -232,7 +234,15 @@ void validate_quad(const QuadProjection& p,int64_t columns){
         if(p.row_begin<0||p.row_begin%4||d.rows%4||p.row_begin>p.storage_rows/4*4-d.rows||reinterpret_cast<uintptr_t>(d.packed)%16)throw std::invalid_argument("Invalid GGUF quad row view");
     }
 }
-unsigned grid_words(int type){switch(type){case GGML_TYPE_IQ1_S:return 1024;case GGML_TYPE_IQ1_M:return 2048;case GGML_TYPE_IQ2_XXS:case GGML_TYPE_IQ3_XXS:return 256;case GGML_TYPE_IQ2_XS:case GGML_TYPE_IQ3_S:return 512;case GGML_TYPE_IQ2_S:return 1024;default:return 0;}}
+unsigned grid_words(int type) {
+    switch(type) {
+#define GRID_WORDS(F) case GGML_TYPE_##F:return GridWords<GGML_TYPE_##F>;
+    GRID_WORDS(IQ1_S) GRID_WORDS(IQ1_M) GRID_WORDS(IQ2_XXS) GRID_WORDS(IQ2_XS)
+    GRID_WORDS(IQ2_S) GRID_WORDS(IQ3_XXS) GRID_WORDS(IQ3_S)
+#undef GRID_WORDS
+    default:return 0;
+    }
+}
 bool small_offsets(const QuadProjection& p,int64_t columns){return !p.quad||quad_storage_bytes(p.projection.type,p.storage_rows,columns)<=UINT32_MAX;}
 template<int F>int original_k_cooperation(int64_t rows,int64_t columns,uint64_t group_blocks=0){
     if constexpr(F==GGML_TYPE_IQ4_XS)return canonical_iq4_k_warps(columns);
@@ -257,7 +267,7 @@ void matvec_quad_m1(const QuadProjection& p,int64_t columns,const void* input,bo
                     constexpr int outputs=4*R/W;
                     // Q2_K keeps its native three-warp launch and has no LUT.
                     constexpr int block_warps=F==GGML_TYPE_Q2_K && W==3?3:4;
-                    fn<<<unsigned((d.rows+outputs-1)/outputs),dim3(32,block_warps),4*GridCount<F>,stream>>>(p,int(columns),input,static_cast<const half*>(residual));
+                    fn<<<unsigned((d.rows+outputs-1)/outputs),dim3(32,block_warps),4*GridWords<F>,stream>>>(p,int(columns),input,static_cast<const half*>(residual));
                     if(dispatch_trace::enabled())dispatch_trace::record(stream,"gguf_quad_m1",reinterpret_cast<const void*>(fn),"format="+std::to_string(F)+" k_warps="+std::to_string(W));
                 };
                 const auto width=[&]<class Index>(){if(residual)format.template operator()<true,true,Index>();else if(half_output)format.template operator()<true,false,Index>();else format.template operator()<false,false,Index>();};
@@ -291,7 +301,7 @@ void matvec_quad_group_m1(const QuadProjection* projections,size_t count,int64_t
             const unsigned a_rows=IsIq1<A> && columns/32>=64?16:8;
             const unsigned b_rows=IsIq1<B> && columns/32>=64?16:8;
             const unsigned split=unsigned((projections[0].projection.rows+a_rows-1)/a_rows),end=unsigned((projections[1].projection.rows+b_rows-1)/b_rows);
-            const unsigned words=std::max(projections[0].quad?GridCount<A>:0u,projections[1].quad?GridCount<B>:0u);
+            const unsigned words=std::max(projections[0].quad?GridWords<A>:0u,projections[1].quad?GridWords<B>:0u);
             fn<<<split+end,dim3(32,4),words*4,stream>>>(projections[0],projections[1],split,int(columns),input);
             if(dispatch_trace::enabled())dispatch_trace::record(stream,"gguf_quad_m1_pair",reinterpret_cast<const void*>(fn),"formats="+std::to_string(A)+"/"+std::to_string(B));
         };
