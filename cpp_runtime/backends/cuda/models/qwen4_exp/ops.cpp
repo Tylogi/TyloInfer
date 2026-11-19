@@ -40,7 +40,6 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
-#include <thread>
 
 namespace mfq::cuda {
 void Qwen4HiddenCapture::begin(bool capture) {
@@ -1072,7 +1071,7 @@ struct Qwen4MtpGraph {
         Tensor ids,hidden,positions,cache_positions,normalized,multi,logits,greedy_host,compact_host,sampling_host,sampling_device;
         Tensor check_attention,check_ffn_input,check_attention_input;
         int64_t* sampling_mapped=nullptr;
-        MtpCompactControl compact_control,probability_control;
+        MtpCompactControl compact_control;
         DecodeWindow window;
         Cell(const Tensor& source,const Tensor& token_ids,cudaStream_t stream)
             :ids(tb::empty_like(token_ids)),hidden(tb::empty_like(source)),
@@ -1102,8 +1101,6 @@ struct Qwen4MtpGraph {
     int64_t capacity=0;
     bool failed=false;
     Tensor last_compact;
-    Tensor queued_host,queued_ids;
-    int32_t* queued_mapped=nullptr;
     bool reusable(const Qwen4ExpMtp& predictor) const {
         return predictor.reuse_decode_graphs && !failed && streamed_decode_graphs(*predictor.execution) &&
             !predictor.layers.empty() && predictor.layers[0]->qsa && predictor.layers[0]->qsa->graph_capacity()>0;
@@ -1112,7 +1109,7 @@ struct Qwen4MtpGraph {
         last_compact={};cells.clear();predictor.layers[0]->qsa->leave_graph();
     }
     MtpStep run(Qwen4ExpMtp& predictor,const MtpTarget& target,const Tensor& hidden,const Tensor& ids,
-               const Tensor& positions = {},bool history_only=false,bool scalar_history=false,bool queued=false,
+               const Tensor& positions = {},bool history_only=false,bool scalar_history=false,
                bool history_tail=false) {
         using ProfileTime=std::chrono::steady_clock;
         const auto profile_started=ProfileTime::now();
@@ -1136,9 +1133,7 @@ struct Qwen4MtpGraph {
             while(capacity<required)capacity=std::min(predictor.config.maximum,capacity*2);
         }
         const bool scalar_chain=history_only && scalar_history && tokens>1;
-        // RAM QSA archive publication reads completed GPU work. Queued chains
-        // retain their device-only resident path until that commit is deferred.
-        int pending_qsa=!(history_only || history_tail || queued)?block.qsa->pending_device_graph_kind(tokens):0;
+        int pending_qsa=!(history_only || history_tail)?block.qsa->pending_device_graph_kind(tokens):0;
         if(pending_qsa>=4 && block.qsa->pending_graph_task_supported())pending_qsa=(pending_qsa&3)+8;
         const auto key=std::make_tuple(int(tokens),int(hidden.scalar_type()),history_only?(scalar_chain?2:1):(history_tail?3:0),pending_qsa);
         auto& owner=cells[key];
@@ -1158,7 +1153,6 @@ struct Qwen4MtpGraph {
         if(!owner)owner=std::make_unique<Cell>(hidden,ids,stream.stream());
         auto& cell=*owner;cell.hidden.copy_(hidden);cell.ids.copy_(ids);
         if(!history_only)cell.compact_control.set(predictor.compact_graph_sampling,"predictor",int(tokens));
-        if(!history_only)cell.probability_control.set(!queued,"predictor_probability",int(tokens));
         cell.window.set_profile_geometry(history_tail?"mtp_history_tail":scalar_chain?"mtp_history_scalar_chain":history_only?"mtp_history":"mtp_predictor",int(tokens));
         predictor.graph_initialized=predictor.graph_initialized || !cell.used_in_request;
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions,cell.positions,start);
@@ -1217,7 +1211,7 @@ struct Qwen4MtpGraph {
                                 cell.compact_control.device,cell.sampling_device.narrow(0,0,64).reshape({1,64}));
                         }
                         (void)sample_greedy_probability_cuda(cell.logits.reshape({1,-1}).contiguous(),
-                            cell.sampling_device.narrow(0,64,1),cell.probability_control.device);
+                            cell.sampling_device.narrow(0,64,1),nullptr);
                         if(cell.sampling_mapped) {
                             sample_publish_packets_cuda(cell.sampling_device,cell.sampling_mapped);
                             if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
@@ -1241,9 +1235,7 @@ struct Qwen4MtpGraph {
                 else restore_routed_decode_workspace_after_capture(execution);
             }
             const auto profile_run_begin=ProfileTime::now();
-            if(queued) {
-                TYLOINFER_RUNTIME_CHECK(cell.window.enqueue_if_device_only(),"queued MTP cell acquired a host dependency");
-            } else cell.window.run();
+            cell.window.run();
             const auto profile_run_end=ProfileTime::now();
             cell.used_in_request=true;++predictor.graph_replays;block.qsa->advance_graph(tokens);
             if(history_tail) {
@@ -1268,7 +1260,6 @@ struct Qwen4MtpGraph {
                     (routed_expert_streamed_bytes(execution)-profile_transfer_before)/1048576.0);
             }
             if(history_only)return {};
-            if(queued)return {cell.normalized,cell.multi,cell.logits};
             if(predictor.compact_graph_sampling && cell.logits.size(-1)>=64)last_compact=cell.compact_host;
             const auto packet=std::uint64_t(*cell.greedy_host.data_ptr<int64_t>());
             const auto bits=std::uint32_t(packet>>32);float probability;
@@ -1277,93 +1268,7 @@ struct Qwen4MtpGraph {
                 static_cast<int32_t>(std::uint32_t(packet)),probability};
         } catch(...) {failed=true;throw;}
     }
-    std::optional<std::vector<int32_t>> greedy_chain(Qwen4ExpMtp& predictor,const MtpTarget& target,
-            const Tensor& hidden,const Tensor& ids,const Tensor& positions,int depth,
-            const std::function<void(const std::vector<int32_t>&)>& publish) {
-        const auto history=ids.size(1),prefix=history-1;
-        if(depth<2 || !reusable(predictor) || history<1 || history>128 ||
-            predictor.lengths[0]+history+depth-1>capacity)return {};
-        const auto ready=[&](int64_t tokens,tb::ScalarType dtype,int mode)->Cell* {
-            const auto found=cells.find({int(tokens),int(dtype),mode,0});
-            if(found==cells.end() || !found->second || !found->second->window.can_enqueue_device_only())return nullptr;
-            return found->second.get();
-        };
-        const auto* chain_option=std::getenv("TYLOINFER_MTP_HISTORY_CHAIN");
-        const bool history_tail=history>1 && (!chain_option || chain_option[0]!='0') &&
-            !predictor.layers[0]->gdn && !predictor.layers[0]->ple && predictor.layers[0]->qsa->supports_history_tail_graph();
-        auto* first=ready(history_tail?history:1,hidden.scalar_type(),history_tail?3:0);
-        if(!first || !first->multi.defined())return {};
-        auto* next=ready(1,first->multi.scalar_type(),0);
-        if(!next || !next->multi.defined() || next->multi.scalar_type()!=first->multi.scalar_type())return {};
-        const bool scalar_history=prefix>1 && (!chain_option || chain_option[0]!='0');
-        for(int64_t offset=0;!history_tail && offset<prefix;) {
-            const auto rows=scalar_history?std::min<int64_t>(4,prefix-offset):int64_t(1);
-            if(!ready(rows,hidden.scalar_type(),scalar_history && rows>1?2:1))return {};
-            offset+=rows;
-        }
-        // Check every needed cell before changing KV or emitting a proposal.
-        // Missing, profiled or host-assisted cells use the ordinary step path.
-        try {
-            if(!queued_host.defined() || queued_host.numel()<depth) {
-                auto host=tb::empty({depth},ids.options().device(tb::kCPU).dtype(tb::kInt32).pinned_memory(true));
-                void* mapped=nullptr;
-                const auto status=cudaHostGetDevicePointer(&mapped,host.data_ptr(),0);
-                if(status!=cudaSuccess){(void)cudaGetLastError();return {};}
-                queued_host=std::move(host);queued_mapped=static_cast<int32_t*>(mapped);
-            }
-            if(!queued_ids.defined())queued_ids=tb::empty({1,1},ids.options());
-        }catch(const MfqResourceExhausted&){return {};}
-        auto* tokens=queued_host.data_ptr<int32_t>();
-        std::fill_n(tokens,depth,int32_t(-1));std::atomic_thread_fence(std::memory_order_seq_cst);
-        const bool previous_compact=predictor.compact_graph_sampling;
-        predictor.compact_graph_sampling=false;
-        try {
-            for(int64_t offset=0;!history_tail && offset<prefix;) {
-                const auto rows=scalar_history?std::min<int64_t>(4,prefix-offset):int64_t(1);
-                (void)run(predictor,target,hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
-                    positions.defined()?positions.narrow(-1,offset,rows):Tensor{},true,scalar_history,true);
-                offset+=rows;
-            }
-            auto current_hidden=history_tail?hidden:hidden.narrow(1,prefix,1);
-            auto current_ids=history_tail?ids:ids.narrow(1,prefix,1);
-            for(int step=0;step<depth;++step) {
-                const auto pos=positions.defined()?(history_tail && step==0?positions:positions.narrow(-1,prefix,1)+step):Tensor{};
-                auto result=run(predictor,target,current_hidden,current_ids,pos,false,false,true,history_tail && step==0);
-                auto* cell=step==0?first:next;
-                sample_export_greedy_ids_cuda(cell->sampling_device.narrow(0,64,1),queued_ids,queued_mapped+step);
-                current_hidden=std::move(result.chain_hidden);current_ids=queued_ids;
-            }
-            check_stream_progress(stream.stream());
-            std::vector<int32_t> result;result.reserve(depth);
-            for(int step=0;step<depth;++step) {
-                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(60);
-                unsigned spins=0;
-                while(*reinterpret_cast<const volatile int32_t*>(tokens+step)<0) {
-                    std::atomic_signal_fence(std::memory_order_seq_cst);
-                    if((++spins&1023u)==0) {
-                        check_stream_progress(stream.stream());
-                        if(std::chrono::steady_clock::now()>deadline)throw std::runtime_error("queued MTP token publication timed out");
-                        std::this_thread::yield();
-                    }
-                }
-                std::atomic_thread_fence(std::memory_order_acquire);
-                result.push_back(tokens[step]);
-                if(publish)publish(result);
-            }
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-            predictor.compact_graph_sampling=previous_compact;
-            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-                static std::atomic<bool> reported{false};
-                if(!reported.exchange(true))std::fprintf(stderr,
-                    "native_mtp_queued_chain actual_match=1 depth=%d history=%lld host_waits=1 gpu_token_feedback=1\n",
-                    depth,static_cast<long long>(history));
-            }
-            return result;
-        }catch(...) {
-            predictor.compact_graph_sampling=previous_compact;failed=true;
-            (void)cudaStreamSynchronize(stream.stream());throw;
-        }
-    }
+
 };
 Tensor Qwen4ExpMtp::graph_compact_topk() const {
     return graph_registry?graph_registry->last_compact:Tensor{};
@@ -1611,7 +1516,7 @@ std::optional<MtpStep> Qwen4ExpMtp::history_tail_step(const MtpTarget& target,Te
         positions=positions.to(tb::kInt32).contiguous();
     }
     if(!graph_registry)graph_registry=std::make_unique<Qwen4MtpGraph>();
-    return graph_registry->run(*this,target,hidden,ids,positions,false,false,false,true);
+    return graph_registry->run(*this,target,hidden,ids,positions,false,false,true);
 }
 
 int64_t Qwen4ExpMtp::cache_position() const noexcept {
@@ -2319,24 +2224,6 @@ std::optional<std::size_t> qwen4_decode_transient_reserve(
     const auto logits=std::size_t(rows)*model.vocab_size()*sizeof(float)*8;
     const auto history=std::size_t(128)*model.hidden_size()*model.hc_mult()*sizeof(float)*4;
     return mfq::engine::prefill_budget_add((std::size_t(256)<<20)+logits+history,*extra);
-}
-
-std::optional<std::vector<int32_t>> qwen4_exp::Qwen4ExpMtp::queued_greedy_chain(const MtpTarget& target,
-        Tensor hidden,Tensor ids,Tensor positions,int depth,
-        const std::function<void(const std::vector<int32_t>&)>& publish) {
-    namespace tb=mfq_tensor_backend;
-    const auto graph=mfq::cuda::runtime_options::mtp_predictor_graph();
-    if(!reuse_decode_graphs || (graph && !*graph) || !graph_registry || batch!=1 || !supports_graph_window(1) ||
-        ids.dim()!=2 || ids.size(0)!=1 || hidden.dim()!=3 || hidden.size(0)!=1 || hidden.size(1)!=ids.size(1) ||
-        hidden.size(2)!=hidden_norm.numel() || !ids.is_cuda() || ids.scalar_type()!=tb::kInt64 || !hidden.is_cuda() ||
-        lengths.empty() || lengths[0]<=0 || this->positions[0].dim()!=3 || this->positions[0].size(1)!=1)return {};
-    if(positions.defined()) {
-        if(positions.dim()==1)positions=positions.reshape({1,1,-1}).expand({3,ids.size(0),ids.size(1)});
-        else if(positions.dim()==2)positions=positions.unsqueeze(1);
-        if(positions.dim()!=3 || positions.size(0)!=3 || positions.size(1)!=1 || positions.size(2)!=ids.size(1))return {};
-        positions=positions.to(tb::kInt32).contiguous();
-    }
-    return graph_registry->greedy_chain(*this,target,hidden,ids,positions,depth,publish);
 }
 
 void qwen4_release_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp) {

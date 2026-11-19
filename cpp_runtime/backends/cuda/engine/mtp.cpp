@@ -224,10 +224,6 @@ template <class Model> struct CudaMtpOps {
     return false;
   }
   void prefetch_target_first(int32_t token) {prefetch_target_ids(token,{});}
-  void prefetch_target_prefix(int32_t token,const std::vector<int32_t>& drafts) {
-    const auto* option=std::getenv("TYLOINFER_MTP_PLE_DRAFT_PREFIX");
-    if(!option || option[0]!='0')prefetch_target_ids(token,drafts);
-  }
   void prefetch_committed_token(int32_t token) {
     const auto* option=std::getenv("TYLOINFER_MTP_PLE_PUBLICATION");
     if(option && option[0]=='0')return;
@@ -523,23 +519,6 @@ template <class Model> struct CudaMtpOps {
     return position_axes == 3
                ? result.reshape({1, tokens}).expand({3, tokens}).contiguous()
                : result;
-  }
-  std::optional<std::vector<int32_t>> predictor_greedy_chain(Tensor hidden,Tensor ids,Tensor positions,int depth,int32_t anchor) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
-          predictor && predictor->layers.size()==1 && model.reuse_decode_graphs && model.graph_registry) {
-        auto result=predictor->queued_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth,
-            [this,anchor](const std::vector<int32_t>& tokens){prefetch_target_prefix(anchor,tokens);});
-        if(result) {
-          projected_predictor_hidden={};projected_predictor_logits={};projected_predictor_compact={};
-          projected_predictor_greedy=-1;projected_predictor_probability=-1.f;
-          const bool initialized=mtp.take_graph_initialization();
-          target_maintenance=target_maintenance || initialized;
-        }
-        return result;
-      }
-    }
-    return {};
   }
   MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
