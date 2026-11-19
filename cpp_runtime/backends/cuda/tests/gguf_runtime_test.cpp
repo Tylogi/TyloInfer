@@ -25,6 +25,7 @@
 #include "../kernels/gguf_m1_residual.h"
 #include "../kernels/gguf_compact.h"
 #include "../kernels/gguf_mmq.h"
+#include "mfq_cuda_activation_ops.h"
 #include "cuda_execution.h"
 #include "quant_linear.h"
 #include "prefill_projection.h"
@@ -3127,6 +3128,29 @@ void run_mmq_prefill_input_reuse() {
         auto expected=tb::empty_like(actual.activation);
         mmq::quantize(converted.data_ptr<float>(),nullptr,expected.data_ptr(),type,256,512,mfq_current_cuda_stream());
         require(same_bytes(actual.activation,expected),"Direct FP16 MMQ input changed the FP32-converted packet");
+
+        auto gate=(half*-17.).contiguous();
+        auto gated=tb::empty_like(half);
+        if(!mmq::fits(type,128,device))continue;
+        Source source;source.add("weight",{128,256},type);
+        auto weight=load_gguf_weight(source,"weight",device);
+        weight.repack_inplace();
+        for(const bool silu:{false,true}) {
+            const auto stream=mfq_current_cuda_stream();
+            mfq::cuda::materialize_gated_input(half.data_ptr(),gate.data_ptr(),true,half.numel(),
+                silu,gated.data_ptr(),stream);
+            auto expected_packet=PrefillInputScope::prepare_mmq(gated,type);
+            auto fused_packet=tb::empty_like(expected_packet.activation);
+            mmq::quantize_f16(half.data_ptr(),fused_packet.data_ptr(),type,256,512,stream,gate.data_ptr(),silu);
+            require(same_bytes(fused_packet,expected_packet.activation),"Fused gate changed the MMQ packet");
+
+            auto input_view=half.unsqueeze(0),gate_view=gate.unsqueeze(0);
+            const auto expected_output=weight.forward(gated.unsqueeze(0));
+            const auto fused_output=weight.try_forward_gated_mmq(input_view,gate_view,silu);
+            require(same_bytes(fused_output,expected_output),"Fused MMQ gated projection changed its output");
+            require(fused_output.sizes()==expected_output.sizes() && !input_view.defined() && !gate_view.defined(),
+                "Fused MMQ gated projection lost shape or retained its inputs");
+        }
     }
     for(auto dtype:{tb::kFloat32,tb::kFloat16}) {
         const auto input=host.to(tb::kCUDA,dtype);
@@ -3145,7 +3169,7 @@ void run_mmq_prefill_input_reuse() {
         const auto unrelated=PrefillInputScope::prepare_mmq(other,GGML_TYPE_IQ2_XS);
         require(same_bytes(unrelated.activation,distinct_input.activation),"MMQ input reused another tensor's activation");
     }
-    std::cout<<"GGUF precise prefill shared MMQ activation bytes PASS\n";
+    std::cout<<"GGUF precise prefill shared and gated MMQ activation bytes PASS\n";
 }
 void run_gguf_residual_activation(int bench_tokens=0,int bench_columns=0,int bench_streams=0) {
     namespace gg=mfq::cuda::gguf;

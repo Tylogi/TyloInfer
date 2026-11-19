@@ -2069,6 +2069,13 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
     }
     TYLOINFER_RUNTIME_CHECK(mode == 1 || mode == 2,
         "input gate mode must be sigmoid or SiLU");
+    if(tokens>32 && is_gguf() && gate.defined()) {
+        auto fused=gguf.try_forward_gated_mmq(x,gate,mode==2);
+        if(fused.defined()) {
+            mfq::cuda::LayerWeightPrefetchKick prefetch;
+            return fused;
+        }
+    }
     // Dense weights retain their existing input conversion before activation.
     if(is_dense())x=x.to(dense.scalar_type());
     auto local_gate = gate.to(x.scalar_type());

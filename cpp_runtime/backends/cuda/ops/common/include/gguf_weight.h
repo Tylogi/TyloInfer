@@ -48,6 +48,9 @@ struct GgufWeight {
     bool can_forward_prefill_residual(std::int64_t tokens,const mfq_tensor_backend::Tensor& residual) const;
     mfq_tensor_backend::Tensor forward_base(mfq_tensor_backend::Tensor input,bool allow_mmq,
         const mfq_tensor_backend::Tensor& prefill_residual) const;
+    // Release both activations after packing when the dense MMQ path fits.
+    mfq_tensor_backend::Tensor try_forward_gated_mmq(mfq_tensor_backend::Tensor& input,
+        mfq_tensor_backend::Tensor& gate,bool silu) const;
     // Consume the native Q8_1 packet produced by a fused upstream operator.
     mfq_tensor_backend::Tensor forward_q8(const mfq_tensor_backend::Tensor&,std::int64_t tokens,
         mfq_tensor_backend::ScalarType output_type,bool position_major=false) const;

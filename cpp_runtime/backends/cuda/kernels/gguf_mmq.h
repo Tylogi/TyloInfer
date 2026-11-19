@@ -16,7 +16,7 @@ int activation_layout(int type);
 void quantize(const float* input,const std::int32_t* ids,void* output,int type,
     std::int64_t columns,std::int64_t rows,cudaStream_t stream);
 void quantize_f16(const void* input,void* output,int type,
-    std::int64_t columns,std::int64_t rows,cudaStream_t stream);
+    std::int64_t columns,std::int64_t rows,cudaStream_t stream,const void* gate=nullptr,bool silu=true);
 void swiglu_quantize(const float* gate_up,void* output,int type,
     std::int64_t columns,std::int64_t rows,float limit,cudaStream_t stream);
 // Quantize a physical token once, then write identical Q8 rows to its routed

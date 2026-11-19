@@ -146,19 +146,20 @@ void quantize(const float* input,const std::int32_t* ids,void* output,int type,
     quantize_mmq_q8_1_cuda(input,ids,output,ggml_type(type),columns,columns,rows*columns,rows*columns,
         pad_columns(columns),rows,1,1,stream);check();
 }
-void quantize_f16(const void* input,void* output,int type,std::int64_t columns,std::int64_t rows,cudaStream_t stream) {
+void quantize_f16(const void* input,void* output,int type,std::int64_t columns,std::int64_t rows,cudaStream_t stream,
+        const void* gate,bool silu) {
     if(!supported(type) || columns%ggml_blck_size(ggml_type(type)) || rows<=0 || rows>INT_MAX ||
-            reinterpret_cast<std::uintptr_t>(input)%alignof(uint2))
+            (reinterpret_cast<std::uintptr_t>(input)|reinterpret_cast<std::uintptr_t>(gate))%alignof(uint2))
         throw std::invalid_argument("GGUF FP16 MMQ activation geometry differs");
     clear_activation_guard(output,activation_bytes(rows,columns),stream);
     quantize_mmq_q8_1_cuda_f16(static_cast<const half*>(input),output,ggml_type(type),columns,
-        pad_columns(columns),int(rows),stream);
+        pad_columns(columns),int(rows),stream,static_cast<const half*>(gate),silu);
     check();
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
-            "native_prefill_mmq_f16_input actual_match=1 M=%lld K=%lld\n",
-            static_cast<long long>(rows),static_cast<long long>(columns));
+        static std::atomic<bool> reported[2]{};
+        if(!reported[gate!=nullptr].exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "native_prefill_mmq_f16_input actual_match=1 M=%lld K=%lld gated=%d\n",
+            static_cast<long long>(rows),static_cast<long long>(columns),int(gate!=nullptr));
     }
 }
 void quantize_scatter(const float* input,const std::int32_t* inverse,void* output,int type,

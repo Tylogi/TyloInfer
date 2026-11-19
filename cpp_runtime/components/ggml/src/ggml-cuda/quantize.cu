@@ -455,11 +455,12 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, typename Input = float>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, typename Input = float, bool gated_f16 = false>
 static __global__ void quantize_mmq_q8_1(
         const Input * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const float limit = 0.f) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const float limit = 0.f,
+        const half * gate = nullptr, bool silu = true) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -513,8 +514,21 @@ static __global__ void quantize_mmq_q8_1(
         } else if constexpr (std::is_same_v<Input, half>) {
             const auto packed = *reinterpret_cast<const uint2 *>(x+base_idx+i00);
             const auto as_float = [](unsigned bits) { return __half2float(__ushort_as_half(bits)); };
-            xi = make_float4(as_float(packed.x), as_float(packed.x >> 16),
-                            as_float(packed.y), as_float(packed.y >> 16));
+            if constexpr(gated_f16) {
+                const auto gate_packed = *reinterpret_cast<const uint2 *>(gate+base_idx+i00);
+                const auto product = [&](unsigned x_bits, unsigned gate_bits) {
+                    const float g = as_float(gate_bits);
+                    const float a = silu ? g/(1.f+expf(-g)) : 1.f/(1.f+expf(-g));
+                    // Match both FP16 rounding steps of a materialized gate.
+                    const float rounded = __half2float(__float2half_rn(a));
+                    return __half2float(__float2half_rn(__fmul_rn(rounded, as_float(x_bits))));
+                };
+                xi = make_float4(product(packed.x, gate_packed.x), product(packed.x >> 16, gate_packed.x >> 16),
+                                 product(packed.y, gate_packed.y), product(packed.y >> 16, gate_packed.y >> 16));
+            } else {
+                xi = make_float4(as_float(packed.x), as_float(packed.x >> 16),
+                                 as_float(packed.y), as_float(packed.y >> 16));
+            }
         } else {
             xi = reinterpret_cast<const float4 *>(x)[(base_idx+i00)/4];
         }
@@ -601,11 +615,12 @@ void quantize_row_q8_1_cuda(
     GGML_UNUSED(type_src0);
 }
 
-template<typename Input>
+template<typename Input, bool Gated = false>
 static void launch_mmq_q8_1(
         const Input * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream,
+        const half * gate = nullptr, bool silu = true) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
@@ -615,16 +630,16 @@ static void launch_mmq_q8_1(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false, Input>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false, Input, Gated>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0.f, gate, silu);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, false, Input>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, false, Input, Gated>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0.f, gate, silu);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, false, Input>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, false, Input, Gated>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0.f, gate, silu);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -640,8 +655,10 @@ void quantize_mmq_q8_1_cuda(
 }
 
 void quantize_mmq_q8_1_cuda_f16(const half * x, void * output, ggml_type type,
-        int64_t width, int64_t padded_width, int rows, cudaStream_t stream) {
-    launch_mmq_q8_1(x, nullptr, output, type, width, width, 0, 0, padded_width, rows, 1, 1, stream);
+        int64_t width, int64_t padded_width, int rows, cudaStream_t stream, const half * gate, bool silu) {
+    if(gate)
+        launch_mmq_q8_1<half,true>(x, nullptr, output, type, width, width, 0, 0, padded_width, rows, 1, 1, stream, gate, silu);
+    else launch_mmq_q8_1(x, nullptr, output, type, width, width, 0, 0, padded_width, rows, 1, 1, stream);
 }
 
 void quantize_swiglu_mmq_q8_1_cuda(const float * gate_up, void * output,
