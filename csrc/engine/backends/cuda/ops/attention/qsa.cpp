@@ -1408,9 +1408,8 @@ Tensor Qsa::forward_graph(State& state, const Tensor& hidden, const Tensor& posi
 struct Qsa::Graph::Impl {
     std::vector<Request> requests;
     std::vector<Row> rows;
-    bool independent, admitted = false, materialized = false, clear = false, hidden = false, laid_out = false;
+    bool independent, admitted = false, materialized = false, clear = false, hidden = false, laid_out = false, adaptive = false;
     std::int64_t tokens = 0, required = 0;
-    int pending = 0;
     std::shared_ptr<cuda::KvMemoryManager> manager;
     std::vector<std::pair<Device, std::size_t>> unmanaged_growth;
     Impl(std::vector<Request> values, bool batch)
@@ -1429,7 +1428,7 @@ bool Qsa::Graph::eligible(bool allow_pending) const {
             pending = true;
         } else ordinary = true;
     }
-    if (pending) return allow_pending && !ordinary && !impl_->independent && mfq_cuda_graph_capture_supported();
+    if (pending) return allow_pending && !ordinary && mfq_cuda_graph_capture_supported();
     auto& executor = cuda::Executor::current();
     const auto offload = executor.kv_offload();
     if (offload) {
@@ -1457,14 +1456,49 @@ bool Qsa::Graph::warmup_supported() const {
 void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool hidden) {
     auto& plan = *impl_;
     if (plan.admitted) throw std::logic_error("QSA graph plan was already admitted");
+    std::vector<std::pair<Device, std::vector<cuda::QsaRamCache*>>> ram;
+    const auto admit_pending = [&](const Request& request, Row& row) {
+        row.capacity = request.maximum;
+        for (const auto& layer : request.layers) {
+            const auto& cache = layer.second->impl_->cache.adaptive;
+            TYLOINFER_RUNTIME_CHECK(cache && cache->pending_supported() && cache->position()==request.position,
+                "incompatible adaptive QSA graph state");
+            const auto kind = cache->device_graph_kind(tokens);
+            TYLOINFER_RUNTIME_CHECK(kind>0 && kind<4 && (!row.pending_kind || row.pending_kind==kind),
+                "invalid adaptive QSA graph append");
+            row.pending_kind = kind;
+            for (const auto& growth : cache->graph_growth(tokens)) {
+                plan.unmanaged_growth.push_back(growth);
+                if (plan.independent) {
+                    if (growth.second > std::numeric_limits<std::size_t>::max() - row.growth)
+                        throw std::overflow_error("QSA graph row growth overflow");
+                    row.growth += growth.second;
+                }
+            }
+            if (auto* staging = cache->ram()) {
+                const auto device = layer.first->impl_->device;
+                auto entry = std::find_if(ram.begin(), ram.end(), [&](const auto& item) { return item.first == device; });
+                if (entry == ram.end()) ram.emplace_back(device, std::vector<cuda::QsaRamCache*>{staging});
+                else entry->second.push_back(staging);
+            }
+        }
+    };
     if (plan.independent) {
         if (tokens != 1) throw std::invalid_argument("independent QSA graph requires one token");
-        for (const auto& request : plan.requests) {
+        for (const auto& request : plan.requests)
+            for (const auto& layer : request.layers)
+                if (layer.second->impl_->cache.adaptive) plan.adaptive = true;
+        for (std::size_t i = 0; i < plan.requests.size(); ++i) {
+            const auto& request = plan.requests[i];
             TYLOINFER_RUNTIME_CHECK(request.position >= 0 && request.maximum > 0 && request.position < request.maximum,
                 "Flash-Next batch graph exceeds max_context");
             plan.required = std::max(plan.required, request.position + 1);
+            if (plan.adaptive) {
+                TYLOINFER_RUNTIME_CHECK(!request.layers.empty(), "adaptive QSA graph requires attention layers");
+                admit_pending(request, plan.rows[i]);
+            }
         }
-        plan.manager = cuda::Executor::current().kv_memory();
+        if (!plan.adaptive) plan.manager = cuda::Executor::current().kv_memory();
     } else {
         if (plan.requests.size() != 1) throw std::invalid_argument("single QSA graph requires one request");
         const auto& request = plan.requests.front();
@@ -1476,25 +1510,9 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         if (!request.layers.empty()) {
             const auto& first = request.layers.front();
             if (first.second->impl_->cache.adaptive) {
-                capacity = request.maximum;
-                std::vector<cuda::QsaRamCache*> ram;
-                for (const auto& layer : request.layers) {
-                    const auto& cache = layer.second->impl_->cache.adaptive;
-                    TYLOINFER_RUNTIME_CHECK(cache && cache->pending_supported() && cache->position()==request.position,
-                        "incompatible adaptive QSA graph state");
-                    const auto kind = cache->device_graph_kind(tokens);
-                    TYLOINFER_RUNTIME_CHECK(kind>0 && kind<4 && (!plan.pending || plan.pending==kind),
-                        "invalid adaptive QSA graph append");
-                    plan.pending = kind;
-                    for (const auto& growth : cache->graph_growth(tokens))
-                        plan.unmanaged_growth.push_back(growth);
-                    if (auto* staging = cache->ram()) ram.push_back(staging);
-                }
-                if (!ram.empty()) {
-                    const auto [gpu, host] = cuda::QsaRamCache::graph_growth(ram);
-                    if (gpu) plan.unmanaged_growth.emplace_back(first.first->impl_->device, gpu);
-                    if (host) plan.unmanaged_growth.emplace_back(Device(kCPU), host);
-                }
+                plan.adaptive = true;
+                admit_pending(request, plan.rows.front());
+                capacity = plan.rows.front().capacity;
             } else if (first.first->graph_capacity(*first.second)) {
                 plan.manager = cuda::Executor::current().kv_memory();
                 capacity = first.first->graph_capacity(*first.second);
@@ -1503,14 +1521,19 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         plan.rows.front().capacity = capacity;
         plan.clear = plan.required > capacity;
     }
+    for (const auto& [device, caches] : ram) {
+        const auto [gpu, host] = cuda::QsaRamCache::graph_growth(caches);
+        if (gpu) plan.unmanaged_growth.emplace_back(device, gpu);
+        if (host) plan.unmanaged_growth.emplace_back(Device(kCPU), host);
+    }
     plan.tokens = tokens;
     plan.hidden = hidden;
     plan.admitted = true;
-    plan.laid_out = !plan.independent && !plan.clear;
+    plan.laid_out = plan.independent ? plan.adaptive : !plan.clear;
 }
 int Qsa::Graph::pending_kind() const {
     if (!impl_->admitted) throw std::logic_error("QSA graph is not admitted");
-    return impl_->pending;
+    return impl_->rows.size() == 1 ? impl_->rows.front().pending_kind : 0;
 }
 std::vector<std::pair<Device, std::size_t>> Qsa::Graph::growth() const {
     const auto& plan = *impl_;
@@ -1541,6 +1564,7 @@ bool Qsa::Graph::clear_required() const {
 void Qsa::Graph::layout() {
     auto& plan = *impl_;
     if (!plan.admitted) throw std::logic_error("QSA graph plan is not admitted");
+    if (plan.independent && plan.adaptive) { plan.laid_out = true; return; }
     if (!plan.independent) {
         const auto& request = plan.requests.front();
         const auto required = request.position + plan.tokens;
@@ -1602,7 +1626,15 @@ const std::vector<Qsa::Graph::Row>& Qsa::Graph::rows() const {
     return impl_->rows;
 }
 std::vector<Tensor> Qsa::Graph::storage() const {
-    return impl_->pending ? pending(impl_->tokens).second : std::vector<Tensor>{};
+    std::vector<Tensor> result;
+    for (std::size_t i = 0; i < impl_->requests.size(); ++i) {
+        const auto kind = impl_->rows[i].pending_kind;
+        if (!kind) continue;
+        for (const auto& layer : impl_->requests[i].layers)
+            for (auto& tensor : layer.second->impl_->cache.adaptive->graph_tensors(impl_->tokens, kind))
+                result.emplace_back(std::move(tensor));
+    }
+    return result;
 }
 std::pair<int, std::vector<Tensor>> Qsa::Graph::pending(std::int64_t tokens, std::int64_t offset) const {
     if (impl_->independent || impl_->requests.size() != 1) return {};
@@ -1624,7 +1656,7 @@ void Qsa::Graph::prepare(std::size_t request_index, std::size_t qsa_index, const
     const auto& request = impl_->requests.at(request_index);
     const auto& layer = request.layers.at(qsa_index);
     layer.first->prepare_graph(*layer.second, positions, impl_->rows.at(request_index).capacity,
-        impl_->pending ? impl_->tokens : 0);
+        impl_->rows.at(request_index).pending_kind ? impl_->tokens : 0);
 }
 void Qsa::Graph::prepare(std::size_t request_index, const Tensor& positions) const {
     const auto& request = impl_->requests.at(request_index);

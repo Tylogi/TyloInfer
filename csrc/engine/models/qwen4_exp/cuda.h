@@ -12,6 +12,7 @@ class Qwen4BatchDecodeGraph;
 class Qwen4BatchDecodeGraph {
   public:
     struct Plan {
+        std::vector<int> signature;
         std::vector<int64_t> capacities;
         std::vector<std::pair<Device, std::size_t>> growth;
         std::unique_ptr<tyloi::ops::Qsa::Graph> attention;

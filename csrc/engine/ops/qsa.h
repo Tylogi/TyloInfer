@@ -78,8 +78,8 @@ public:
             std::vector<std::pair<const Qsa*, State*>> layers;
             std::int64_t position = 0, maximum = 0, reserve = 0;
         };
-        /** Describe a request's capacity and unmanaged growth; managed growth is in growth(). */
-        struct Row { std::int64_t capacity = 0; std::size_t growth = 0; };
+        /** Describe a request's capacity, private unmanaged growth and pending append kind. */
+        struct Row { std::int64_t capacity = 0; std::size_t growth = 0; int pending_kind = 0; };
         /** Borrow the supplied operators and states for this plan's lifetime. */
         Graph(std::vector<Request> requests, bool independent);
         ~Graph();

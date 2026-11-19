@@ -995,6 +995,10 @@ struct Qwen4BatchDecodeGraph::Impl {
     qwen4_exp::Model& model;
     DecodeStream stream;
     std::unique_ptr<DecodeWindow> window;
+    struct Variant { std::unique_ptr<DecodeWindow> window; DenseTensor logits; std::uint64_t touched; };
+    std::map<std::vector<int>, Variant> variants;
+    std::vector<int> signature;
+    std::uint64_t clock = 0;
     std::vector<State*> requests;
     std::vector<int64_t> capacities;
     std::vector<DenseTensor> positions, cache_positions, position_storage;
@@ -1005,9 +1009,47 @@ struct Qwen4BatchDecodeGraph::Impl {
     int64_t captures = 0, replays = 0;
     explicit Impl(qwen4_exp::Model& owner)
         : model(owner) {}
+    DecodeWindow* find(const std::vector<int>& key) const {
+        if (key == signature) return window.get();
+        const auto found = variants.find(key);
+        return found == variants.end() ? nullptr : found->second.window.get();
+    }
+    void select(const std::vector<int>& key, bool rebuild) {
+        if (key != signature && window)
+            variants.insert_or_assign(signature, Variant{std::move(window), std::move(logits), ++clock});
+        if (rebuild) {
+            variants.erase(key);
+            while (variants.size() >= 4) {
+                const auto oldest = std::min_element(variants.begin(), variants.end(),
+                    [](const auto& a, const auto& b) { return a.second.touched < b.second.touched; });
+                variants.erase(oldest);
+            }
+            window = std::make_unique<DecodeWindow>(cuda::options::layer_timings(), true);
+            window->set_profile_geometry("batch_decode", static_cast<int>(key.size()));
+            logits = {};
+        } else if (!window) {
+            auto variant = variants.extract(key);
+            if (variant.empty()) throw std::logic_error("Qwen4 batch graph variant was retired");
+            window = std::move(variant.mapped().window);
+            logits = std::move(variant.mapped().logits);
+        }
+        signature = key;
+    }
+    std::vector<::tyloi::Tensor> storage(const tyloi::ops::Qsa::Graph& attention,
+            const std::vector<State*>& rows) const {
+        auto owners = attention.storage();
+        for (auto* request : rows) for (std::size_t i = 0; i < model.layers.size(); ++i) {
+            auto& state = *request->layers[i];
+            const auto& weights = *model.layers[i];
+            for (auto* tensor : state.graph_state(weights)) owners.push_back(*tensor);
+            if (weights.qsa) for (auto* tensor : weights.qsa->graph_state(*state.qsa)) owners.push_back(*tensor);
+        }
+        return owners;
+    }
     void clear() {
         if (requests.empty() && !window) return;
         window.reset();
+        variants.clear(); signature.clear();
         for (auto* request : requests) {
             for (std::size_t i = 0; i < request->layers.size(); ++i) {
                 const auto& weights = *model.layers[i];
@@ -1027,6 +1069,7 @@ int64_t Qwen4BatchDecodeGraph::captures() const { return graph_->captures; }
 int64_t Qwen4BatchDecodeGraph::replays() const { return graph_->replays; }
 tyloi::StepSequence<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
         std::vector<State*> requests, bool greedy) {
+    if (requests.empty()) co_return;
     auto& graph = *graph_;
     auto& model = graph.model;
     std::vector<tyloi::ops::Qsa::Graph::Request> rows;
@@ -1040,7 +1083,7 @@ tyloi::StepSequence<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
         rows.push_back(std::move(row));
     }
     auto attention = std::make_unique<tyloi::ops::Qsa::Graph>(std::move(rows), true);
-    if (!attention->eligible()) co_return;
+    if (!attention->eligible(true)) co_return;
     for (auto* request : requests) {
         for (std::size_t i = 0; i < request->layers.size(); ++i) {
             const auto& weights = *model.layers[i];
@@ -1048,20 +1091,15 @@ tyloi::StepSequence<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
         }
     }
     const auto batch = static_cast<int64_t>(requests.size());
-    attention->admit();
     auto stream_scope=graph.stream.enter();
+    attention->admit();
+    Plan plan;
+    for (const auto& row : attention->rows()) plan.signature.push_back(row.pending_kind);
+    const auto* window = graph.find(plan.signature);
     bool reuse = graph.requests == requests && graph.window && graph.greedy == greedy;
-    if (reuse) {
-        std::vector<::tyloi::Tensor> owners;
-        for(auto* request:requests)for(std::size_t i=0;i<model.layers.size();++i) {
-            auto& state=*request->layers[i];const auto& weights=*model.layers[i];
-            for(auto* tensor:state.graph_state(weights))owners.push_back(*tensor);
-            if(weights.qsa)for(auto* tensor:weights.qsa->graph_state(*state.qsa))owners.push_back(*tensor);
-        }
-        reuse=graph.window->matches(owners);
-    }
     if (reuse) for (int64_t row = 0; row < batch; ++row)
         reuse = reuse && requests[row]->position() + 1 <= graph.capacities[row];
+    if (reuse && window) reuse = window->valid() && window->matches(graph.storage(*attention, requests));
     if (!reuse) {
         std::vector<std::pair<Device, std::size_t>> exit_growth;
         for (auto* request : graph.requests)
@@ -1074,10 +1112,10 @@ tyloi::StepSequence<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
             co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(exit_growth)};
         stream_scope = graph.stream.enter();
         graph.clear();
+        window = nullptr;
     }
-    Plan plan;
-    plan.rebuild = !graph.window;
-    if (plan.rebuild) {
+    plan.rebuild = !window;
+    if (!reuse) {
         attention->layout();
         for (std::size_t row = 0; row < requests.size(); ++row) {
             plan.capacities.push_back(attention->rows()[row].capacity);
@@ -1106,10 +1144,11 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
     co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, plan.attention->growth()};
     stream_scope = graph.stream.enter();
     plan.attention->materialize();
+    const bool fresh = !plan.capacities.empty();
     if (plan.rebuild) {
         auto fixed = DecodeWindow::fixed_growth(ids.device(), ::tyloi::cuda::options::layer_timings(), false, 0);
-        add_growth(fixed, ids.device(), std::size_t(batch) * sizeof(int64_t), 3);
-        for (std::size_t i = 0; i < model.layers.size(); ++i) {
+        if (fresh) add_growth(fixed, ids.device(), std::size_t(batch) * sizeof(int64_t), 3);
+        for (std::size_t i = 0; fresh && i < model.layers.size(); ++i) {
             const auto& layer = *model.layers[i];
             if (layer.ple) for (const auto& [device, bytes] : layer.ple->graph_stage_growth(1, ids.device()))
                 add_growth(fixed, device, bytes, std::size_t(batch));
@@ -1122,9 +1161,11 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
         stream_scope.reset();
         co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(fixed)};
         stream_scope = graph.stream.enter();
+    }
+    graph.select(plan.signature, plan.rebuild);
+    if (fresh) {
         graph.requests = requests;
         graph.capacities = plan.capacities;
-        graph.window = std::make_unique<DecodeWindow>(::tyloi::cuda::options::layer_timings(),true);
         graph.ids = graph.window->buffer(ids.sizes().vec(),ids.options()).dense();
         graph.ple.resize(batch);
         graph.position_storage.resize(batch);
@@ -1137,7 +1178,6 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                 const auto& weights = *model.layers[i];
                 auto& layer = *state.layers[i];
                 if (weights.gdn) weights.gdn->initialize_request_cache(layer.gdn);
-                if (weights.qsa) weights.qsa->prepare_graph(*layer.qsa,state.positions,graph.capacities[row]);
                 if (weights.ple) graph.ple[row][i] = weights.ple->graph_stage(layer.ple,1,ids.device());
             }
         }
@@ -1152,16 +1192,16 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                 }
                 if(rows.size()==requests.size())graph.gdn_addresses[i]=tyloi::ops::Gdn::prepare_independent_batch(rows).dense();
             }
-        // Cached MFE owns its graph pool; dense execution needs its own.
-        if (!prepared) graph.window->prepare_pool();
-        graph.window->set_profile_geometry("batch_decode",static_cast<int>(batch));
     }
+    // Cached MFE owns its graph pool; dense execution needs its own.
+    if (plan.rebuild && !prepared) graph.window->prepare_pool();
     graph.ids.copy_(ids);
     std::vector<std::tuple<qwen4_exp::Ple*,qwen4_exp::Ple::State*,qwen4_exp::NgramEmbedding::Context>> ple_contexts;
     for (int64_t row = 0; row < batch; ++row) {
         auto& state = *requests[row];
         mfq_qwen4_exp::fill_decode_positions(graph.cache_positions[row],graph.positions[row],
                                             state.cache_pos,state.decode_position_delta);
+        if (fresh || plan.signature[row]) plan.attention->prepare(row, state.positions);
         for (std::size_t i = 0; i < state.layers.size(); ++i) {
             const auto& weights = *model.layers[i];
             auto& layer = *state.layers[i];
@@ -1277,14 +1317,8 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
             }
             }
             recording->complete();
-            std::vector<::tyloi::Tensor> owners;
-            for(auto* request:requests)for(std::size_t i=0;i<model.layers.size();++i) {
-                auto& state=*request->layers[i];const auto& weights=*model.layers[i];
-                for(auto* tensor:state.graph_state(weights))owners.push_back(*tensor);
-                if(weights.qsa)for(auto* tensor:weights.qsa->graph_state(*state.qsa))owners.push_back(*tensor);
-            }
             graph.window->retain_result(graph.logits);
-            graph.window->retain(owners);
+            graph.window->retain(graph.storage(*plan.attention, requests));
         }
         catch(const std::exception& error) {
             for (const auto& saved : recurrent) saved.tensor->dense().copy_(saved.snapshot);
@@ -1311,7 +1345,7 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
         for (std::size_t i = 0; i < state.layers.size(); ++i)
             if (model.layers[i]->qsa) model.layers[i]->qsa->advance_graph(*state.layers[i]->qsa,1);
         state.positions=append_decode_positions(state.positions ? state.positions.dense() : DenseTensor{},
-            graph.cache_positions[row], graph.position_storage[row],model.max_position_embeddings());
+            graph.positions[row], graph.position_storage[row],model.max_position_embeddings());
         ++state.cache_pos;
     }
     stream_scope.reset();
