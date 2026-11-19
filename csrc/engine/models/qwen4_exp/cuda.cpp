@@ -1597,30 +1597,28 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         // have already been submitted before this stream-ordered release.
         if(tokens>9216)hidden={};
         if(batch_experts) {
-            capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
             auto& qwen_block=*block;
-            capture.resume();
             DenseTensor ffn_output;
-            {
+            for(int64_t begin=0;begin<tokens;) {
+                capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
+                auto count=expert_batch_count(tokens-begin);
+                const auto tail=tokens-begin-count;
+                // Keep tiny tails in the prefill path to retain shared prefill images.
+                if(tail>0 && tail<=8)count-=16-tail;
                 tyloi::ops::ProfileRange range("prefill.ffn");
-                if(expert_batch_count(tokens)==tokens) {
-                    ffn_output=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,ffn_inputs,reference_rows).dense();
-                } else {
-                    for(int64_t begin=0;begin<tokens;) {
-                        auto count=expert_batch_count(tokens-begin);
-                        const auto tail=tokens-begin-count;
-                        // Keep tiny tails in the prefill path to retain shared prefill images.
-                        if(tail>0 && tail<=8)count-=16-tail;
-                        auto part=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),reference_rows).dense();
-                        if(!ffn_output.defined()) {
-                            auto shape=part.sizes().vec();shape[1]=tokens;
-                            ffn_output=::tyloi::cuda::empty(shape,part.options());
-                        }
-                        ffn_output.narrow(1,begin,count).copy_(part);
-                        begin+=count;
-                    }
-                }
+                auto part=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,
+                    ffn_inputs.narrow(1,begin,count),reference_rows).dense();
                 range.finish();
+                if(count==tokens) {
+                    ffn_output=std::move(part);
+                    break;
+                }
+                if(!ffn_output.defined()) {
+                    auto shape=part.sizes().vec();shape[1]=tokens;
+                    ffn_output=::tyloi::cuda::empty(shape,part.options());
+                }
+                ffn_output.narrow(1,begin,count).copy_(part);
+                begin+=count;
             }
             TYLOINFER_RUNTIME_CHECK(ffn_output.defined(),"expert prefill produced no output");
             if(audit_batch) {
@@ -1647,6 +1645,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             }
             DenseTensor post_hidden=next_hidden;
             for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
+                capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
                 const auto count=std::min(compute_chunk,tokens-begin);
                 if(mfq_qwen4_exp::try_gated_residual_post_out(ffn_output.narrow(1,begin,count),
                     next_hidden.narrow(1,begin,count),ffn_gate.narrow(1,begin,count),

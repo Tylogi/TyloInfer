@@ -147,18 +147,33 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                             throw std::invalid_argument("invalid prefill workspace geometry");
                         const auto memory = [&] {
                             const std::array<Device, 1> devices{device};
-                            const auto snapshot = executor.memory(devices).at(0);
-                            return prefill_budget_add(snapshot.allocatable, snapshot.workspace);
+                            return executor.memory(devices).at(0);
                         };
-                        const auto available = weights.prefill_budget(true);
-                        const auto fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
-                        const auto before = prefill_budget_add(memory(), available.lendable_bytes);
+                        auto available = weights.prefill_budget(true);
+                        auto resources = memory();
+                        auto fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
+                        auto before = prefill_budget_add(prefill_budget_add(resources.allocatable, resources.workspace),
+                            available.lendable_bytes);
+                        const auto wanted = std::min({tile.tokens, *tile.compute, max_prefill_compute_chunk});
+                        const auto wanted_rows = std::size_t(wanted) > std::numeric_limits<std::size_t>::max() / tile.row_bytes
+                            ? std::numeric_limits<std::size_t>::max() : std::size_t(wanted) * tile.row_bytes;
+                        const auto required = prefill_budget_add(fixed, wanted_rows);
+                        if (required > before) {
+                            const auto reusable = prefill_budget_add(resources.workspace, available.lendable_bytes);
+                            budget.workspace(device, required > reusable ? required - reusable : 0);
+                            available = weights.prefill_budget(true);
+                            resources = memory();
+                            fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
+                            before = prefill_budget_add(prefill_budget_add(resources.allocatable, resources.workspace),
+                                available.lendable_bytes);
+                        }
                         auto selected = select_prefill_chunk(tile.tokens, *tile.compute, before, fixed, tile.row_bytes);
                         if (selected <= 0) throw std::runtime_error("insufficient CUDA prefill workspace before expert loan");
                         const auto rows = std::size_t(selected) > std::numeric_limits<std::size_t>::max() / tile.row_bytes
                             ? std::numeric_limits<std::size_t>::max() : std::size_t(selected) * tile.row_bytes;
                         loan->begin(prefill_budget_add(fixed, rows));
-                        const auto after = memory();
+                        resources = memory();
+                        const auto after = prefill_budget_add(resources.allocatable, resources.workspace);
                         const auto after_fixed = prefill_budget_add(request.bytes, loan->transfer_bytes());
                         const auto requested = selected;
                         selected = select_prefill_chunk(tile.tokens, selected, after, after_fixed, tile.row_bytes);
