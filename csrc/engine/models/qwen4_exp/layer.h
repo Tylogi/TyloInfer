@@ -28,12 +28,14 @@ struct Layer final {
 };
 
 Tensor feed_forward(const Moe& weights, const Tensor& input,
-                    std::int64_t projection_rows = 0);
+                    std::int64_t projection_rows = 0, std::int64_t prefill_offset = 0,
+                    std::int64_t prefill_rows = 0);
 
 Tensor forward(const Layer& weights, LayerState& request,
                     Tensor x, const Tensor& ids,
                     const Tensor& positions, const Tensor& full_positions,
-                    int64_t confirmed = 0, const Tensor& host_ids = {});
+                    int64_t confirmed = 0, const Tensor& host_ids = {},
+                    std::int64_t prefill_offset = 0, std::int64_t prefill_rows = 0);
 
 Tensor prefill_ple(const Layer& weights, LayerState& request,
                         Tensor x, const Tensor& ids, const Tensor& host_ids);

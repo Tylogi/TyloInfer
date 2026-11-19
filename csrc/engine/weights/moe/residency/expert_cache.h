@@ -89,6 +89,7 @@ void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
     std::span<const std::uint8_t> keep,bool executed=false);
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept;
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache);
+void discard_moe_prefill_routes(const std::shared_ptr<MoeExpertCache>& cache);
 // Target, predictor and request batches share the MFE pool on their compute stream.
 bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.

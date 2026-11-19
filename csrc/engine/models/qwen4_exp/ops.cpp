@@ -87,6 +87,7 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
             if (layers[i]->ple) layers[i]->ple->prefetch_tokens(state->layers[i]->ple, host_ids);
     }
     auto hidden = repeat_hidden(ops::contiguous(ops::copy(embeddings, device)), metadata.hc_mult);
+    const auto prefill_rows = input.advance && batch == 1 && tokens > 8 && !input.suffix && !confirmed ? tokens : 0;
     const auto* mtp = predictor();
     const auto targets = device.is_cuda() && input.raw_hidden && mtp
         ? mtp->target_layers() : std::span<const std::int64_t>{};
@@ -104,7 +105,7 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
         auto local_full = ops::copy(full_positions, layer.device);
         hidden = ops::contiguous(ops::copy(hidden, layer.device));
         hidden = qwen4_exp::forward(layer, *state->layers[i], std::move(hidden),
-            local_ids, local_positions, local_full, confirmed, host_ids);
+            local_ids, local_positions, local_full, confirmed, host_ids, 0, prefill_rows);
         taps.capture(std::int64_t(i), hidden);
         trace();
     }

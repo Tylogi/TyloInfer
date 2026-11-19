@@ -133,13 +133,19 @@ MoeResidencyManager* MoeExpertCache::ensure_residency() {
     return moe_residency_.get();
 }
 
+bool MoeExpertCache::use_prefill_counts(int layer, const MoeRoutePlan& route) const {
+    return route.prefill && route.counts.defined() && route.counts.numel() == route.n_experts &&
+        moe_residency_ && moe_residency_->can_record_prefill(layer);
+}
+
 void MoeCachedSource::begin_routes(const MoeRoutePlan& route) {
     if (std::none_of(cache_->pipeline_bundles_.begin(), cache_->pipeline_bundles_.end(),
                      [&](const auto& bundle) { return bundle[2] == id_; })) return;
     const MfqCudaGuard guard(cache_->owner_device_);
     if (auto* manager = cache_->ensure_residency()) {
         manager->before_layer(layer_id_);
-        (void)route_experts(route);
+        if (cache_->kv_expert_loan_ || !cache_->use_prefill_counts(layer_id_, route))
+            (void)route_experts(route);
     }
 }
 
@@ -155,6 +161,12 @@ void MoeCachedSource::finish_routes(const MoeRoutePlan& route) {
     const auto total = route.row_total > 0 ? route.row_total : rows;
     if (total > std::numeric_limits<int>::max())
         throw std::runtime_error("cached MoE route publication coordinates mismatch");
+    if (cache_->use_prefill_counts(layer_id_, route)) {
+        cache_->moe_residency_->record_prefill_counts(layer_id_, route.counts,
+            static_cast<int>(rows), static_cast<int>(route.ids.size(1)),
+            static_cast<int>(route.row_offset), static_cast<int>(total));
+        return;
+    }
     if (route.row_offset + rows == total)
         cache_->moe_residency_->after_layer(layer_id_, {}, static_cast<int>(total), false,
             tyloi::cuda::Executor::current_ffn().batch_serial);
@@ -184,7 +196,7 @@ void MoeExpertCache::observe_route(int source_id, int layer, const MoeRoutePlan 
             [&](const auto& bundle) { return bundle[2] == source_id; })) {
         cudaStreamCaptureStatus capture;
         TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_get_current_cuda_stream().stream(), &capture));
-        if (capture == cudaStreamCaptureStatusNone)
+        if (capture == cudaStreamCaptureStatusNone && !use_prefill_counts(layer, route))
             moe_residency_->observe_routes(layer, ids, rows, row_offset, row_total,
                 tyloi::cuda::Executor::current_ffn().batch_serial);
     }
@@ -2827,6 +2839,9 @@ void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) 
     if(!cache)return;
     release_moe_prefill_buffers(cache);
     cache->prepare_decode_residency();
+}
+void discard_moe_prefill_routes(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(cache)cache->discard_prefill_routes();
 }
 void drain_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache) {
     if (!cache) return;

@@ -74,7 +74,7 @@ struct ExpertBatch::Impl {
 
 ExpertBatch::ExpertBatch(std::span<const Tensor> gate_up, const Tensor& down, const Tensor& ids,
                          std::int64_t row_offset, std::int64_t row_total,
-                         ops::MlpActivation activation)
+                         ops::MlpActivation activation, bool)
     : impl_(std::make_unique<Impl>(Impl{{gate_up.begin(), gate_up.end()}, down, ids,
                                          row_offset, row_total, activation})) {
     if (row_offset < 0 || row_total <= 0 || row_offset > row_total ||

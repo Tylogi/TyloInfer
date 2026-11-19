@@ -337,6 +337,7 @@ void Engine::retire_request(Request& request) noexcept {
     idle_state_ = std::move(request.state);
     try {
         drain();
+        weights_->discard_prefill();
         if (batch_ && config_.preallocate_kv) {
             auto scope = executor_->enter();
             graph_->invalidate();

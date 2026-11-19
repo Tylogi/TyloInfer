@@ -93,6 +93,7 @@ const MoeRoutePlan& moe_route_to_device(
     replica->n_experts = source.n_experts;
     replica->row_offset = source.row_offset;
     replica->row_total = source.row_total;
+    replica->prefill = source.prefill;
     replica->mma_tile_m = source.mma_tile_m;
     replica->wide_tile_m = source.wide_tile_m;
     replica->map_ready = source.map_ready;
@@ -101,7 +102,7 @@ const MoeRoutePlan& moe_route_to_device(
     return *replica;
 }
 
-MoeRoutePlan build_moe_route_plan(::tyloi::DenseTensor ids, int n_experts) {
+MoeRoutePlan build_moe_route_plan(::tyloi::DenseTensor ids, int n_experts, bool prefill) {
     if (!ids.is_cuda() || ids.scalar_type() != ::tyloi::kInt32 || ids.dim() != 2) {
         throw std::runtime_error("MoE ids must be CUDA int32 [tokens, routes]");
     }
@@ -121,7 +122,7 @@ MoeRoutePlan build_moe_route_plan(::tyloi::DenseTensor ids, int n_experts) {
     result.wide_tile_experts = empty;
     result.counts = empty;
     result.cursors = empty;
-    if (result.ids.size(0) > 8) {
+    if (prefill || result.ids.size(0) > 8) {
         const int64_t rows_per_expert = std::max<int64_t>(
             1, (result.ids.numel() + n_experts - 1) / n_experts);
         const bool use_coarse_mma = rows_per_expert >= 4;

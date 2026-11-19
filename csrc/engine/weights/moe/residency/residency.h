@@ -8,6 +8,7 @@
 #include <vector>
 #include <iosfwd>
 class MoeExpertCache;
+namespace tyloi { class DenseTensor; }
 class MoeResidencyManager {
 public:
     using MemorySample = tyloi::HostMemorySample;
@@ -65,6 +66,9 @@ public:
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
     void record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* stream);
+    bool can_record_prefill(int layer) const;
+    void record_prefill_counts(int layer,const tyloi::DenseTensor& counts,int tokens,int routes,int row_offset=0,int row_total=0);
+    void discard_prefill();
     void prepare_decode();
     void release_transfer_stages();
     Stats stats() const noexcept;
@@ -77,4 +81,6 @@ private:
     void prepare_direct_exchange();
     void publish_pending();
     void rollback();
+    void record_prefill_sample(int layer,const int32_t* data,std::size_t elements,int tokens,int routes,
+        const tyloi::DenseTensor* counts,int row_offset,int row_total,void* stream);
 };

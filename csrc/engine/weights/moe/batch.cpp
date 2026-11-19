@@ -26,7 +26,7 @@ std::shared_ptr<const MfeTensor> cpu_expert(const std::shared_ptr<const MfeTenso
 
 ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, const Tensor& ids,
                          std::int64_t row_offset, std::int64_t row_total,
-                         ops::MlpActivation activation)
+                         ops::MlpActivation activation, bool prefill)
     : impl_(std::make_unique<Impl>()) {
     if ((banks.size() != 1 && banks.size() != 2) || !down || !ids ||
         ids.dim() != 2 || !ids.representation<DenseTensor>() || !ids.is_cuda() || ids.scalar_type() != kInt32 ||
@@ -111,11 +111,13 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     auto& executor = cuda::Executor::current();
     if (!tq_routed) {
         b.route = executor.profiler().measure("moe.route_map", [&] {
-            return build_moe_route_plan(ids.dense(), static_cast<int>(banks[0].size(0)));
+            return build_moe_route_plan(ids.dense(), static_cast<int>(banks[0].size(0)),
+                prefill && bool(b.down && b.down->cached_source));
         });
     }
     b.route.row_offset = row_offset;
     b.route.row_total = row_total;
+    b.route.prefill = prefill;
     if (!cuda::Executor::current_ffn().batch_serial) b.prepare();
 }
 

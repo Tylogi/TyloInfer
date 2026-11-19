@@ -333,6 +333,10 @@ void Cache::retire_prefill() {
     release_moe_prefill_buffers(data_->moe);
 }
 
+void Cache::discard_prefill() {
+    discard_moe_prefill_routes(data_->moe);
+}
+
 void Cache::settle() {
     release_workspace();
     finish_exchange();

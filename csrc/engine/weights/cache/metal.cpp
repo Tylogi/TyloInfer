@@ -386,6 +386,7 @@ void Cache::drain() const {
 }
 void Cache::finish_exchange() const { drain(); }
 void Cache::retire_prefill() { drain(); }
+void Cache::discard_prefill() {}
 void Cache::settle() { drain(); }
 void Cache::request(bool) { drain(); }
 std::optional<std::size_t> Cache::prepare_prefill(Device device, std::size_t,

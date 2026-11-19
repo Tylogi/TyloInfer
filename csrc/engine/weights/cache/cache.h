@@ -120,6 +120,7 @@ public:
     void drain() const;
     void finish_exchange() const;
     void retire_prefill();
+    void discard_prefill();
     void settle();
     void trace(const char* boundary, bool wait, const source::Source* source);
     void release_workspace(std::size_t required_available =

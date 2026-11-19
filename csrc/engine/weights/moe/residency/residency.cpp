@@ -259,11 +259,11 @@ struct MoeResidencyManager::Impl {
     std::unique_ptr<tyloi::cuda::HostBuffer> backup_descriptors;
     tyloi::MoeCacheMappedCopyDescriptor* backup_descriptors_device=nullptr;
     uint8_t* backup_ram_device=nullptr;
-    struct PrefillRoutes {int tokens=0,routes=0;};
+    struct PrefillRoutes {int tokens=0,routes=0,total=0;std::size_t elements=0;bool counts=false;};
     std::vector<PrefillRoutes> prefill_routes;
     ::tyloi::DenseTensor prefill_route_device;
     std::unique_ptr<tyloi::cuda::HostBuffer> prefill_route_host;
-    int prefill_route_stride=0;
+    std::size_t prefill_route_stride=0;
     cudaEvent_t prefill_done=nullptr;
     bool prefill_pending=false;
     std::vector<Move> pending;
@@ -534,6 +534,7 @@ MoeResidencyManager::~MoeResidencyManager() {
             (void)cudaEventSynchronize(impl_->prefill_done);
             (void)cudaEventDestroy(impl_->prefill_done);
         }
+        impl_->prefill_route_device={};
         if(impl_->worker.joinable()) {
             {std::lock_guard<std::mutex> lock(impl_->worker_mutex);impl_->stopping=true;}
             impl_->work_available.notify_one();impl_->work_finished.notify_all();impl_->worker.join();
@@ -558,68 +559,139 @@ MoeResidencyManager::~MoeResidencyManager() {
         impl_->work_available.notify_one();impl_->work_finished.notify_all();impl_->worker.join();
     }
 }
-void MoeResidencyManager::record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* raw_stream) {
+bool MoeResidencyManager::can_record_prefill(int layer) const {
+    const auto& s=*impl_;
+    if(!s.cache->reuse_learning() || layer<0 || !s.cache->options_.policy.adapt || !s.cache->options_.policy.warm)return false;
+    const auto* option=tyloi::cuda::env_lookup("TYLOINFER_MOE_PREFILL_RESIDENCY");
+    if((option && option[0]=='0') || s.route_history->pending())return false;
+    return std::any_of(s.cache->pipeline_bundles_.begin(),s.cache->pipeline_bundles_.end(),[&](const auto& bundle) {
+        return s.cache->sources_[bundle[0]]->layer_id_==layer;
+    });
+}
+void MoeResidencyManager::record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* stream) {
+    if(!can_record_prefill(layer))return;
+    if(!ids || tokens<1 || routes<1)throw std::invalid_argument("invalid prefill routes");
+    const auto tail=std::min(tokens,32);
+    record_prefill_sample(layer,ids+int64_t(tokens-tail)*routes,std::size_t(tail)*routes,tail,routes,nullptr,0,tail,stream);
+}
+void MoeResidencyManager::record_prefill_counts(int layer,const tyloi::DenseTensor& counts,int tokens,int routes,int row_offset,int row_total) {
+    if(!can_record_prefill(layer))return;
+    const auto& s=*impl_;
+    if(!counts.defined() || counts.device()!=s.cache->device() || counts.scalar_type()!=tyloi::kInt32 ||
+       counts.dim()!=1 || !counts.is_contiguous() || tokens<1 || routes<1 || row_offset<0 || row_total<0)
+        throw std::invalid_argument("invalid prefill route counts");
+    if(!row_total)row_total=tokens;
+    if(row_offset>row_total || tokens>row_total-row_offset || std::int64_t(row_total)*routes>INT32_MAX)
+        throw std::invalid_argument("invalid prefill route window");
+    for(const auto& bundle:s.cache->pipeline_bundles_) {
+        const auto& source=s.cache->sources_[bundle[0]];
+        if(source->layer_id_==layer && counts.numel()!=source->n_experts())
+            throw std::invalid_argument("prefill route count width differs from expert bundle");
+    }
+    const MfqCudaGuard guard(s.cache->device());
+    const auto stream=tyloi::cuda::current_stream(s.cache->device().index);
+    counts.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()),stream.lifetime());
+    record_prefill_sample(layer,counts.data_ptr<int32_t>(),std::size_t(counts.numel()),tokens,routes,&counts,row_offset,row_total,stream.stream());
+}
+void MoeResidencyManager::record_prefill_sample(int layer,const int32_t* data,std::size_t elements,int tokens,int routes,
+        const tyloi::DenseTensor* counts,int row_offset,int row_total,void* raw_stream) {
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
-    if(!s.cache->reuse_learning() || layer<0 || !s.cache->options_.policy.adapt || !s.cache->options_.policy.warm)return;
-    const auto* option=tyloi::cuda::env_lookup("TYLOINFER_MOE_PREFILL_RESIDENCY");
-    if(option && option[0]=='0')return;
     const auto stream=static_cast<cudaStream_t>(raw_stream);
     if(!s.prefill_done)TYLOINFER_CUDA_CHECK(cudaEventCreateWithFlags(&s.prefill_done,cudaEventDisableTiming));
     if(s.prefill_routes.empty())s.prefill_routes.resize(s.cache->pipeline_bundles_.size());
-    if(routes>s.prefill_route_stride) {
-        if(s.prefill_pending)TYLOINFER_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
-        const int64_t elements=int64_t(s.prefill_routes.size())*32*routes;
-        // The samples are consumed after prefill returns the borrowed expert
-        // storage. They must not be allocated from that temporary workspace.
-        tyloi::cuda::ResidentAllocationScope resident;
-        auto next=::tyloi::cuda::empty({elements},::tyloi::TensorOptions().device(s.cache->device()).dtype(::tyloi::kInt32));
-        // Preserve samples if a model uses different routing widths by layer.
-        if(s.prefill_route_device.defined())for(std::size_t b=0;b<s.prefill_routes.size();++b) {
-            const auto& sample=s.prefill_routes[b];if(!sample.tokens)continue;
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(next.data_ptr<int32_t>()+b*32*routes,
-                s.prefill_route_device.data_ptr<int32_t>()+b*32*s.prefill_route_stride,
-                sample.tokens*sample.routes*sizeof(int32_t),cudaMemcpyDeviceToDevice,stream));
-        }
-        s.prefill_route_device=std::move(next);s.prefill_route_stride=routes;
-        s.prefill_route_host=std::make_unique<tyloi::cuda::HostBuffer>(elements*sizeof(int32_t),false);
+    if(row_offset)for(std::size_t b=0;b<s.prefill_routes.size();++b) {
+        if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_!=layer)continue;
+        const auto& sample=s.prefill_routes[b];
+        if(!counts || !sample.counts || sample.tokens!=row_offset || sample.total!=row_total ||
+           sample.routes!=routes || sample.elements!=elements)
+            throw std::logic_error("prefill route window is not contiguous");
     }
+    if(elements>s.prefill_route_stride) {
+        if(s.prefill_pending)TYLOINFER_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
+        if(elements>std::size_t(INT64_MAX)/s.prefill_routes.size() || elements>SIZE_MAX/sizeof(int32_t)/s.prefill_routes.size())
+            throw std::overflow_error("prefill route workspace exceeds addressable size");
+        const auto total=elements*s.prefill_routes.size();
+        tyloi::cuda::ResidentAllocationScope resident;
+        ::tyloi::DenseTensor next;
+        {
+            tyloi::cuda::StreamGuard allocation({s.cache->device().index,s.stream});
+            next=::tyloi::cuda::empty({int64_t(total)},::tyloi::TensorOptions().device(s.cache->device()).dtype(::tyloi::kInt32));
+        }
+        auto host=std::make_unique<tyloi::cuda::HostBuffer>(total*sizeof(int32_t),false);
+        TYLOINFER_CUDA_CHECK(cudaEventRecord(s.prefill_done,s.stream));
+        TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,s.prefill_done,0));
+        try {
+            if(s.prefill_route_device.defined()) {
+                for(std::size_t b=0;b<s.prefill_routes.size();++b) {
+                    const auto& sample=s.prefill_routes[b];if(!sample.tokens)continue;
+                    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(next.data_ptr<int32_t>()+b*elements,
+                        s.prefill_route_device.data_ptr<int32_t>()+b*s.prefill_route_stride,
+                        sample.elements*sizeof(int32_t),cudaMemcpyDeviceToDevice,stream));
+                }
+                // Retire old storage before its owning stream can recycle it.
+                TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+        } catch(...) {(void)cudaStreamSynchronize(stream);throw;}
+        s.prefill_route_device=std::move(next);s.prefill_route_stride=elements;
+        s.prefill_route_host=std::move(host);
+    }
+    else if(s.prefill_pending)TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,s.prefill_done,0));
     for(std::size_t b=0;b<s.prefill_routes.size();++b) {
         if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_!=layer)continue;
         auto& sample=s.prefill_routes[b];
-        const auto tail=std::min(tokens,32),bytes=tail*routes*int(sizeof(int32_t));
-        sample.tokens=tail;sample.routes=routes;
-        // Keep route samples on-device during prefill. Small D2H copies at
-        // every layer interfere with the overlapping expert-weight transfers.
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_device.data_ptr<int32_t>()+b*32*s.prefill_route_stride,
-            ids+int64_t(tokens-tail)*routes,bytes,cudaMemcpyDeviceToDevice,stream));
-        TYLOINFER_CUDA_CHECK(cudaEventRecord(s.prefill_done,stream));
+        try {
+            if(row_offset) {
+                auto destination=s.prefill_route_device.narrow(0,int64_t(b*s.prefill_route_stride),int64_t(elements));
+                destination.add_(*counts);
+            }else TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_device.data_ptr<int32_t>()+b*s.prefill_route_stride,
+                    data,elements*sizeof(int32_t),cudaMemcpyDeviceToDevice,stream));
+            TYLOINFER_CUDA_CHECK(cudaEventRecord(s.prefill_done,stream));
+        } catch(...) {
+            (void)cudaStreamSynchronize(stream);
+            for(std::size_t i=0;i<s.prefill_routes.size();++i)
+                if(s.cache->sources_[s.cache->pipeline_bundles_[i][0]]->layer_id_==layer)s.prefill_routes[i].tokens=0;
+            throw;
+        }
+        sample={row_offset+tokens,routes,row_total,elements,counts!=nullptr};
         s.prefill_pending=true;
     }
+}
+void MoeResidencyManager::discard_prefill() {
+    auto& s=*impl_;
+    const MfqCudaGuard guard(s.cache->device());
+    if(s.prefill_pending)TYLOINFER_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
+    for(auto& sample:s.prefill_routes)sample={};
+    s.prefill_pending=false;
 }
 void MoeResidencyManager::prepare_decode() {
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
     if(!s.prefill_pending)return;
-    apply_pending();
     if(!s.cache->reuse_learning()) {
         TYLOINFER_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
         for(auto& sample:s.prefill_routes)sample.tokens=0;
         s.prefill_pending=false;return;
     }
+    if(s.route_history->pending() || s.cache->pipeline_residency_suspended_)return;
+    apply_pending();
     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.prefill_done,0));
     TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_host->data(),s.prefill_route_device.data_ptr(),
         s.prefill_route_device.numel()*sizeof(int32_t),cudaMemcpyDeviceToHost,s.stream));
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(s.stream));
     const auto started=std::chrono::steady_clock::now();
+    bool learned=false;
     for(std::size_t b=0;b<s.prefill_routes.size();++b) {
         auto& sample=s.prefill_routes[b];if(!sample.tokens)continue;
-        const auto* ids=static_cast<const int32_t*>(s.prefill_route_host->data())+b*32*s.prefill_route_stride;
-        s.route_history->prefill(b,std::span<const int32_t>(ids,std::size_t(sample.tokens)*sample.routes),
-            sample.tokens,sample.routes);
-        sample.tokens=0;
+        if(sample.tokens!=sample.total){sample.tokens=0;continue;}
+        const auto* data=static_cast<const int32_t*>(s.prefill_route_host->data())+b*s.prefill_route_stride;
+        const auto values=std::span<const int32_t>(data,sample.elements);
+        if(sample.counts)s.route_history->prefill_counts(b,values,sample.tokens,sample.routes);
+        else s.route_history->prefill(b,values,sample.tokens,sample.routes);
+        sample.tokens=0;learned=true;
     }
     s.prefill_pending=false;
+    if(!learned)return;
     const auto before=s.committed_projections.load();
     // This boundary is outside the prefill workspace loan. All expert slots
     // contain weights again and the usual transactional guards still apply.

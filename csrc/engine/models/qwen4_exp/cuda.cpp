@@ -1664,7 +1664,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
                 ffn_gate.narrow(1,begin,count).copy_(mix.gate.dense());
                 output=mix.residual.dense();
             } else output=qwen4_exp::forward(*block,layer_state,
-                input,chunk_ids,positions,full_positions,0,host_ids).dense();
+                input,chunk_ids,positions,full_positions,0,host_ids,begin,tokens).dense();
             // Retain the original rounding at every layer boundary. The next
             // chunk is independent of this input once its cache writes retire.
             TYLOINFER_RUNTIME_CHECK(output.sizes()==input.sizes(),"layer-major decoder changed hidden shape");
@@ -1707,7 +1707,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
                 if(tail>0 && tail<=8)count-=16-tail;
                 tyloi::ops::ProfileRange range("prefill.ffn");
                 auto part=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,
-                    ffn_inputs.narrow(1,begin,count),reference_rows).dense();
+                    ffn_inputs.narrow(1,begin,count),reference_rows,begin,tokens).dense();
                 range.finish();
                 if(count==tokens) {
                     ffn_output=std::move(part);

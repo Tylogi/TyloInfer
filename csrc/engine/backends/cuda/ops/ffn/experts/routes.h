@@ -14,7 +14,7 @@ class Collectives;
 
 struct MoeRoutePlan;
 
-MoeRoutePlan build_moe_route_plan(::tyloi::DenseTensor ids, int n_experts);
+MoeRoutePlan build_moe_route_plan(::tyloi::DenseTensor ids, int n_experts, bool prefill = false);
 
 const MoeRoutePlan& moe_route_to_device(
     tyloi::cuda::Collectives& collectives,
@@ -44,6 +44,7 @@ struct MoeRoutePlan {
     // local to this route; these fields identify their rows in the window.
     std::int64_t row_offset = 0;
     std::int64_t row_total = 0;
+    bool prefill = false;
     int mma_tile_m = 8;
     int wide_tile_m = 8;
     bool map_ready = false;

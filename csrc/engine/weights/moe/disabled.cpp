@@ -56,6 +56,7 @@ void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache)noexcept {}
 
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) {}
+void discard_moe_prefill_routes(const std::shared_ptr<MoeExpertCache>& cache) {}
 
 bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) { return {}; }
 

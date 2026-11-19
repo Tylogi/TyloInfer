@@ -607,6 +607,8 @@ public:
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
     void prepare_decode_residency() { if(moe_residency_)moe_residency_->prepare_decode(); }
+    void discard_prefill_routes() { if(moe_residency_)moe_residency_->discard_prefill(); }
+    bool use_prefill_counts(int layer, const MoeRoutePlan& route) const;
 
     void begin_route_experts(
             const MoeRoutePlan & route,

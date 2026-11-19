@@ -216,6 +216,24 @@ public:
         history.prefill_reset = false;
     }
 
+    void prefill_counts(std::size_t bundle, std::span<const int32_t> counts, int rows, int routes) {
+        auto& history = histories_.at(bundle);
+        if (rows < 1 || routes < 1 || counts.size() != history.heat.size())
+            throw std::invalid_argument("invalid prefill route geometry");
+        const auto expected = std::uint64_t(rows) * std::uint64_t(routes);
+        std::uint64_t total = 0;
+        for (const auto count : counts) {
+            if (count < 0 || std::uint64_t(count) > expected - total)
+                throw std::invalid_argument("invalid prefill route counts");
+            total += std::uint64_t(count);
+        }
+        if (total != expected) throw std::invalid_argument("invalid prefill route counts");
+        for (std::size_t expert = 0; expert < counts.size(); ++expert)
+            history.heat[expert] = expert_prefill_usage(std::uint64_t(counts[expert]), std::size_t(rows));
+        std::fill(history.observations.begin(), history.observations.end(), 0.0f);
+        history.prefill_reset = false;
+    }
+
     void stage_prefill(std::size_t bundle, std::span<const int32_t> ids, int rows) {
         auto& history = histories_.at(bundle);
         if (rows < 1 || ids.empty() || ids.size() % std::size_t(rows))
