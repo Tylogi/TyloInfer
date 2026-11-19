@@ -25,6 +25,7 @@ struct MtpStep {
     // Optional last-row vocabulary projection computed in the predictor graph.
     Tensor sample_logits;
     int32_t greedy_token=-1;
+    Tensor sample_compact{};
 };
 
 struct MtpRow {
@@ -33,6 +34,7 @@ struct MtpRow {
     Tensor ids;
     Tensor positions;
     Tensor context = {};
+    bool compact_sampling = false;
 };
 
 struct MtpDraft {

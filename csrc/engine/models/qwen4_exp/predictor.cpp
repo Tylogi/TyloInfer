@@ -60,14 +60,36 @@ Tensor Predictor::embed(Tensor ids) const {
 
 Tensor Predictor::logits(Tensor hidden) const {
     ::tyloi::ops::ProfileRange range("model.lm_head", hidden.device());
+    if (draft_output) {
+        auto subset = ops::project(hidden, draft_output);
+        auto shape = subset.dense().sizes().vec();
+        shape.back() = config.vocab;
+        auto logits = ops::empty(shape, subset.options());
+        ops::fill(logits, -std::numeric_limits<float>::infinity());
+        ops::index_copy(logits, -1, draft_token_ids, subset);
+        range.finish();
+        return logits;
+    }
     auto projected = ::tyloi::ops::project(hidden, output);
     range.finish();
     return ::tyloi::ops::softcap(projected, softcap);
 }
 
+Tensor Predictor::fuse(const Tensor& hidden, Tensor embeddings) const {
+    const auto b = hidden.size(0), t = hidden.size(1);
+    auto e = ops::project(ops::rms_norm(embeddings, embedding_norm, config.eps, 1.0, embeddings.scalar_type()),
+                          embedding_fusion);
+    // Release prior-stage tensors before later projections allocate.
+    embeddings = {};
+    auto normalized = ops::rms_norm(hidden, hidden_norm, config.eps, 1.0, hidden.scalar_type());
+    auto streams = ops::project(ops::reshape(normalized, {b, t, config.streams, config.hidden}), hidden_fusion);
+    return ops::reshape(ops::add(streams, ops::unsqueeze(e, -2)), {b, t, config.streams * config.hidden});
+}
+
 void Predictor::reset(tyloi::models::MtpState& value, int64_t next_batch) const {
     auto& request=state<PredictorState>(value);
     tyloi::models::require_model(next_batch > 0, "Qwen4-Exp MTP batch must be positive");
+    request.release_graphs();
     for (std::size_t i=0; i<layers.size(); ++i)
         request.layer_states[i]->reset(*layers[i]);
     for (auto &pos : request.positions)
@@ -114,7 +136,12 @@ std::vector<std::pair<Device, std::size_t>> Predictor::growth(
             std::size_t(start + t)), sizeof(std::int32_t)));
     const auto& block = *layers.front();
     const auto& layer_state = *request.layer_states.front();
-    if (block.qsa) add(block.device, block.qsa->allocation_bytes(*layer_state.qsa, b, t, reset));
+    if (block.qsa) {
+        const auto& qsa = *layer_state.qsa;
+        const bool exit_graph = !reset && block.device.is_cuda() && block.qsa->graph_exit_growth_bytes(qsa);
+        add(block.device, exit_graph ? block.qsa->exit_growth(qsa, t)
+                                     : block.qsa->allocation_bytes(qsa, b, t, reset));
+    }
     return result;
 }
 
@@ -169,23 +196,15 @@ std::pair<Tensor, Tensor> Predictor::evaluate(tyloi::models::MtpState& value, co
         auto full = cache && request.positions[layer].defined() ? ops::cat(segments, -1) : current;
         pos = {current, full};
     }
-    Tensor x;
-    {
-        Tensor e;
-        {
-            e = ops::project(ops::rms_norm(embeds, embedding_norm, config.eps, 1.0, embeds.scalar_type()),
-                                      embedding_fusion);
-        }
-        // Release prior-stage tensors before later projections allocate.
-        embeds = {};
-        Tensor streams;
-        auto normalized = ops::rms_norm(hidden, hidden_norm, config.eps, 1.0, hidden.scalar_type());
-        streams = ops::project(ops::reshape(normalized, {b, t, config.streams, config.hidden}), hidden_fusion);
-        x = ops::reshape(ops::add(streams, ops::unsqueeze(e, -2)), {b, t, config.streams * config.hidden});
-    }
+    auto x = fuse(hidden, std::move(embeds));
     Tensor multi;
     {
         auto &block = *layers[layer];
+        auto& qsa = *request.layer_states[layer]->qsa;
+        if (block.device.is_cuda() && block.qsa->graph_exit_growth_bytes(qsa)) {
+            request.release_graphs();
+            block.qsa->leave_graph(qsa);
+        }
         // Teacher-forced rows each receive the target hidden state. Only
         // the attention input contributes persistent predictor history;
         // attention readout, FFN and final mixer have no consumer here.
@@ -217,7 +236,9 @@ tyloi::models::MtpStep Predictor::step(tyloi::models::MtpState& value, const tyl
                                       const tyloi::Tensor& input_positions,
                                       const tyloi::models::ForwardOptions&) const {
     auto result = evaluate(value,input_hidden, input_ids, 0, true, input_positions);
-    return {std::move(result.first), std::move(result.second)};
+    auto projected = draft_output ? logits(ops::contiguous(ops::slice(
+        result.first, 1, result.first.size(1) - 1, result.first.size(1)))) : Tensor{};
+    return {std::move(result.first), std::move(result.second), std::move(projected)};
 }
 
 std::vector<tyloi::models::MtpStep> Predictor::batch_step(
@@ -304,6 +325,11 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
         for (const auto& projection : projections)
             row_projections.push_back(ops::slice(projection, 0,
                 static_cast<std::int64_t>(index), static_cast<std::int64_t>(index + 1)));
+        auto& qsa = *requests[index]->layer_states.front()->qsa;
+        if (block.device.is_cuda() && block.qsa->graph_exit_growth_bytes(qsa)) {
+            requests[index]->release_graphs();
+            block.qsa->leave_graph(qsa);
+        }
         attended.push_back(block.qsa->forward(
             *requests[index]->layer_states.front()->qsa,
             ops::slice(attention_input, 0, static_cast<std::int64_t>(index),
@@ -317,6 +343,7 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
     auto ffn_output = tyloi::models::qwen4_exp::feed_forward(block.ffn, ffn_input);
     auto multi = block.ffn_gr.post(ffn_output, ffn_residual, ffn_gate);
     auto sample = final_mixer->pre(multi).mixed;
+    auto projected = draft_output ? logits(sample) : Tensor{};
 
     std::vector<tyloi::models::MtpStep> result;
     result.reserve(rows.size());
@@ -328,26 +355,11 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
             ops::slice(sample, 0, static_cast<std::int64_t>(index),
                        static_cast<std::int64_t>(index + 1)),
             ops::slice(multi, 0, static_cast<std::int64_t>(index),
-                       static_cast<std::int64_t>(index + 1))});
+                       static_cast<std::int64_t>(index + 1)),
+            projected ? ops::slice(projected, 0, static_cast<std::int64_t>(index),
+                                   static_cast<std::int64_t>(index + 1)) : Tensor{}});
     }
     return result;
-}
-
-void Predictor::history_step(tyloi::models::MtpState& value,Tensor hidden,Tensor ids,Tensor positions,bool scalar_chain) const {
-    if(ids.dim()==1)ids=ops::unsqueeze(ids,0);
-    if(positions.defined()) {
-        if(positions.dim()==1)positions=ops::expand(ops::reshape(positions,{1,1,-1}),{3,ids.size(0),ids.size(1)});
-        else if(positions.dim()==2)positions=ops::unsqueeze(positions,1);
-        tyloi::models::require_model(positions.dim()==3 && positions.size(0)==3 &&
-            positions.size(1)==ids.size(0) && positions.size(2)==ids.size(1),"invalid MTP history positions");
-        positions=ops::contiguous(ops::cast(positions,::tyloi::kInt32));
-    }
-    if(scalar_chain && ids.size(1)>1) {
-        for(int64_t row=0;row<ids.size(1);++row) {
-            auto row_positions=positions.defined()?ops::slice(positions,-1,row,row+1):Tensor{};
-            (void)step(value,ops::slice(hidden,1,row,row+1),ops::slice(ids,1,row,row+1),row_positions);
-        }
-    } else (void)step(value,hidden,ids,positions);
 }
 
 void Predictor::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const {

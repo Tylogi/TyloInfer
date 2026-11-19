@@ -4,6 +4,7 @@
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/qwen4_exp/causal_lm.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/memory.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/group.h"
 #include "engine/weights/moe/experts.h"
@@ -168,6 +169,31 @@ std::optional<Predictor> Predictor::load_if_present(const tyloi::weights::Loader
     loader.role = "qwen4_exp";
     if (!tyloi::models::qwen4_exp::load_predictor(result, loader, main))
         return std::nullopt;
+    if (result.device.is_cuda()) {
+        constexpr auto head = "predictor.output.weight";
+        constexpr auto tokens = "predictor.output.token_ids";
+        const bool has_head = loader.has(head), has_tokens = loader.has(tokens);
+        require_model(has_head == has_tokens, "MTP draft output requires both weights and vocabulary IDs");
+        if (has_head) {
+            const auto& metadata = require_tensor(loader.source, tokens);
+            require_model(metadata.dtype == "I64" || metadata.dtype == "I32",
+                "MTP draft vocabulary IDs must be integers");
+            auto ids = loader.host(tokens);
+            const auto& weight = require_tensor(loader.source, head);
+            require_model(ids.dim() == 1 && ids.numel() > 0 && weight.shape &&
+                *weight.shape == std::vector<int64_t>({ids.numel(), main.hidden}),
+                "MTP draft output geometry differs from target");
+            auto ordered = tyloi::ops::read_integers(ids);
+            std::sort(ordered.begin(), ordered.end());
+            require_model(ordered.front() >= 0 && ordered.back() < main.vocab &&
+                std::adjacent_find(ordered.begin(), ordered.end()) == ordered.end(),
+                "MTP draft vocabulary contains invalid or duplicate IDs");
+            result.draft_output = loader.weight(head, TensorParallelAxis::Mirrored);
+            result.draft_token_ids = tyloi::ops::contiguous(tyloi::ops::copy(
+                tyloi::ops::cast(ids, tyloi::kInt64), result.device));
+            tyloi::weights::observe_weight(result.draft_token_ids);
+        }
+    }
     return result;
 }
 

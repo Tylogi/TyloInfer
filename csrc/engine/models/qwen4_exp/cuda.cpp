@@ -28,6 +28,7 @@
 #include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/tq/source.h"
 #include "engine/backends/cuda/executor/graph/window.h"
+#include "engine/backends/cuda/executor/graph_pool_lease.h"
 #include "engine/backends/cuda/ops/profile.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include <iostream>
@@ -46,6 +47,8 @@
 #include <chrono>
 #include <exception>
 #include <limits>
+#include <map>
+#include <tuple>
 
 namespace tyloi::models::qwen4_exp {
 using namespace ::tyloi::cuda;
@@ -145,10 +148,268 @@ static ::tyloi::DenseTensor append_decode_positions(
 }
 }
 
-
-
 namespace tyloi::models::qwen4_exp {
 using namespace ::tyloi::cuda;
+
+struct PredictorGraphs {
+    struct Cell {
+        explicit Cell(cudaStream_t stream) : window(stream) {}
+        Tensor ids, hidden, positions, cache_positions, greedy_host, compact_host, greedy;
+        MtpStep output;
+        DecodeWindow window;
+    };
+
+    explicit PredictorGraphs(StreamHandle stream) : stream(std::move(stream)) {}
+
+    StreamHandle stream;
+    std::shared_ptr<GraphPoolLease> pool;
+    std::map<std::tuple<int64_t, ScalarType, MtpStepMode>, std::unique_ptr<Cell>> cells;
+    DenseTensor history;
+    int64_t capacity = 0;
+
+    static void prepare(Cell& cell, const MtpRow& row, int64_t start) {
+        ops::copy_into(cell.ids, row.ids);
+        ops::copy_into(cell.hidden, row.hidden);
+        mfq_qwen4_exp::fill_decode_positions(cell.cache_positions.dense(), cell.positions.dense(), start);
+    }
+
+    std::size_t history_growth(const PredictorState& state, int64_t tokens) const {
+        const auto required = state.position() + tokens, maximum = state.owner.config.maximum;
+        if (!cuda::options::position_buffer("TYLOINFER_MTP_POSITION_BUFFER").value_or(true))
+            return std::size_t(required) * 3 * sizeof(int32_t);
+        if (history.defined() && history.data_ptr() == state.positions[0].dense().data_ptr() &&
+            required <= history.size(-1)) return 0;
+        const auto doubled = required > maximum / 2 ? maximum : required * 2;
+        return std::size_t(std::min(maximum, std::max<int64_t>(256, doubled))) * 3 * sizeof(int32_t);
+    }
+
+    Tensor positions(const PredictorState& state, const Cell& cell) {
+        return append_decode_positions(state.positions[0].dense(), cell.positions.dense(),
+            history, state.owner.config.maximum, "TYLOINFER_MTP_POSITION_BUFFER");
+    }
+
+    static void advance(PredictorState& state, Tensor positions, int64_t tokens) {
+        state.owner.layers.front()->qsa->advance_graph(*state.layer_states.front()->qsa, tokens);
+        state.positions[0] = std::move(positions);
+        state.lengths[0] += tokens;
+    }
+};
+
+namespace {
+
+bool predictor_graph_enabled() {
+    return cuda::options::mtp_predictor_graph().value_or(true) && mfq_cuda_graph_capture_supported();
+}
+
+std::vector<Tensor> predictor_graph_storage(const Predictor& model, PredictorState& state) {
+    std::vector<Tensor> owners;
+    const auto& attention = *model.layers.front()->qsa;
+    for (auto* tensor : attention.graph_state(*state.layer_states.front()->qsa)) owners.push_back(*tensor);
+    return owners;
+}
+
+} // namespace
+
+StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow row, MtpStepMode mode,
+        const ForwardOptions& options) const {
+    auto* request = row.state ? dynamic_cast<PredictorState*>(row.state) : nullptr;
+    if (!request || !request->belongs_to(*this) || target.predictor() != this ||
+        !device.is_cuda() || options.trace || options.primary != device.index || !predictor_graph_enabled() ||
+        request->batch != 1 || request->position() <= 0 || layers.size() != 1 || row.positions ||
+        !row.ids || row.ids.device() != device || row.ids.scalar_type() != kInt64 ||
+        row.ids.dim() != 2 || row.ids.size(0) != 1 || row.ids.size(1) < 1 || row.ids.size(1) > 8 ||
+        !row.hidden || row.hidden.device() != device || row.hidden.is_encoded() || row.hidden.dim() != 3 ||
+        row.hidden.size(0) != 1 || row.hidden.size(1) != row.ids.size(1) || row.hidden.size(2) != hidden_norm.numel())
+        co_return;
+    const auto& block = *layers.front();
+    const auto tokens = row.ids.size(1), start = request->position();
+    if (!request->positions[0] || block.device != device || !block.qsa || block.gdn || block.ple ||
+        tokens > config.maximum - start ||
+        (mode != MtpStepMode::history && (!tq_graph_supports_tokens(tokens) || !routed_graph_supported(block.ffn))))
+        co_return;
+    if (mode == MtpStepMode::tail && tokens == 1) mode = MtpStepMode::full;
+    const auto* history_chain = cuda::env_lookup("TYLOINFER_MTP_HISTORY_CHAIN");
+    if (mode == MtpStepMode::tail && ((history_chain && history_chain[0] == '0') || cuda::Executor::current().kv_offload()))
+        co_return;
+
+    auto& qsa = *block.qsa;
+    auto& cache = *request->layer_states.front()->qsa;
+    ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
+    if (!graph.eligible()) co_return;
+    const auto stream = cuda::current_stream(device.index);
+    auto& graphs = request->graphs;
+    if (graphs && graphs->stream.stream() != stream.stream()) request->release_graphs();
+    if (!graphs) graphs = std::make_shared<PredictorGraphs>(stream);
+    graph.admit(tokens, graphs->capacity, true);
+    auto growth = graph.growth();
+    add_growth(growth, device, graphs->history_growth(*request, tokens));
+    if (!growth.empty())
+        co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
+    graph.materialize();
+    if (graph.clear_required()) {
+        co_yield GraphPhase::ready;
+        graphs->cells.clear();
+        if (const auto bytes = qsa.graph_exit_growth_bytes(cache)) {
+            std::vector<std::pair<Device, std::size_t>> growth{{device, bytes}};
+            co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
+            qsa.leave_graph(cache);
+        }
+        graph.layout();
+    }
+    graphs->capacity = graph.rows().front().capacity;
+    if (const auto bytes = qsa.managed_memory(cache) ? 0 : qsa.graph_growth_bytes(cache, graphs->capacity)) {
+        std::vector<std::pair<Device, std::size_t>> growth{{device, bytes}};
+        co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
+    }
+    graph.prepare(0, request->positions[0]);
+
+    const auto owners = predictor_graph_storage(*this, *request);
+    auto& slot = graphs->cells[{tokens, row.hidden.scalar_type(), mode}];
+    if (slot && !slot->window.matches(owners)) slot.reset();
+    const bool capture = !slot;
+    const bool readout = mode != MtpStepMode::history;
+    const bool compact = readout && row.compact_sampling && config.vocab >= 64;
+    if (capture) {
+        co_yield GraphPhase::ready;
+        auto fixed = DecodeWindow::fixed_growth(device, false, readout, 0);
+        add_growth(fixed, device, row.hidden.nbytes());
+        add_growth(fixed, device, std::size_t(tokens) * (2 * sizeof(int64_t) + 3 * sizeof(int32_t)));
+        if (readout) add_growth(fixed, Device(kCPU), 65 * sizeof(int64_t));
+        co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(fixed)};
+        if (!graphs->pool) graphs->pool = GraphPoolLease::acquire(cuda::default_context(device.index), stream.stream());
+        auto cell = std::make_unique<PredictorGraphs::Cell>(stream.stream());
+        const auto integer = TensorOptions().device(device).dtype(kInt64);
+        cell->ids = cell->window.buffer({1, tokens}, integer);
+        cell->hidden = cell->window.buffer({1, tokens, row.hidden.size(2)}, row.hidden.options());
+        cell->positions = cell->window.buffer({3, 1, tokens}, integer.dtype(kInt32));
+        cell->cache_positions = cell->window.buffer({tokens}, integer);
+        if (readout) {
+            auto packet = cuda::empty({65}, integer.device(kCPU).pinned_memory(true));
+            cell->compact_host = packet.narrow(0, 0, 64).reshape({1, 64});
+            cell->greedy_host = packet.narrow(0, 64, 1);
+        }
+        slot = std::move(cell);
+    }
+
+    auto& cell = *slot;
+    PredictorGraphs::prepare(cell, row, start);
+    if (readout) cell.window.set_compact_sampling(compact, "predictor", 1);
+    if (capture) {
+        if (readout) co_yield GraphPhase::prepare;
+        auto recording = cell.window.begin_capture();
+        while (recording->next()) {
+            std::exception_ptr failure;
+            bool warm = false;
+            try {
+                auto input = fuse(cell.hidden, embed(cell.ids));
+                auto mix = block.attention_gr.pre(input);
+                const auto prefix = mode == MtpStepMode::tail ? tokens - 1 : 0;
+                if (prefix) {
+                    qsa.forward_graph(cache, ops::slice(mix.mixed, 1, 0, prefix),
+                        ops::contiguous(ops::slice(cell.positions, 2, 0, prefix)),
+                        ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true);
+                }
+                auto attention = qsa.forward_graph(cache, ops::slice(mix.mixed, 1, prefix, tokens),
+                    ops::contiguous(ops::slice(cell.positions, 2, prefix, tokens)),
+                    ops::slice(cell.cache_positions, 0, prefix, tokens), {}, true, !readout);
+                if (readout) {
+                    auto residual = block.attention_gr.post(attention,
+                        ops::slice(mix.residual, 1, prefix, tokens), ops::slice(mix.gate, 1, prefix, tokens));
+                    auto ffn = block.ffn_gr.pre(residual);
+                    auto chain = block.ffn_gr.post(feed_forward(block.ffn, ffn.mixed), ffn.residual, ffn.gate);
+                    auto sample = final_mixer->pre(chain).mixed;
+                    const auto end = sample.size(1);
+                    auto last = ops::slice(sample, 1, end - 1, end);
+                    auto scores = draft_token_ids ? logits(std::move(last)) : target.logits(last);
+                    cell.output = {std::move(sample), std::move(chain), std::move(scores)};
+                    cell.greedy = cell.window.sample(cell.output.sample_logits, cell.greedy_host, cell.compact_host, 1);
+                }
+                warm = recording->finish();
+            } catch (...) { failure = std::current_exception(); }
+            if (failure) {
+                if (!recording->retry(failure)) std::rethrow_exception(failure);
+                warm = true;
+            }
+            if (warm) {
+                cell.output = {};
+                cell.greedy = {};
+                recording->release_warm_outputs();
+                recording->pause();
+                co_yield GraphRequest{GraphPhase::admit, nullptr, recording->growth()};
+                recording->resume();
+            }
+        }
+        recording->complete();
+        cell.window.retain(owners);
+    }
+    auto positions = graphs->positions(*request, cell);
+    if (readout || !cell.window.enqueue_if_device_only()) cell.window.run();
+    graphs->advance(*request, std::move(positions), tokens);
+    if (readout) {
+        auto result = cell.output;
+        result.sample_hidden = ops::clone(result.sample_hidden);
+        result.chain_hidden = ops::clone(result.chain_hidden);
+        result.sample_logits = ops::clone(result.sample_logits);
+        result.greedy_token = int32_t(*cell.greedy_host.dense().data_ptr<int64_t>());
+        if (compact) result.sample_compact = ops::clone(cell.compact_host);
+        co_yield std::move(result);
+    } else co_yield MtpStep{};
+}
+
+StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow row, int depth,
+        const ForwardOptions& options) const {
+    auto* request = row.state ? dynamic_cast<PredictorState*>(row.state) : nullptr;
+    if (!request || !request->belongs_to(*this) || target.predictor() != this || options.trace ||
+        !device.is_cuda() || !predictor_graph_enabled() || row.positions || request->batch != 1 ||
+        depth < 2 || depth > engine::mtp::kMaximumReportedDraftDepth || !request->graphs ||
+        !row.ids || row.ids.device() != device || row.ids.scalar_type() != kInt64 || row.ids.dim() != 2 ||
+        row.ids.size(0) != 1 || row.ids.size(1) < 1 || !row.hidden || row.hidden.device() != device ||
+        row.hidden.dim() != 3 || row.hidden.size(0) != 1 || row.hidden.size(1) != row.ids.size(1) ||
+        row.hidden.size(2) != hidden_norm.numel()) co_return;
+
+    auto& graphs = *request->graphs;
+    const auto tokens = row.ids.size(1), start = request->position();
+    const auto written = tokens + depth - 1;
+    if (start <= 0 || written > graphs.capacity - start ||
+        graphs.stream.stream() != cuda::current_stream(device.index).stream()) co_return;
+    const auto owners = predictor_graph_storage(*this, *request);
+    const auto ready = [&](int64_t width, ScalarType type, MtpStepMode mode) -> PredictorGraphs::Cell* {
+        const auto found = graphs.cells.find({width, type, mode});
+        return found != graphs.cells.end() && found->second->window.valid() &&
+            found->second->window.matches(owners) ? found->second.get() : nullptr;
+    };
+    auto* first = ready(tokens, row.hidden.scalar_type(), tokens > 1 ? MtpStepMode::tail : MtpStepMode::full);
+    if (!first) co_return;
+    auto* next = ready(1, first->output.chain_hidden.scalar_type(), MtpStepMode::full);
+    if (!next || next->output.chain_hidden.scalar_type() != first->output.chain_hidden.scalar_type()) co_return;
+
+    auto& qsa = *layers.front()->qsa;
+    auto& cache = *request->layer_states.front()->qsa;
+    ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
+    graph.admit(written, graphs.capacity, true);
+    auto growth = graph.growth();
+    add_growth(growth, device, graphs.history_growth(*request, written));
+    if (!growth.empty())
+        co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
+    graph.materialize();
+    graph.prepare(0, request->positions[0]);
+
+    auto packet = ops::empty({1, depth + 1}, row.ids.options());
+    ops::copy_into(ops::slice(packet, 1, 0, 1), ops::slice(row.ids, 1, tokens - 1, tokens));
+    for (int index = 0; index < depth; ++index) {
+        auto& cell = index == 0 ? *first : *next;
+        PredictorGraphs::prepare(cell, row, request->position());
+        auto positions = graphs.positions(*request, cell);
+        cell.window.set_compact_sampling(false, "predictor", 1);
+        if (!cell.window.enqueue_if_device_only()) cell.window.run();
+        graphs.advance(*request, std::move(positions), cell.ids.size(1));
+        row.ids = ops::reshape(cell.greedy, {1, 1});
+        row.hidden = cell.output.chain_hidden;
+        ops::copy_into(ops::slice(packet, 1, index + 1, index + 2), row.ids);
+    }
+    co_yield MtpDraft{std::move(packet)};
+}
+
 namespace {
 
 ::tyloi::DenseTensor qwen4_last_hidden(::tyloi::DenseTensor hidden) {

@@ -758,6 +758,7 @@ public:
     }
 
     void publish() noexcept override {
+        state_.release_graphs();
         state_.layer_states.swap(candidate_->layer_states);
         state_.positions.swap(candidate_->positions);
         state_.lengths.swap(candidate_->lengths);

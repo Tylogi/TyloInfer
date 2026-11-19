@@ -13,6 +13,7 @@ namespace tyloi::models::qwen4_exp {
 struct Layer;
 struct LayerState;
 struct Predictor;
+struct PredictorGraphs;
 
 struct PredictorState final : tyloi::models::MtpState {
     explicit PredictorState(const Predictor& owner, bool initialize_layers = true);
@@ -20,17 +21,20 @@ struct PredictorState final : tyloi::models::MtpState {
     int64_t position() const noexcept override;
     std::vector<Tensor> storage() const override;
     std::unique_ptr<tyloi::models::Restore> prepare_restore(const MtpSessionState&) override;
+    void release_graphs() noexcept override { graphs.reset(); }
 
     const Predictor& owner;
     std::vector<std::unique_ptr<LayerState>> layer_states;
     std::vector<::tyloi::Tensor> positions;
     std::vector<int64_t> lengths;
     int64_t batch = 0;
+    std::shared_ptr<PredictorGraphs> graphs;
 };
 
 struct Predictor final : tyloi::models::Mtp {
     tyloi::models::qwen4_exp::Config config;
     ::tyloi::Tensor embedding, output;
+    ::tyloi::Tensor draft_output, draft_token_ids;
     double softcap = 0;
     ::tyloi::Device device;
     ::tyloi::Tensor embedding_norm, hidden_norm;
@@ -51,6 +55,7 @@ struct Predictor final : tyloi::models::Mtp {
 
     Tensor embed(Tensor ids) const;
     Tensor logits(Tensor hidden) const;
+    Tensor fuse(const Tensor& hidden, Tensor embeddings) const;
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
     void reset(tyloi::models::MtpState&, int64_t next_batch = 1) const override;
@@ -70,9 +75,10 @@ struct Predictor final : tyloi::models::Mtp {
     std::vector<tyloi::models::MtpStep> batch_step(
         std::span<const tyloi::models::MtpRow>,
         const tyloi::models::ForwardOptions& = {}) const override;
-    void history_step(tyloi::models::MtpState&, Tensor hidden, Tensor ids, Tensor positions = {},
-                      bool scalar_chain = false) const;
-
+#if TYLOINFER_HAS_CUDA
+    StepSequence<MtpStep> graph_step(const CausalModel&, MtpRow, MtpStepMode, const ForwardOptions&) const override;
+    StepSequence<MtpDraft> greedy_draft(const CausalModel&, MtpRow, int, const ForwardOptions&) const override;
+#endif
     void trim_cache_to(tyloi::models::MtpState&, int64_t position) const override;
 
     bool teacher_forced_prompt_prime() const noexcept override;

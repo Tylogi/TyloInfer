@@ -85,7 +85,7 @@ public:
     void retain_result(Tensor value);
     bool matches(std::span<const Tensor> owners) const;
     void set_compact_sampling(bool enabled,const char* role,int rows);
-    void sample(const Tensor& logits,const Tensor& greedy_host,const Tensor& compact_host,int rows);
+    Tensor sample(const Tensor& logits,const Tensor& greedy_host,const Tensor& compact_host,int rows);
     class Signal {
     public:
         ~Signal();

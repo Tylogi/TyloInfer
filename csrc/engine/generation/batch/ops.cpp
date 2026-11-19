@@ -551,17 +551,23 @@ private:
                     predictor_execution_->submit(roots);
                 }
             }
-            std::vector<Tensor> hidden;
-            for (const auto& value:outputs) hidden.push_back(value.sample_hidden);
-            auto input=ops::contiguous(ops::cat(hidden,0));
-            if (!mtp_->preserve_output_dtype()) input=ops::cast(input,kFloat16);
-            auto logits=ops::reshape(model_.logits(input,true,models::LogitPrecision::input),
-                {std::int64_t(active.size()),vocab_size()});
+            Tensor logits;
+            if (std::any_of(outputs.begin(),outputs.end(),[](const auto& value) { return !value.sample_logits; })) {
+                std::vector<Tensor> hidden;
+                for (const auto& value:outputs) hidden.push_back(value.sample_hidden);
+                auto input=ops::contiguous(ops::cat(hidden,0));
+                if (!mtp_->preserve_output_dtype()) input=ops::cast(input,kFloat16);
+                logits=ops::reshape(model_.logits(input,true,models::LogitPrecision::input),
+                    {std::int64_t(active.size()),vocab_size()});
+            }
             for (std::size_t i=0;i<active.size();++i) {
                 auto& row=active[i];
                 auto& request=*row.request;
                 const auto sampling=mtp_->draft_sampling(request.sampling,compact(request));
-                auto values=probability_logits(ops::slice(logits,0,i,i+1),row.counts,sampling);
+                auto projected=outputs[i].sample_logits
+                    ? ops::reshape(outputs[i].sample_logits,{1,vocab_size()})
+                    : ops::slice(logits,0,i,i+1);
+                auto values=probability_logits(std::move(projected),row.counts,sampling);
                 std::int32_t token;
                 if (request.sampler->greedy()) token=ops::item(ops::sample_greedy(values));
                 else if (compact(request)) {

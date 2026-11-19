@@ -52,7 +52,7 @@ struct MtpOps {
     std::int64_t prefill_chunk_size;
     bool graph_enabled;
     Tensor input_ids, counts, known_ids_host, known_ids_device;
-    Tensor projected_predictor_hidden, projected_predictor_logits;
+    Tensor projected_predictor_hidden, projected_predictor_logits, projected_predictor_compact;
     Tensor projected_target_hidden, projected_target_logits, projected_target_compact;
     Tensor projected_target_ids;
     std::vector<std::int32_t> projected_target_tokens;
@@ -170,7 +170,7 @@ struct MtpOps {
         if (!device.is_cuda()) return false;
         if (info.graph == models::GraphOwner::executor)
             return weights.graph_safe(weights::Cache::Graph::legacy);
-        return !mtp.target_layers().empty() && (routed || weights.graph_safe(weights::Cache::Graph::native));
+        return routed || weights.graph_safe(weights::Cache::Graph::native);
     }
     Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0, bool queued = false) {
         target_transfer_bytes = 0;
@@ -272,27 +272,28 @@ struct MtpOps {
         return result;
     }
     models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions,
-                                   models::MtpStepMode mode = models::MtpStepMode::full) {
+                                   models::MtpStepMode mode = models::MtpStepMode::full,
+                                   bool compact_sampling = false) {
         auto predictor_options = options;
         predictor_options.serial_experts = false;
-        budget.reserve(mtp.growth(predictor, hidden, ids, positions, predictor_options));
+        std::optional<models::MtpStep> graph;
+        if (graph_enabled && hidden && hidden.device() == device && (!prepared || !prepared->transformed()))
+            graph = drive_draft(mtp.graph_step(model, {&predictor, hidden, ids, positions, {}, compact_sampling}, mode, predictor_options),
+                               ids.size(1), predictor_maintenance, mode);
         models::MtpStep result;
-        {
+        if (graph) result = std::move(*graph);
+        else {
+            budget.reserve(mtp.growth(predictor, hidden, ids, positions, predictor_options));
             auto scope = ops::dense_scope(&predictor_execution, device);
             hidden = ops::copy(hidden, device);
-            std::optional<models::MtpStep> graph;
-            if (graph_enabled && (!prepared || !prepared->transformed()))
-                graph = drive_draft(mtp.graph_step(model, {&predictor, hidden, ids, positions}, mode, predictor_options),
-                                    ids.size(1), predictor_maintenance, mode);
-            if (graph) result = std::move(*graph);
-            else {
-                result = mtp.step(predictor, hidden, ids, positions, predictor_options);
-                predictor_execution.submit(predictor.storage());
-                const std::array<Tensor, 3> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits};
-                predictor_execution.submit(outputs);
-            }
+            result = mtp.step(predictor, hidden, ids, positions, predictor_options);
+            predictor_execution.submit(predictor.storage());
+            const std::array<Tensor, 4> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits,
+                result.sample_compact};
+            predictor_execution.submit(outputs);
         }
         projected_predictor_logits = result.sample_logits;
+        projected_predictor_compact = result.sample_compact;
         projected_predictor_greedy = result.greedy_token;
         if (projected_predictor_logits.defined())
             projected_predictor_hidden = slice(result.sample_hidden, 1, result.sample_hidden.size(1) - 1, 1);
@@ -305,7 +306,7 @@ struct MtpOps {
         auto scope = ops::dense_scope(&predictor_execution, device);
         Capture capture(predictor_execution, weights, budget, device);
         std::optional<T> result;
-        std::array<Tensor, 3> outputs;
+        std::array<Tensor, 4> outputs;
         bool admitted = false;
         try {
             while (auto step = job.next()) {
@@ -322,9 +323,10 @@ struct MtpOps {
                             output.dim() != 2 || output.size(0) != 1 || output.size(1) != depth + 1)
                             throw std::logic_error("incomplete MTP verification window");
                     } else if constexpr (std::is_same_v<T, models::MtpStep>) {
-                        outputs = {step.value->sample_hidden, step.value->chain_hidden, step.value->sample_logits};
+                        outputs = {step.value->sample_hidden, step.value->chain_hidden, step.value->sample_logits,
+                            step.value->sample_compact};
                         if (mode == models::MtpStepMode::history) {
-                            if (outputs[0] || outputs[1] || outputs[2])
+                            if (outputs[0] || outputs[1] || outputs[2] || outputs[3])
                                 throw std::logic_error("MTP history graph returned output tensors");
                         } else {
                             const auto rows = mode == models::MtpStepMode::tail ? 1 : depth;
@@ -334,6 +336,10 @@ struct MtpOps {
                                     throw std::logic_error("incomplete MTP predictor step");
                             if (outputs[2] && outputs[2].device() != device)
                                 throw std::logic_error("MTP predictor logits are on the wrong device");
+                            if (outputs[3] && (!outputs[2] || !outputs[3].device().is_cpu() || outputs[3].is_encoded() ||
+                                    outputs[3].scalar_type() != kInt64 || outputs[3].dim() != 2 ||
+                                    outputs[3].size(0) != 1 || outputs[3].size(1) != 64))
+                                throw std::logic_error("invalid MTP predictor compact output");
                         }
                     } else {
                         auto& output = outputs[0] = *step.value;
@@ -368,6 +374,7 @@ struct MtpOps {
         if (!result) return {};
         projected_predictor_hidden = {};
         projected_predictor_logits = {};
+        projected_predictor_compact = {};
         projected_predictor_greedy = -1;
         result->initialized = result->initialized || initialized;
         return std::move(*result);
@@ -377,6 +384,8 @@ struct MtpOps {
                 graph_enabled && (!prepared || !prepared->transformed()), context),
             depth, initialized);
         if (!result) throw std::logic_error("MTP block draft ended without a result");
+        projected_predictor_hidden = {}; projected_predictor_logits = {}; projected_predictor_compact = {};
+        projected_predictor_greedy = -1;
         return std::move(*result);
     }
     int64_t predictor_prefill_chunk_size(int64_t requested) const { return mtp.prefill_chunk_size(requested); }
@@ -399,9 +408,11 @@ struct MtpOps {
         models::MtpStep result;
         result = mtp.prefill(predictor, hidden, ids, positions, predictor_options);
         predictor_execution.submit(predictor.storage());
-        timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits});
+        timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits, result.sample_compact});
         const auto elapsed = timer->elapsed_ms();
         if (bytes) workspace.finish();
+        projected_predictor_hidden = {}; projected_predictor_logits = {}; projected_predictor_compact = {};
+        projected_predictor_greedy = -1;
         return elapsed;
     }
     void trace_prompt_prefill(double target_ms, double predictor_ms, double workspace_ms) const {
@@ -476,6 +487,9 @@ struct MtpOps {
     }
     mtp::CompactDistribution compact_probabilities(Tensor logits, Tensor token_counts, const MfqSamplingParams& parameters) {
         if (parameters.top_k <= 0 || parameters.top_k > 64 || !(parameters.temperature > 0.0)) throw std::runtime_error("compact MTP sampling requires top-k 1-64");
+        if (!penalties && same_data(logits, projected_predictor_logits) && projected_predictor_compact &&
+            logits.dim() == 2 && logits.size(0) == projected_predictor_compact.size(0))
+            return std::move(mtp::compact_rows_from_packed(projected_predictor_compact, parameters).front());
         return std::move(mtp::compact_rows(probability_logits(std::move(logits), std::move(token_counts), parameters), parameters).front());
     }
     std::vector<mtp::CompactDistribution> compact_probability_rows(Tensor logits, const MfqSamplingParams& parameters) {
@@ -1023,7 +1037,7 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
             }
 
             auto head=ops.predictor_step(std::move(hidden_rows),std::move(history_ids),std::move(history_positions),
-                                         models::MtpStepMode::tail);
+                                         models::MtpStepMode::tail, compact_stochastic && !penalties);
             predictor_history_position += history_rows;
             require_execution(predictor.position() == predictor_history_position,
                 "MTP predictor cache did not advance");
@@ -1040,7 +1054,7 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                         ops.ids_for({token}),
                         positioned_prompt
                             ? ops.decode_positions(predictor_history_position + position + 1, 1)
-                            : Tensor{});
+                            : Tensor{}, models::MtpStepMode::full, compact_stochastic && !penalties);
                     sample_hidden = next.sample_hidden;
                     chain_hidden = next.chain_hidden;
                 }

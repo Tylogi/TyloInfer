@@ -475,9 +475,9 @@ void DecodeWindow::set_compact_sampling(bool enabled,const char* role,int rows) 
     std::cerr<<"runtime_mtp_compact_control role="<<role<<" rows="<<rows<<" enabled="<<int(enabled)<<'\n';
     state.previous=int(enabled);
 }
-void DecodeWindow::sample(const Tensor& logits,const Tensor& greedy_host,const Tensor& compact_host,int rows) {
+Tensor DecodeWindow::sample(const Tensor& logits,const Tensor& greedy_host,const Tensor& compact_host,int rows) {
     auto flat=logits.dense().reshape({rows,-1}).contiguous();
-    if(rows>1 && logits.size(-1)>=64) {
+    if((rows>1 || sampling_) && logits.size(-1)>=64) {
         if(!sampling_)throw std::logic_error("compact sampling was not configured");
         auto compact=sample_top_k_compact_if_cuda(flat,64,sampling_->control.dense().data_ptr<int32_t>());
         TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(compact_host.dense().data_ptr(),compact.data_ptr(),
@@ -486,6 +486,7 @@ void DecodeWindow::sample(const Tensor& logits,const Tensor& greedy_host,const T
     auto greedy=sample_greedy_cuda(flat);
     TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(greedy_host.dense().data_ptr(),greedy.data_ptr(),
         rows*sizeof(int64_t),cudaMemcpyDeviceToHost,stream_));
+    return Tensor{std::move(greedy)};
 }
 Tensor DecodeWindow::buffer(const std::vector<int64_t>& shape,const TensorOptions& options,bool zero) {
     Tensor result=zero ? cuda::zeros(shape,options) : cuda::empty(shape,options);
