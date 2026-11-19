@@ -413,6 +413,8 @@ set(TYLOINFER_CUDA_EXECUTION_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/route_stats.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/allocation.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/qsa/ram_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/qsa/tq_cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/working_set.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/graph/decode.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/tq/resources.cpp

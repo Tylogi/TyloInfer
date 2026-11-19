@@ -199,7 +199,8 @@ struct QsaTqCache::Impl {
         }
     };
     std::string directory;
-    cudaStream_t codec_stream_key=nullptr;std::once_flag bind_encoder;
+    StreamHandle stream;
+    std::once_flag bind_encoder;
     std::shared_ptr<TqCodecArena> encoder;
 
     Impl(int64_t max,int h,int kh,int w,int ih,int iw,int b,const ::tyloi::TensorOptions& opts,bool ssd)
@@ -213,7 +214,7 @@ struct QsaTqCache::Impl {
         rows=int(row_count);capacity=int((max+3)/4);
         ram_bits=int(option("TYLOINFER_QSA_RAM_KV_BITS",0));
         if(ram_bits && ram_bits!=16 && ram_bits!=8 && ram_bits!=4)throw std::invalid_argument("QSA RAM KV bits must be 16, 8 or 4");
-        check(cudaGetDevice(&device));codec_stream_key=mfq_current_cuda_stream();
+        check(cudaGetDevice(&device));stream=current_stream(device);
         const auto update=option("TYLOINFER_QSA_TQ_UPDATE_TOKENS",128);
         if(update!=128 && update!=256)throw std::invalid_argument("adaptive QSA update interval must be 128 or 256");
         interval=unsigned(update);
@@ -238,11 +239,13 @@ struct QsaTqCache::Impl {
         initialize_cache();
     }
     ~Impl() {
-        (void)cudaSetDevice(device);
-        if(history_transfer.pending){(void)cudaEventSynchronize(history_transfer.done);history_transfer.pending=false;}
-        ram.reset();cache.reset();(void)cudaStreamSynchronize(mfq_current_cuda_stream());
-        for(auto& old:retired)if(old.done)(void)cudaEventDestroy(old.done);
-        for(auto& upload:uploads)if(upload.done)(void)cudaEventDestroy(upload.done);
+        internal::on_device_noexcept(device,[&] {
+            StreamGuard guard(stream);
+            if(history_transfer.pending){(void)cudaEventSynchronize(history_transfer.done);history_transfer.pending=false;}
+            ram.reset();cache.reset();(void)cudaStreamSynchronize(stream.stream());
+            for(auto& old:retired)if(old.done)(void)cudaEventDestroy(old.done);
+            for(auto& upload:uploads)if(upload.done)(void)cudaEventDestroy(upload.done);
+        });
     }
     void initialize_cache() {
         if(ram_bits) {
@@ -304,7 +307,7 @@ struct QsaTqCache::Impl {
             }
             return result;
         }
-        std::call_once(bind_encoder,[this]{encoder=ram_bits?shared_codec_arena(device,codec_stream_key):std::make_shared<TqCodecArena>();});
+        std::call_once(bind_encoder,[this]{encoder=ram_bits?shared_codec_arena(device,stream.stream()):std::make_shared<TqCodecArena>();});
         auto& arena=*encoder;std::lock_guard<std::mutex> encoder_guard(arena.mutex);
         auto& encoder_stream=arena.stream;auto& encoder_owner=arena.owner;
         auto& source=arena.source;auto& source_views=arena.source_views;auto& decoded=arena.decoded;
@@ -491,7 +494,10 @@ struct QsaTqCache::Impl {
             key_offsets.push_back(group->host.size());group->host.insert(group->host.end(),entry.image->key.begin(),entry.image->key.end());
             value_offsets.push_back(group->host.size());group->host.insert(group->host.end(),entry.image->value.begin(),entry.image->value.end());
         }
-        group->payload=upload(group->host.data(),group->host.size(),options);
+        {
+            ResidentAllocationScope resident;
+            group->payload=upload(group->host.data(),group->host.size(),options);
+        }
         group->records.resize(batch.size());
         std::vector<std::size_t> ids;
         for(std::size_t i=0;i<batch.size();++i) {
@@ -711,7 +717,8 @@ struct QsaTqCache::Impl {
         }
     }
     ::tyloi::DenseTensor forward(const ::tyloi::DenseTensor& query,const ::tyloi::DenseTensor& keys,const ::tyloi::DenseTensor& values,const ::tyloi::DenseTensor& iq,
-        const ::tyloi::DenseTensor& raw,const ::tyloi::DenseTensor& positions,const QsaTqCache::Pool& pool,bool history_only,const ::tyloi::DenseTensor& gate,::tyloi::DenseTensor output,bool fp16_math) {
+        const ::tyloi::DenseTensor& raw,const ::tyloi::DenseTensor& positions,const QsaTqCache::Pool& pool,bool history_only,
+        const ::tyloi::DenseTensor& gate,::tyloi::DenseTensor output,bool fp16_math,const ::tyloi::DenseTensor& full_positions) {
         cancel_batch_warmup();finish_history();
         const auto t=keys.size(1),start=tokens;
         pending_graph=false;
@@ -741,7 +748,10 @@ struct QsaTqCache::Impl {
         if(complete) {
             const auto span=complete*4;
             auto group=std::make_shared<ImageBatch>();
-            group->payload=::tyloi::cuda::empty({int64_t(2*complete*canonical_bytes)},options.dtype(::tyloi::kUInt8));
+            {
+                ResidentAllocationScope resident;
+                group->payload=::tyloi::cuda::empty({int64_t(2*complete*canonical_bytes)},options.dtype(::tyloi::kUInt8));
+            }
             auto* canonical_k=group->payload.data_ptr<std::uint8_t>();auto* canonical_v=canonical_k+complete*canonical_bytes;
             if(ram_bits==16) {
                 auto modes=::tyloi::cuda::empty({2*complete*rows*256},options.dtype(::tyloi::kFloat32));
@@ -757,9 +767,11 @@ struct QsaTqCache::Impl {
                 archive=::tyloi::cuda::empty({int64_t(archive_bytes)},options.dtype(::tyloi::kUInt8));
             }
             check(tq::tq_pack_archive(canonical_k,canonical_v,r.data_ptr<float>(),archive.data_ptr<std::uint8_t>(),int(complete),int(canonical_bytes),index_width,mfq_current_cuda_stream()));
-            auto origin=positions.narrow(-1,0,1)-start;
-            if(origin.dim()==1)origin=origin.reshape({1,1});
-            auto block_positions=::tyloi::cuda::arange(complete,positions.options().dtype(::tyloi::kInt64))*4+base*4+origin;
+            auto starts=::tyloi::cuda::arange(complete,positions.options().dtype(::tyloi::kInt64))*4+base*4;
+            auto active=positions.dim()==1?positions.unsqueeze(0):positions;
+            auto block_positions=full_positions.defined()
+                ?full_positions.index_select(-1,starts)
+                :starts+(active.narrow(-1,0,1)-start);
             auto pooled=pool(r.narrow(1,0,span),block_positions).to(::tyloi::kFloat32).contiguous();
             check(tq::indexer_affine16_encode(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>()+base*index_width,
                 index_scales.data_ptr<std::uint16_t>()+base,index_zero.data_ptr<std::int16_t>()+base,int(complete),index_width,mfq_current_cuda_stream()));
@@ -1246,7 +1258,9 @@ QsaTqCache::Tensor QsaTqCache::forward_pending_graph(const Tensor& q,const Tenso
     const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute){
     return impl_->forward_pending_graph(q,k,v,iq,raw,positions,gate,std::move(output),pool,absolute);}
 QsaTqCache::Tensor QsaTqCache::forward(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
-    const Tensor& positions,const Pool& pool,bool history_only,const Tensor& gate,Tensor output,bool fp16_math){return impl_->forward(q,k,v,iq,raw,positions,pool,history_only,gate,std::move(output),fp16_math);}
+    const Tensor& positions,const Pool& pool,bool history_only,const Tensor& gate,Tensor output,bool fp16_math,const Tensor& full_positions){
+    return impl_->forward(q,k,v,iq,raw,positions,pool,history_only,gate,std::move(output),fp16_math,full_positions);
+}
 std::shared_ptr<void> QsaTqCache::hold_host_workspace(std::size_t bytes) {
     return impl_->ram?impl_->ram->hold_workspace(bytes):std::shared_ptr<void>{};
 }

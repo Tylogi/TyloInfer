@@ -556,6 +556,7 @@ std::shared_ptr<StageArena> arena_for(int device,cudaStream_t stream,int capacit
     static thread_local std::map<Key,std::weak_ptr<StageArena>> arenas;
     auto& weak=arenas[{device,stream,capacity,count,stride}];auto arena=weak.lock();
     if(!arena) {
+        ResidentAllocationScope resident;
         arena=std::make_shared<StageArena>();arena->stride=stride;arena->pinned_account=pinned_account;
         arena->payload=::tyloi::cuda::empty({int64_t(8ULL*count*stride)},options.dtype(::tyloi::kUInt8));
         arena->first=::tyloi::cuda::empty({capacity},options.dtype(::tyloi::kInt32));

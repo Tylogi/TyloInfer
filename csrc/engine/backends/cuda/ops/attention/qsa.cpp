@@ -8,6 +8,7 @@
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
+#include "engine/backends/cuda/executor/qsa/tq_cache.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/ops/qwen4_exp.h"
@@ -43,6 +44,15 @@ class QsaCore {
               values(model.c_.maximum, model.c_.kv_heads * model.value_width(), model.cache_dtype()),
               index(model.c_.maximum, model.c_.index_width)
               {
+            const auto& c = model.c_;
+            if (qsa_tq_cache_enabled()) {
+                TYLOINFER_RUNTIME_CHECK(c.pool == 4 && !c.quantization.enabled(),
+                    "adaptive QSA requires four-token blocks and its own KV codec");
+                ResidentAllocationScope resident;
+                adaptive = std::make_unique<QsaTqCache>(c.maximum,c.heads,c.kv_heads,c.width,
+                    c.index_heads,c.index_width,c.budget,model.w_->query_norm.options().device(c.device));
+                return;
+            }
             auto& executor = tyloi::cuda::Executor::current();
             auto manager = executor.kv_memory();
             if (manager)
@@ -61,6 +71,7 @@ class QsaCore {
         State(State&&) = default;
         State& operator=(State&&) = default;
         SequenceCache keys,values,index;
+        std::unique_ptr<QsaTqCache> adaptive;
         std::shared_ptr<state::KvOffloadStore> offload;
         std::unique_ptr<state::KvOffloadSequence> offloaded_kv,offloaded_index,offloaded_pooled;
         ::tyloi::Tensor graph_keys,graph_values,graph_pooled,graph_index;
@@ -76,7 +87,10 @@ class QsaCore {
                               c_.budget % c_.pool == 0 && rotary_,
                           "invalid Qwen4 QSA configuration");
     }
-    int64_t position(const State& request) const { return request.offload && request.offloaded_kv ? request.offloaded_kv->position() : request.keys.position(); }
+    int64_t position(const State& request) const {
+        if (request.adaptive) return request.adaptive->position();
+        return request.offload && request.offloaded_kv ? request.offloaded_kv->position() : request.keys.position();
+    }
     bool managed_memory(const State& request) const {return request.memory && request.memory->ready;}
     int64_t graph_capacity(const State& request) const {return managed_memory(request)?c_.maximum:0;}
     std::vector<::tyloi::Tensor*> graph_state(State& request) const {
@@ -129,6 +143,7 @@ class QsaCore {
         if (request.offload) return 0;
         const auto required = position(request) + tokens;
         TYLOINFER_RUNTIME_CHECK(tokens > 0 && required <= c_.maximum, "QSA growth exceeds max_context");
+        if (request.adaptive) return 0;
         std::size_t bytes = 0;
         for (const auto* cache : {&request.keys, &request.values, &request.index}) {
             const auto& storage = cache->storage();
@@ -148,6 +163,10 @@ class QsaCore {
         const auto start = reset ? int64_t(0) : position(request);
         TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && start >= 0 && start <= c_.maximum &&
             tokens <= c_.maximum - start, "invalid QSA allocation window");
+        if (request.adaptive) {
+            TYLOINFER_RUNTIME_CHECK(batch == 1, "adaptive QSA needs one cache per sequence");
+            return 0;
+        }
         const auto add = [](std::size_t a, std::size_t b) {
             if (a > std::numeric_limits<std::size_t>::max() - b)
                 throw std::overflow_error("QSA allocation size overflow");
@@ -222,7 +241,9 @@ class QsaCore {
         bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
         return bytes;
     }
-    bool supports_session(const State& request) const { return !request.offload && !(request.memory && request.memory->offload); }
+    bool supports_session(const State& request) const {
+        return !request.adaptive && !request.offload && !(request.memory && request.memory->offload);
+    }
     /** Validate a QSA snapshot against this layer's cache geometry and device. */
     void validate_session(const State& request, const ::tyloi::ops::Qsa::Snapshot& state,
                           int64_t count, tyloi::Device device) const {
@@ -269,12 +290,13 @@ class QsaCore {
         stage(request.index,saved.index);
     }
     std::size_t session_bytes(const State& request,int64_t count) const {
-        if(count<=0)return 0;
+        if(count<=0 || request.adaptive)return 0;
         return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+
             c_.index_width*request.index.storage().element_size());
     }
     void capture_session(const State& request,::tyloi::ops::Qsa::Snapshot& state,int64_t count,std::size_t& bytes) const {
-        TYLOINFER_RUNTIME_CHECK(!request.offload && count>0 && count<=position(request),"invalid Qwen4 QSA session boundary");
+        TYLOINFER_RUNTIME_CHECK(!request.adaptive && !request.offload && count>0 && count<=position(request),
+            "invalid Qwen4 QSA session boundary");
         const auto save=[&](const DenseTensor& tensor) {
             auto saved=std::make_shared<DenseTensor>(tensor.contiguous().clone());bytes+=std::size_t(saved->numel())*saved->element_size();return saved;
         };
@@ -295,7 +317,7 @@ class QsaCore {
         const auto* keys=state.keys.representation<DenseTensor>();
         const auto* values=state.values.representation<DenseTensor>();
         const auto* index=state.index.representation<DenseTensor>();
-        TYLOINFER_RUNTIME_CHECK(!request.offload && keys && values && index && keys->defined() && values->defined() && index->defined() &&
+        TYLOINFER_RUNTIME_CHECK(!request.adaptive && !request.offload && keys && values && index && keys->defined() && values->defined() && index->defined() &&
             keys->dim()==3 && keys->size(0)==1 && keys->size(1)==count &&
             keys->size(2)==c_.kv_heads*key_width() && keys->scalar_type()==cache_dtype() &&
             values->dim()==3 && values->size(0)==1 && values->size(1)==count &&
@@ -318,6 +340,12 @@ class QsaCore {
     }
     /** Return owning handles for the request's unmanaged resident cache. */
     std::vector<::tyloi::Tensor> resident_cache_tensors(const State& request) const {
+        if (request.adaptive) {
+            std::vector<::tyloi::Tensor> result;
+            for (auto& value : request.adaptive->resident_tensors())
+                if (value.defined()) result.emplace_back(std::move(value));
+            return result;
+        }
         if(managed_memory(request))return {}; // Count physical GPU/RAM tiers through KvMemoryManager.
         return {request.keys.storage(), request.values.storage(), request.index.storage(),
             request.graph_keys, request.graph_values, request.graph_pooled};
@@ -331,6 +359,7 @@ class QsaCore {
         request.graph_keys={};request.graph_values={};request.graph_pooled={};request.graph_index={};
     }
     void reset(State& request) {
+        if (request.adaptive) { request.adaptive->reset(); return; }
         if (request.offload) {
             if(request.offloaded_kv)request.offloaded_kv->reset();
             if(request.offloaded_index)request.offloaded_index->reset();
@@ -344,6 +373,7 @@ class QsaCore {
         request.graph_keys={};request.graph_values={};request.graph_pooled={};request.graph_index={};
     }
     void prepare_graph(State& request,const DenseTensor& full_positions, int64_t capacity) {
+        TYLOINFER_RUNTIME_CHECK(!request.adaptive, "adaptive QSA requires eager execution");
         activate_memory(request);
         TYLOINFER_RUNTIME_CHECK(!request.offload || managed_memory(request), "streamed QSA graphs require a resident indexer");
         if(managed_memory(request)) {
@@ -545,6 +575,11 @@ class QsaCore {
         request.index.advance_fixed(tokens);
     }
     void truncate(State& request,int64_t keep) {
+        if (request.adaptive) {
+            MfqCudaGuard guard(c_.device);
+            request.adaptive->truncate(keep);
+            return;
+        }
         if (request.offload) {
             TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= position(request), "invalid offloaded QSA truncation");
             request.offloaded_kv->truncate(keep);
@@ -567,10 +602,15 @@ class QsaCore {
         TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
                               hidden.size(1) > 0,
                           "Qwen4 QSA requires nonempty [B,T,H] input");
+        TYLOINFER_RUNTIME_CHECK(!history_only || use_cache,"QSA history priming requires a cache");
+        if (request.adaptive && use_cache) {
+            TYLOINFER_RUNTIME_CHECK(!selection_trace, "adaptive QSA does not expose a selection trace");
+            return forward_adaptive(*request.adaptive,hidden,current_positions,full_positions,projections,
+                project_output,history_only);
+        }
         activate_memory(request);
         auto graph_keys = (request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{});
         auto graph_values = (request.graph_values.defined()?request.graph_values.dense():DenseTensor{});
-        TYLOINFER_RUNTIME_CHECK(!history_only || use_cache,"QSA history priming requires a cache");
         if(use_cache && hidden.size(1)>8 && !selection_trace && !history_only) {
             // Index scores grow with both query rows and the accumulated
             // context. Bound that workspace independently of the FFN tile.
@@ -768,6 +808,43 @@ class QsaCore {
     DenseTensor encode_key(const DenseTensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.key_bits(),false):x.to(::tyloi::kFloat16); }
     DenseTensor encode_value(const DenseTensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.value_bits(),true):x.to(::tyloi::kFloat16); }
     struct Projection {DenseTensor gate,query,key,value,iq,raw;bool cache_written=false;};
+    DenseTensor forward_adaptive(QsaTqCache& cache,const DenseTensor& hidden,const DenseTensor& positions,
+            const DenseTensor& full_positions,const std::vector<DenseTensor>& projections,
+            bool project_output,bool history_only) {
+        const auto start=cache.position(),tokens=hidden.size(1);
+        TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1 && tokens<=c_.maximum-start &&
+            positions.size(-1)==tokens && full_positions.size(-1)==start+tokens,
+            "adaptive QSA cache/position geometry mismatch");
+        const auto rows=cache.prefill_rows(tokens);
+        const auto type=hidden.scalar_type()==::tyloi::kFloat16 ? ::tyloi::kFloat16 : ::tyloi::kFloat32;
+        auto output=history_only ? DenseTensor{} : ::tyloi::cuda::empty({1,tokens,c_.heads*c_.width},
+            hidden.options().dtype(type));
+        const auto pool=[&](const DenseTensor& raw,const DenseTensor& starts) {
+            auto pooled=raw.reshape({1,raw.size(1)/c_.pool,c_.pool,c_.index_width}).mean(2);
+            pooled=project_norm(pooled,w_->index_key_norm.dense());
+            return rotary_->forward(pooled.unsqueeze(1),starts).squeeze(1);
+        };
+        try {
+            for (int64_t begin=0;begin<tokens;begin+=rows) {
+                const auto count=std::min(rows,tokens-begin);
+                auto h=hidden.narrow(1,begin,count),pos=positions.narrow(-1,begin,count);
+                std::vector<DenseTensor> projected;
+                for (const auto& value:projections) projected.push_back(value.narrow(1,begin,count));
+                auto p=history_only?project_history(h,pos):project(h,pos,true,{},{},{},std::move(projected));
+                auto buffer=history_only?DenseTensor{}:output.narrow(1,begin,count);
+                cache.forward(p.query,p.key,p.value,p.iq,p.raw,pos,pool,history_only,p.gate,std::move(buffer),true,
+                    full_positions.narrow(-1,0,start+begin+count));
+            }
+            if (tokens>8) cache.release_prefill_workspace();
+            if (history_only) return {};
+            output=output.to(hidden.scalar_type());
+            return project_output?this->project_output(output):output;
+        } catch (...) {
+            cache.truncate(start);
+            if (tokens>8) cache.release_prefill_workspace();
+            throw;
+        }
+    }
     DenseTensor streamed_graph_attention(State& request,const Projection& p,const DenseTensor& selected,::tyloi::ScalarType output_type) {
         auto* window=DecodeWindow::recording();
         TYLOINFER_RUNTIME_CHECK(window && selected.size(1)<=8,"streamed QSA requires a decode window of at most eight rows");
@@ -1133,6 +1210,7 @@ std::vector<Tensor> Qsa::storage(const State& state) const {
         if (value.defined()) result.push_back(hold(value.dense()));
     };
     const auto& cache = state.impl_->cache;
+    if (cache.adaptive) result = impl_->core.resident_cache_tensors(cache);
     add(cache.keys.storage()); add(cache.values.storage()); add(cache.index.storage());
     add(cache.graph_keys); add(cache.graph_values); add(cache.graph_pooled); add(cache.graph_index);
     if (cache.memory)
@@ -1224,6 +1302,10 @@ Qsa::Graph::~Graph() = default;
 Qsa::Graph::Graph(Graph&&) noexcept = default;
 Qsa::Graph& Qsa::Graph::operator=(Graph&&) noexcept = default;
 bool Qsa::Graph::eligible() const {
+    if (cuda::qsa_tq_cache_enabled()) return false;
+    for (const auto& request : impl_->requests)
+        for (const auto& layer : request.layers)
+            if (layer.second->impl_->cache.adaptive) return false;
     auto& executor = cuda::Executor::current();
     const auto offload = executor.kv_offload();
     if (offload) {

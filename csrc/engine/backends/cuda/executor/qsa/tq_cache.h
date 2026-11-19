@@ -41,7 +41,7 @@ public:
         const Pool& pool={},const Tensor& absolute_positions={});
     Tensor forward(const Tensor& query,const Tensor& keys,const Tensor& values,const Tensor& iq,
                    const Tensor& raw_index,const Tensor& positions,const Pool& pool,bool history_only=false,
-                   const Tensor& gate={},Tensor output={},bool fp16_math=true);
+                   const Tensor& gate={},Tensor output={},bool fp16_math=true,const Tensor& full_positions={});
     tyloinfer::qsa::AdaptiveCacheStats stats() const;
     // Observe I/O without finishing pending history or changing cache policy.
     std::uint64_t ssd_read_bytes() const;
