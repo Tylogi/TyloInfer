@@ -86,6 +86,50 @@ Tensor Predictor::fuse(const Tensor& hidden, Tensor embeddings) const {
     return ops::reshape(ops::add(streams, ops::unsqueeze(e, -2)), {b, t, config.streams * config.hidden});
 }
 
+void Predictor::validate_positions(const Tensor& positions, int64_t batch, int64_t tokens) {
+    if (!positions.defined()) return;
+    const auto dims = positions.dim();
+    tyloi::models::require_model((dims == 1 && positions.size(0) == tokens) ||
+        (dims == 2 && (positions.size(0) == 3 || positions.size(0) == 4) && positions.size(1) == tokens) ||
+        (dims == 3 && (positions.size(0) == 3 || positions.size(0) == 4) &&
+            (positions.size(1) == 1 || positions.size(1) == batch) && positions.size(2) == tokens),
+        "Qwen4 MTP positions require [T]/[3,T]/[4,T]/[3,B,T]/[4,B,T]");
+}
+
+Tensor Predictor::normalize_positions(const Tensor& positions, int64_t batch, int64_t tokens) const {
+    validate_positions(positions, batch, tokens);
+    auto current = ops::cast(ops::copy(positions, device), kInt32);
+    if (current.dim() == 1)
+        current = ops::expand(ops::reshape(current, {1, 1, tokens}), {3, 1, tokens});
+    else if (current.dim() == 2)
+        current = ops::unsqueeze(current, 1);
+    if (current.size(0) == 4) current = ops::slice(current, 0, 1, 4);
+    return ops::contiguous(ops::expand(current, {3, batch, tokens}));
+}
+
+std::size_t Predictor::position_growth(const Tensor& positions, int64_t batch, int64_t tokens) const {
+    const auto multiply = [](std::size_t a, std::size_t b) {
+        if (b && a > std::numeric_limits<std::size_t>::max() / b)
+            throw std::overflow_error("predictor position growth overflow");
+        return a * b;
+    };
+    std::size_t result = 0;
+    const auto add = [&](std::size_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() - result)
+            throw std::overflow_error("predictor position growth overflow");
+        result += bytes;
+    };
+    if (positions.defined()) {
+        if (positions.device() != device) add(positions.nbytes());
+        if (positions.scalar_type() != kInt32) add(multiply(std::size_t(positions.numel()), sizeof(std::int32_t)));
+    } else {
+        add(multiply(std::size_t(tokens), sizeof(std::int64_t)));
+        add(multiply(std::size_t(tokens), sizeof(std::int32_t)));
+    }
+    add(multiply(multiply(multiply(std::size_t(3), std::size_t(batch)), std::size_t(tokens)), sizeof(std::int32_t)));
+    return result;
+}
+
 void Predictor::reset(tyloi::models::MtpState& value, int64_t next_batch) const {
     auto& request=state<PredictorState>(value);
     tyloi::models::require_model(next_batch > 0, "Qwen4-Exp MTP batch must be positive");
@@ -121,16 +165,8 @@ std::vector<std::pair<Device, std::size_t>> Predictor::growth(
             throw std::overflow_error("predictor position growth overflow");
         return a * b;
     };
-    const auto current = multiply(multiply(multiply(std::size_t(3), std::size_t(b)), std::size_t(t)), sizeof(std::int32_t));
     if (hidden.device() != device) add(device, hidden.nbytes());
-    if (positions.defined()) {
-        if (positions.device() != device) add(device, positions.nbytes());
-        if (positions.scalar_type() != kInt32) add(device, multiply(std::size_t(positions.numel()), sizeof(std::int32_t)));
-    } else {
-        add(device, multiply(std::size_t(t), sizeof(std::int64_t)));
-        add(device, multiply(std::size_t(t), sizeof(std::int32_t)));
-    }
-    add(device, current);
+    add(device, position_growth(positions, b, t));
     if (!reset && request.positions.front().defined())
         add(device, multiply(multiply(multiply(std::size_t(3), std::size_t(b)),
             std::size_t(start + t)), sizeof(std::int32_t)));
@@ -158,6 +194,7 @@ std::pair<Tensor, Tensor> Predictor::evaluate(tyloi::models::MtpState& value, co
                           hidden.size(2) == hidden_norm.numel(),
                       "Qwen4-Exp MTP input geometry mismatch");
     const auto b = ids.size(0), t = ids.size(1);
+    validate_positions(supplied_positions, b, t);
     const auto capacity = config.maximum;
     const auto count = int64_t(request.lengths.size());
     tyloi::models::require_model(count > 0 && b > 0 && t > 0, "invalid predictor geometry");
@@ -177,21 +214,8 @@ std::pair<Tensor, Tensor> Predictor::evaluate(tyloi::models::MtpState& value, co
         // Full positions persist across predictor priming tiles and must
         // not occupy expert storage borrowed by this prefill phase.
         weights::Resident resident;
-        auto current = supplied_positions.defined()
-                           ? supplied_positions
-                           : ::tyloi::ops::arange(start, start + t, device);
-        current = ops::cast(ops::copy(current, device), kInt32);
-        if (current.dim() == 1)
-            current = ops::expand(ops::reshape(current, {1, 1, t}), {3, 1, t});
-        else if (current.dim() == 2)
-            current = ops::unsqueeze(current, 1);
-        if (current.dim() == 3 && current.size(0) == 4)
-            current = ops::slice(current, 0, 1, 4);
-        tyloi::models::require_model(current.dim() == 3 && current.size(0) == 3 &&
-                              current.size(-1) == t &&
-                              (current.size(1) == 1 || current.size(1) == b),
-                          "Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
-        current = ops::contiguous(ops::expand(current, {3, b, t}));
+        auto current = normalize_positions(supplied_positions.defined() ? supplied_positions
+            : ::tyloi::ops::arange(start, start + t, device), b, t);
         const std::array<Tensor, 2> segments{request.positions[layer], current};
         auto full = cache && request.positions[layer].defined() ? ops::cat(segments, -1) : current;
         pos = {current, full};
@@ -282,20 +306,8 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
         hidden_rows.push_back(ops::copy(row.hidden, device));
         id_rows.push_back(ops::contiguous(ops::copy(ops::cast(row.ids, ::tyloi::kInt64), device)));
 
-        auto current = row.positions.defined()
-            ? row.positions
-            : ::tyloi::ops::arange(request.lengths.front(), request.lengths.front() + 1, device);
-        current = ops::cast(ops::copy(current, device), kInt32);
-        if (current.dim() == 1)
-            current = ops::expand(ops::reshape(current, {1, 1, 1}), {3, 1, 1});
-        else if (current.dim() == 2)
-            current = ops::unsqueeze(current, 1);
-        if (current.dim() == 3 && current.size(0) == 4)
-            current = ops::slice(current, 0, 1, 4);
-        tyloi::models::require_model(current.dim() == 3 && current.size(0) == 3 &&
-                current.size(1) == 1 && current.size(2) == 1,
-            "Qwen4 predictor batch positions require [T], [3,T] or [3,1,T]");
-        current = ops::contiguous(ops::expand(current, {3, 1, 1}));
+        auto current = normalize_positions(row.positions.defined() ? row.positions
+            : ::tyloi::ops::arange(request.lengths.front(), request.lengths.front() + 1, device), 1, 1);
         current_positions.push_back(current);
         full_positions.push_back(request.positions.front().defined()
             ? ops::cat(std::array<Tensor, 2>{request.positions.front(), current}, -1)

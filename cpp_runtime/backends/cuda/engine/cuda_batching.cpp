@@ -499,7 +499,6 @@ FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
     TYLOINFER_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= 32,
                       "Flash-Next continuous batching supports 1..32 requests");
     model_.reset(1);
-    if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;
 int64_t FlashNextBatchOperations::vocab_size() const { return model_.vocab_size(); }
@@ -517,12 +516,10 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
         {"continuous_batching_packed_prefill_requests",double(packed_prefill_requests_)},
         {"continuous_batching_packed_prefill_tokens",double(packed_prefill_tokens_)},
         {"continuous_batching_moe_cached_row_serial",0.0},
-        {"continuous_batching_cuda_graph_captures",double(graph_ ? graph_->captures() : 0)},
-        {"continuous_batching_cuda_graph_replays",double(graph_ ? graph_->replays() : 0)},
         {"continuous_batching_request_kv_bytes",double(bytes)},
         {"continuous_batching_request_contexts",double(contexts)}};
 }
-void FlashNextBatchOperations::suspend_decode() { if (graph_) graph_->clear(); }
+void FlashNextBatchOperations::suspend_decode() {}
 void FlashNextBatchOperations::resume_decode(int64_t) {}
 static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure) {
     try {std::rethrow_exception(failure);}
@@ -695,7 +692,6 @@ void FlashNextBatchOperations::activate(const std::shared_ptr<Request>& request,
     accept(request,sampled);
 }
 void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& request) {
-    if (graph_) graph_->clear();
     finish_routed_expert_exchanges(execution_);
     request->cache.reset(); request->prefill_ids = {}; request->prefill_timers.clear(); request->packed_prefill_ms=0;
 }
@@ -732,8 +728,8 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
     const bool greedy = config_.greedy && std::all_of(state.active.begin(),state.active.end(),[](const auto& request) {
         return !request->eligible || (request->sampler->greedy() && !request->sampler->has_penalties() && !request->token_constraint);
     });
-    std::optional<Tensor> captured;
-    try { if(graph_)captured=graph_->run(caches,ids,host_ids,greedy); }
+    Tensor logits;
+    try { logits=qwen4_batch_decode(model_,caches,std::move(ids),host_ids); }
     catch(const std::exception& error) {
         const std::string message=error.what();
         if(!dynamic_cast<const MfqResourceExhausted*>(&error) &&
@@ -743,11 +739,9 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
         throw mfq::engine::InferenceInputError(mfq::engine::InferenceInputErrorCode::ContextLength,
             "insufficient GPU or pinned RAM for the batch decode workspace; reduce concurrent requests");
     }
-    auto logits = captured ? std::move(*captured) : qwen4_batch_decode(model_,caches,std::move(ids),host_ids);
     Tensor greedy_tokens;
     if (greedy) {
-        greedy_tokens = captured ? logits.to(mfq_tensor_backend::kCPU).contiguous()
-            : sample_greedy_cuda(logits.contiguous()).to(mfq_tensor_backend::kCPU).contiguous();
+        greedy_tokens = sample_greedy_cuda(logits.contiguous()).to(mfq_tensor_backend::kCPU).contiguous();
         ++greedy_batches_;
     }
     ++decode_batches_; decode_tokens_ += tokens.size();

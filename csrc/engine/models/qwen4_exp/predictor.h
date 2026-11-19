@@ -104,6 +104,11 @@ struct Predictor final : tyloi::models::Mtp {
         int maximum_depth, tyloi::engine::mtp::PolicyState& state) const override;
     bool supports_session_state(const tyloi::models::MtpState&) const noexcept override;
     MtpSessionState capture_session_state(const tyloi::models::MtpState&, int64_t,const tyloi::Tensor&) const override;
+
+private:
+    static void validate_positions(const Tensor& positions, int64_t batch, int64_t tokens);
+    Tensor normalize_positions(const Tensor& positions, int64_t batch, int64_t tokens) const;
+    std::size_t position_growth(const Tensor& positions, int64_t batch, int64_t tokens) const;
 };
 
 } // namespace tyloi::models::qwen4_exp

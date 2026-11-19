@@ -155,7 +155,7 @@ using namespace ::tyloi::cuda;
 struct PredictorGraphs {
     struct Cell {
         explicit Cell(cudaStream_t stream) : window(stream) {}
-        Tensor ids, hidden, positions, cache_positions, greedy_host, compact_host, greedy;
+        Tensor ids, hidden, positions, cache_positions, pool_positions, greedy_host, compact_host, greedy;
         MtpStep output;
         DecodeWindow window;
     };
@@ -172,6 +172,22 @@ struct PredictorGraphs {
         ::tyloi::ops::copy_into(cell.ids, row.ids);
         ::tyloi::ops::copy_into(cell.hidden, row.hidden);
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions.dense(), cell.positions.dense(), start);
+    }
+
+    static void prepare_pool(Cell& cell, const PredictorState& state) {
+        if (!cell.pool_positions) return;
+        const auto pool = state.owner.config.pool, start = state.position();
+        const auto& current = cell.positions.dense();
+        const auto& history = state.positions[0].dense();
+        auto& destination = cell.pool_positions.dense();
+        for (int64_t row = 0; row < current.size(-1);) {
+            const auto prior = (start + row) % pool;
+            const auto first = start + row - prior;
+            const auto count = std::min(pool - prior, current.size(-1) - row);
+            auto position = first < start ? history.narrow(-1, first, 1) : current.narrow(-1, first - start, 1);
+            destination.narrow(-1, row, count).copy_(position.expand({3, 1, count}));
+            row += count;
+        }
     }
 
     std::size_t history_growth(const PredictorState& state, int64_t tokens) const {
@@ -216,7 +232,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     auto* request = row.state ? dynamic_cast<PredictorState*>(row.state) : nullptr;
     if (!request || !request->belongs_to(*this) || target.predictor() != this ||
         !device.is_cuda() || options.trace || options.primary != device.index || !predictor_graph_enabled() ||
-        request->batch != 1 || request->position() <= 0 || layers.size() != 1 || row.positions ||
+        request->batch != 1 || request->position() <= 0 || layers.size() != 1 ||
         !row.ids || row.ids.device() != device || row.ids.scalar_type() != kInt64 ||
         row.ids.dim() != 2 || row.ids.size(0) != 1 || row.ids.size(1) < 1 || row.ids.size(1) > 8 ||
         !row.hidden || row.hidden.device() != device || row.hidden.is_encoded() || row.hidden.dim() != 3 ||
@@ -232,6 +248,9 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     const auto* history_chain = cuda::env_lookup("TYLOINFER_MTP_HISTORY_CHAIN");
     if (mode == MtpStepMode::tail && ((history_chain && history_chain[0] == '0') || cuda::Executor::current().kv_offload()))
         co_return;
+    if (row.positions && (!row.positions.representation<DenseTensor>() || row.positions.is_encoded() ||
+        (!row.positions.device().is_cpu() && !row.positions.device().is_cuda()))) co_return;
+    validate_positions(row.positions, 1, tokens);
 
     auto& qsa = *block.qsa;
     auto& cache = *request->layer_states.front()->qsa;
@@ -244,6 +263,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     graph.admit(tokens, graphs->capacity, true);
     auto growth = graph.growth();
     add_growth(growth, device, graphs->history_growth(*request, tokens));
+    if (row.positions) add_growth(growth, device, position_growth(row.positions, 1, tokens));
     if (!growth.empty())
         co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
     graph.materialize();
@@ -266,6 +286,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
 
     const auto pending = graph.pending_kind();
     const bool pending_tail = pending && mode == MtpStepMode::tail;
+    const bool pool_positions = !pending && config.maximum > config.budget;
     const auto owners = predictor_graph_storage(*this, *request, graph.storage());
     auto& slot = graphs->cells[{tokens, row.hidden.scalar_type(), mode, pending}];
     if (slot && !slot->window.matches(owners)) slot.reset();
@@ -276,7 +297,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
         co_yield GraphPhase::ready;
         auto fixed = DecodeWindow::fixed_growth(device, false, readout, 0);
         add_growth(fixed, device, row.hidden.nbytes());
-        add_growth(fixed, device, std::size_t(tokens) * (2 * sizeof(int64_t) + 3 * sizeof(int32_t)));
+        add_growth(fixed, device, std::size_t(tokens) * (2 * sizeof(int64_t) + (pool_positions ? 6 : 3) * sizeof(int32_t)));
         if (readout) add_growth(fixed, Device(kCPU), 65 * sizeof(int64_t));
         co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(fixed)};
         if (!graphs->pool) graphs->pool = GraphPoolLease::acquire(cuda::default_context(device.index), stream.stream());
@@ -286,6 +307,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
         cell->hidden = cell->window.buffer({1, tokens, row.hidden.size(2)}, row.hidden.options());
         cell->positions = cell->window.buffer({3, 1, tokens}, integer.dtype(kInt32));
         cell->cache_positions = cell->window.buffer({tokens}, integer);
+        if (pool_positions) cell->pool_positions = cell->window.buffer({3, 1, tokens}, integer.dtype(kInt32));
         if (readout) {
             auto packet = cuda::empty({65}, integer.device(kCPU).pinned_memory(true));
             cell->compact_host = packet.narrow(0, 0, 64).reshape({1, 64});
@@ -296,6 +318,9 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
 
     auto& cell = *slot;
     PredictorGraphs::prepare(cell, row, start);
+    if (row.positions)
+        ::tyloi::ops::copy_into(cell.positions, normalize_positions(row.positions, 1, tokens));
+    PredictorGraphs::prepare_pool(cell, *request);
     if (readout) cell.window.set_compact_sampling(compact, "predictor", 1);
     if (capture) {
         if (readout) co_yield GraphPhase::prepare;
@@ -307,15 +332,19 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
                 auto input = fuse(cell.hidden, embed(cell.ids));
                 auto mix = block.attention_gr.pre(input);
                 const auto prefix = mode == MtpStepMode::tail ? tokens - 1 : 0;
+                const auto pool_rows = [&](int64_t begin, int64_t end) {
+                    return cell.pool_positions ? ::tyloi::ops::slice(cell.pool_positions, 2, begin, end) : Tensor{};
+                };
                 if (prefix && !pending_tail) {
                     qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, 0, prefix),
                         ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, 0, prefix)),
-                        ::tyloi::ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true);
+                        ::tyloi::ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true, false, pool_rows(0, prefix));
                 }
                 const auto begin = pending_tail ? 0 : prefix;
                 auto attention = qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, begin, tokens),
                     ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, begin, tokens)),
-                    ::tyloi::ops::slice(cell.cache_positions, 0, begin, tokens), {}, true, !readout, pending_tail);
+                    ::tyloi::ops::slice(cell.cache_positions, 0, begin, tokens), {}, true, !readout, pending_tail,
+                    pool_rows(begin, tokens));
                 if (readout) {
                     auto residual = block.attention_gr.post(attention,
                         ::tyloi::ops::slice(mix.residual, 1, prefix, tokens), ::tyloi::ops::slice(mix.gate, 1, prefix, tokens));
@@ -426,6 +455,7 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
                 throw std::logic_error("MTP pending graph storage changed during draft");
         }
         PredictorGraphs::prepare(cell, row, request->position());
+        PredictorGraphs::prepare_pool(cell, *request);
         auto positions = graphs.positions(*request, cell);
         cell.window.set_compact_sampling(false, "predictor", 1);
         if (pending || !cell.window.enqueue_if_device_only()) cell.window.run();
@@ -1264,11 +1294,16 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                     : block.attention_gr.pre(hidden,tyloi::ops::ResidualRole::attention);
                 graph.window->mark(static_cast<int>(i),"attention_core_begin");
                 const bool project_batch=batch>1 && ::tyloi::cuda::options::batch_attention_projections();
-                const auto projections=project_batch ? (block.gdn ? block.gdn->project_inputs(mix.mixed)
-                    : block.qsa->project_inputs(mix.mixed)) : std::vector<::tyloi::Tensor>{};
+                const auto projections=project_batch && block.gdn ? block.gdn->project_inputs(mix.mixed) : std::vector<::tyloi::Tensor>{};
                 std::vector<::tyloi::DenseTensor> attended;
                 DenseTensor attention;
-                if(project_batch && block.gdn && graph.gdn_addresses[i].defined())
+                if(project_batch && block.qsa) {
+                    std::vector<tyloi::ops::Qsa::GraphRow> rows;
+                    rows.reserve(requests.size());
+                    for (std::size_t row = 0; row < requests.size(); ++row)
+                        rows.push_back({requests[row]->layers[i]->qsa.get(),graph.positions[row],graph.cache_positions[row]});
+                    attention=block.qsa->forward_independent_graph(mix.mixed,rows).dense();
+                } else if(project_batch && block.gdn && graph.gdn_addresses[i].defined())
                     attention=block.gdn->forward_independent_batch(requests[0]->layers[i]->gdn,mix.mixed,projections,graph.gdn_addresses[i]).dense();
                 if(!attention.defined())for (int64_t row = 0; row < batch; ++row) {
                     auto& layer = *requests[row]->layers[i];

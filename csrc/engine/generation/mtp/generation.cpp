@@ -277,7 +277,8 @@ struct MtpOps {
         auto predictor_options = options;
         predictor_options.serial_experts = false;
         std::optional<models::MtpStep> graph;
-        if (graph_enabled && hidden && hidden.device() == device && (!prepared || !prepared->transformed()))
+        if (graph_enabled && hidden && hidden.device() == device &&
+            (positions || !prepared || !prepared->transformed()))
             graph = drive_draft(mtp.graph_step(model, {&predictor, hidden, ids, positions, {}, compact_sampling}, mode, predictor_options),
                                ids.size(1), predictor_maintenance, mode);
         models::MtpStep result;

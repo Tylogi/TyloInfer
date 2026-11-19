@@ -593,12 +593,10 @@ struct QsaTqCache::Impl {
         auto absolute=absolute_positions.defined()?absolute_positions:positions;
         if(absolute.dim()==1)absolute=absolute.reshape({1,n});
         auto phase=positions.reshape({-1}).narrow(0,0,1).remainder(4);
-        auto block_ids=::tyloi::cuda::arange(blocks,positions.options());
-        auto starts=block_ids*4+(absolute.narrow(-1,0,1)-phase);
-        auto last=absolute.narrow(-1,n-1,1);
-        starts=::tyloi::cuda::where(starts<=last,starts,last);
+        auto offsets=(::tyloi::cuda::arange(blocks,positions.options())*4-phase).clamp(0,n-1);
+        auto starts=absolute.index_select(-1,offsets);
         auto first=starts.narrow(-1,0,1);
-        first.copy_(::tyloi::cuda::where(graph_first_position.narrow(0,3,1)>0,graph_first(absolute),first));
+        first.copy_(::tyloi::cuda::where(graph_first_position.narrow(0,3,1)>0,graph_first(absolute),first-phase));
         auto pooled=pool(batch.index,starts).to(::tyloi::kFloat32).contiguous();
         check(tq::indexer_affine16_append_batch(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>(),index_scales.data_ptr<std::uint16_t>(),
             index_zero.data_ptr<std::int16_t>(),positions.data_ptr<int64_t>(),blocks,index_width,capacity,mfq_current_cuda_stream()));

@@ -1260,24 +1260,6 @@ class Qsa {
         if(grouped_projection_ && w_.input_projection)return w_.input_projection(execution,x);
         return {w_.query(execution,x),w_.key(execution,x),w_.value(execution,x),w_.index_query_key(execution,x)};
     }
-    std::vector<Projection> project_requests(CudaExecutionContext& execution,const Tensor& hidden,
-            const std::vector<Tensor>& positions) {
-        TYLOINFER_RUNTIME_CHECK(hidden.dim()==3 && hidden.size(0)>0 &&
-            positions.size()==std::size_t(hidden.size(0)),"QSA request projection batch mismatch");
-        for(const auto& position:positions)
-            TYLOINFER_RUNTIME_CHECK(position.dim()==1 && position.size(0)==hidden.size(1),
-                "QSA request projection positions must match its token rows");
-        auto axes=tb::cat(positions,0).reshape({1,hidden.size(0),hidden.size(1)});
-        auto all=project(execution,hidden,axes);
-        std::vector<Projection> result;result.reserve(positions.size());
-        const auto row=[](const Tensor& value,int64_t index) {
-            return value.defined()?value.narrow(0,index,1):Tensor{};
-        };
-        for(int64_t index=0;index<hidden.size(0);++index)
-            result.push_back({row(all.gate,index),row(all.query,index),row(all.key,index),row(all.value,index),
-                row(all.iq,index),row(all.raw,index),false});
-        return result;
-    }
     Tensor project_output(CudaExecutionContext& execution,const Tensor& x) const {
         return w_.output(execution,x);
     }
@@ -1465,12 +1447,10 @@ class Qsa {
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
                          const Tensor& positions,const Tensor& cache_positions,
                          std::vector<Tensor> projections={},bool project_output=true,bool history_only=false,
-                         bool query_tail=false,const Projection* prepared=nullptr) {
-        TYLOINFER_RUNTIME_CHECK(!prepared || (!history_only && !query_tail && hidden.size(0)==1),
-            "QSA prepared request projection requires a complete independent row");
+                         bool query_tail=false) {
         if(adaptive_) {
             TYLOINFER_RUNTIME_CHECK(!query_tail,"adaptive QSA uses complete verification rows");
-            auto p=prepared?*prepared:history_only?project_history(execution,hidden,positions):project(execution,hidden,positions,true,{},{},{},std::move(projections));
+            auto p=history_only?project_history(execution,hidden,positions):project(execution,hidden,positions,true,{},{},{},std::move(projections));
             if(!history_only && adaptive_->pending_graph_enabled()) {
                 auto buffer=tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
                     hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
@@ -1522,7 +1502,7 @@ class Qsa {
         const auto query_positions=query_tail?cache_positions.narrow(0,t-1,1):cache_positions;
         const bool dense_capacity=(streamed?c_.maximum:graph_keys_.size(2))<=c_.budget;
         const bool exclusive=managed_memory() && memory_->hot.exclusive();
-        auto p=prepared?*prepared:history_only?project_history(execution,hidden,positions):
+        auto p=history_only?project_history(execution,hidden,positions):
             project(execution,hidden,positions,!dense_capacity,cache_positions,
                        quantization_.enabled() || exclusive || streamed?Tensor{}:graph_keys_,quantization_.enabled() || exclusive || streamed?Tensor{}:graph_values_,
                        std::move(projections),query_tail);

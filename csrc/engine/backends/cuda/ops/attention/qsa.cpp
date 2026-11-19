@@ -39,6 +39,7 @@ namespace tyloi::ops::detail {
 using namespace ::tyloi::cuda;
 
 class QsaCore {
+    struct Projection;
   public:
     struct State {
         explicit State(const QsaCore& model)
@@ -453,13 +454,17 @@ class QsaCore {
     }
     DenseTensor forward_graph(State& request,const DenseTensor& hidden,
                          const DenseTensor& positions,const DenseTensor& cache_positions,
-                         std::vector<DenseTensor> projections,bool project_output,bool history_only,bool query_tail) {
+                         std::vector<DenseTensor> projections,bool project_output,bool history_only,bool query_tail,
+                         const Projection* prepared=nullptr,const DenseTensor& pool_positions={}) {
+        TYLOINFER_RUNTIME_CHECK(!prepared || (!history_only && !query_tail && hidden.size(0)==1),
+            "QSA prepared graph projection requires a complete independent row");
         if(request.adaptive) {
             TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1 && request.adaptive->pending_graph_enabled(),
                 "adaptive QSA requires a complete pending graph window");
             const auto tokens=hidden.size(1);
             Projection p;
-            if(history_only) p=project_history(hidden,positions);
+            if(prepared) p=*prepared;
+            else if(history_only) p=project_history(hidden,positions);
             else if(query_tail && tokens>1) {
                 const auto prefix=tokens-1;
                 auto history=project_history(hidden.narrow(1,0,prefix),positions.narrow(-1,0,prefix).contiguous());
@@ -492,7 +497,7 @@ class QsaCore {
         const auto t=hidden.size(1),pools=request.graph_pooled.size(1);
         const bool dense_capacity=(streamed?c_.maximum:request.graph_keys.size(2))<=c_.budget;
         const bool exclusive=managed_memory(request) && request.memory->hot.exclusive();
-        auto p=history_only?project_history(hidden,positions):
+        auto p=prepared?*prepared:history_only?project_history(hidden,positions):
             project(hidden,positions,!dense_capacity,cache_positions,
                        quantization_.enabled() || exclusive || streamed?DenseTensor{}:graph_keys,quantization_.enabled() || exclusive || streamed?DenseTensor{}:graph_values,
                        std::move(projections));
@@ -559,13 +564,15 @@ class QsaCore {
             return finish(gated.to(hidden.scalar_type()));
         }
         DenseTensor block,pooled;
+        // The existing pooling kernels derive the block start from a token's offset.
+        const auto index_positions=pool_positions.defined() ? pool_positions+cache_positions.remainder(c_.pool) : positions;
         const auto* pool_fusion=tyloi::cuda::env_lookup("TYLOINFER_QSA_POOL_FUSED");
         const auto* pool_write=tyloi::cuda::env_lookup("TYLOINFER_QSA_POOL_WRITE_FUSED");
         const bool pool_written=(!pool_fusion || pool_fusion[0]!='0') && (!pool_write || pool_write[0]!='0') &&
             request.index.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(request.index.storage().dense(),w_->index_key_norm.dense(),
-                positions,cache_positions,graph_pooled,c_.pool,c_.maximum,c_.eps);
+                index_positions,cache_positions,graph_pooled,c_.pool,c_.maximum,c_.eps);
         if(!pool_written && rotary_->fused() && (!pool_fusion || pool_fusion[0]!='0') && request.index.storage().size(1)>=c_.maximum) {
-            auto prepared=mfq_qwen4_exp::live_index_pool(request.index.storage().dense(),positions,cache_positions,c_.pool,c_.maximum);
+            auto prepared=mfq_qwen4_exp::live_index_pool(request.index.storage().dense(),index_positions,cache_positions,c_.pool,c_.maximum);
             block=prepared[1];
             pooled=rotary_->forward_normalized(prepared[0].unsqueeze(2),w_->index_key_norm.dense(),prepared[2],c_.eps).squeeze(1);
         }else if(!pool_written) {
@@ -573,7 +580,7 @@ class QsaCore {
             auto row=(block.unsqueeze(-1)*c_.pool+::tyloi::cuda::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
             pooled=request.index.storage().dense().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
             pooled=::tyloi::cuda::attention_ops::rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
-            auto delta=positions-cache_positions;
+            auto delta=index_positions-cache_positions;
             auto block_positions=block*c_.pool+delta;
             pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
         }
@@ -633,6 +640,41 @@ class QsaCore {
             gated=(attended.to(::tyloi::kFloat32)*::tyloi::cuda::sigmoid(p.gate.to(::tyloi::kFloat32))).to(hidden.scalar_type());
         }
         return finish(std::move(gated));
+    }
+    struct GraphRow { State* state; DenseTensor positions, cache_positions; };
+    DenseTensor forward_independent_graph(const DenseTensor& hidden, std::span<const GraphRow> rows) {
+        TYLOINFER_RUNTIME_CHECK(hidden.dim()==3 && hidden.size(0)>0 && hidden.size(1)>0 &&
+            rows.size()==std::size_t(hidden.size(0)), "QSA independent graph batch mismatch");
+        std::vector<DenseTensor> positions;
+        positions.reserve(rows.size());
+        for (const auto& row : rows) {
+            TYLOINFER_RUNTIME_CHECK(row.state && row.positions.defined() && row.positions.dim()==1 &&
+                row.positions.size(0)==hidden.size(1) && row.positions.device()==hidden.device() &&
+                (row.positions.scalar_type()==::tyloi::kInt32 || row.positions.scalar_type()==::tyloi::kInt64) &&
+                row.cache_positions.defined() && row.cache_positions.dim()==1 &&
+                row.cache_positions.size(0)==hidden.size(1) && row.cache_positions.device()==hidden.device() &&
+                row.cache_positions.scalar_type()==::tyloi::kInt64,
+                "QSA independent graph row geometry mismatch");
+            if (!positions.empty()) TYLOINFER_RUNTIME_CHECK(row.positions.scalar_type()==positions.front().scalar_type(),
+                "QSA independent graph position types differ");
+            positions.push_back(row.positions);
+        }
+        auto axes=::tyloi::cuda::cat(positions,0).reshape({1,hidden.size(0),hidden.size(1)});
+        auto all=project(hidden,axes);
+        if(auto* window=DecodeWindow::recording())window->mark_current("qsa_projection_end");
+        const auto slice=[](const DenseTensor& value,int64_t index) {
+            return value.defined()?value.narrow(0,index,1):DenseTensor{};
+        };
+        std::vector<DenseTensor> outputs;
+        outputs.reserve(rows.size());
+        for (std::size_t i=0;i<rows.size();++i) {
+            const auto index=static_cast<int64_t>(i);
+            Projection projected{slice(all.gate,index),slice(all.query,index),slice(all.key,index),
+                slice(all.value,index),slice(all.iq,index),slice(all.raw,index),false};
+            outputs.push_back(forward_graph(*rows[i].state,hidden.narrow(0,index,1),rows[i].positions,
+                rows[i].cache_positions,{},false,false,false,&projected));
+        }
+        return outputs.size()==1 ? outputs.front() : ::tyloi::cuda::cat(outputs,0);
     }
     void advance_graph(State& request,int64_t tokens,int64_t attention_rows) {
         if(request.adaptive) {
@@ -1397,13 +1439,26 @@ Tensor Qsa::forward(State& state, const Tensor& hidden, const Tensor& positions,
     }
 }
 Tensor Qsa::forward_graph(State& state, const Tensor& hidden, const Tensor& positions, const Tensor& cache_positions,
-        std::vector<Tensor> projections, bool project_output, bool history_only, bool query_tail) const {
+        std::vector<Tensor> projections, bool project_output, bool history_only, bool query_tail,
+        const Tensor& pool_positions) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->device.is_cuda()) guard.emplace(impl_->device);
     Tensor result{DenseTensor{}};
     result.dense()=impl_->core.forward_graph(state.impl_->cache, hidden.dense(), positions.dense(), cache_positions.dense(),
-        views(projections), project_output, history_only, query_tail);
+        views(projections), project_output, history_only, query_tail, nullptr,
+        pool_positions ? pool_positions.dense() : DenseTensor{});
     return result;
+}
+Tensor Qsa::forward_independent_graph(const Tensor& hidden, std::span<const GraphRow> rows) const {
+    std::optional<MfqCudaGuard> guard;
+    if (impl_->device.is_cuda()) guard.emplace(impl_->device);
+    std::vector<detail::QsaCore::GraphRow> values;
+    values.reserve(rows.size());
+    for (const auto& row : rows) {
+        TYLOINFER_RUNTIME_CHECK(row.state, "QSA independent graph row has no state");
+        values.push_back({&row.state->impl_->cache, row.positions.dense(), row.cache_positions.dense()});
+    }
+    return hold(impl_->core.forward_independent_graph(hidden.dense(), values));
 }
 struct Qsa::Graph::Impl {
     std::vector<Request> requests;

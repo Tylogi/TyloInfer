@@ -334,7 +334,11 @@ Tensor Qsa::forward(State& state, const Tensor& hidden, const Tensor& positions,
         throw;
     }
 }
-Tensor Qsa::forward_graph(State&, const Tensor&, const Tensor&, const Tensor&, std::vector<Tensor>, bool, bool, bool) const {
+Tensor Qsa::forward_graph(State&, const Tensor&, const Tensor&, const Tensor&, std::vector<Tensor>, bool, bool, bool,
+        const Tensor&) const {
+    throw std::logic_error("Metal QSA does not support graphs");
+}
+Tensor Qsa::forward_independent_graph(const Tensor&, std::span<const GraphRow>) const {
     throw std::logic_error("Metal QSA does not support graphs");
 }
 

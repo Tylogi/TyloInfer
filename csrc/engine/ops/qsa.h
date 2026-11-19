@@ -122,6 +122,8 @@ public:
 
     /** Own the attention state in a session snapshot. */
     struct Snapshot { Tensor keys, values, index; std::shared_ptr<const tyloi::state::qsa::Session> ram; };
+    /** Describe one independently cached graph row. */
+    struct GraphRow { State* state; Tensor positions, cache_positions; };
 
     /** Construct attention from its immutable weights and geometry. */
     Qsa(QsaWeights weights, QsaConfig config);
@@ -193,7 +195,9 @@ public:
     /** Execute attention using prepared graph cache storage. */
     Tensor forward_graph(State&, const Tensor& hidden, const Tensor& positions, const Tensor& cache_positions,
         std::vector<Tensor> projections = {}, bool project_output = true, bool history_only = false,
-        bool query_tail = false) const;
+        bool query_tail = false, const Tensor& pool_positions = {}) const;
+    /** Project and attend independently cached graph rows without the output projection. */
+    Tensor forward_independent_graph(const Tensor& hidden, std::span<const GraphRow> rows) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
