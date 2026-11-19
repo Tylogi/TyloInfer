@@ -117,12 +117,38 @@ __global__ void grouped_rms_norm_kernel(const Value* input,const float* weight,V
         const float value=static_cast<float>(input[base+column]);
         sum=__fadd_rn(sum,__fmul_rn(value,value));
     }
-    __shared__ float partial[Threads];partial[threadIdx.x]=sum;__syncthreads();
-    for(int stride=Threads/2;stride>0;stride/=2) {
-        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+    const auto warp_tail=[](float value) {
+        #pragma unroll
+        for(int stride=16;stride>0;stride/=2) {
+            const float other=__shfl_down_sync(0xffffffffu,value,stride);
+            if(threadIdx.x<stride)value=__fadd_rn(value,other);
+        }
+        return value;
+    };
+    if constexpr(Threads==32) {
+        sum=__shfl_sync(0xffffffffu,warp_tail(sum),0);
+    } else {
+        __shared__ float partial[Threads];
+        partial[threadIdx.x]=sum;
         __syncthreads();
+        if(threadIdx.x<32) {
+            // Keep the original binary reduction order while the first warp
+            // combines the per-thread sums without repeated block barriers.
+            float stripes[Threads/32];
+            #pragma unroll
+            for(int i=0;i<Threads/32;++i)stripes[i]=partial[threadIdx.x+32*i];
+            #pragma unroll
+            for(int stride=Threads/64;stride>0;stride/=2) {
+                #pragma unroll
+                for(int i=0;i<stride;++i)stripes[i]=__fadd_rn(stripes[i],stripes[i+stride]);
+            }
+            const auto reduced=warp_tail(stripes[0]);
+            if(threadIdx.x==0)partial[0]=reduced;
+        }
+        __syncthreads();
+        sum=partial[0];
     }
-    const float mean=__fdiv_rn(partial[0],static_cast<float>(width));
+    const float mean=__fdiv_rn(sum,static_cast<float>(width));
     const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(mean,eps)));
     for(int column=threadIdx.x;column<width;column+=Threads) {
         const float normalized=__fmul_rn(static_cast<float>(input[base+column]),inverse);
