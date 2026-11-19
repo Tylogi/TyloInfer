@@ -74,6 +74,7 @@ from tyloinfer.server.runtime.prefix_disk_budget import maintain_prefix_disk_bud
 from tyloinfer.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
 from tyloinfer.server.runtime.qsa_kv_policy import QSA_KV_BUFFER_BYTES, qsa_index_requirement
 from tyloinfer.server.runtime.kv_budget import checkpoint_kv_budget, check_ssd_capacity
+from tyloinfer.server.runtime.qsa_cache_policy import apply_qsa_cache_defaults, resolve_qsa_cache_mode
 from tyloinfer.server.runtime.native import (
     NativeRuntimeError,
     append_native_prefill_chunk_override,
@@ -479,7 +480,7 @@ class RuntimePool:
             try:
                 await self.load(
                     context,  # type: ignore[arg-type]
-                    request.model_dump(mode="python"),
+                    request.model_dump(mode="python", exclude_unset=True),
                 )
             except BaseException:
                 async with self._lock:
@@ -632,10 +633,10 @@ class RuntimePool:
             saved_memory = self.context_policy.model_kv_memory.get(artifact.resource.name)
             if saved_memory is not None:
                 request = request.model_copy(update={"kv_memory": saved_memory})
+        cuda_qsa = self.backend == "cuda" and artifact.resource.architecture.casefold().startswith("qwen4_exp")
         if request.kv_memory.allocation == "dynamic" and request.kv_memory.placement in {"ram", "auto_ssd"}:
             raise _job_error("kv_dynamic_unavailable", "Experimental dynamic KV requires VRAM or automatic without SSD")
-        if request.kv_memory != KvMemorySettings() and (self.backend != "cuda" or
-                not artifact.resource.architecture.casefold().startswith("qwen4_exp")):
+        if request.kv_memory != KvMemorySettings() and not cuda_qsa:
             raise _job_error("kv_memory_unsupported", "Configurable KV placement currently requires the CUDA QSA backend")
         if 'kv_quantization' not in request.model_fields_set:
             saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
@@ -649,7 +650,12 @@ class RuntimePool:
         resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
         request = request.model_copy(update={"context_size": resolved,
             "qsa_kv_offload": request.qsa_kv_offload.model_copy(update={"target_context": resolved})})
-        if self.backend == "cuda" and artifact.resource.architecture.casefold().startswith("qwen4_exp"):
+        if cuda_qsa:
+            if not request.qsa_kv_offload.enabled:
+                environment = {**os.environ, **self.runtime_environment}
+                kv_memory = apply_qsa_cache_defaults(artifact, request.kv_memory, request.kv_quantization, environment)
+                if kv_memory is not request.kv_memory:
+                    request = request.model_copy(update={"kv_memory": kv_memory})
             await asyncio.to_thread(self._validate_kv_memory_budget, artifact, request)
         if request.qsa_kv_offload.enabled:
             await self._validate_qsa_kv_policy(artifact, request.qsa_kv_offload, yarn_enabled=request.yarn_enabled)
@@ -4605,7 +4611,6 @@ class RuntimePool:
     def _qsa_cache_mode(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> str:
         if getattr(self, 'backend', 'cuda') != 'cuda':
             return 'legacy'
-        from tyloinfer.server.runtime.qsa_cache_policy import resolve_qsa_cache_mode
         environment = {**os.environ, **getattr(self, 'runtime_environment', {})}
         return resolve_qsa_cache_mode(artifact, request.kv_memory, request.kv_quantization, environment)
 

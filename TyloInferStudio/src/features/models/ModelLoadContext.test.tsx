@@ -57,6 +57,14 @@ it('enforces the sparse RAM/SSD dependency and keeps non-sparse KV in VRAM', () 
   expect(screen.getByRole('combobox', { name: '默认 KV 量化档位' })).toHaveValue('2.5');
 });
 
+it.each([['cuda', true], ['metal', false]])('displays automatic SSD KV for %s', (backend, enabled) => {
+  render(<Form runtime={{ backend }} />);
+  fireEvent.click(screen.getByRole('button', { name: '高级' }));
+  const ssd = screen.getByRole('checkbox', { name: 'SSD KV' });
+  expect(ssd).toBeDisabled();
+  expect((ssd as HTMLInputElement).checked).toBe(enabled);
+});
+
 const GiB = 2 ** 30;
 const model: ModelArtifact = { id: 'small', name: 'Qwen-S2-L', architecture: 'qwen4_exp', format: 'tq',
   shard_count: 5, total_bytes: 40 * GiB, estimated_resident_weight_bytes: 8 * GiB, ssd_ple_bytes: 32 * GiB,

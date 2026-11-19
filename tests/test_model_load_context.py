@@ -24,7 +24,10 @@ def test_load_defaults_resolve_by_model(architecture, automatic, ssd, ram):
     assert result.kv_memory.ram_preallocated == (ram if architecture == 'qwen4_exp' and not automatic else True)
     assert result.kv_quantization.enabled == (not automatic and architecture != 'llama')
     assert not result.qsa_kv_offload.enabled
-    assert {'kv_memory', 'kv_quantization', 'qsa_kv_offload'} <= result.model_fields_set
+    assert 'qsa_kv_offload' in result.model_fields_set
+    inherited = architecture == 'qwen4_exp' and automatic
+    assert ('kv_memory' in result.model_fields_set) != inherited
+    assert ('kv_quantization' in result.model_fields_set) != inherited
     # Replayed requests retain the resolved per-model settings.
     assert apply_load_context(ModelLoadRequest.model_validate(result.model_dump()), architecture, 'cuda') == result
 

@@ -47,6 +47,7 @@ export interface RuntimeContextPolicy {
 export interface KvMemorySettings {
   placement: 'auto' | 'auto_ssd' | 'vram' | 'ram';
   allocation: 'preallocated' | 'dynamic';
+  ram_preallocated?: boolean;
 }
 
 export interface KvQuantizationSettings {

@@ -7,6 +7,16 @@ from tyloinfer.server.runtime.kv_budget import KvTierBudget
 
 _MODES = frozenset({'auto', 'fp16', 'affine8', 'tq4', 'legacy'})
 _BITS = {'0': 'legacy', '16': 'fp16', '8': 'affine8', '4': 'tq4'}
+_PRECISION_ENV = ('TYLOINFER_QSA_CACHE_MODE', 'TYLOINFER_QSA_RAM_KV_BITS', 'TYLOINFER_QSA_ADAPTIVE_TQ')
+
+
+def apply_qsa_cache_defaults(artifact, settings, quantization, environment: Mapping[str, str]):
+    if (settings.model_fields_set & {'qsa_mode', 'placement'}
+            or any(environment.get(name) for name in _PRECISION_ENV)):
+        return settings
+    if resolve_qsa_cache_mode(artifact, settings, quantization, environment) == 'auto':
+        return settings.model_copy(update={'qsa_mode': 'affine8', 'placement': 'auto_ssd'})
+    return settings
 
 
 def resolve_qsa_cache_mode(artifact, settings, quantization, environment: Mapping[str, str]) -> str:

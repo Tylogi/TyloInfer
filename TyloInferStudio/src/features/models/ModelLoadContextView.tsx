@@ -6,9 +6,9 @@ import type { LoadContextDefaults } from './loadContextDefaults';
 import type { KvQuantizationSettings, RuntimeContextPolicy } from '../../shared/api/resources/runtime';
 import type { ModelArtifact } from '../../shared/api/types';
 
-export function ModelLoadContextView({ value, onChange, disabled = false, model, policy, renderMemoryEstimate }: {
+export function ModelLoadContextView({ value, onChange, disabled = false, model, policy, backend, renderMemoryEstimate }: {
  value: LoadContextDefaults; onChange(value: LoadContextDefaults): void; disabled?: boolean;
- model?: ModelArtifact; policy: RuntimeContextPolicy | null;
+ model?: ModelArtifact; policy: RuntimeContextPolicy | null; backend?: string;
  renderMemoryEstimate(props: { value: LoadContextDefaults; valid: boolean; onSparseChange(sparse: boolean | null): void }): ReactNode;
 }) {
  const { tr } = useSettings();
@@ -22,6 +22,11 @@ export function ModelLoadContextView({ value, onChange, disabled = false, model,
   const patch = (change: Partial<LoadContextDefaults>) => onChange({ ...value, ...change });
   const locked = disabled || value.automatic;
   const sparse = model ? detectedSparse === true : kind === 'sparse';
+  const cudaQsa = sparse && backend === 'cuda' && (!model || model.architecture.toLowerCase().startsWith('qwen4_exp'));
+  const savedMemory = model && policy?.model_kv_memory?.[model.name];
+  const savedQuantization = model && policy?.model_kv_quantization?.[model.name];
+  const automaticSsd = cudaQsa && (savedMemory ? savedMemory.placement === 'auto_ssd' : !savedQuantization?.enabled);
+  const automaticRam = !cudaQsa || savedMemory?.ram_preallocated !== false;
   const automaticContext = model ? policy?.model_overrides[model.name]
     ?? (model.context_capacity ? Math.min(model.context_capacity, policy?.max_context_size ?? Infinity) : policy?.fallback_context_size) : undefined;
   return <section className="model-load-context" aria-label={tr('上下文管理', 'Context management')}>
@@ -48,8 +53,10 @@ export function ModelLoadContextView({ value, onChange, disabled = false, model,
         onChange={event => { patch({ automatic: event.target.checked }); if (!event.target.checked) setExpanded(true); }} />{tr('自动', 'Automatic')}</label>
     </div>
     <div id={id} hidden={!expanded} className="model-load-advanced-body">
-      <p>{sparse
-        ? tr('自动：关闭 SSD KV、开启预分配、关闭 KV 量化。取消勾选后可手动调整。',
+      <p>{cudaQsa
+        ? tr('自动默认使用固定 INT8、开启 SSD KV 和 RAM 预分配。已保存的模型设置优先。',
+          'Automatic defaults to fixed INT8, SSD KV and RAM preallocation. Saved model settings take precedence.')
+        : sparse ? tr('自动：关闭 SSD KV、开启预分配、关闭 KV 量化。取消勾选后可手动调整。',
           'Automatic: SSD KV off, preallocation on, KV quantization off. Uncheck to customize.')
         : tr('自动：开启预分配、关闭 KV 量化。取消勾选后可手动调整。',
           'Automatic: preallocation on, KV quantization off. Uncheck to customize.')}</p>
@@ -61,7 +68,7 @@ export function ModelLoadContextView({ value, onChange, disabled = false, model,
         detail={tr('显存和内存容纳不下的冷 KV 写入 SSD；长上下文可能变慢，并占用磁盘空间。',
           'Cold KV spills to SSD when VRAM and RAM are full; this can slow long contexts and use disk space.')}
         trailing={<input type="checkbox" aria-label="SSD KV" disabled={locked}
-          checked={!value.automatic && value.ssd_kv}
+          checked={value.automatic ? automaticSsd : value.ssd_kv}
           onChange={event => patch({ ssd_kv: event.target.checked, ...(event.target.checked ? {} : { ram_preallocated: true }) })} />} />}
       <SettingRow title={sparse ? tr('RAM 预分配', 'RAM preallocation') : tr('VRAM 预分配', 'VRAM preallocation')}
         detail={sparse
@@ -70,7 +77,7 @@ export function ModelLoadContextView({ value, onChange, disabled = false, model,
           : tr('加载时为目标上下文预留 KV 显存，关闭后按需分配。',
             'Reserve KV VRAM for the target context at load time. When off, allocate on demand.')}
         trailing={<input type="checkbox" aria-label={sparse ? tr('RAM 预分配', 'RAM preallocation') : tr('VRAM 预分配', 'VRAM preallocation')}
-          disabled={locked} checked={value.automatic || (sparse ? value.ram_preallocated : value.vram_preallocated)}
+          disabled={locked} checked={value.automatic ? automaticRam : (sparse ? value.ram_preallocated : value.vram_preallocated)}
           onChange={event => patch(sparse ? { ram_preallocated: event.target.checked, ...(!event.target.checked ? { ssd_kv: true } : {}) }
             : { vram_preallocated: event.target.checked })} />} />
       <SettingRow title={tr('默认 KV 量化档位', 'Default KV quantization')}
@@ -80,7 +87,7 @@ export function ModelLoadContextView({ value, onChange, disabled = false, model,
           value={value.automatic || !value.kv_quantization.enabled ? 'off' : String(value.kv_quantization.bits)}
           onChange={event => patch({ kv_quantization: { algorithm: 'turboquant', enabled: event.target.value !== 'off',
             bits: event.target.value === 'off' ? value.kv_quantization.bits : Number(event.target.value) as KvQuantizationSettings['bits'] } })}>
-          <option value="off">{tr('关闭（原精度）', 'Off (native precision)')}</option>
+          <option value="off">{tr('关闭 TurboQuant', 'TurboQuant off')}</option>
           {[2, 2.5, 3, 3.5, 4, 6, 8].map(bits => <option key={bits} value={bits}>{bits} bit</option>)}
         </select>} />
     </div>

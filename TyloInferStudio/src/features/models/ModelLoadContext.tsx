@@ -17,6 +17,6 @@ export function ModelLoadContext({ value, onChange, disabled = false, models = [
    if (model) void runtimeApi.contextPolicy().then(value => { if (active) setPolicy(value); }).catch(() => {});
    return () => { active = false; };
  }, [model?.id]);
- return <ModelLoadContextView value={value} onChange={onChange} disabled={disabled} model={model} policy={policy}
+ return <ModelLoadContextView value={value} onChange={onChange} disabled={disabled} model={model} policy={policy} backend={runtime?.backend}
    renderMemoryEstimate={props => <ModelLoadMemoryEstimate models={models} runtime={runtime} deviceIds={deviceIds} disabled={disabled} {...props} />} />;
 }

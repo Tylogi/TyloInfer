@@ -5,15 +5,16 @@ per-model context settings. Metal keeps its existing allocation controls.
 
 ## Explicit QSA cache modes
 
-Managed CUDA Flash-Next selects `kv_memory.qsa_mode: "auto"` for supported
-four-token QSA blocks with automatic RAM placement. The CLI option
-`tyloinfer serve --qsa-cache-mode auto` makes that selection explicit. The independent
-`kv_quantization` setting still selects the ordinary packed-KV implementation;
+Managed CUDA Flash-Next defaults to fixed Affine INT8 with SSD KV for supported
+four-token QSA blocks. RAM preallocation stays enabled. Saved model settings,
+explicit cache mode or placement, and precision environment overrides take
+precedence. The independent `kv_quantization` setting still selects the
+ordinary packed-KV implementation;
 explicit VRAM, mapped-RAM and dynamic raw allocation retain their old paths.
 Other attention backends are not changed by the QSA policy.
 
 ```json
-{"kv_memory": {"qsa_mode": "auto", "placement": "auto"}}
+{"kv_memory": {"qsa_mode": "affine8", "placement": "auto_ssd"}}
 ```
 
 - `auto` reuses the RAM precision policy: nominal 5% FP16, 15% Affine INT8 and
@@ -24,7 +25,8 @@ Other attention backends are not changed by the QSA policy.
   and be read back without refitting. Partial append buffers remain temporary.
 - `legacy` retains the ordinary raw-KV implementation and its admission checks.
 
-Auto does not by itself enable SSD. `placement: "auto_ssd"` enables the existing
+To opt into adaptive precision without SSD, specify `qsa_mode: "auto"` and
+`placement: "auto"` in the load request. `placement: "auto_ssd"` enables the
 cold-block SSD tier. Admission then reserves resident index/descriptor metadata
 and bounded staging/codec buffers, not the entire historical KV population in
 RAM. Disk capacity is checked independently against the selected encoded
@@ -78,7 +80,7 @@ base model's `qsa_adaptive_*` counters alone do not include those request stores
 
 Configuration precedence is explicit API/per-model `qsa_mode`, then
 `TYLOINFER_QSA_CACHE_MODE`, then legacy `TYLOINFER_QSA_RAM_KV_BITS`, then the
-managed Auto default. The native environment accepts `auto`, `fp16`, `affine8`,
+managed default described above. The native environment accepts `auto`, `fp16`, `affine8`,
 `tq4` and `legacy`. Legacy numeric values 16/8/4 migrate to fixed modes, not
 Auto; zero selects legacy. Existing configurations that used 16 to request
 adaptation must now select `qsa_mode: "auto"` explicitly. The managed service
@@ -112,8 +114,8 @@ duplicate in RAM. `ram_preallocated` defaults to true; disabling it requires
 
 Studio's model loading policy includes a collapsible Context management
 component. An empty default context means 32768 tokens, capped by the model's
-supported limit. Automatic settings disable KV quantization and SSD KV and
-enable preallocation. Manual settings distinguish sparse-attention RAM/SSD
+supported limit. Automatic settings use the managed default for CUDA Flash-Next
+QSA. Manual settings distinguish sparse-attention RAM/SSD
 controls from other models' VRAM preallocation. Defaults are saved per server
 in the current browser and resolved against model/backend capabilities when
 loading. Explicit API KV settings take precedence over these defaults.

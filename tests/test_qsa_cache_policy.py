@@ -1,9 +1,11 @@
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from tyloinfer.server.protocol.models import KvMemorySettings, KvQuantizationSettings, ModelLoadRequest
-from tyloinfer.server.runtime.qsa_cache_policy import qsa_cache_budget, resolve_qsa_cache_mode
+from tyloinfer.server.protocol.models import KvMemorySettings, KvQuantizationSettings, ModelLoadRequest, RuntimeContextPolicy
+from tyloinfer.server.runtime.qsa_cache_policy import apply_qsa_cache_defaults, qsa_cache_budget, resolve_qsa_cache_mode
 
 
 def artifact():
@@ -39,6 +41,28 @@ def test_api_then_named_mode_then_legacy_precision_precedence():
     assert resolve(KvMemorySettings(qsa_mode='auto'), {'TYLOINFER_QSA_CACHE_MODE': 'fp16'}) == 'auto'
     with pytest.raises(ValueError, match='Invalid QSA cache mode'):
         resolve(environment={'TYLOINFER_QSA_CACHE_MODE': 'invalid'})
+
+
+@pytest.mark.parametrize('memory,quantized,environment,expected', [
+    ({}, False, {}, ('affine8', 'auto_ssd')),
+    ({'ram_budget_bytes': 2 << 30}, False, {}, ('affine8', 'auto_ssd')),
+    ({'placement': 'auto'}, False, {}, ('auto', 'auto')),
+    ({'qsa_mode': 'auto'}, False, {}, ('auto', 'auto')),
+    ({'qsa_mode': 'tq4', 'placement': 'auto_ssd'}, False, {}, ('tq4', 'auto_ssd')),
+    ({}, True, {}, ('legacy', 'auto')),
+    ({}, False, {'TYLOINFER_QSA_CACHE_MODE': 'auto'}, ('auto', 'auto')),
+    ({}, False, {'TYLOINFER_QSA_ADAPTIVE_TQ': '1'}, ('auto', 'auto')),
+    ({'allocation': 'dynamic'}, False, {}, ('legacy', 'auto')),
+])
+def test_managed_qsa_defaults_respect_existing_choices(memory, quantized, environment, expected):
+    model = artifact()
+    quantization = KvQuantizationSettings(enabled=quantized)
+    settings = apply_qsa_cache_defaults(model, KvMemorySettings(**memory), quantization, environment)
+    assert (resolve(settings, environment, quantization, model), settings.placement) == expected
+    assert settings.ram_preallocated and settings.ram_budget_bytes == memory.get('ram_budget_bytes')
+    model.source_config['indexer_compress_ratio'] = 8
+    original = KvMemorySettings()
+    assert apply_qsa_cache_defaults(model, original, quantization, environment) is original
 
 
 @pytest.mark.parametrize('settings', [KvMemorySettings(placement='vram'),
@@ -127,28 +151,71 @@ def test_missing_native_layout_is_not_faked_with_fp16_or_ignored():
         qsa_cache_budget(model, 262144, KvMemorySettings(), 'auto')
 
 
-def test_serve_wires_auto_ssd_and_gguf_expert_ram_reservation(tmp_path, monkeypatch):
+@pytest.mark.parametrize('entry,expected', [
+    ('startup', ('affine8', 'auto_ssd')),
+    ('api', ('affine8', 'auto_ssd')),
+    ('studio', ('affine8', 'auto_ssd')),
+    ('saved', ('auto', 'auto')),
+])
+def test_serve_wires_ssd_kv_and_gguf_expert_ram_reservation(tmp_path, monkeypatch, entry, expected):
     from tyloinfer.server.runtime.runtime_pool import RuntimePool
     from tyloinfer.server.state.catalog import ModelCatalog
     model = artifact(); model.path = tmp_path/'fixture.gguf'; model.routed_expert_bytes = 40 << 30
     model.resource = SimpleNamespace(name='fixture', format='gguf', structured_decisions=False,
-        architecture='qwen4_exp_text')
+        architecture='qwen4_exp_text', loadable=True, gguf_companion_required=False)
+    monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.native_gguf_companion_arguments', lambda *a: [])
     monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.native_tokenizer_arguments', lambda *a: [])
     monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.native_runtime_environment', lambda *a, **kw: {})
-    pool = RuntimePool(ModelCatalog([]), tmp_path/'runtime', backend='cuda', max_requests_per_instance=4)
+    fields = {'context_management': {}} if entry in {'studio', 'saved'} else {}
+    request = ModelLoadRequest(model='fixture', **fields)
+    pool = RuntimePool(ModelCatalog([]), tmp_path/'runtime', backend='cuda', max_requests_per_instance=4,
+        startup_loads=[request] if entry == 'startup' else [])
+    pool.catalog.resolve = AsyncMock(return_value=model)
+    monkeypatch.setattr(pool, '_maintain_prefix_disk_budget', AsyncMock())
     monkeypatch.setattr(pool, 'resolve_context_size', lambda *a, **kw: 262144)
     monkeypatch.setattr(pool, '_cuda_expert_host_budget', lambda *a: 2 << 30)
     monkeypatch.setattr(pool, '_cuda_device_vram_limit', lambda *a: 20 << 30)
     monkeypatch.setattr(pool, '_kv_ram_limit', lambda *a: 4 << 30)
     monkeypatch.setattr(pool, '_prefix_cache_directory', lambda: tmp_path)
-    request = ModelLoadRequest(model='fixture', kv_memory=dict(qsa_mode='auto', placement='auto_ssd'))
-    argv, environment = pool._launch_configuration(model, request, port=0)
-    assert environment['TYLOINFER_QSA_CACHE_MODE'] == 'auto'
-    assert environment['TYLOINFER_QSA_TQ_DIRECTORY'] == str(tmp_path/'qsa-kv')
-    assert environment['TYLOINFER_KV_PLACEMENT'] == 'auto_ssd'
-    assert environment['TYLOINFER_MOE_HOST_CACHE_BYTES'] == str(2 << 30)
-    assert int(environment['TYLOINFER_KV_RAM_LIMIT_BYTES']) < 4 << 30
-    assert argv[argv.index('--continuous-batching')+1] == '4'
+    for name in ('TYLOINFER_QSA_CACHE_MODE', 'TYLOINFER_QSA_RAM_KV_BITS', 'TYLOINFER_QSA_ADAPTIVE_TQ'):
+        monkeypatch.delenv(name, raising=False)
+    if entry == 'saved':
+        pool.context_policy = RuntimeContextPolicy(model_kv_memory={'fixture': {'qsa_mode': 'auto', 'placement': 'auto'}})
+    disk_checks = []
+    monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.check_ssd_capacity',
+        lambda path, size: disk_checks.append((path, size)))
+    validate = pool._validate_kv_memory_budget
+
+    class AdmissionChecked(Exception):
+        pass
+
+    def capture_admission(artifact, resolved):
+        plan = validate(artifact, resolved)
+        argv, environment = pool._launch_configuration(artifact, resolved, port=0)
+        mode, placement = expected
+        assert environment['TYLOINFER_QSA_CACHE_MODE'] == mode
+        assert environment['TYLOINFER_QSA_TQ_DIRECTORY'] == str(tmp_path/'qsa-kv')
+        assert environment['TYLOINFER_KV_PLACEMENT'] == placement
+        assert environment['TYLOINFER_KV_RAM_PREALLOCATED'] == '1'
+        assert disk_checks == ([(tmp_path, plan.ssd_capacity_bytes + (64 << 20))] if placement == 'auto_ssd' else [])
+        assert environment['TYLOINFER_MOE_HOST_CACHE_BYTES'] == str(2 << 30)
+        assert int(environment['TYLOINFER_KV_RAM_LIMIT_BYTES']) < 4 << 30
+        assert argv[argv.index('--continuous-batching')+1] == '4'
+        raise AdmissionChecked
+
+    monkeypatch.setattr(pool, '_validate_kv_memory_budget', capture_admission)
+
+    async def run():
+        try:
+            with pytest.raises(AdmissionChecked):
+                if entry == 'startup':
+                    await pool.start()
+                else:
+                    await pool.load(SimpleNamespace(), request.model_dump(exclude_unset=True))
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
 
 
 def test_concurrent_qsa_does_not_freeze_optional_expert_complement(monkeypatch):

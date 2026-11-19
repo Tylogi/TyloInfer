@@ -58,7 +58,7 @@ Linux 用 `export TYLOINFER_SERVER_API_KEY='replace-with-your-secret'`。
 | PP 分块 `--prefill-chunk-size` | 默认 `auto`；CUDA 按待处理输入和当前工作区预算选择，最大 `8192` | 通常省略。需要限制峰值时可设 `4096` 等较小上限；预算不足时仍会缩小 |
 | GPU 专家缓存 `--moe-gpu-cache-gb` | 在受支持路径上按显存和模型自动规划 | 通常省略。`0` 表示专家全部常驻，并非关闭专家缓存；不要直接填显卡总容量 |
 | 专家 RAM / SSD | RAM 能容纳完整专家集时预加载；不足时自动使用有界 RAM 缓存和 SSD 专家流式 | SSD 模式优先使用本机 NVMe。它能运行更大的模型，速度受磁盘读取影响 |
-| KV | CUDA 默认预分配，KV 量化和 SSD KV 默认关闭 | 保持默认作为起点；需要长上下文时再配置[KV 内存策略](runtime/cuda-kv-memory.md) |
+| KV | CUDA Flash-Next 的 QSA 默认使用固定 Affine INT8，允许冷 KV 写入 SSD；启用 RAM 预分配 | 按目标上下文预留 SSD 空间。精度和放置可在[KV 内存策略](runtime/cuda-kv-memory.md)中显式指定 |
 | 并发 | CUDA 每个模型默认 1 个请求 | 有并发需求再加 `--max-requests-per-runtime 2`；更多并发会增加 KV 和工作区需求 |
 | 前缀缓存 | 默认开启 | 多轮对话保留它；SSD 前缀缓存与 SSD KV 是不同功能 |
 
