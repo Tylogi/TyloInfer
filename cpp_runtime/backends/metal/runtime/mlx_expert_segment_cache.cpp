@@ -375,9 +375,13 @@ struct MlxExpertSegmentCache::Impl {
         struct ReadJob {
             std::size_t field;
             std::uint64_t offset;
-            std::vector<std::span<std::byte>> targets;
+            std::size_t target_begin, target_count;
         };
         std::vector<ReadJob> jobs;
+        std::vector<std::span<std::byte>> targets;
+        const auto max_jobs = pending.size() * layer.source.fields.size();
+        jobs.reserve(max_jobs);
+        targets.reserve(max_jobs);
         std::size_t first_jobs = 0;
         for (std::size_t field = 0; field < layer.source.fields.size(); ++field) {
             const auto& source = layer.source.fields[field];
@@ -387,13 +391,12 @@ struct MlxExpertSegmentCache::Impl {
                 while (last < pending.size() && last - first < maximum && pending[last].first == pending[last - 1].first + 1 &&
                     source.begin(std::int32_t(pending[last].first)) == source.begin(std::int32_t(pending[last - 1].first)) +
                         source.size(std::int32_t(pending[last - 1].first))) ++last;
-                ReadJob job{field, source.begin(std::int32_t(pending[first].first)), {}};
-                job.targets.reserve(last - first);
+                jobs.push_back({field, source.begin(std::int32_t(pending[first].first)), targets.size(), last - first});
                 for (auto item = first; item < last; ++item) {
                     const int e = std::int32_t(pending[item].first);
-                    job.targets.emplace_back(pool->data(pending[item].second.offset + layer.field_offset(field, e)), source.size(e));
+                    targets.emplace_back(pool->data(pending[item].second.offset + layer.field_offset(field, e)), source.size(e));
                 }
-                jobs.push_back(std::move(job)); first = last;
+                first = last;
             }
             if (field + 1 == first_fields) first_jobs = jobs.size();
         }
@@ -415,7 +418,8 @@ struct MlxExpertSegmentCache::Impl {
             for (auto job = begin; job < end; ++job) {
                 const auto& read = jobs[std::size_t(job)];
                 const auto& field = layer.source.fields[read.field];
-                model.readv_range(field.tensor, read.offset, read.targets);
+                model.readv_range(field.tensor, read.offset,
+                    std::span<const std::span<std::byte>>(targets).subspan(read.target_begin, read.target_count));
             }
         };
         try {
