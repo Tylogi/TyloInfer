@@ -28,8 +28,6 @@ void mfq_legacy_set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCac
 void mfq_legacy_reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t mfq_legacy_reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
     std::size_t allocation_bytes=0);
-std::size_t mfq_legacy_reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
-std::size_t mfq_legacy_share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t mfq_legacy_moe_expert_host_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 void mfq_legacy_resize_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 double mfq_legacy_moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);

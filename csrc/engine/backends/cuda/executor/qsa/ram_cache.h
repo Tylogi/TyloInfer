@@ -9,19 +9,6 @@
 #include <utility>
 
 namespace tyloi::cuda {
-using QsaRamReclaimer=std::function<std::size_t(std::size_t)>;
-// Registration is owned by the engine. Queries retain only the callback for
-// their duration; it must in turn use weak ownership of disposable RAM data.
-std::shared_ptr<void> register_qsa_ram_reclaimer(int device,cudaStream_t stream,QsaRamReclaimer reclaim);
-std::size_t reclaim_qsa_ram(int device,cudaStream_t stream,std::size_t bytes);
-// RAM-only KV may reclaim optional expert RAM after compression. SSD-backed
-// KV instead spills cold blocks and retains the RAM expert population.
-std::shared_ptr<void> register_qsa_ram_capacity_reclaimer(int device,cudaStream_t stream,QsaRamReclaimer reclaim);
-std::size_t reclaim_qsa_ram_capacity(int device,cudaStream_t stream,std::size_t bytes);
-// Unlike a reclaim request, every reservation callback receives the complete
-// free-RAM target. A zero target releases a previous optional-cache limit.
-std::shared_ptr<void> register_qsa_ram_budget_reserver(int device,cudaStream_t stream,QsaRamReclaimer reserve);
-std::size_t reserve_qsa_ram_budget(int device,cudaStream_t stream,std::size_t free_bytes);
 struct QsaRamWorkspaceProgress {std::size_t logical=0,physical=0;};
 // A shared budget changes after each layer is reclaimed. Revisit all layers
 // until the host allocation can proceed, rather than accepting a local fit.

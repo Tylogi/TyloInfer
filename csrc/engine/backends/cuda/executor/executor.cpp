@@ -194,7 +194,8 @@ Executor::Executor(Options options, int primary)
       owned_branches_(std::make_unique<Branches>()), branches_(*owned_branches_),
       owned_collectives_(std::make_unique<Collectives>()), collectives_(*owned_collectives_),
       owned_routes_(std::make_unique<RouteStats>(env_value("TYLOINFER_MOE_ROUTE_STATS").value_or(""),
-          env_flag("TYLOINFER_MOE_ROUTE_OUTPUT_ENERGY", false))), routes_(*owned_routes_), primary_(primary) {
+          env_flag("TYLOINFER_MOE_ROUTE_OUTPUT_ENERGY", false))), routes_(*owned_routes_),
+      budget_(std::make_shared<BudgetLink>()), primary_(primary) {
     profiler_.filter = options_.profile_filter;
     mode_.linear.shared_input = options_.projection.grouped && options_.tensor_parallel_shared_linear_attention_input;
     mode_.linear.fused_conv = options_.linear_conv_prefill_fused;
@@ -206,10 +207,11 @@ Executor::Executor(Options options, int primary)
 Executor::Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
         Branches& branches, Collectives& collectives, RouteStats& routes,
         const Options& options, Mode& mode, int primary,
-        std::weak_ptr<KvMemoryManager> kv_memory, std::weak_ptr<state::KvOffloadStore> kv_offload)
+        std::weak_ptr<KvMemoryManager> kv_memory, std::weak_ptr<state::KvOffloadStore> kv_offload,
+        const std::shared_ptr<BudgetLink>& budget)
     : contexts_(contexts), options_(options), mode_(mode), profiler_(profiler), mmq_(mmq), tq_(tq), branches_(branches),
       collectives_(collectives), routes_(routes), kv_memory_(std::move(kv_memory)),
-      kv_offload_(std::move(kv_offload)), primary_(primary) {}
+      kv_offload_(std::move(kv_offload)), budget_(budget), primary_(primary) {}
 
 Executor::~Executor() = default;
 
@@ -291,7 +293,7 @@ std::unique_ptr<Executor> Executor::fork() const {
 
 std::unique_ptr<Executor> Executor::fork(int primary) const {
     return std::unique_ptr<Executor>(new Executor(contexts_, profiler_, mmq_, tq_, branches_,
-        collectives_, routes_, options_, mode_, primary, kv_memory_, kv_offload_));
+        collectives_, routes_, options_, mode_, primary, kv_memory_, kv_offload_, budget_));
 }
 
 void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<state::KvOffloadStore> offload) {
@@ -328,6 +330,7 @@ void Executor::finalize_kv(tyloi::weights::Cache& weights) {
 }
 
 void Executor::bind_budget(tyloi::engine::Budget* budget) {
+    budget_->value = budget;
     if (auto memory = kv_memory()) memory->bind_budget(budget);
     if (auto offload = kv_offload()) offload->bind_budget(budget);
 }

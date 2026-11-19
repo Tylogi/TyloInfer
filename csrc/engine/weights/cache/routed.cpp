@@ -307,6 +307,20 @@ std::size_t Cache::reserve(std::size_t bytes) {
     return data_->tq ? data_->tq->reserve(bytes) : reclaim_moe_optional_host(data_->moe, bytes);
 }
 
+std::size_t Cache::reclaim_host_duplicates(std::size_t bytes) {
+    return data_->tq ? data_->tq->reclaim_duplicates(bytes) : reclaim_moe_expert_duplicates(data_->moe, bytes);
+}
+
+std::size_t Cache::reserve_host_capacity(std::size_t bytes) {
+    reclaim_host(bytes, data_->host_limit);
+    return data_->tq ? data_->tq->reserve(bytes) : reserve_moe_expert_host(data_->moe, bytes);
+}
+
+void Cache::share_host(std::size_t bytes) {
+    if (data_->tq) data_->tq->share_host(bytes);
+    else share_moe_expert_host(data_->moe, bytes);
+}
+
 void Cache::drain() const {
     drain_moe_expert_cache(data_->moe);
 }

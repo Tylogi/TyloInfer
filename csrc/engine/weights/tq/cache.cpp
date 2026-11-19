@@ -297,6 +297,7 @@ TqCache::TqCache(std::size_t budget,std::size_t host_budget,std::size_t process_
      device_(retain_all?std::nullopt:std::optional<std::size_t>(budget)),
      device_budget_(device_.limit()),
      process_host_limit_(process_limit),
+     ordinary_host_limit_(*host_.limit()),
      profile_(tyloi::cuda::env_lookup("TYLOINFER_TQ_PROFILE_CACHE")!=nullptr) {
     if(!tq_)throw std::invalid_argument("TQ expert cache requires its execution pool");
 }
@@ -526,6 +527,39 @@ void TqCache::reclaim(int device, std::size_t available_bytes) {
 std::size_t TqCache::reclaim(std::size_t bytes) {
     std::lock_guard<std::mutex> guard(mutex_);
     return reclaim_host_locked(bytes);
+}
+
+std::size_t TqCache::reclaim_duplicates(std::size_t bytes) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!bytes) return 0;
+    std::unordered_set<std::uint64_t> resident;
+    for (const auto& [key, _] : device_.entries()) resident.insert(key.image);
+    std::vector<std::uint64_t> duplicates;
+    for (auto key = host_.keys().rbegin(); key != host_.keys().rend(); ++key)
+        if (resident.contains(*key)) duplicates.push_back(*key);
+    const auto before = host_accounting_->physical.load(std::memory_order_relaxed);
+    for (const auto key : duplicates) {
+        host_.erase(key);
+        const auto after = host_accounting_->physical.load(std::memory_order_relaxed);
+        if (before > after && before - after >= bytes) break;
+    }
+    const auto after = host_accounting_->physical.load(std::memory_order_relaxed);
+    return before > after ? before - after : 0;
+}
+
+std::size_t TqCache::share_host(std::size_t free_bytes) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!free_bytes) {
+        host_.limit(ordinary_host_limit_);
+        return 0;
+    }
+    const auto before = host_accounting_->physical.load(std::memory_order_relaxed);
+    reserve_host_locked(free_bytes);
+    const auto physical = host_accounting_->physical.load(std::memory_order_relaxed);
+    host_.limit(tyloi::shared_host_cache_limit(ordinary_host_limit_, physical,
+        available_host_bytes(process_host_limit_), free_bytes));
+    const auto after = host_accounting_->physical.load(std::memory_order_relaxed);
+    return before > after ? before - after : 0;
 }
 
 void TqCache::preload(int device, std::size_t workspace_reserve) {

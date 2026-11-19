@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -30,6 +31,16 @@ struct HostMemorySample {
 };
 HostMemorySample sample_host_memory();
 void trim_host_cache() noexcept;
+/** Limit an optional cache while allowing another owner to grow into free RAM. */
+inline std::size_t shared_host_cache_limit(std::size_t ordinary, std::size_t used,
+        std::size_t available, std::size_t requested) noexcept {
+    if (!requested) return ordinary;
+    if (available >= requested) {
+        const auto retained = std::min(ordinary, used);
+        return retained + std::min(ordinary - retained, available - requested);
+    }
+    return std::min(ordinary, used - std::min(used, requested - available));
+}
 
 class HostCache {
 public:

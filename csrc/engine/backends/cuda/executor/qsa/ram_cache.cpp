@@ -2,9 +2,11 @@
 #include "engine/backends/cuda/kernels/attention/qsa/ram.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/memory/host.h"
+#include "engine/memory/budget.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/tensor/encoding/qsa/tq_cpu.h"
 #include <algorithm>
@@ -26,32 +28,6 @@ namespace tyloi::cuda {
 
 namespace tq=tyloinfer::qsa;
 namespace {
-using RamReclaimKey=std::pair<int,cudaStream_t>;
-struct RamReclaimRegistration;
-struct RamReclaimRegistry {
-    std::mutex mutex;
-    std::map<RamReclaimKey,std::vector<std::weak_ptr<RamReclaimRegistration>>> entries;
-};
-std::shared_ptr<RamReclaimRegistry> ram_reclaim_registry() {
-    static auto registry=std::make_shared<RamReclaimRegistry>();return registry;
-}
-struct RamReclaimRegistration {
-    RamReclaimKey key;
-    QsaRamReclaimer reclaim;
-    unsigned kind=0;
-    std::weak_ptr<RamReclaimRegistry> registry;
-    ~RamReclaimRegistration() {
-        if(auto owner=registry.lock()) {
-            std::lock_guard<std::mutex> lock(owner->mutex);
-            const auto it=owner->entries.find(key);
-            if(it==owner->entries.end())return;
-            auto& values=it->second;
-            values.erase(std::remove_if(values.begin(),values.end(),
-                [](const auto& value){return value.expired();}),values.end());
-            if(values.empty())owner->entries.erase(it);
-        }
-    }
-};
 void check(int code){TYLOINFER_CUDA_CHECK(cudaError_t(code));}
 std::size_t setting(const char* name,std::size_t fallback=0) {
     const auto* value=tyloi::cuda::env_lookup(name);if(!value || !*value)return fallback;
@@ -117,6 +93,7 @@ struct RamRetirement {
 };
 struct RamWorker {
     int device;cudaStream_t stream;
+    std::weak_ptr<const Executor::BudgetLink> binding;
     std::mutex mutex;std::condition_variable changed;
     std::deque<std::pair<std::uint64_t,std::packaged_task<void()>>> jobs;
     std::vector<std::weak_ptr<RamAccount>> accounts;
@@ -137,7 +114,8 @@ struct RamWorker {
     std::uint64_t next_job=0;
     std::atomic<std::uint64_t> running_job{0},urgent_through{0};
     bool stop=false;std::thread worker;
-    explicit RamWorker(int device,cudaStream_t stream):device(device),stream(stream),
+    RamWorker(int device,cudaStream_t stream,std::weak_ptr<const Executor::BudgetLink> binding)
+        :device(device),stream(stream),binding(std::move(binding)),
         cpu_codecs([device](std::size_t){check(cudaSetDevice(device));}),worker([this]{
         for(;;) {
             std::pair<std::uint64_t,std::packaged_task<void()>> task;
@@ -147,10 +125,14 @@ struct RamWorker {
         }
     }){}
     ~RamWorker(){
-        try{reserve_qsa_ram_budget(device,stream,0);}catch(...){}
         {std::lock_guard<std::mutex> lock(mutex);stop=true;changed.notify_all();}worker.join();
         for(auto& p:retired)if(p.done){(void)cudaEventSynchronize(p.done);(void)cudaEventDestroy(p.done);}
         for(auto& p:publications)if(p.done)(void)cudaEventDestroy(p.done);
+        try{if(auto* budget=host_budget())budget->share_ram(this,0);}catch(...){}
+    }
+    engine::Budget* host_budget() const noexcept {
+        if (const auto link=binding.lock()) return link->value;
+        return nullptr;
     }
     std::size_t collect() {
         std::vector<RamRetirement> ready;
@@ -244,9 +226,10 @@ struct RamWorker {
         const auto maximum=std::numeric_limits<std::size_t>::max();
         if(!count || per_cache>(maximum-overhead)/count)throw std::overflow_error("QSA RAM protected capacity overflow");
         const auto target=per_cache*count+overhead;
-        const auto free=tyloi::sample_host_memory().available_host_bytes();
+        const auto free=tyloi::sample_host_memory().headroom();
         const auto shortage=tq::ram_kv_reclaim_bytes(free,physical,target);
-        return reclaim_qsa_ram_capacity(device,stream,shortage);
+        auto* budget=host_budget();
+        return budget?budget->reclaim_ram_capacity(shortage):0;
     }
     std::size_t last_reservation=0,last_reservation_free=0;
     std::size_t budget() {
@@ -263,7 +246,7 @@ struct RamWorker {
                 // small staging allocation remains in the physical overhead.
                 count+=bytes || wanted;++it;
             }else it=accounts.erase(it);}
-        auto free=tyloi::sample_host_memory().available_host_bytes();
+        auto free=tyloi::sample_host_memory().headroom();
         const auto workspace=workspace_bytes.load();
         const auto kv_free=tq::ram_kv_reclaim_bytes(0,physical,logical);
         const auto required_free=workspace>std::numeric_limits<std::size_t>::max()-kv_free?
@@ -271,8 +254,10 @@ struct RamWorker {
         const auto shortage=required_free>free?required_free-free:0;
         // Called on the model thread, outside store/pool locks and graph
         // capture. Release disposable prefix RAM before quantizing live KV.
-        if(shortage && reclaim_qsa_ram(device,stream,shortage)) {
-            free=tyloi::sample_host_memory().available_host_bytes();
+        auto* budget=host_budget();
+        if(shortage && budget) {
+            budget->reclaim_ram(shortage);
+            free=tyloi::sample_host_memory().headroom();
             physical=pool_account->physical.load();
         }
         const auto overhead=physical>logical?physical-logical:0;
@@ -286,16 +271,17 @@ struct RamWorker {
         constexpr std::size_t granule=4ULL<<20;
         const auto rounded=required>maximum-(granule-1)?maximum:
             (required+granule-1)/granule*granule;
-        if(rounded!=last_reservation || (free<rounded && last_reservation_free>free && last_reservation_free-free>=granule)) {
-            reserve_qsa_ram_budget(device,stream,rounded);last_reservation=rounded;
-            free=tyloi::sample_host_memory().available_host_bytes();
+        if(budget && (rounded!=last_reservation || (free<rounded && last_reservation_free>free && last_reservation_free-free>=granule))) {
+            budget->share_ram(this,rounded);last_reservation=rounded;
+            free=tyloi::sample_host_memory().headroom();
             physical=pool_account->physical.load();last_reservation_free=free;
         }
         // Pending prefill outputs and descriptor growth must remain possible
         // throughout the chunk, after every background KV maintenance pass.
         auto total=tq::ram_kv_budget(free-std::min(free,workspace),physical);
         if(const auto* cap=tyloi::cuda::env_lookup("TYLOINFER_KV_RAM_LIMIT_BYTES");cap && *cap)total=std::min(total,setting("TYLOINFER_KV_RAM_LIMIT_BYTES"));
-        return count && total>overhead?(total-overhead)/count:0;
+        const auto retained=physical>logical?physical-logical:0;
+        return count && total>retained?(total-retained)/count:0;
     }
 };
 // One background encoder per serialized model execution stream. Different
@@ -303,7 +289,12 @@ struct RamWorker {
 std::shared_ptr<RamWorker> worker_for(int device,cudaStream_t stream) {
     static thread_local std::map<std::pair<int,cudaStream_t>,std::weak_ptr<RamWorker>> workers;
     auto& weak=workers[{device,stream}];auto worker=weak.lock();
-    if(!worker){worker=std::make_shared<RamWorker>(device,stream);weak=worker;}return worker;
+    if(!worker) {
+        const auto* executor=Executor::active();
+        worker=std::make_shared<RamWorker>(device,stream,executor?executor->budget_link():std::weak_ptr<const Executor::BudgetLink>{});
+        weak=worker;
+    }
+    return worker;
 }
 struct RamSlab {
     ::tyloi::DenseTensor host;
@@ -578,53 +569,6 @@ std::shared_ptr<StageArena> arena_for(int device,cudaStream_t stream,int capacit
     }
     return arena;
 }
-}
-static std::shared_ptr<void> register_ram_reclaimer(int device,cudaStream_t stream,QsaRamReclaimer reclaim,unsigned kind) {
-    if(!reclaim)return {};
-    const auto registry=ram_reclaim_registry();
-    auto registration=std::make_shared<RamReclaimRegistration>();
-    registration->key={device,stream};registration->reclaim=std::move(reclaim);registration->registry=registry;registration->kind=kind;
-    {std::lock_guard<std::mutex> lock(registry->mutex);registry->entries[registration->key].push_back(registration);}
-    return registration;
-}
-std::shared_ptr<void> register_qsa_ram_reclaimer(int device,cudaStream_t stream,QsaRamReclaimer reclaim) {
-    return register_ram_reclaimer(device,stream,std::move(reclaim),0);
-}
-std::shared_ptr<void> register_qsa_ram_capacity_reclaimer(int device,cudaStream_t stream,QsaRamReclaimer reclaim) {
-    return register_ram_reclaimer(device,stream,std::move(reclaim),1);
-}
-static std::size_t reclaim_ram(int device,cudaStream_t stream,std::size_t bytes,unsigned kind) {
-    if(!bytes && kind!=2)return 0;
-    const auto registry=ram_reclaim_registry();
-    std::vector<std::shared_ptr<RamReclaimRegistration>> callbacks;
-    {
-        std::lock_guard<std::mutex> lock(registry->mutex);
-        const auto it=registry->entries.find({device,stream});
-        if(it==registry->entries.end())return 0;
-        // Reserve before locking weak entries: an allocation failure must
-        // not destroy their last owner while the registry mutex is held.
-        callbacks.reserve(it->second.size());
-        for(const auto& weak:it->second)if(auto owner=weak.lock();owner && owner->kind==kind)callbacks.push_back(std::move(owner));
-    }
-    std::size_t released=0;
-    for(const auto& callback:callbacks) {
-        const auto n=callback->reclaim(kind==2?bytes:bytes-released);
-        released+=std::min(n,kind==2?std::numeric_limits<std::size_t>::max()-released:bytes-released);
-        if(kind!=2 && released==bytes)break;
-    }
-    return released;
-}
-std::size_t reclaim_qsa_ram(int device,cudaStream_t stream,std::size_t bytes) {
-    return reclaim_ram(device,stream,bytes,0);
-}
-std::size_t reclaim_qsa_ram_capacity(int device,cudaStream_t stream,std::size_t bytes) {
-    return reclaim_ram(device,stream,bytes,1);
-}
-std::shared_ptr<void> register_qsa_ram_budget_reserver(int device,cudaStream_t stream,QsaRamReclaimer reserve) {
-    return register_ram_reclaimer(device,stream,std::move(reserve),2);
-}
-std::size_t reserve_qsa_ram_budget(int device,cudaStream_t stream,std::size_t free_bytes) {
-    return reclaim_ram(device,stream,free_bytes,2);
 }
 static std::shared_ptr<void> hold_worker_workspace(std::shared_ptr<RamWorker> owner,std::size_t bytes) {
     if(!bytes)return {};

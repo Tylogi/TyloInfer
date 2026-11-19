@@ -1,6 +1,7 @@
 #include "engine/weights/cache/workspace.h"
 #include "engine/weights/cache/resources.h"
 #include "engine/memory/budget.h"
+#include "engine/memory/host.h"
 #include "engine/weights/moe/prepare/prepare.h"
 #include "engine/weights/moe/prepare/load.h"
 #include "env.h"
@@ -84,6 +85,26 @@ std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) 
     const auto released=host_experts_->reclaim_optional(shortage);
     if(released)std::cerr<<"runtime_prefill_backup action=reclaim bytes="<<released
         <<" available_bytes="<<*available<<" allocation_bytes="<<allocation_bytes<<'\n';
+    return released;
+}
+
+std::size_t MoeExpertCache::reclaim_host_duplicates(std::size_t bytes) {
+    return host_experts_->reclaim(bytes,true);
+}
+
+std::size_t MoeExpertCache::reserve_host(std::size_t bytes) {
+    if(!bytes)return 0;
+    auto available=available_host_ram();
+    if(!available || *available>=bytes)return 0;
+    tyloi::trim_host_cache();
+    available=available_host_ram();
+    if(!available || *available>=bytes)return 0;
+    return host_experts_->reclaim(bytes-*available);
+}
+
+std::size_t MoeExpertCache::share_host(std::size_t bytes) {
+    const auto released=bytes?reserve_host(bytes):0;
+    host_experts_->share(bytes,bytes?available_host_ram():std::nullopt);
     return released;
 }
 
@@ -2619,6 +2640,15 @@ void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::siz
 }
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t allocation_bytes) {
     return cache?cache->reclaim_optional_host(allocation_bytes):0;
+}
+std::size_t reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    return cache?cache->reclaim_host_duplicates(bytes):0;
+}
+std::size_t reserve_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t free_bytes) {
+    return cache?cache->reserve_host(free_bytes):0;
+}
+std::size_t share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t free_bytes) {
+    return cache?cache->share_host(free_bytes):0;
 }
 
 void finalize_moe_expert_cache(

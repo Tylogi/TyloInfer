@@ -40,6 +40,9 @@ public:
     void reclaim(tyloi::Device device) override;
     void set_memory_limit(tyloi::Device device, std::size_t bytes) override;
     void bind_budget(tyloi::engine::Budget* budget) override;
+    /** Model-thread budget binding shared by the root executor and its forks. */
+    struct BudgetLink { tyloi::engine::Budget* value = nullptr; };
+    std::weak_ptr<const BudgetLink> budget_link() const noexcept { return budget_; }
     tyloi::engine::Metrics metrics() const override;
     void drain() override;
     void clear() override;
@@ -149,7 +152,8 @@ private:
     Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
              Branches& branches, Collectives& collectives, RouteStats& routes,
              const Options& options, Mode& mode, int primary,
-             std::weak_ptr<KvMemoryManager>, std::weak_ptr<state::KvOffloadStore>);
+             std::weak_ptr<KvMemoryManager>, std::weak_ptr<state::KvOffloadStore>,
+             const std::shared_ptr<BudgetLink>&);
     std::unique_ptr<ContextSet> owned_contexts_;
     ContextSet& contexts_;
     std::unique_ptr<Options> owned_options_;
@@ -171,6 +175,7 @@ private:
     std::weak_ptr<state::KvOffloadStore> kv_offload_;
     std::shared_ptr<KvMemoryManager> owned_kv_memory_;
     std::shared_ptr<state::KvOffloadStore> owned_kv_offload_;
+    std::shared_ptr<BudgetLink> budget_;
     int primary_;
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;

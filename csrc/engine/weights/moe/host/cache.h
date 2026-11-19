@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 struct MoeHostExpertReservation;
@@ -67,6 +68,8 @@ public:
     // Drop only idle negative-key backup images, oldest first. Active leases
     // and the last CPU copies of routed experts are never reclaimed here.
     std::size_t reclaim_optional(std::size_t bytes);
+    std::size_t reclaim(std::size_t bytes,bool duplicates_only=false);
+    void share(std::size_t requested,std::optional<std::size_t> available);
     bool contains(tyloi::MoeCacheKey key) const;
     // Read an already cached immutable image without invoking a loader.
     Lease find(tyloi::MoeCacheKey key,bool touch=true);

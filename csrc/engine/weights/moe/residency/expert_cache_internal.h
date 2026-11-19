@@ -51,6 +51,9 @@ public:
     MoePrefillWorkspaceBudget prefill_workspace_budget(bool allow_borrow) const;
     std::optional<std::size_t> available_host_ram() const;
     std::size_t reclaim_optional_host(std::size_t allocation_bytes);
+    std::size_t reclaim_host_duplicates(std::size_t bytes);
+    std::size_t reserve_host(std::size_t bytes);
+    std::size_t share_host(std::size_t bytes);
     void reserve_workspace(std::size_t bytes);
     tyloi::engine::Budget* budget_ = nullptr;
     bool layer_prefill_ready() const { return pipeline_prefill_layer_layout_ && pipeline_ram_registered_bytes_>0; }

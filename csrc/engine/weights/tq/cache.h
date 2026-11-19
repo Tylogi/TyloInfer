@@ -40,6 +40,8 @@ public:
     void preload(int device, std::size_t workspace_reserve);
     void reclaim(int device, std::size_t available_bytes);
     std::size_t reclaim(std::size_t bytes) override;
+    std::size_t reclaim_duplicates(std::size_t bytes);
+    std::size_t share_host(std::size_t free_bytes);
     void prepare_decode(int device, std::size_t workspace_reserve);
     void observe_routes(const std::array<std::uint64_t,3>& banks, std::span<const std::int64_t> ids,
                         int rows, int row_offset, int row_total, int device, bool independent);
@@ -98,6 +100,7 @@ private:
     bool learning_ = true;
     std::unordered_map<std::uint64_t, std::vector<ViewTable>> view_tables_;
     std::size_t payload_bytes_ = 0, resident_bound_ = 0, process_host_limit_ = 0;
+    std::size_t ordinary_host_limit_;
     std::uint64_t source_reads_ = 0, source_batches_ = 0;
     std::vector<Source> sources_;
     std::mutex mutex_;

@@ -41,15 +41,6 @@ std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) 
         []{mfq_release_host_allocator_cache();});
 }
 
-std::size_t MoeExpertCache::reclaim_host_duplicates(std::size_t bytes) {
-    return host_experts_->reclaim(bytes,true);
-}
-
-std::size_t MoeExpertCache::share_host(std::size_t bytes) {
-    return host_experts_->share(bytes,[this]{return available_host_ram();},
-        []{mfq_release_host_allocator_cache();});
-}
-
 std::shared_ptr<MoeCachedSource> MoeExpertCache::retain_source(std::shared_ptr<MoeCachedSource> source) {
     const auto payload=source->logical_weight_bytes(),host=source->host_bytes();
     if(payload<0 || static_cast<std::uint64_t>(payload)>std::numeric_limits<std::size_t>::max()-source_bytes_ ||
@@ -2532,12 +2523,6 @@ void mfq_legacy_reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cac
 }
 std::size_t mfq_legacy_reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t allocation_bytes) {
     return cache?cache->reclaim_optional_host(allocation_bytes):0;
-}
-std::size_t mfq_legacy_reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
-    return cache?cache->reclaim_host_duplicates(bytes):0;
-}
-std::size_t mfq_legacy_share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
-    return cache?cache->share_host(bytes):0;
 }
 std::size_t mfq_legacy_moe_expert_host_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache?cache->host_minimum_bytes():0;

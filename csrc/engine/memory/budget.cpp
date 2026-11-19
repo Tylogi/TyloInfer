@@ -1,6 +1,7 @@
 #include "engine/memory/budget.h"
 
 #include "engine/generation/prefill/budget.h"
+#include "engine/memory/host.h"
 #include "engine/state/session/sessions.h"
 #include "engine/requests/processor.h"
 #include "engine/engine.h"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -40,6 +42,10 @@ void Budget::bind(bool predictor) {
 }
 
 void Budget::unbind() noexcept {
+    if (!ram_shares_.empty()) {
+        ram_shares_.clear();
+        try { weights_.share_host(0); } catch (...) {}
+    }
     weights_.unbind();
 }
 
@@ -83,6 +89,40 @@ void Budget::reserve_ram(std::size_t bytes) {
     weights_.reserve(bytes);
     if (bytes && shared_memory_)
         reserve_kv(primary_, bytes);
+}
+
+namespace {
+std::size_t host_target(std::size_t free, std::size_t shortage) {
+    return free + std::min(shortage, std::numeric_limits<std::size_t>::max() - free);
+}
+}
+
+void Budget::reclaim_ram(std::size_t shortage) {
+    if (!shortage) return;
+    const auto target = host_target(sample_host_memory().headroom(), shortage);
+    cache_.reserve_ram(target);
+    const auto free = sample_host_memory().headroom();
+    if (target > free && weights_.reclaim_host_duplicates(target - free)) trim_host_cache();
+}
+
+std::size_t Budget::reclaim_ram_capacity(std::size_t shortage) {
+    return shortage ? weights_.reserve_host_capacity(host_target(sample_host_memory().headroom(), shortage)) : 0;
+}
+
+void Budget::share_ram(const void* worker, std::size_t bytes) {
+    if (!bytes && !ram_shares_.erase(worker)) return;
+    const auto [entry, inserted] = bytes ? ram_shares_.try_emplace(worker, 0) : std::pair{ram_shares_.end(), false};
+    auto total = bytes;
+    for (const auto& [owner, reserved] : ram_shares_)
+        if (owner != worker) total = host_target(total, reserved);
+    try {
+        if (total) cache_.reserve_ram(total);
+        weights_.share_host(total);
+    } catch (...) {
+        if (inserted) ram_shares_.erase(entry);
+        throw;
+    }
+    if (bytes) entry->second = bytes;
 }
 
 void Budget::reserve(std::span<const std::pair<Device, std::size_t>> growth) {

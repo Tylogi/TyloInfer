@@ -9,7 +9,6 @@
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/kv_offload.h"
-#include "runtime/qsa_ram_cache.h"
 #include "runtime/kv_expert_loan.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq_cuda_process_memory.h"
@@ -45,7 +44,6 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::shared_ptr<void> ram_prefix_reclaimer,ram_expert_reclaimer,ram_duplicate_reclaimer,ram_budget_reserver;
     std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
     std::optional<mfq::DecisionModelSpec> decision_model;
@@ -294,25 +292,6 @@ struct CudaEngineState {
             }
             else throw std::invalid_argument("trained D3 decisions require a Qwen3.5/Qwen3.8 backbone");
         }
-        ram_prefix_reclaimer=register_qsa_ram_reclaimer(execution->layer_placement.primary_device(),
-            mfq_current_cuda_stream(),cache.ram_reclaimer());
-        ram_duplicate_reclaimer=register_qsa_ram_reclaimer(execution->layer_placement.primary_device(),
-            mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
-                auto owner=weak.lock();if(!owner)return std::size_t(0);
-                return reclaim_routed_expert_duplicates(*owner,bytes);
-            });
-        ram_budget_reserver=register_qsa_ram_budget_reserver(execution->layer_placement.primary_device(),
-            mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
-                auto owner=weak.lock();if(!owner)return std::size_t(0);
-                return share_routed_expert_host(*owner,bytes);
-            });
-        ram_expert_reclaimer=register_qsa_ram_capacity_reclaimer(execution->layer_placement.primary_device(),
-            mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
-                auto owner=weak.lock();if(!owner)return std::size_t(0);
-                const auto free=mfq::sample_host_memory().available_host_bytes();
-                const auto maximum=std::numeric_limits<std::size_t>::max();
-                return reclaim_routed_optional_host(*owner,bytes>maximum-free?maximum:free+bytes);
-            });
         initial_expert_budget=routed_expert_cache_budget_bytes(*execution);
         if (execution->qsa_kv_store)
             execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) {
@@ -440,7 +419,6 @@ struct CudaEngineState {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     ~CudaEngineState() {
-        ram_budget_reserver.reset();ram_duplicate_reclaimer.reset();ram_expert_reclaimer.reset();ram_prefix_reclaimer.reset();
         language.restore_decode_workspace={};
         if(components.mtp)components.mtp->decode_workspace_changed={};
         try {release_graph_expert_space();}

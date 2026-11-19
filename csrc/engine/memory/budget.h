@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <utility>
 
 namespace tyloi::state { class Sessions; }
@@ -56,6 +57,11 @@ public:
     void reclaim_kv(Device device, std::size_t bytes);
     void reserve_kv(Device device, std::size_t bytes);
     void reserve_ram(std::size_t bytes);
+    /** Relieve immediate host pressure before compacting live KV. */
+    void reclaim_ram(std::size_t shortage);
+    std::size_t reclaim_ram_capacity(std::size_t shortage);
+    /** Keep capacity available for active RAM KV workers until they release it. */
+    void share_ram(const void* worker, std::size_t bytes);
     void reserve(std::span<const std::pair<Device, std::size_t>> growth);
     void workspace(Device device, std::size_t bytes);
     PrefillChunk batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
@@ -82,6 +88,7 @@ private:
     std::size_t weight_budget_ = 0;
     std::size_t initial_expert_budget_ = 0;
     std::size_t allocation_ceiling_ = 0;
+    std::unordered_map<const void*, std::size_t> ram_shares_;
 };
 
 } // namespace tyloi::engine

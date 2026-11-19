@@ -69,6 +69,4 @@ void restore_routed_decode_workspace(CudaExecutionContext& execution,std::size_t
         std::optional<std::size_t> transient=std::nullopt);
 void restore_routed_decode_workspace_after_capture(CudaExecutionContext& execution);
 std::size_t reclaim_routed_optional_host(CudaExecutionContext& execution,std::size_t allocation_bytes);
-std::size_t reclaim_routed_expert_duplicates(CudaExecutionContext&,std::size_t bytes);
-std::size_t share_routed_expert_host(CudaExecutionContext&,std::size_t allocation_bytes);
 } // namespace mfq::cuda

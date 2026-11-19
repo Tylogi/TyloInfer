@@ -368,6 +368,9 @@ std::size_t Cache::reserve(std::size_t bytes) {
     for (const auto& group : data_->groups) after = add(after, resident(group.cache));
     return before > after ? before - after : 0;
 }
+std::size_t Cache::reclaim_host_duplicates(std::size_t) { return 0; }
+std::size_t Cache::reserve_host_capacity(std::size_t bytes) { return reserve(bytes); }
+void Cache::share_host(std::size_t) {}
 void Cache::workspace(std::size_t bytes) {
     if (data_->budget) data_->budget->reclaim(bytes);
 }

@@ -50,8 +50,6 @@ public:
     MoePrefillWorkspaceBudget prefill_workspace_budget(bool allow_borrow) const;
     std::optional<std::size_t> available_host_ram() const;
     std::size_t reclaim_optional_host(std::size_t allocation_bytes);
-    std::size_t reclaim_host_duplicates(std::size_t bytes);
-    std::size_t share_host(std::size_t bytes);
     std::size_t host_minimum_bytes() const {
         return std::max(host_experts_->minimum_budget(),pipeline_ram_complement_
             ?static_cast<std::size_t>(pipeline_ram_complement_->nbytes()):std::size_t(0));

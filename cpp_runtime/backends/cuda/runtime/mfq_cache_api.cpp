@@ -130,25 +130,9 @@ std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cac
 #endif
 }
 
-std::size_t reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    return mfq_legacy_reclaim_moe_expert_duplicates(cache,bytes);
-#else
-    return 0;
-#endif
-}
-
 std::size_t moe_expert_source_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     return mfq_legacy_moe_expert_source_bytes(cache);
-#else
-    return 0;
-#endif
-}
-
-std::size_t share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    return mfq_legacy_share_moe_expert_host(cache,bytes);
 #else
     return 0;
 #endif

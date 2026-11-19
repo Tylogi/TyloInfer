@@ -191,19 +191,6 @@ std::size_t reclaim_routed_optional_host(CudaExecutionContext& execution,std::si
         reclaim_moe_optional_host(execution.moe_expert_cache,allocation_bytes);
 }
 
-std::size_t reclaim_routed_expert_duplicates(CudaExecutionContext& execution,std::size_t bytes) {
-    auto released=reclaim_gguf_expert_duplicates(execution.gguf_expert_cache,bytes);
-    if(released<bytes)released+=reclaim_tq_expert_duplicates(execution.tq_expert_cache,bytes-released);
-    if(released<bytes)released+=reclaim_moe_expert_duplicates(execution.moe_expert_cache,bytes-released);
-    return released;
-}
-std::size_t share_routed_expert_host(CudaExecutionContext& execution,std::size_t bytes) {
-    auto released=share_gguf_expert_host(execution.gguf_expert_cache,bytes);
-    released+=share_tq_expert_host(execution.tq_expert_cache,bytes);
-    released+=share_moe_expert_host(execution.moe_expert_cache,bytes);
-    return released;
-}
-
 RoutedCacheLearningScope::RoutedCacheLearningScope(CudaExecutionContext& execution,bool enabled)
         :legacy_(execution.moe_expert_cache),gguf_(execution.gguf_expert_cache),tq_(execution.tq_expert_cache),
          legacy_previous_(set_moe_reuse_learning(legacy_,enabled)),

@@ -1,5 +1,6 @@
 #include "env.h"
 #include "engine/weights/moe/host/cache.h"
+#include "engine/memory/host.h"
 
 #include <algorithm>
 #include <atomic>
@@ -78,7 +79,8 @@ struct MoeHostExpertCache::Impl {
         std::exception_ptr error;
         std::condition_variable condition;
     };
-    const std::size_t budget;
+    const std::size_t ordinary_budget;
+    std::size_t budget;
     std::shared_ptr<Ledger> ledger=std::make_shared<Ledger>();
     mutable std::mutex mutex;
     std::list<tyloi::MoeCacheKey> lru;
@@ -106,7 +108,7 @@ struct MoeHostExpertCache::Impl {
     std::unordered_set<tyloi::MoeCacheKey,tyloi::MoeCacheKeyHash> device_cached;
     Entry *device_head=nullptr,*device_tail=nullptr;
 
-    explicit Impl(std::size_t bytes):budget(bytes) {}
+    explicit Impl(std::size_t bytes):ordinary_budget(bytes),budget(bytes) {}
     void forget_ghost(tyloi::MoeCacheKey key) {
         const auto found=ghosts.find(key);if(found==ghosts.end())return;
         ghost_bytes-=found->second.bytes;ghost_lru.erase(found->second.position);ghosts.erase(found);
@@ -419,7 +421,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::try_find(tyloi::MoeCacheKey key,bo
 
 void MoeHostExpertCache::preserve_resident_experts() {
     std::lock_guard lock(impl_->mutex);
-    impl_->preserve=true;
+    impl_->preserve=true;impl_->budget=impl_->ordinary_budget;
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::acquire(tyloi::MoeCacheKey key,std::size_t bytes,
@@ -599,6 +601,45 @@ std::size_t MoeHostExpertCache::reclaim_optional(std::size_t bytes) {
     }
     state.counters.optional_reclaimed_bytes+=released;
     return released;
+}
+std::size_t MoeHostExpertCache::reclaim(std::size_t bytes,bool duplicates_only) {
+    if(!bytes)return 0;
+    auto released=duplicates_only?0:reclaim_optional(bytes);
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    state.refresh_device_hints();
+    for(auto* candidate=state.device_tail;candidate && released<bytes;) {
+        auto* previous=candidate->device_prev;const auto key=*candidate->position;
+        if(!state.exchanging.contains(key) && !(state.preserve && key.source>=0) && candidate->value.use_count()==1) {
+            const auto size=candidate->value->bytes;
+            if(key.source<0)state.counters.optional_reclaimed_bytes+=size;
+            state.counters.device_duplicate_evicted_bytes+=size;
+            state.remove(state.entries.find(key));++state.counters.evictions;++state.counters.device_duplicate_evictions;
+            released+=size;
+        }
+        candidate=previous;
+    }
+    if(duplicates_only)return released;
+    for(auto* queue:{&state.lru,&state.reused}) {
+        auto candidate=queue->end();
+        while(candidate!=queue->begin() && released<bytes) {
+            --candidate;const auto key=*candidate;
+            if(state.exchanging.contains(key) || (state.preserve && key.source>=0))continue;
+            const auto found=state.entries.find(key);
+            if(found->second.value.use_count()!=1)continue;
+            const auto size=found->second.value->bytes;
+            state.remember_eviction(key,found->second);
+            if(key.source<0)state.counters.optional_reclaimed_bytes+=size;
+            ++candidate;state.remove(found);++state.counters.evictions;released+=size;
+        }
+        if(released>=bytes)break;
+    }
+    return released;
+}
+void MoeHostExpertCache::share(std::size_t requested,std::optional<std::size_t> available) {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    if(state.preserve || !requested)state.budget=state.ordinary_budget;
+    else if(available)state.budget=tyloi::shared_host_cache_limit(
+        state.ordinary_budget,state.ledger->managed.load(),*available,requested);
 }
 bool MoeHostExpertCache::exchange(tyloi::MoeCacheKey incoming,tyloi::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy) {

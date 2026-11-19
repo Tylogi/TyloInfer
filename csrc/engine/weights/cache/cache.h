@@ -114,6 +114,9 @@ public:
     void finalize(std::size_t reserve = 0, std::size_t kv_charge = 0);
     void resize(std::size_t bytes);
     std::size_t reserve(std::size_t bytes);
+    std::size_t reclaim_host_duplicates(std::size_t bytes);
+    std::size_t reserve_host_capacity(std::size_t free_bytes);
+    void share_host(std::size_t free_bytes);
     void drain() const;
     void finish_exchange() const;
     void retire_prefill();

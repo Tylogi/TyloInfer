@@ -93,8 +93,6 @@ void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
 void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
     std::size_t allocation_bytes=0);
-std::size_t reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
-std::size_t share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t moe_expert_host_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 void resize_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
