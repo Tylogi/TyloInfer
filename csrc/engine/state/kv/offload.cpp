@@ -18,6 +18,16 @@
 #include <tuple>
 namespace tyloi::state {
 namespace {
+std::size_t checked_multiply(std::size_t a, std::size_t b) {
+    if (b && a > std::numeric_limits<std::size_t>::max() / b)
+        throw std::overflow_error("CUDA KV gather size overflow");
+    return a * b;
+}
+std::size_t checked_add(std::size_t a, std::size_t b) {
+    if (a > std::numeric_limits<std::size_t>::max() - b)
+        throw std::overflow_error("CUDA KV gather size overflow");
+    return a + b;
+}
 constexpr auto no_offset = std::numeric_limits<std::size_t>::max();
 struct Slots {
     std::map<std::size_t,std::size_t> free;
@@ -205,12 +215,20 @@ struct KvOffloadStore::Impl {
 KvOffloadStore::KvOffloadStore(state::KvOffloadConfig config, ::tyloi::Executor* executor) : impl_(std::make_shared<Impl>(std::move(config), executor)) {}
 KvOffloadStore::~KvOffloadStore() = default;
 KvOffloadStore::GatherLayout KvOffloadStore::gather_layout(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads,int64_t key_width) {
-    if(rows<=0 || width<=0 || heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
+    if(rows<=0 || width<=0 || (dtype!=kFloat16 && dtype!=kInt16 && dtype!=kInt32) ||
+       heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
         throw std::invalid_argument("invalid CUDA KV gather geometry");
-    return {rows,width,4+rows*(key_width?2*heads:1)*4,dtype};
+    constexpr auto max_descriptors=(std::numeric_limits<int64_t>::max()-4)/4;
+    if(rows>std::numeric_limits<int64_t>::max()/width || rows>max_descriptors ||
+       (key_width && heads>max_descriptors/rows/2))
+        throw std::overflow_error("CUDA KV gather size overflow");
+    GatherLayout layout{rows,width,4+rows*(key_width?2*heads:1)*4,dtype};
+    (void)layout.gpu_bytes();
+    return layout;
 }
 std::size_t KvOffloadStore::GatherLayout::gpu_bytes() const {
-    return std::size_t(rows)*width*::tyloi::scalar_size(dtype)*2+std::size_t(descriptors)*sizeof(int64_t);
+    const auto payload=checked_multiply(checked_multiply(std::size_t(rows),std::size_t(width)),::tyloi::scalar_size(dtype));
+    return checked_add(checked_multiply(payload,2),checked_multiply(std::size_t(descriptors),sizeof(int64_t)));
 }
 std::shared_ptr<ops::KvGatherWorkspace> KvOffloadStore::gather_workspace(int64_t rows,int64_t width,ScalarType dtype,int64_t heads,int64_t key_width) {
     if (impl_->config.device.is_metal()) throw std::runtime_error("Metal KV fixed gather is unsupported");
@@ -246,10 +264,10 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
     const auto type = input.scalar_type();
     const bool valid_type = type == kFloat16 ||
         (metal ? (type == ScalarType::bfloat16 || type == ScalarType::float32 || type == ScalarType::uint32)
-               : type == kInt32);
+               : (type == kInt16 || type == kInt32));
     if (input.device() != impl_->config.device || input.is_encoded() ||
         input.dim() != 2 || !input.numel() || !valid_type)
-        throw std::invalid_argument("CUDA KV microblock must contain nonempty FP16 or packed GPU rows");
+        throw std::invalid_argument("KV microblock must contain nonempty supported GPU rows");
     const auto bytes = input.nbytes();
     if (bytes > impl_->config.buffer_bytes / 2)
         throw std::invalid_argument("CUDA KV microblock exceeds its write staging buffer");

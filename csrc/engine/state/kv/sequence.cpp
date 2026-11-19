@@ -26,7 +26,7 @@ KvOffloadSequence::KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int6
     const bool metal = device.is_metal() && device.index == 0;
     if ((!device.is_cuda() || device.index < 0) && !metal)
         throw std::invalid_argument("invalid CUDA KV sequence geometry");
-    if (dtype != kFloat16 && dtype != kInt32 &&
+    if (dtype != kFloat16 && dtype != kInt32 && !(device.is_cuda() && dtype == kInt16) &&
         !(metal && (dtype == ScalarType::bfloat16 || dtype == ScalarType::float32 || dtype == ScalarType::uint32)))
         throw std::invalid_argument("invalid CUDA KV sequence geometry");
     const auto width_bytes = scalar_size(dtype);

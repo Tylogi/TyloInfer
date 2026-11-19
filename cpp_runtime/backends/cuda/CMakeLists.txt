@@ -506,10 +506,8 @@ set(TYLOINFER_CUDA_MODEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${TYLOINFER_CUDA_ROOT}/models/deepseek_v41/vision.cpp
     ${TYLOINFER_CUDA_ROOT}/models/qwen4_exp/ops.cpp
-    ${TYLOINFER_CUDA_ROOT}/runtime/kv_offload.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/qsa_tq_cache.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/qsa_ram_cache.cpp
-    ${TYLOINFER_CUDA_ROOT}/runtime/kv_memory.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/kv_vmm.cpp
     ${TYLOINFER_CUDA_ROOT}/models/glm5_next/ops.cpp
     ${TYLOINFER_CUDA_ROOT}/models/gemma4/ops.cpp

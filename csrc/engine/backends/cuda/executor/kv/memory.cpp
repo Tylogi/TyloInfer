@@ -29,14 +29,6 @@ std::size_t setting(const char* name, std::size_t fallback) {
     if (*value == '-' || !end || *end) throw std::invalid_argument(std::string("invalid ") + name);
     return std::size_t(result);
 }
-bool discrete_device() {
-    if(const auto* value=tyloi::cuda::env_lookup("TYLOINFER_MEMORY_ARCHITECTURE"))return std::string(value)=="discrete";
-    int device=0,integrated=0,host_tables=0;
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&integrated,cudaDevAttrIntegrated,device));
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&host_tables,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device));
-    return !integrated && !host_tables;
-}
 } // namespace
 
 engine::KvOptions kv_memory_options() {
@@ -69,10 +61,14 @@ std::shared_ptr<KvMemoryAllocation> KvMemoryManager::add(int64_t maximum,int64_t
     if (ready_) {
         auto policy=options_;policy.additional_request=true;
         if(policy.budget_policy && policy.gpu_budget)for(const auto& weak:allocations_)if(auto existing=weak.lock()) {
-            if(existing->layout.maximum!=maximum || existing->layout.heads!=heads || existing->layout.key_width!=kw || existing->layout.value_width!=vw)continue;
-            policy.gpu_budget=existing->layout.index_bytes()+(existing->hot.exclusive()?
+            const auto& layout = existing->layout;
+            if (layout.maximum!=maximum || layout.heads!=heads || layout.key_width!=kw || layout.value_width!=vw ||
+                layout.index_width!=iw || layout.pool!=pool || layout.dtype!=options.scalar_type() ||
+                existing->selected_columns!=selected_columns || existing->options.target_device()!=options.target_device())
+                continue;
+            policy.gpu_budget=layout.index_bytes()+(existing->hot.exclusive()?
                 std::size_t(existing->hot.keys.numel()+existing->hot.values.numel())*width_bytes(existing->options):
-                existing->host || existing->offload?0:existing->layout.raw_bytes());
+                existing->host || existing->offload?0:layout.raw_bytes());
             break;
         }
         // Independent graph sessions require directly addressable raw caches.
@@ -110,7 +106,7 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
         per_cell+=a->layout.row_bytes();
         fixed_metadata+=std::size_t(a->layout.maximum)*16+56;
     }
-    const bool discrete=discrete_device();
+    const bool discrete=separate_memory(device.index);
     const bool tiered_budget=options_.budget_policy && discrete;
     const auto initial_free=context->available_memory();
     if(!admission && (initial_free<reserve || index>initial_free-reserve))throw std::runtime_error(insufficient);

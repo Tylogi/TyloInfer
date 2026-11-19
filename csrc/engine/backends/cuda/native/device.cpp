@@ -1,8 +1,9 @@
 #include "device.h"
+#include "env.h"
 
 #include <sstream>
 #include <string>
-#include <cstring>
+#include <string_view>
 
 namespace tyloi::cuda {
 namespace {
@@ -52,9 +53,18 @@ void check(cublasStatus_t status, const char* expression, const char* file, int 
 }
 
 bool separate_memory(int device) {
-    cudaDeviceProp properties{};
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
+    if (const auto* value = env_lookup("TYLOINFER_MEMORY_ARCHITECTURE")) {
+        const std::string_view setting(value);
+        if (setting == "discrete") return true;
+        if (setting == "unified") return false;
+        if (!setting.empty() && setting != "unknown")
+            throw std::invalid_argument("invalid TYLOINFER_MEMORY_ARCHITECTURE: expected discrete, unified or unknown");
+    }
+    int integrated = 0, host_page_tables = 0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(
+        &host_page_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
+    return !integrated && !host_page_tables;
 }
 
 DeviceGuard::DeviceGuard(int device) {
