@@ -134,6 +134,10 @@ std::size_t activation_bytes(std::int64_t rows,std::int64_t columns) {
         throw std::overflow_error("GGUF MMQ activation size overflows");
     return (std::size_t(rows)*std::size_t(blocks)+128)*sizeof(block_q8_1_mmq);
 }
+int activation_layout(int type) {
+    if(!supported(type))throw std::invalid_argument("Unsupported GGUF MMQ activation layout");
+    return int(mmq_get_q8_1_ds_layout(ggml_type(type)));
+}
 void quantize(const float* input,const std::int32_t* ids,void* output,int type,
         std::int64_t columns,std::int64_t rows,cudaStream_t stream) {
     if(!supported(type) || columns%ggml_blck_size(ggml_type(type)) || rows<=0 || rows>INT_MAX)

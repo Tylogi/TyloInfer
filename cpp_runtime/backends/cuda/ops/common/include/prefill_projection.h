@@ -5,6 +5,10 @@
 #include <memory>
 #include <vector>
 
+struct MmqPrefillInput {
+    mfq_tensor_backend::Tensor activation,exponents;
+};
+
 class PrefillInputScope {
     struct Impl;std::unique_ptr<Impl> impl_;
     PrefillInputScope();
@@ -13,6 +17,7 @@ public:
     ~PrefillInputScope();
     static bool lookup(const mfq_tensor_backend::Tensor& input,
         mfq_tensor_backend::Tensor& half,mfq_tensor_backend::Tensor& exponents);
+    static MmqPrefillInput prepare_mmq(const mfq_tensor_backend::Tensor& input,int weight_type);
     static std::unique_ptr<PrefillInputScope> prepare_rms(
         const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& weight,
         double eps,double offset,mfq_tensor_backend::Tensor& normalized);

@@ -12,6 +12,7 @@ bool fits(int type,std::int64_t rows,int device);
 // inactive columns. J is bounded by its scheduler at 512 on every backend.
 constexpr int id_guard=512;
 std::size_t activation_bytes(std::int64_t tokens,std::int64_t columns);
+int activation_layout(int type);
 void quantize(const float* input,const std::int32_t* ids,void* output,int type,
     std::int64_t columns,std::int64_t rows,cudaStream_t stream);
 void swiglu_quantize(const float* gate_up,void* output,int type,

@@ -783,17 +783,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
         if(allow_mmq && (!mmq_setting || mmq_setting[0]!='0') && mmq_rows>0 && tokens<=INT_MAX && neuron_len<=INT_MAX &&
                 (dtype==tb::kFloat16 || dtype==tb::kFloat32) && mmq::fits(type,mmq_rows,packed.get_device()) &&
                 (!final_rows || mmq::fits(type,final_rows,packed.get_device()))) {
-            auto input_float=x.to(tb::kFloat32).contiguous();
-            tb::Tensor exponents,scaled;
-            if(dtype==tb::kFloat32) {
-                scaled=tb::empty_like(input_float);
-                exponents=tb::empty({tokens},packed.options().dtype(tb::kInt32));
-                mfq::cuda::gguf::pack_scaled_f32(input_float.data_ptr<float>(),scaled.data_ptr<float>(),
-                    exponents.data_ptr<std::int32_t>(),tokens,neuron_len,mfq_current_cuda_stream());
-                input_float=scaled;
-            }
-            auto activation=tb::empty({std::int64_t(mmq::activation_bytes(tokens,neuron_len))},packed.options());
-            mmq::quantize(input_float.data_ptr<float>(),nullptr,activation.data_ptr(),int(type),neuron_len,tokens,mfq_current_cuda_stream());
+            const auto [activation,exponents]=GgufPrefillInputScope::prepare_mmq(x,int(type));
             auto result=output_dtype==tb::kFloat32?output:tb::empty({tokens,out},packed.options().dtype(tb::kFloat32));
             const auto guard_bytes=std::size_t(mmq_alignment)*ggml_type_size(type);
             tb::Tensor weight;
@@ -823,7 +813,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
                     mmq_rows=next;
                 }
             }
-            for(const auto& tensor:{input_float,exponents,activation,result,weight})if(tensor.defined())mfq_cuda_record_stream(tensor,stream);
+            for(const auto& tensor:{result,weight})mfq_cuda_record_stream(tensor,stream);
             mmq::Context context;
             for(std::int64_t begin=0;begin<out;begin+=mmq_rows) {
                 const auto count=std::min(mmq_rows,out-begin);

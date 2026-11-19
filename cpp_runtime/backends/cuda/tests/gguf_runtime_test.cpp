@@ -27,6 +27,7 @@
 #include "../kernels/gguf_mmq.h"
 #include "cuda_execution.h"
 #include "quant_linear.h"
+#include "prefill_projection.h"
 #include "storage/weight_loader.h"
 #include "storage/pinned_copy_plan.h"
 #include "storage/moe_pinned_expert_arena.h"
@@ -3105,6 +3106,39 @@ public:
 #endif
     }
 };
+
+void run_mmq_prefill_input_reuse() {
+    namespace mmq=mfq::cuda::gguf::mmq;
+    const auto device=mfq_current_cuda_device();
+    if(!mmq::fits(GGML_TYPE_IQ2_XS,128,device) || !mmq::fits(GGML_TYPE_IQ3_XXS,128,device) ||
+            !mmq::fits(GGML_TYPE_Q4_K,128,device))return;
+    ScopedEnvironment precise("TYLOINFER_PREFILL_TENSORCORE","0");
+    auto host=tb::empty({512,256},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+    for(int64_t i=0;i<host.numel();++i)host.data_ptr<float>()[i]=std::sin(float(i)*.052f);
+    const auto same_bytes=[](const tb::Tensor& a,const tb::Tensor& b) {
+        if(!a.defined() || !b.defined())return a.defined()==b.defined();
+        const auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
+        return x.nbytes()==y.nbytes() && std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes())==0;
+    };
+    for(auto dtype:{tb::kFloat32,tb::kFloat16}) {
+        const auto input=host.to(tb::kCUDA,dtype);
+        const auto other=input*-1.;
+        const auto expected=PrefillInputScope::prepare_mmq(input,GGML_TYPE_IQ3_XXS);
+        const auto distinct_layout=PrefillInputScope::prepare_mmq(input,GGML_TYPE_Q4_K);
+        const auto distinct_input=PrefillInputScope::prepare_mmq(other,GGML_TYPE_IQ2_XS);
+        const PrefillInputScope scope(input);
+        const auto first=PrefillInputScope::prepare_mmq(input,GGML_TYPE_IQ2_XS);
+        const auto shared=PrefillInputScope::prepare_mmq(input,GGML_TYPE_IQ3_XXS);
+        require(shared.activation.data_ptr()==first.activation.data_ptr(),"Compatible MMQ products did not share their activation");
+        require(same_bytes(shared.activation,expected.activation) && same_bytes(shared.exponents,expected.exponents),
+            "Shared MMQ activation changed exact input bytes");
+        const auto different=PrefillInputScope::prepare_mmq(input,GGML_TYPE_Q4_K);
+        require(same_bytes(different.activation,distinct_layout.activation),"MMQ input reused an incompatible Q8 layout");
+        const auto unrelated=PrefillInputScope::prepare_mmq(other,GGML_TYPE_IQ2_XS);
+        require(same_bytes(unrelated.activation,distinct_input.activation),"MMQ input reused another tensor's activation");
+    }
+    std::cout<<"GGUF precise prefill shared MMQ activation bytes PASS\n";
+}
 void run_gguf_residual_activation(int bench_tokens=0,int bench_columns=0,int bench_streams=0) {
     namespace gg=mfq::cuda::gguf;
     const bool benchmark=bench_tokens>0;
@@ -5963,7 +5997,7 @@ int main(int argc,char** argv) {
         catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     }
     if(argc==2 && std::strcmp(argv[1],"--prefill-precision-check")==0) {
-        try{run_scaled_dense_prefill();run_streamed_dense_prefill();run_prefill_precision();return 0;}
+        try{run_scaled_dense_prefill();run_streamed_dense_prefill();run_prefill_precision();run_mmq_prefill_input_reuse();return 0;}
         catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     }
     if(argc==2 && std::strcmp(argv[1],"--mmq-scatter-check")==0) {
