@@ -879,7 +879,9 @@ struct QsaTqCache::Impl {
     tb::Tensor stage_pending(const tb::Tensor& selected,int queries,int count,const tb::Tensor& positions) {
         if(!ram)return views;
         if(graph_ssd_task)return ram->stage_graph_task(selected,queries,count,views,positions,queries);
-        if(!graph_host_boundary)return ram->stage(selected,queries,count,views,positions,tokens,queries);
+        // Top-k emits each complete block once, followed by the causal tail.
+        if(!graph_host_boundary)
+            return ram->stage(selected,queries,count,views,positions,tokens,queries,false,queries==1);
         auto* window=DecodeWindow::recording();
         if(!window)throw std::logic_error("SSD QSA graph requires its decode window host boundary");
         cudaStreamCaptureStatus capture;check(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));

@@ -171,26 +171,32 @@ void publication(int& cases) {
     Device<tq::RamCacheSlot> slots(tq::ram_cache_ways);
     Device<std::uint8_t> arena(count*slot),cached(tq::ram_cache_ways*cache_slot);
     const tq::RamStageCache cache{slots.p,locks.p,frame.p,cached.p,tq::ram_cache_ways*cache_slot,cache_slot,1};
+    Device<tq::RamStageCache> cache_parameters(1);cache_parameters.put({cache});
     Graph graph;
     check(cudaMemset(source.p,0,capacity*sizeof(tq::RamBlockView)));
     check(cudaError_t(tq::tq_reset_ram_stage_cache(cache,graph.stream)));
-    const auto stage=[&] {
+    const auto stage=[&](bool unique=false) {
         check(cudaError_t(tq::tq_stage_ram_selected_cached(source.p,capacity,selected.p,1,count,
-            first.p,output.p,arena.p,count*slot,slot,cache,copied.p,hits.p,graph.stream)));
+            unique?nullptr:first.p,output.p,arena.p,count*slot,slot,cache,copied.p,hits.p,graph.stream,
+            cache_parameters.p)));
     };
     // Prime the device capability query before capturing a changing position.
     selected.put({{-1,0},{-1,0},{-1,0}});stage();check(cudaStreamSynchronize(graph.stream));
     check(cudaStreamBeginCapture(graph.stream,cudaStreamCaptureModeThreadLocal));
     check(cudaError_t(tq::tq_publish_ram_append(source.p,capacity,live.p,position.p,0,8,256,128,graph.stream)));
-    stage();check(cudaStreamEndCapture(graph.stream,&graph.graph));check(cudaGraphInstantiate(&graph.exec,graph.graph,0));
+    stage(true);check(cudaStreamEndCapture(graph.stream,&graph.graph));check(cudaGraphInstantiate(&graph.exec,graph.graph,0));
     for(int replay=0;replay<4;++replay) {
         const int start=3+4*replay;
         position.put({start});
-        selected.put({{start/4,15},{start/4+1,15},{start/4+2,7}});
+        selected.put({{start/4,15},{start/4+1,15},{replay%2?-1:start/4+2,7}});
         for(int at=0;at<capacity*slot;++at)payload.host[at]=std::uint8_t(at*13+replay*29);
         check(cudaGraphLaunch(graph.exec,graph.stream));check(cudaStreamSynchronize(graph.stream));
         std::vector<tq::TqBlockView> actual(count);check(cudaMemcpy(actual.data(),output.p,count*sizeof(actual[0]),cudaMemcpyDeviceToHost));
         for(int at=0;at<count;++at) {
+            if(replay%2 && at==count-1) {
+                if(actual[at].key || actual[at].value)throw std::runtime_error("Unique QSA staging retained a stale view");
+                continue;
+            }
             const int id=start/4+at,bytes=id%2?128:256;
             std::vector<std::uint8_t> k(bytes),v(bytes);
             check(cudaMemcpy(k.data(),actual[at].key,bytes,cudaMemcpyDeviceToHost));
@@ -212,6 +218,11 @@ void publication(int& cases) {
     stage();check(cudaStreamSynchronize(graph.stream));
     std::uint64_t read=1,hit=0;check(cudaMemcpy(&read,copied.p,8,cudaMemcpyDeviceToHost));check(cudaMemcpy(&hit,hits.p,8,cudaMemcpyDeviceToHost));
     if(read || hit!=1)throw std::runtime_error("Packed cache hit requested an evicted RAM source");
+    selected.put({{5,15},{-1,0},{-1,0}});
+    stage(true);check(cudaStreamSynchronize(graph.stream));
+    check(cudaMemcpy(&read,copied.p,8,cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(&hit,hits.p,8,cudaMemcpyDeviceToHost));
+    if(read || hit!=1)throw std::runtime_error("Unique QSA staging lost a packed cache hit");
     ++cases;
 }
 

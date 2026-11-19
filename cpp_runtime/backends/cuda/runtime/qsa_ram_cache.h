@@ -106,7 +106,8 @@ public:
     bool discard_idle_descriptors();
     void bind_descriptors(const Tensor& live);
     Tensor stage(const Tensor& selected,int queries,int count,const Tensor& live,
-        const Tensor& position,std::int64_t host_position,int appended,bool selection_ready=false);
+        const Tensor& position,std::int64_t host_position,int appended,bool selection_ready=false,
+        bool unique_selection=false);
     // Copy one layer's original encoded KV once for an entire prefill chunk.
     // Return no stage when current GPU workspace cannot hold its real bytes.
     std::optional<QsaRamPrefillStage> stage_prefill(std::size_t blocks,std::size_t reserve_blocks=0,

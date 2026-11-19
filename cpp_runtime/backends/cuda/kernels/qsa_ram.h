@@ -127,6 +127,7 @@ int tq_stage_ram_selected(const RamBlockView* sources,int capacity,
 
 // The cache and source table belong to one serialized execution stream.
 // Store only original packed images, without persistent FP16 expansion.
+// A single query with distinct valid block IDs may omit first_use.
 int tq_stage_ram_selected_cached(const RamBlockView* sources,int capacity,
     const SelectedBlock* selected,int queries,int count,
     std::uint32_t* first_use,TqBlockView* selected_views,

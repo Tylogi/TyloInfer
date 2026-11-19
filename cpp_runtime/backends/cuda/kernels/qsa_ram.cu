@@ -94,23 +94,29 @@ __global__ void reset_stage_locks(const RamStageCache* cache) {
         cache->locks[set]=0;
 }
 
-template<bool Resume=false,bool Dynamic=false> __global__ void bucket_cached_hits(const RamBlockView* source,
+template<bool Resume=false,bool Dynamic=false,bool Unique=false> __global__ void bucket_cached_hits(const RamBlockView* source,
         const SelectedBlock* selected,std::uint32_t* first,TqBlockView* output,int count,int capacity,
         std::size_t stride,RamStageCache cache,std::uint64_t* hits,const RamStageCache* device_cache=nullptr) {
     if constexpr(Dynamic)cache=*device_cache;
     const int lane=threadIdx.x&31;
     const auto at=std::int64_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;if(at>=count)return;
-    const auto s=selected[at];if(s.id<0 || s.id>=capacity || !s.token_mask)return;
-    if constexpr(Dynamic)if(!cache.sets) {
-        if(!Resume && !lane)atomicMin(first+s.id,unsigned(at));
+    const auto s=selected[at];
+    if(s.id<0 || s.id>=capacity || !s.token_mask) {
+        if constexpr(Unique)if(!lane)output[at]={};
         return;
     }
-    unsigned claimed=0;
-    if(!lane) {
-        if constexpr(Resume)claimed=first[s.id]==unsigned(at) && !output[at].key;
-        else claimed=atomicCAS(first+s.id,UINT_MAX,unsigned(at))==UINT_MAX;
+    if constexpr(Dynamic)if(!cache.sets) {
+        if constexpr(!Resume && !Unique)if(!lane)atomicMin(first+s.id,unsigned(at));
+        return;
     }
-    if(!__shfl_sync(0xffffffff,claimed,0))return;
+    if constexpr(!Unique) {
+        unsigned claimed=0;
+        if(!lane) {
+            if constexpr(Resume)claimed=first[s.id]==unsigned(at) && !output[at].key;
+            else claimed=atomicCAS(first+s.id,UINT_MAX,unsigned(at))==UINT_MAX;
+        }
+        if(!__shfl_sync(0xffffffff,claimed,0))return;
+    }
     const auto record=source[s.id];const auto extent=(std::size_t(record.key_bytes)+15u)&~std::size_t(15u);
     if(extent+record.value_bytes>stride){asm volatile("trap;");return;}
     const int set=int(ram_cache_set(unsigned(s.id),unsigned(cache.sets),cache.owner)),base=set*ram_cache_ways;
@@ -557,31 +563,30 @@ int tq_stage_ram_selected_cached(const RamBlockView* sources,int capacity,
     if(queries<0 || count<0 || capacity<0)return cudaErrorInvalidValue;
     if(!queries || !count)return cudaSuccess;
     if(!valid_cache(cache) || !stride || (stride&15u) || !sources || !capacity ||
-        !selected || !first || !output || !arena || (reinterpret_cast<std::uintptr_t>(arena)&15u) ||
+        !selected || (!first && queries!=1) || !output || !arena || (reinterpret_cast<std::uintptr_t>(arena)&15u) ||
         queries>INT_MAX/count)return cudaErrorInvalidValue;
     const int total=queries*count;
     if(stride>std::numeric_limits<std::size_t>::max()/std::size_t(total) ||
         arena_bytes<std::size_t(total)*stride)return cudaErrorInvalidValue;
     int ctas=0;auto error=staging_ctas(cache.sets,&ctas);if(error!=cudaSuccess)return error;
-    const auto grid=unsigned((std::int64_t(std::max(capacity,cache.sets))+255)/256);
-    if(device_cache) {
-        initialize_staging<true><<<grid,256,0,stream>>>(first,capacity,cache,copied,hits,device_cache);
+    const auto launch=[&]<bool Dynamic,bool Unique>() -> int {
+        const int first_size=Unique?0:capacity;
+        const auto grid=unsigned((std::int64_t(std::max(first_size,cache.sets))+255)/256);
+        initialize_staging<Dynamic><<<grid,256,0,stream>>>(first,first_size,cache,copied,hits,device_cache);
         error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        bucket_cached_hits<false,true><<<unsigned((std::int64_t(total)+7)/8),256,0,stream>>>(sources,selected,first,output,total,capacity,stride,cache,hits,device_cache);
+        bucket_cached_hits<false,Dynamic,Unique><<<unsigned((std::int64_t(total)+7)/8),256,0,stream>>>(
+            sources,selected,first,output,total,capacity,stride,cache,hits,device_cache);
         error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        stage_cache_misses<false,true><<<ctas,512,0,stream>>>(sources,selected,output,
+        stage_cache_misses<false,Dynamic><<<ctas,512,0,stream>>>(sources,selected,output,
             static_cast<std::uint8_t*>(arena),stride,cache,copied,device_cache);
-    }else {
-        initialize_staging<><<<grid,256,0,stream>>>(first,capacity,cache,copied,hits);
-        error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        bucket_cached_hits<><<<unsigned((std::int64_t(total)+7)/8),256,0,stream>>>(sources,selected,first,output,total,capacity,stride,cache,hits);
-        error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        stage_cache_misses<><<<ctas,512,0,stream>>>(sources,selected,output,
-            static_cast<std::uint8_t*>(arena),stride,cache,copied);
-    }
-    error=cudaGetLastError();if(error!=cudaSuccess)return error;
-    resolve_cached_views<<<unsigned((std::int64_t(total)+255)/256),256,0,stream>>>(selected,first,output,total,capacity);
-    return cudaGetLastError();
+        if constexpr(!Unique) {
+            error=cudaGetLastError();if(error!=cudaSuccess)return error;
+            resolve_cached_views<<<unsigned((std::int64_t(total)+255)/256),256,0,stream>>>(selected,first,output,total,capacity);
+        }
+        return cudaGetLastError();
+    };
+    if(device_cache)return first?launch.template operator()<true,false>():launch.template operator()<true,true>();
+    return first?launch.template operator()<false,false>():launch.template operator()<false,true>();
 }
 
 int tq_export_ram_selection(const std::int32_t* missing,const SelectedBlock* selected,

@@ -2092,7 +2092,7 @@ void QsaRamCache::release_idle() {
         "native_qsa_ram_idle_metadata actual_match=1 released_bytes=%zu\n",metadata);
 }
 QsaRamCache::Tensor QsaRamCache::stage(const Tensor& selected,int queries,int count,const Tensor& live,
-        const Tensor& position,std::int64_t host_position,int appended,bool selection_ready) {
+        const Tensor& position,std::int64_t host_position,int appended,bool selection_ready,bool unique_selection) {
     RamPinnedForeground pinned_foreground;
     auto& s=*impl_;if(queries<1 || queries>8 || count!=s.count)throw std::invalid_argument("QSA RAM staging requires its prepared query window");
     if(!s.arena || queries>s.arena->queries || (s.prefill_staging && s.arena->stride!=s.staging_stride()))
@@ -2241,8 +2241,8 @@ QsaRamCache::Tensor QsaRamCache::stage(const Tensor& selected,int queries,int co
         a.payload.data_ptr(),a.payload.numel(),a.stride,s.gpu_cache,tq::RamStageStep::Available,nullptr,nullptr,
         mfq_current_cuda_stream(),static_cast<const tq::RamStageCache*>(s.cache_parameters.data_ptr())));
     else if(s.gpu_cache.sets)check(tq::tq_stage_ram_selected_cached(s.sources.data_ptr<tq::RamBlockView>(),s.capacity,selected.data_ptr<tq::SelectedBlock>(),queries,count,
-        a.first.data_ptr<std::uint32_t>(),a.views.data_ptr<tq::TqBlockView>(),a.payload.data_ptr(),a.payload.numel(),a.stride,s.cache_envelope(),nullptr,nullptr,mfq_current_cuda_stream(),
-        static_cast<const tq::RamStageCache*>(s.cache_parameters.data_ptr())));
+        unique_selection?nullptr:a.first.data_ptr<std::uint32_t>(),a.views.data_ptr<tq::TqBlockView>(),a.payload.data_ptr(),a.payload.numel(),
+        a.stride,s.cache_envelope(),nullptr,nullptr,mfq_current_cuda_stream(),static_cast<const tq::RamStageCache*>(s.cache_parameters.data_ptr())));
     else check(tq::tq_stage_ram_selected(s.sources.data_ptr<tq::RamBlockView>(),s.capacity,selected.data_ptr<tq::SelectedBlock>(),queries,count,
         a.first.data_ptr<std::uint32_t>(),a.views.data_ptr<tq::TqBlockView>(),a.payload.data_ptr(),a.payload.numel(),a.stride,
         probe?probe->copied.data_ptr<std::uint64_t>():nullptr,mfq_current_cuda_stream(),a.stride<2*s.fp16_bytes));
@@ -2265,8 +2265,12 @@ QsaRamCache::Tensor QsaRamCache::stage(const Tensor& selected,int queries,int co
     }
     copy_guard.pending=false;
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static thread_local unsigned reported=0;const unsigned mask=1u<<(queries-1);
-        if(!(reported&mask)){reported|=mask;std::fprintf(stderr,"native_qsa_ram_stage actual_match=1 queries=%d bits=%d union_copy=1 cache_bytes=%zu shared_stream_arena=1\n",queries,s.bits,s.gpu_cache.payload_bytes);}
+        const bool unique_cached=unique_selection && !split_copy && !deferred_cache && s.gpu_cache.sets;
+        static thread_local unsigned reported=0;
+        const unsigned mask=1u<<(queries-1+(unique_cached?8:0));
+        if(!(reported&mask)){reported|=mask;std::fprintf(stderr,
+            "native_qsa_ram_stage actual_match=1 queries=%d bits=%d union_copy=1 cache_bytes=%zu shared_stream_arena=1 unique_selection=%d\n",
+            queries,s.bits,s.gpu_cache.payload_bytes,int(unique_cached));}
     }
     return a.views;
 }
