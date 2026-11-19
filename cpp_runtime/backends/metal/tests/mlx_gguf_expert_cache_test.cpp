@@ -133,6 +133,19 @@ int main() {
         check(cache.apply_ffn(0, x, only_zero, weights), reference(only_zero));
         require(cache.stats().misses == after_insert.misses && cache.stats().hits == after_insert.hits + 1,
             "GGUF LRU retained numeric expert order instead of the last token's accesses");
+        {
+            MlxGgufExpertCache reuse(model, {"model.block.0"}, one_expert * 2, 4);
+            const array only_one({1, 1, 1, 1}, {2, 2}, int32);
+            check(reuse.apply_ffn(0, x, only_zero, weights), reference(only_zero));
+            check(reuse.apply_ffn(0, x, only_zero, weights), reference(only_zero));
+            check(reuse.apply_ffn(0, x, only_one, weights), reference(only_one));
+            check(reuse.apply_ffn(0, x, only_two, weights), reference(only_two));
+            const auto before = reuse.stats();
+            check(reuse.apply_ffn(0, x, only_zero, weights), reference(only_zero));
+            require(reuse.stats().hits == before.hits + 1 && reuse.stats().misses == before.misses,
+                "multi-row GGUF decode evicted a reused expert ahead of a one-use page");
+            require(reuse.resident_bytes() <= reuse.limit_bytes(), "expert reuse exceeded the cache budget");
+        }
         require(cache.resident_bytes() <= cache.limit_bytes(), "GGUF cache exceeded budget");
         require(cache.set_limit(one_expert) > 0 && cache.resident_bytes() <= one_expert, "GGUF cache shrink did not evict");
         const array distinct({0, 1, 2, 3}, {2, 2}, int32);
