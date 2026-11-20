@@ -1,6 +1,8 @@
 #pragma once
 
 #include "tyloinfer/token_constraint.h"
+#include "tyloinfer/decision_model.h"
+#include "decision.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "mlx_mtp.h"
@@ -116,7 +118,9 @@ public:
         std::optional<Qwen35Linear> output,
         mlx::core::Dtype activation_dtype = mlx::core::float16,
         std::optional<MlxQwen35MtpModule> mtp = std::nullopt,
-        std::optional<MlxGridVisionPromptComponent> vision = std::nullopt);
+        std::optional<MlxGridVisionPromptComponent> vision = std::nullopt,
+        std::optional<DecisionModelSpec> decision = std::nullopt,
+        std::optional<mlx::core::array> decision_readout = std::nullopt);
 
     // token_ids must be a non-empty [batch,tokens] array. Cached calls append
     // contiguously; uncached calls do not mutate existing cache state.
@@ -172,6 +176,8 @@ public:
 
     void reset_cache(int batch = 1);
     mlx::core::array score_forward(const mlx::core::array& token_ids, bool last_token_only);
+    bool supports_decisions() const noexcept { return decision_.has_value(); }
+    mfq::engine::DecisionResult decide(const mfq::engine::DecisionTokens& request);
     void clear_cache() noexcept;
     void reset_generation_state() noexcept;
 
@@ -279,6 +285,12 @@ private:
         bool use_cache,
         int speculative_confirmed = 0,
         bool full_logits = true);
+    mlx::core::array backbone_forward(
+        const mlx::core::array& embeddings,
+        const mlx::core::array* positions,
+        bool use_cache,
+        int speculative_confirmed,
+        std::optional<int> decision_state = std::nullopt);
     std::pair<mlx::core::array, mlx::core::array>
     forward_with_hidden(
         const mlx::core::array& token_ids,
@@ -301,6 +313,8 @@ private:
     mlx::core::Dtype activation_dtype_;
     std::optional<MlxQwen35MtpModule> mtp_;
     std::optional<MlxGridVisionPromptComponent> vision_;
+    std::optional<DecisionModelSpec> decision_;
+    std::optional<mlx::core::array> decision_readout_;
     MlxMtpGenerationStats last_mtp_stats_;
     mfq::engine::mtp::PolicyState mtp_policy_state_;
     std::vector<std::size_t> last_prefill_chunk_sizes_;

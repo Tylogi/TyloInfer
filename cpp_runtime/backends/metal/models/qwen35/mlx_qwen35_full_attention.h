@@ -113,6 +113,7 @@ public:
         const mlx::core::array& positions,
         int position_offset,
         bool use_cache);
+    mlx::core::array forward_decision(const mlx::core::array& input, int state_tokens);
 
     mlx::core::array operator()(
         const mlx::core::array& input,
@@ -151,7 +152,8 @@ private:
         const mlx::core::array& input,
         const mlx::core::array* positions,
         int position_offset,
-        bool use_cache);
+        bool use_cache,
+        int state_tokens = 0);
 
     Qwen35Config config_;
     MlxRmsNorm attention_norm_;

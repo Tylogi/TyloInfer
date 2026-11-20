@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -24,6 +26,31 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
+
+array load_decision_weight(const ModelSource& source, int hidden) {
+    namespace mx = mlx::core;
+    if (!source.has_asset(kDecisionReadoutAsset))
+        throw std::invalid_argument("trained decision model is missing readout.safetensors");
+    const auto bytes = source.read_asset(kDecisionReadoutAsset);
+    const auto [dtype, values] = parse_decision_readout(bytes, hidden);
+    const Shape shape{255, hidden};
+    auto weight = [&] {
+        if (dtype == "F32") {
+            std::vector<float> data(values.size() / sizeof(float));
+            std::memcpy(data.data(), values.data(), values.size());
+            return array(data.data(), shape, mx::float32);
+        }
+        std::vector<std::uint16_t> data(values.size() / sizeof(std::uint16_t));
+        std::memcpy(data.data(), values.data(), values.size());
+        return mx::astype(mx::view(array(data.data(), shape, mx::uint16),
+            dtype == "BF16" ? mx::bfloat16 : mx::float16), mx::float32);
+    }();
+    weight.eval();
+    const auto* values_f32 = weight.data<float>();
+    if (!std::all_of(values_f32, values_f32 + weight.size(), [](float value) { return std::isfinite(value); }))
+        throw std::invalid_argument("decision readout contains nonfinite weights");
+    return weight;
+}
 
 // One predictor layer is recurrently chained; it does not limit the chain to
 // one token. This is the model-family capability consumed by the common MTP
@@ -376,10 +403,17 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const Qwen35Config& config,
     const Qwen35TensorNames& names) {
     const auto& runtime_config = config;
+    const auto* source = model.native_source();
+    auto decision = source ? decision_model_spec(*source) : std::nullopt;
+    const bool trained_readout = decision && !decision->vocabulary_readout;
+    std::optional<array> decision_weight;
+    if (trained_readout)
+        decision_weight = load_decision_weight(*source, checked_positive_int(config.hidden_size, "hidden_size"));
     validate_qwen35_model_bindings(
         model,
         runtime_config,
-        names);
+        names,
+        trained_readout);
 
     std::vector<MlxQwen35Layer> layers;
     layers.reserve(
@@ -414,7 +448,7 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
     auto embedding =
         Qwen35Embedding::load(model, names.token_embedding);
     std::optional<Qwen35Linear> output;
-    if (!runtime_config.tie_word_embeddings) {
+    if (!runtime_config.tie_word_embeddings && (!trained_readout || model.contains(names.output))) {
         output.emplace(
             Qwen35Linear::load(model, names.output));
     }
@@ -433,8 +467,11 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
             runtime_config.rms_norm_eps,
             runtime_config.norm_weight_offset),
         std::move(output),
-        mlx::core::float16,
-        std::move(mtp));
+        trained_readout ? mlx::core::bfloat16 : mlx::core::float16,
+        std::move(mtp),
+        std::nullopt,
+        std::move(decision),
+        std::move(decision_weight));
 }
 
 MlxQwen35CausalLm::MlxQwen35CausalLm(
@@ -445,7 +482,9 @@ MlxQwen35CausalLm::MlxQwen35CausalLm(
     std::optional<Qwen35Linear> output,
     mlx::core::Dtype activation_dtype,
     std::optional<MlxQwen35MtpModule> mtp,
-    std::optional<MlxGridVisionPromptComponent> vision)
+    std::optional<MlxGridVisionPromptComponent> vision,
+    std::optional<DecisionModelSpec> decision,
+    std::optional<array> decision_readout)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -453,7 +492,9 @@ MlxQwen35CausalLm::MlxQwen35CausalLm(
       output_(std::move(output)),
       activation_dtype_(activation_dtype),
       mtp_(std::move(mtp)),
-      vision_(std::move(vision)) {
+      vision_(std::move(vision)),
+      decision_(std::move(decision)),
+      decision_readout_(std::move(decision_readout)) {
     validate_components();
 }
 
@@ -470,9 +511,10 @@ void MlxQwen35CausalLm::validate_components() const {
         config_.max_position_embeddings,
         "max_position_embeddings");
     if (activation_dtype_ != mlx::core::float16 &&
+        activation_dtype_ != mlx::core::bfloat16 &&
         activation_dtype_ != mlx::core::float32) {
         throw std::runtime_error(
-            "Qwen3.5 activation dtype must be float16 or float32");
+            "Qwen3.5 activation dtype must be floating point");
     }
     if (embedding_.vocabulary_size() != vocab ||
         embedding_.hidden_size() != hidden ||
@@ -486,12 +528,12 @@ void MlxQwen35CausalLm::validate_components() const {
                 "Qwen3.5 tied embeddings must not provide a separate "
                 "output weight");
         }
-    } else if (!output_.has_value()) {
+    } else if (!output_ && !decision_readout_) {
         throw std::runtime_error(
             "Qwen3.5 untied embeddings require an output weight");
-    } else if (
+    } else if (output_ && (
         output_->input_size() != hidden ||
-        output_->output_size() != vocab) {
+        output_->output_size() != vocab)) {
         throw std::runtime_error(
             "Qwen3.5 causal LM output dimensions mismatch");
     }
@@ -531,6 +573,75 @@ array MlxQwen35CausalLm::score_forward(const array& token_ids, bool last_token_o
     if (token_ids.ndim() != 2 || token_ids.shape(0) != 1 || token_ids.shape(1) <= 0)
         throw std::invalid_argument("score token IDs must have [1,tokens] shape");
     return forward_embeddings_impl(embed_tokens(token_ids), nullptr, false, 0, !last_token_only).first;
+}
+
+mfq::engine::DecisionResult MlxQwen35CausalLm::decide(const mfq::engine::DecisionTokens& request) {
+    namespace mx = mlx::core;
+    using Clock = std::chrono::steady_clock;
+    if (!decision_) throw std::invalid_argument("decision reads are unavailable for this model");
+    if (request.reads.empty() || request.reads.size() > 64)
+        throw std::invalid_argument("decision requests require 1 to 64 reads");
+    const auto& spec = *decision_;
+    std::size_t total = 0;
+    for (const auto& read : request.reads) {
+        const auto tokens = read.prompt.size();
+        if (!tokens || tokens > std::size_t(config_.max_position_embeddings) ||
+                (spec.max_tokens && tokens > *spec.max_tokens) || tokens > 1048576 - total ||
+                read.labels.empty() || read.labels.size() > 255)
+            throw std::invalid_argument("invalid decision prompt or label count");
+        if (spec.attention == DecisionAttention::prefix_bidirectional &&
+                (!read.state_tokens || read.state_tokens >= tokens))
+            throw std::invalid_argument("decision state boundary is outside the prompt");
+        if (std::any_of(read.prompt.begin(), read.prompt.end(),
+                [&](auto token) { return token < 0 || token >= config_.vocab_size; }))
+            throw std::invalid_argument("decision prompt token is outside the vocabulary");
+        std::unordered_set<std::int64_t> labels;
+        for (const auto id : read.labels) {
+            if (id < 0 || id >= config_.vocab_size || !labels.insert(id).second ||
+                    (!spec.vocabulary_readout &&
+                        std::find(spec.token_ids.begin(), spec.token_ids.end(), id) == spec.token_ids.end()))
+                throw std::invalid_argument("invalid or untrained decision label");
+        }
+        total += tokens;
+    }
+    mfq::engine::DecisionResult result;
+    for (const auto& read : request.reads) {
+        const auto begin = Clock::now();
+        const int tokens = static_cast<int>(read.prompt.size());
+        const std::vector<std::int32_t> ids(read.prompt.begin(), read.prompt.end());
+        const array input(ids.data(), {1, tokens}, mx::int32);
+        const int boundary = spec.attention == DecisionAttention::bidirectional ? -1
+            : spec.attention == DecisionAttention::prefix_bidirectional ? static_cast<int>(read.state_tokens) : 0;
+        auto hidden = backbone_forward(embed_tokens(input), nullptr, false, 0, boundary);
+        auto last = output_norm_(mx::slice(hidden, {0, tokens - 1, 0}, {1, tokens, hidden.shape(2)}));
+        std::vector<std::int32_t> rows;
+        rows.reserve(read.labels.size());
+        for (const auto id : read.labels) {
+            if (spec.vocabulary_readout) rows.push_back(static_cast<std::int32_t>(id));
+            else rows.push_back(static_cast<std::int32_t>(
+                std::find(spec.token_ids.begin(), spec.token_ids.end(), id) - spec.token_ids.begin()));
+        }
+        const auto indices = array(rows.data(), {static_cast<int>(rows.size())}, mx::int32);
+        auto logits = [&] {
+            if (decision_readout_)
+                return mx::matmul(mx::astype(last, mx::float32), mx::transpose(mx::take(*decision_readout_, indices, 0)));
+            if (config_.tie_word_embeddings)
+                return mx::matmul(mx::astype(last, mx::float32), mx::transpose(embedding_(indices, mx::float32)));
+            return output_->project_rows(last, indices);
+        }();
+        logits = mx::contiguous(mx::reshape(logits, {-1}));
+        logits.eval();
+        const auto temperature = spec.temperature_for(read.type, request.reads.size());
+        const auto* scores = logits.data<float>();
+        std::vector<double> scaled;
+        scaled.reserve(rows.size());
+        for (std::size_t i = 0; i < rows.size(); ++i) scaled.push_back(scores[i] / temperature);
+        auto answer = mfq::engine::normalize_decision(read.labels, scaled);
+        answer.prompt_tokens = tokens;
+        answer.prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        result.reads.push_back(std::move(answer));
+    }
+    return result;
 }
 
 array MlxQwen35CausalLm::forward(
@@ -641,6 +752,21 @@ MlxQwen35CausalLm::forward_embeddings_impl(
     bool use_cache,
     int speculative_confirmed,
     bool full_logits) {
+    auto hidden = backbone_forward(embeddings, positions, use_cache, speculative_confirmed);
+    const int tokens = hidden.shape(1);
+    auto head_input = full_logits ? hidden : mlx::core::slice(hidden, {0, tokens - 1, 0},
+        {hidden.shape(0), tokens, hidden.shape(2)});
+    auto logits = project_logits(head_input);
+    if (use_cache) cache_position_ += tokens;
+    return {std::move(logits), std::move(hidden)};
+}
+
+array MlxQwen35CausalLm::backbone_forward(
+    const array& embeddings,
+    const array* positions,
+    bool use_cache,
+    int speculative_confirmed,
+    std::optional<int> decision_state) {
     if (embeddings.ndim() != 3 ||
         embeddings.shape(0) <= 0 ||
         embeddings.shape(1) <= 0 ||
@@ -699,6 +825,9 @@ MlxQwen35CausalLm::forward_embeddings_impl(
         hidden = std::visit(
             [&](auto& block) {
                 using Block = std::decay_t<decltype(block)>;
+                if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>) {
+                    if (decision_state) return block.forward_decision(hidden, *decision_state);
+                }
                 if constexpr (std::is_same_v<
                                   Block,
                                   MlxQwen35LinearAttentionBlock>) {
@@ -726,23 +855,11 @@ MlxQwen35CausalLm::forward_embeddings_impl(
             captured.push_back(hidden);
         if (dispatch_decode && (layer_index < 6 || layer_index % 3 == 0))
             mlx::core::async_eval({hidden});
+        if (decision_state) hidden.eval();
         ++layer_index;
     }
     if (!captured.empty()) hidden_capture_ = mlx::core::concatenate(captured, -1);
-    auto head_input = full_logits
-        ? hidden
-        : mlx::core::slice(
-              hidden,
-              Shape{0, tokens - 1, 0},
-              Shape{
-                  batch,
-                  tokens,
-                  static_cast<int>(config_.hidden_size)});
-    auto logits = project_logits(head_input);
-    if (use_cache) {
-        cache_position_ += tokens;
-    }
-    return {std::move(logits), std::move(hidden)};
+    return hidden;
 }
 
 std::pair<array, array>
@@ -807,6 +924,8 @@ array MlxQwen35CausalLm::project_logits(
 
 array MlxQwen35CausalLm::project_normalized(
     const array& hidden) const {
+    if (!config_.tie_word_embeddings && !output_)
+        throw std::invalid_argument("this model has only a trained decision readout");
     return config_.tie_word_embeddings
         ? embedding_.project(hidden)
         : (*output_)(hidden);

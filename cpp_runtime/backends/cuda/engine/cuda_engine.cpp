@@ -665,7 +665,8 @@ struct CudaEngineState {
                                 if(!decision_model->vocabulary_readout && found==decision_model->token_ids.end())
                                     throw std::invalid_argument("decision label is absent from trained codebook");
                                 const auto row=decision_model->vocabulary_readout?i:std::size_t(found-decision_model->token_ids.begin());
-                                selected.push_back(logits.template data_ptr<float>()[row]/decision_model->temperature_for(read.type));
+                                selected.push_back(logits.template data_ptr<float>()[row] /
+                                    decision_model->temperature_for(read.type, value.reads.size()));
                             }
                         } else if(value.full_vocabulary) {
                             auto logits=language.logits_from_hidden(prepared.hidden).to(mfq_tensor_backend::kFloat32)

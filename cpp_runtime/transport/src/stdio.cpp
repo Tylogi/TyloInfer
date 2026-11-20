@@ -831,7 +831,9 @@ public:
                 }
                 if(op=="decide") {
                     if(!scheduler.info().decisions)throw ApiError(501,"decisions_unavailable","decision reads are unavailable for this model");
-                    auto request=parse_decision_request(params,true);
+                    const auto decision_params = nlohmann::ordered_json::parse(line)
+                        .value("params", nlohmann::ordered_json::object());
+                    auto request=parse_decision_request(decision_params,true);
                     if(!request.model.empty() && request.model!=config_.model_name)
                         throw ApiError(404,"model_not_found","the requested decision model is not served","model");
                     try {

@@ -467,11 +467,16 @@ array MlxQwen35FullAttentionBlock::forward(
         use_cache);
 }
 
+array MlxQwen35FullAttentionBlock::forward_decision(const array& input, int state_tokens) {
+    return forward_impl(input, nullptr, 0, false, state_tokens);
+}
+
 array MlxQwen35FullAttentionBlock::forward_impl(
     const array& input,
     const array* positions,
     int position_offset,
-    bool use_cache) {
+    bool use_cache,
+    int state_tokens) {
     if (input.ndim() != 3 ||
         input.shape(0) <= 0 ||
         input.shape(1) <= 0 ||
@@ -625,11 +630,27 @@ array MlxQwen35FullAttentionBlock::forward_impl(
         }
     }
 
-    auto attended = use_cache && cache_->quantized() ? cache_->attention(query) : scaled_dot_product_attention(
-        query,
-        key_cache,
-        value_cache,
-        true);
+    auto attended = [&] {
+        if (state_tokens == 0)
+            return use_cache && cache_->quantized() ? cache_->attention(query)
+                : scaled_dot_product_attention(query, key_cache, value_cache, true);
+        const auto bidirectional = [](const array& q, const array& k, const array& v) {
+            const int dim = q.shape(3);
+            const float scale = 1.0f / std::sqrt(float(dim));
+            if (dim == 64 || dim == 96 || dim == 128 || dim == 256)
+                return mlx::core::fast::scaled_dot_product_attention(q, k, v, scale, "",
+                    std::nullopt, std::nullopt, true);
+            return scaled_dot_product_attention(q, k, v, false, scale);
+        };
+        if (state_tokens < 0) return bidirectional(query, key, value);
+        const auto rows = [](const array& x, int first, int last) {
+            return mlx::core::slice(x, {0, 0, first, 0}, {x.shape(0), x.shape(1), last, x.shape(3)});
+        };
+        auto state = bidirectional(rows(query, 0, state_tokens),
+            rows(key, 0, state_tokens), rows(value, 0, state_tokens));
+        auto question = bidirectional(rows(query, state_tokens, tokens), key, value);
+        return mlx::core::concatenate({state, question}, 2);
+    }();
     detail::profile_eval("qwen35.full_attention.sdpa", attended);
     attended = mlx::core::reshape(
         mlx::core::transpose(attended, {0, 2, 1, 3}),

@@ -18,6 +18,8 @@ EngineStatus MlxEngine::status() const {
 }
 Admission MlxEngine::admit(EngineRequest request) {
     if (!model_) throw std::runtime_error("Metal engine is unloaded");
+    if (info_.decisions)
+        throw InferenceInputError(InferenceInputErrorCode::Unsupported, "D3 is a decision model; use /v1/systemone");
     return requests_.admit(std::move(request), text_.get(), info_, *this);
 }
 void MlxEngine::cancel(const RequestId& id) { requests_.cancel(id); }
@@ -49,6 +51,12 @@ ControlResult MlxEngine::control(ControlRequest request) {
             return text_->decode_tokens(value.tokens, value.excluded);
         else if constexpr (std::is_same_v<T, CountTokens>)
             return TokenCount{text_->count_tokens(value.prompt), info_.max_context};
+        else if constexpr (std::is_same_v<T, DecisionText>) {
+            if (!info_.decisions) throw std::invalid_argument("decision reads are unavailable for this model");
+            if (!requests_.empty() || duplex_active_)
+                throw ControlBusyError("decision reads require an idle runtime");
+            return model_->control(text_->prepare_decisions(value, info_.max_context));
+        }
         else if constexpr (std::is_same_v<T, ScoreText>) {
             if (!info_.probability) throw std::invalid_argument("probability scoring is unavailable for this model");
             if (!requests_.empty() || duplex_active_)

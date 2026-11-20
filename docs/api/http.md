@@ -718,9 +718,11 @@ compatible weights, backend support and scheduling are still required.
 
 `POST /v1/systemone` returns one JSON decision result, not a chat completion or
 SSE stream. It requires a model with a supported native decision implementation.
-A model appearing in `/v1/models`, or this route being present, does not by itself
-establish decision capability. The CUDA and Metal d1 text adapters use this same route and
-the existing managed model lifecycle; see [d1 setup and limitations](../cli/d1-native.md#managed-serving).
+The CUDA and Metal runtimes serve D3 text and JSON decisions on this route
+from Qwen3.5 checkpoints with a trained HF decision head or D3 GGUF metadata.
+Metal keeps D3 weights resident. D3 image and video decisions, Box, and Track
+are outside the text API. The CUDA and Metal d1 text adapters share this
+route and the managed model lifecycle. See [d1 setup and limitations](../cli/d1-native.md#managed-serving).
 
 The managed runtime must be ready and idle. Readiness is checked first: a runtime
 in `BUSY` state (including an active chat request) or otherwise not `READY`

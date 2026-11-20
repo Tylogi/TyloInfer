@@ -49,9 +49,10 @@ static bool authorized(const httplib::Request & req, httplib::Response & res, co
     return false;
 }
 
-static json parse_body(const httplib::Request & req) {
+template <class Json = json>
+static Json parse_body(const httplib::Request & req) {
     try {
-        return json::parse(req.body);
+        return Json::parse(req.body);
     } catch (const json::parse_error & error) {
         throw ApiError(400, "invalid_request_error", std::string("invalid JSON: ") + error.what());
     }
@@ -861,7 +862,7 @@ int run_mfq_http_transport(
         if(!authorized(req,res,config.api_key))return;
         try {
             if(!scheduler.info().decisions)throw ApiError(501,"decisions_unavailable","decision reads are unavailable for this model");
-            auto request=parse_decision_request(parse_body(req),true);
+            auto request=parse_decision_request(parse_body<nlohmann::ordered_json>(req),true);
             if(!request.model.empty() && request.model!=config.model_name)
                 throw ApiError(404,"model_not_found","the requested decision model is not served","model");
             const auto result=std::get<mfq::engine::DecisionResult>(scheduler.control(request.input));

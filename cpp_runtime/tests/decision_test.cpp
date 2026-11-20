@@ -82,12 +82,30 @@ int main() {
     assert(!parse_decision_request(conditional,true).input.full_vocabulary);
     result.reads.pop_back();rejects([&]{decision_result_json(request,result,"sample");});
 
+    const auto ordered = parse_decision_request(nlohmann::ordered_json::parse(
+        R"({"state":{"z":"inside, colon:","a":[1,2]},"questions":{
+            "z":{"type":"choice","criteria":{"green":null,"blue":null}},
+            "a":{"type":"noul"}}})"));
+    assert(ordered.questions.front().id == "z");
+    assert(ordered.questions.front().options == std::vector<std::string>({"green", "blue"}));
+    assert(ordered.input.reads.front().state == R"({"z": "inside, colon:", "a": [1, 2]})");
+
     json spec{{"format_version",1},{"format_id","d3-code-readout-v1"},{"attention_mode","prefix_bidir"},
         {"temperature",0.75},{"validated_length",32768},{"max_length",65536}};
     for(int i=0;i<255;++i){spec["codes"].push_back("code"+std::to_string(i));spec["token_ids"].push_back(i);}
     const auto trained=mfq::parse_decision_model(spec.dump());
     assert(trained.attention==mfq::DecisionAttention::prefix_bidirectional && trained.max_tokens==32768);
     assert(trained.temperature==0.75 && trained.codes.size()==255);
+    auto calibrated = spec;
+    calibrated["prompt_layout"] = "header-v1";
+    calibrated["temperature_by_questions"] = {{"max_questions", {1, 4}}, {"temperature", {1.05, 1.1, 1.2}}};
+    const auto header = mfq::parse_decision_model(calibrated.dump());
+    assert(header.question_header);
+    assert(header.temperature_for("choice", 1) == 1.05);
+    assert(header.temperature_for("noul", 4) == 1.1);
+    assert(header.temperature_for("score", 5) == 1.2);
+    calibrated["temperature_by_questions"]["max_questions"] = {4, 1};
+    rejects([&] { mfq::parse_decision_model(calibrated.dump()); });
     for(const auto& patch:{json{{"attention_mode","unknown"}},json{{"temperature",0}},
         json{{"pooling","mean"}},json{{"max_length",-1}},json{{"format_version",2}},
         json{{"prompt","other"}},json{{"codes",json::array({"A"})}}}) {

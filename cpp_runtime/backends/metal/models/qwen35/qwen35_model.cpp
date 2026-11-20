@@ -890,7 +890,8 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
 void validate_qwen35_model_bindings(
     const MfqContainer& model,
     const Qwen35Config& config,
-    const Qwen35TensorNames& names) {
+    const Qwen35TensorNames& names,
+    bool trained_readout) {
     require_tensor(
         model,
         names.token_embedding,
@@ -907,7 +908,7 @@ void validate_qwen35_model_bindings(
             names.output,
             {config.vocab_size, config.hidden_size},
             false);
-    } else if (!config.tie_word_embeddings) {
+    } else if (!config.tie_word_embeddings && !trained_readout) {
         throw std::runtime_error(
             "Qwen3.5 model is missing untied output tensor: " +
             names.output);
@@ -1086,6 +1087,15 @@ Qwen35Linear::Qwen35Linear(MlxLinear linear)
 
 array Qwen35Linear::operator()(const array& input) const {
     return linear_(input);
+}
+
+array Qwen35Linear::project_rows(const array& input, const array& rows) const {
+    namespace mx = mlx::core;
+    if (const auto* weight = linear_.gguf_weight_ref())
+        return mx::matmul(mx::astype(input, mx::float32), mx::transpose(weight->embedding(rows, mx::float32)));
+    if (const auto* weight = linear_.dense_weight_ref())
+        return mx::matmul(mx::astype(input, mx::float32), mx::transpose(mx::astype(mx::take(*weight, rows, 0), mx::float32)));
+    return mx::astype(mx::take(linear_(input), rows, -1), mx::float32);
 }
 
 Qwen35Embedding Qwen35Embedding::load(

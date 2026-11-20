@@ -1973,6 +1973,13 @@ class RuntimePool:
                 raise BackendError("runtime_maintenance_timeout", "runtime maintenance did not finish in time; retry the request",
                     retryable=True, status_code=503) from None
 
+    def _require_generation_model(self, instance: _Runtime) -> None:
+        if (self.backend == "metal" and instance.artifact.resource.structured_decisions
+                and not is_d1_config(instance.artifact.source_config)):
+            raise BackendError(
+                "generation_unavailable", "D3 is a decision model; use /v1/systemone", status_code=501,
+            )
+
     async def preflight(
         self,
         *,
@@ -2008,6 +2015,7 @@ class RuntimePool:
                 response_format=response_format,
             )
             return
+        self._require_generation_model(instance)
         if is_d1_config(instance.artifact.source_config):
             await instance.backend.preflight(model=instance.artifact.resource.name)
         async with self._lock:
@@ -2054,6 +2062,7 @@ class RuntimePool:
                 async for delta in fallback_stream:
                     yield delta
             return
+        self._require_generation_model(instance)
         assert instance.request_slots is not None
         async with self._lock:
             await self._wait_for_runtime_maintenance_locked(instance, global_only=True)
