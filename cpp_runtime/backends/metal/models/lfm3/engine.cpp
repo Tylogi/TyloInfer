@@ -2,7 +2,9 @@
 #include "models/lfm3/layer_weights.h"
 #include "models/lfm3/request.h"
 #include "mlx_gguf.h"
+#include "mlx_platform.h"
 #include <mlx/backend/metal/metal.h>
+#include <mlx/fast.h>
 
 #include <algorithm>
 #include <chrono>
@@ -273,6 +275,13 @@ struct Engine::Impl {
         return activate(columns(projection, 0, width), columns(projection, width, width));
     }
 
+    array project_attention(const array& output, const array& gate) {
+        auto mixed = mx::transpose(output, {1, 0, 2});
+        auto gates = fp32(rounded(mx::sigmoid(fp32(gate))));
+        return project(mx::reshape(rounded(fp32(mixed) * mx::expand_dims(gates, -1)),
+            {mixed.shape(0), config.heads * config.head_dim}), "self_attn.o_proj.weight");
+    }
+
     array attention(const array& q, const array& k, const array& v, const array& gate, bool sliding) {
         const int tokens = q.shape(0), dim = config.head_dim, half = dim / 2;
         const double theta = sliding ? config.sliding_theta : config.full_theta;
@@ -294,6 +303,27 @@ struct Engine::Impl {
         auto queries = qk(q, "self_attn.q_norm.weight", config.heads);
         auto keys = qk(k, "self_attn.k_norm.weight", config.kv_heads);
         auto values = fp32(mx::transpose(mx::reshape(v, {tokens, config.kv_heads, dim}), {1, 0, 2}));
+        const int state_tokens = request->state_tokens;
+        const auto first_group = request->groups.begin() + state_tokens;
+        const bool mixed_groups = !sliding && !std::all_of(first_group, request->groups.end(),
+            [&](int group) { return group == *first_group; });
+        const float scale = 1.0f / std::sqrt(float(dim));
+        std::vector<array> tiles;
+        int first_query = 0;
+        // State queries see every key. Keep question masks on the tiled FP32 path.
+        const int unmasked_queries = mixed_groups ? state_tokens : tokens;
+        const auto* tf32 = std::getenv("MLX_ENABLE_TF32");
+        if (!sliding && dim == 128 && unmasked_queries >= 1024 && (!tf32 || std::atoi(tf32) != 0)
+                && !metal::mlx_metal_nax_disabled() && metal::mlx_apple_chip_starts_with("Apple M5")) {
+            auto rows = mx::slice(queries, {0, 0, 0}, {config.heads, unmasked_queries, dim});
+            auto attended = rounded(mx::squeeze(mx::fast::scaled_dot_product_attention(
+                mx::expand_dims(rows, 0), mx::expand_dims(keys, 0), mx::expand_dims(values, 0), scale), 0));
+            if (unmasked_queries == tokens) return project_attention(attended, gate);
+            attended.eval();
+            tiles.push_back(std::move(attended));
+            first_query = unmasked_queries;
+        }
+
         const int groups_per_head = config.heads / config.kv_heads;
         if (groups_per_head > 1) {
             keys = mx::repeat(keys, groups_per_head, 0);
@@ -301,30 +331,32 @@ struct Engine::Impl {
         }
         keys = mx::transpose(keys, {0, 2, 1});
         auto group = host_ids(request->groups);
-        auto key_pos = mx::reshape(positions, {1, tokens});
         auto key_group = mx::reshape(group, {1, tokens});
-        auto state = array(request->state_tokens, mx::int32);
-        std::vector<array> tiles;
+        auto state = array(state_tokens, mx::int32);
         constexpr int tile = 256;
-        for (int start = 0; start < tokens; start += tile) {
+        for (int start = first_query; start < tokens; start += tile) {
             const int end = std::min(start + tile, tokens), count = end - start;
-            auto query_pos = mx::reshape(mx::slice(positions, {start}, {end}), {count, 1});
-            auto query_group = mx::reshape(mx::slice(group, {start}, {end}), {count, 1});
-            auto visible = sliding
-                ? mx::logical_and(mx::less_equal(key_pos, query_pos), mx::greater(key_pos, query_pos - config.window))
-                : mx::logical_or(mx::logical_or(mx::less(query_pos, state),
-                    mx::less(key_pos, state)), mx::equal(key_group, query_group));
+            // The union of the causal windows for these queries.
+            const int first_key = sliding ? std::max(0, start - (config.window - 1)) : 0;
+            const int last_key = sliding ? end : tokens;
             auto row_q = mx::slice(queries, {0, start, 0}, {config.heads, end, dim});
-            auto scores = mx::matmul(row_q, keys) * (1.0f / std::sqrt(float(dim)));
-            scores = mx::where(visible, scores, array(-std::numeric_limits<float>::infinity()));
-            auto tile_output = rounded(mx::matmul(mx::softmax(scores, -1, true), values));
+            auto tile_keys = sliding ? mx::slice(keys, {0, 0, first_key}, {config.heads, dim, last_key}) : keys;
+            auto tile_values = sliding ? mx::slice(values, {0, first_key, 0}, {config.heads, last_key, dim}) : values;
+            auto scores = mx::matmul(row_q, tile_keys) * scale;
+            if (sliding || (mixed_groups && end > state_tokens)) {
+                auto key_pos = mx::reshape(mx::slice(positions, {first_key}, {last_key}), {1, last_key - first_key});
+                auto query_pos = mx::reshape(mx::slice(positions, {start}, {end}), {count, 1});
+                auto visible = sliding
+                    ? mx::logical_and(mx::less_equal(key_pos, query_pos), mx::greater(key_pos, query_pos - config.window))
+                    : mx::logical_or(mx::logical_or(mx::less(query_pos, state), mx::less(key_pos, state)),
+                        mx::equal(key_group, mx::reshape(mx::slice(group, {start}, {end}), {count, 1})));
+                scores = mx::where(visible, scores, array(-std::numeric_limits<float>::infinity()));
+            }
+            auto tile_output = rounded(mx::matmul(mx::softmax(scores, -1, true), tile_values));
             tile_output.eval();
             tiles.push_back(std::move(tile_output));
         }
-        auto mixed = mx::transpose(mx::concatenate(tiles, 1), {1, 0, 2});
-        auto gates = fp32(rounded(mx::sigmoid(fp32(gate))));
-        return project(mx::reshape(rounded(fp32(mixed) * mx::expand_dims(gates, -1)), {tokens, config.heads * dim}),
-            "self_attn.o_proj.weight");
+        return project_attention(mx::concatenate(tiles, 1), gate);
     }
 
     array attend(const array& x, std::size_t layer) {
