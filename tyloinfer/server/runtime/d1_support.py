@@ -9,7 +9,11 @@ from pathlib import Path
 
 from tyloinfer.formats.gguf import _metadata_stream, _MetadataReader
 from tyloinfer.runtime.d1_contract import D1Calibration, D1Contract
-from tyloinfer.server.runtime.native import NativeRuntimeError, find_native_runtime_resource
+from tyloinfer.server.runtime.native import (
+    NativeRuntimeError,
+    find_native_runtime_resource,
+    native_runtime_environment,
+)
 
 
 def is_d1_config(config: dict | None) -> bool:
@@ -67,13 +71,13 @@ def d1_gguf_metadata(path: Path) -> dict | None:
 
 def d1_launch_configuration(executable: Path, artifact, request, *, transport: str, port: int,
                             backend: str, environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
-    if backend != 'cuda':
-        raise NativeRuntimeError('d1 native serving currently requires the CUDA backend')
+    if backend not in {'cuda', 'metal'}:
+        raise NativeRuntimeError('d1 native serving requires a CUDA or Metal backend')
     root = d1_assets(artifact.path)
     name = 'tyloinfer-d1-native' + ('.exe' if os.name == 'nt' else '')
     binary = find_native_runtime_resource(executable, name)
     if binary is None:
-        raise NativeRuntimeError('the CUDA runtime installation is missing tyloinfer-d1-native')
+        raise NativeRuntimeError(f'the {backend} runtime installation is missing tyloinfer-d1-native')
     command = [sys.executable, '-m', 'tyloinfer.server.runtime.d1_worker', '--native', str(binary),
                '--assets', str(root), '--weights', str(artifact.path), '--model-name', artifact.resource.name,
                '--ctx-size', str(request.context_size), '--transport', transport,
@@ -82,6 +86,6 @@ def d1_launch_configuration(executable: Path, artifact, request, *, transport: s
         command.extend(['--host', '127.0.0.1', '--port', str(port)])
     result = dict(os.environ)
     result.update(environment)
-    if request.device_ids:
+    if backend == 'cuda' and request.device_ids:
         result['CUDA_VISIBLE_DEVICES'] = ','.join(request.device_ids)
-    return command, result
+    return command, native_runtime_environment(binary, backend, result)

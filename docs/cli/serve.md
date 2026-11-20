@@ -388,8 +388,9 @@ is forwarded to CUDA workers only for artifacts marked `structured_decisions`;
 it is not a general MoE expert-cache switch. API loading uses the corresponding
 `jev_weights` field, also defaulting to `"stream"`. See the
 [decision request contract](../api/http.md#82-structured-decisions) for request
-fields and exclusive-runtime limits. The CUDA d1 text adapter uses this same API
-but requires resident weights: use `--jev-weights vram` for CLI startup loading.
+fields and exclusive-runtime limits. The d1 text adapter supports CUDA and
+Metal, both with streamed and resident weights. See
+[native d1 execution](d1-native.md#managed-serving).
 For API loading, omit `jev_weights` to use d1 residency automatically, or select
 `"vram"` explicitly; explicit `"stream"` is rejected. See
 [d1 serving setup](d1-native.md#managed-serving).

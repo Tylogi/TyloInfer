@@ -1,4 +1,6 @@
-#include "engine.h"
+#include "models/lfm3/engine.h"
+#include "models/lfm3/layer_weights.h"
+#include "models/lfm3/request.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -15,10 +17,9 @@
 #include <cmath>
 #include <limits>
 #include <map>
-#include <set>
 #include <stdexcept>
 
-namespace mfq::cuda::d1 {
+namespace mfq::models::lfm3::d1 {
 namespace {
 using B = __nv_bfloat16;
 using Clock = std::chrono::steady_clock;
@@ -283,25 +284,15 @@ struct Engine::Impl {
         load("embedding_norm.weight", {c.hidden});
         for (std::size_t i = 0; i < c.layers.size(); ++i) {
             const auto p = "layers." + std::to_string(i) + ".";
-            for (const auto* norm : {"operator_norm", "ffn_norm"}) load(p + norm + ".weight", {c.hidden});
-            if (c.sandwich) for (const auto* norm : {"post_operator_norm", "post_ffn_norm"}) load(p + norm + ".weight", {c.hidden});
-            load(p + "feed_forward.w1.weight", {c.intermediate, c.hidden});
-            load(p + "feed_forward.w3.weight", {c.intermediate, c.hidden});
-            load(p + "feed_forward.w2.weight", {c.hidden, c.intermediate});
-            if (fused) pack(p + "feed_forward.fused", {p + "feed_forward.w1.weight", p + "feed_forward.w3.weight"});
-            if (c.layers[i] == "conv") {
-                load(p + "conv.conv.weight", {c.hidden, 1, c.convolution});
-                load(p + "conv.in_proj.weight", {3LL * c.hidden, c.hidden});
-                load(p + "conv.out_proj.weight", {c.hidden, c.hidden});
-            } else {
-                const auto a = p + "self_attn.";
-                load(a + "q_proj.weight", {std::int64_t(c.heads) * c.head_dim, c.hidden});
-                load(a + "k_proj.weight", {std::int64_t(c.kv_heads) * c.head_dim, c.hidden});
-                load(a + "v_proj.weight", {std::int64_t(c.kv_heads) * c.head_dim, c.hidden});
-                load(a + "gate_proj.weight", {c.heads, c.hidden});
-                load(a + "o_proj.weight", {c.hidden, std::int64_t(c.heads) * c.head_dim});
-                load(a + "q_norm.weight", {c.head_dim}); load(a + "k_norm.weight", {c.head_dim});
-                if (fused) pack(a + "fused", {a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight", a + "gate_proj.weight"});
+            load_layer_weights(c, i, [&](const std::string& key, const std::vector<std::int64_t>& shape) {
+                load(p + key, shape);
+            });
+            if (fused) {
+                pack(p + "feed_forward.fused", {p + "feed_forward.w1.weight", p + "feed_forward.w3.weight"});
+                if (c.layers[i] != "conv") {
+                    const auto a = p + "self_attn.";
+                    pack(a + "fused", {a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight", a + "gate_proj.weight"});
+                }
             }
         }
         check(cudaDeviceSynchronize());
@@ -467,6 +458,7 @@ struct Engine::Impl {
     }
     Tensor normalize(const Tensor& x, std::size_t layer, const char* name) { return norm(x, weights.at(prefix(layer) + name + ".weight")); }
     Tensor finalize(const Tensor& x) { return norm(x, weights.at("embedding_norm.weight")); }
+    void finish_layer(const Tensor&) {}
     Tensor add(const Tensor& x, const Tensor& y) {
         Tensor out(x.count); add_kernel<<<blocks(x.count), 256>>>(x.data, y.data, out.data, x.count); check(cudaGetLastError()); return out;
     }
@@ -594,21 +586,13 @@ nlohmann::json Engine::ready() const {
 }
 nlohmann::json Engine::evaluate(const nlohmann::json& request) {
     auto& m = *impl_;
-    if (request.value("use_cache", false) || request.contains("past_key_values")) throw std::invalid_argument("d1 native execution does not reuse prefix/KV/conv state");
-    const auto ids = request.at("tokens").get<std::vector<int>>();
-    const auto groups = request.at("question_ids").get<std::vector<int>>();
-    const auto slots = request.at("slots").get<std::vector<int>>();
-    const auto candidates = request.at("candidate_ids").get<std::vector<int>>();
-    const auto state = request.at("state_tokens").get<int>();
-    if (ids.empty() || ids.size() > std::size_t(m.c.context) || ids.size() != groups.size() || state < 0 || state >= int(ids.size()) || slots.empty() || candidates.empty())
-        throw std::invalid_argument("invalid native d1 input geometry");
-    for (std::size_t i = 0; i < ids.size(); ++i)
-        if (ids[i] < 0 || ids[i] >= m.c.vocabulary || (i >= std::size_t(state) && groups[i] <= 0)) throw std::invalid_argument("invalid native d1 token/group");
-    for (auto slot : slots) if (slot < 0 || slot >= int(ids.size())) throw std::invalid_argument("d1 answer slot outside input");
-    std::set<int> unique;
-    for (auto token : candidates) if (token < 0 || token >= m.c.vocabulary || !unique.insert(token).second) throw std::invalid_argument("invalid native d1 candidates");
-    const int iterations = request.value("iterations", 1), warmup = request.value("warmup", 0);
-    if (iterations < 1 || iterations > 1000 || warmup < 0 || warmup > 100) throw std::invalid_argument("invalid native d1 iteration count");
+    const auto input = Request::parse(request, m.c);
+    const auto& ids = input.tokens;
+    const auto& groups = input.groups;
+    const auto& slots = input.slots;
+    const auto& candidates = input.candidates;
+    const int state = input.state_tokens;
+    const int iterations = input.iterations, warmup = input.warmup;
     Raw dids(ids.size() * 4), dgroups(groups.size() * 4), dslots(slots.size() * 4), dcandidates(candidates.size() * 4);
     check(cudaMemcpy(dids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
     check(cudaMemcpy(dgroups.p, groups.data(), groups.size() * 4, cudaMemcpyHostToDevice));

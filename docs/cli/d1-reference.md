@@ -2,7 +2,7 @@
 
 This is an **explicit PyTorch correctness/reference path**, not the native CUDA
 or Metal runtime. The reference command does not register serving models or
-change native dispatch. For the separate CUDA engine and its existing
+change native dispatch. For the native CUDA and Metal engines and their
 `/v1/systemone` integration, see [native d1 execution](d1-native.md#managed-serving).
 
 ## Supported contract
@@ -110,7 +110,7 @@ python -m pytest tests/test_lfm3_reference.py tests/test_d1_official_parity.py -
 
 `TYLOINFER_D1_MODEL` opts into loading a real local checkpoint for the smoke test.
 A smoke test alone does not establish official probability parity or real-model
-performance. A separate [standalone CUDA/cuBLAS command](d1-native.md) now provides
+performance. A separate [standalone native command](d1-native.md) now provides
 native text execution and packed Q8_0 weight-only GPU projections. That command
 is not native serving/API registration, Metal support or A8 activation computation.
 

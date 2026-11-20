@@ -719,7 +719,7 @@ compatible weights, backend support and scheduling are still required.
 `POST /v1/systemone` returns one JSON decision result, not a chat completion or
 SSE stream. It requires a model with a supported native decision implementation.
 A model appearing in `/v1/models`, or this route being present, does not by itself
-establish decision capability. The CUDA d1 text adapter uses this same route and
+establish decision capability. The CUDA and Metal d1 text adapters use this same route and
 the existing managed model lifecycle; see [d1 setup and limitations](../cli/d1-native.md#managed-serving).
 
 The managed runtime must be ready and idle. Readiness is checked first: a runtime

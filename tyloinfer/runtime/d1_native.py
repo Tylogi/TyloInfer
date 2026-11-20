@@ -1,4 +1,4 @@
-"""Text d1 orchestration shared by standalone and managed CUDA execution.
+"""Text d1 orchestration shared by standalone and managed native execution.
 
 Python handles tokenization and calibrated readout only; no PyTorch numerical
 fallback, checkpoint Python execution or automatic download.
@@ -19,7 +19,7 @@ from tyloinfer.runtime.d1_reference import LocalTokenizer, pack_requests, read_a
 
 
 class D1Native:
-    backend = "native-cuda-cublas-lfm3"
+    backends = frozenset({"native-cuda-cublas-lfm3", "native-metal-mlx-lfm3"})
 
     def __init__(
         self,
@@ -72,8 +72,10 @@ class D1Native:
             self.ready = self._receive()
             if self.ready.get("ready") is not True or self.ready.get("native_runtime") is not True:
                 raise RuntimeError("native d1 executable did not announce readiness")
-            if self.ready.get("backend") != self.backend:
+            backend = self.ready.get("backend")
+            if not isinstance(backend, str) or backend not in self.backends:
                 raise RuntimeError("unexpected native d1 backend")
+            self.backend = backend
         except BaseException:
             self.close()
             raise

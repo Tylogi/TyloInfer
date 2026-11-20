@@ -23,7 +23,8 @@ def test_pinned_real_native_answers(kind, placement):
     with D1Native(Path(assets), Path(binary), weights=weights, weight_placement=placement) as runtime:
         output = runtime.decide_batch(requests())
         assert runtime.ready['weight_placement'] == placement
-        assert runtime.ready['layer_buffer_count'] == (2 if placement == 'stream' else 0)
+        stream_slots = 1 if runtime.backend == "native-metal-mlx-lfm3" else 2
+        assert runtime.ready['layer_buffer_count'] == (stream_slots if placement == 'stream' else 0)
         assert (runtime.ready['streamed_weight_bytes'] > 0) == (placement == 'stream')
     first, second = [row["answers"] for row in output]
     assert first["refund"]["noul"] > 0.98

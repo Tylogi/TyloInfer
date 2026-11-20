@@ -189,7 +189,7 @@ def test_managed_d1_rejects_chat_before_committing_stream(tmp_path):
 
 
 @pytest.mark.parametrize('backend,options,code', [
-    ('metal', {}, 'backend_unsupported'),
+    ('hip', {}, 'backend_unsupported'),
     ('cuda', {'device_ids': ['0', '1']}, 'unsupported_device'),
 ])
 def test_managed_d1_rejects_unsupported_load_capabilities(tmp_path, monkeypatch, backend, options, code):
@@ -214,14 +214,19 @@ def test_managed_d1_rejects_unsupported_load_capabilities(tmp_path, monkeypatch,
 
 def test_hf_catalog_recognizes_d1_without_a_d3_config(tmp_path):
     root = assets(tmp_path / 'decision')
-    artifact = ModelCatalog._inspect_hf(tmp_path, root)
+    def inspect_d3(*args):
+        pytest.fail('d1 must not use the D3 native inspector')
+
+    catalog = ModelCatalog([tmp_path], native_inspector=inspect_d3)
+    artifact = asyncio.run(catalog.resolve(root.name))
     assert artifact.resource.loadable and artifact.resource.structured_decisions
     assert artifact.resource.architecture == 'lfm3_d1-hf'
     assert not (root / 'decision_config.json').exists()
 
 
+@pytest.mark.parametrize('backend', ['cuda', 'metal'])
 @pytest.mark.parametrize('placement', ['stream', 'vram'])
-def test_managed_d1_forwards_weight_placement_and_reports_ram(tmp_path, monkeypatch, placement):
+def test_managed_d1_forwards_weight_placement_and_reports_ram(tmp_path, monkeypatch, backend, placement):
     from tyloinfer.server.protocol.models import ModelLoadRequest
     from tyloinfer.server.runtime.d1_support import d1_launch_configuration
     from tyloinfer.server.runtime.runtime_pool import RuntimePool
@@ -230,9 +235,13 @@ def test_managed_d1_forwards_weight_placement_and_reports_ram(tmp_path, monkeypa
     artifact = ModelCatalog._inspect_hf(tmp_path, root)
     monkeypatch.setattr('tyloinfer.server.runtime.d1_support.find_native_runtime_resource', lambda *_args: tmp_path / 'native')
     request = ModelLoadRequest(model=root.name, context_size=2048, jev_weights=placement)
-    command, _ = d1_launch_configuration(tmp_path / 'runtime', artifact, request,
-        transport='stdio', port=0, backend='cuda', environment={})
+    metallib = tmp_path / 'mlx.metallib'
+    metallib.touch()
+    command, environment = d1_launch_configuration(tmp_path / 'runtime', artifact, request,
+        transport='stdio', port=0, backend=backend, environment={})
     assert command[command.index('--jev-weights') + 1] == placement
+    if backend == 'metal':
+        assert environment['TYLOINFER_MLX_METALLIB'] == str(metallib)
     native = NativeFixture(root)
     native.ready.update(weight_placement=placement, streamed_weight_bytes=4096 if placement == 'stream' else 0,
                         layer_buffer_bytes=512 if placement == 'stream' else 0)

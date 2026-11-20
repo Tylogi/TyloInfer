@@ -4,7 +4,8 @@
       "dmg"
     ],
     "externalBin": [
-      "../../packaging/sidecars/mfq-decode-metal"
+      "../../packaging/sidecars/mfq-decode-metal",
+      "../../packaging/sidecars/tyloinfer-d1-native"
     ],
     "resources": {
       "../dist": "web-ui",

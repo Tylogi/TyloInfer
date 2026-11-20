@@ -31,7 +31,7 @@ public:
     static bool supports_native(const MfqContainer& model, const std::string& name);
     const MlxNativeGgufWeight* native_weight_ref() const noexcept { return native_.get(); }
     static MlxGgufWeight from_bytes(std::string_view dtype,
-        std::span<const std::uint8_t> bytes, mlx::core::Shape shape);
+        std::span<const std::uint8_t> bytes, mlx::core::Shape shape, bool stage = true);
     static MlxGgufWeight from_experts(std::string_view dtype, mlx::core::Shape shape,
         const std::vector<std::int32_t>& ids, const std::vector<mlx::core::array>& packed,
         std::shared_ptr<MlxWeightResidency> residency = {});
@@ -45,6 +45,7 @@ public:
         const std::vector<std::string>& dtypes, mlx::core::array table,
         std::shared_ptr<MlxWeightResidency> residency);
     mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul_q8_bf16(const mlx::core::array& input) const;
     mlx::core::array grouped_row_matmul(const mlx::core::array& input, int groups) const;
     mlx::core::array swiglu(const MlxGgufWeight& up, const mlx::core::array& input) const;
     mlx::core::array embedding(const mlx::core::array& ids,

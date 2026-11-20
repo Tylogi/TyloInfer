@@ -8,11 +8,11 @@ from pathlib import Path
 
 
 def add_parser(sub):
-    parser = sub.add_parser("d1-native", help="standalone CUDA/cuBLAS d1 text decisions")
+    parser = sub.add_parser("d1-native", help="standalone CUDA or Metal d1 text decisions")
     parser.add_argument("--model", type=Path, required=True, help="local matching HF assets")
     parser.add_argument("--weights", type=Path, help="local HF directory or official Q8_0 GGUF")
     parser.add_argument("--weights-placement", choices=("stream", "vram"), default="vram",
-                        help="two streamed layer buffers or all weights resident in VRAM")
+                        help="stage layer weights or keep all weights resident on the GPU")
     parser.add_argument(
         "--executable", type=Path, required=True, help="built tyloinfer-d1-native binary"
     )

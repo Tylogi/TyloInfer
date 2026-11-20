@@ -605,10 +605,10 @@ class RuntimePool:
                 artifact.resource.error or "model artifact is incomplete",
             )
         if is_d1_config(artifact.source_config):
-            if self.backend != 'cuda':
-                raise _job_error('backend_unsupported', 'd1 native serving currently requires CUDA')
+            if self.backend not in {'cuda', 'metal'}:
+                raise _job_error('backend_unsupported', 'd1 native serving requires CUDA or Metal')
             if len(request.device_ids) > 1:
-                raise _job_error('unsupported_device', 'd1 requires a single CUDA device')
+                raise _job_error('unsupported_device', 'd1 requires a single device')
             request = request.model_copy(update={'prefix_cache_enabled': False})
         if artifact.resource.gguf_companion_required and not request.gguf_companions:
             raise _job_error("gguf_companion_required", "Select the external Engram tables before loading this GGUF model")

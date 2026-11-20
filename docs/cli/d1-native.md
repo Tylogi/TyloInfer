@@ -1,7 +1,7 @@
 # Standalone native d1 text execution
 
-`tyloinfer d1-native` runs the LFM3 text backbone in a separate CUDA/cuBLAS
-executable. Python performs tokenization, question packing and calibrated answer
+`tyloinfer d1-native` runs the LFM3 text backbone in a native CUDA/cuBLAS or Apple Silicon Metal
+companion executable. Python performs tokenization, question packing and calibrated answer
 readout; it does not run a PyTorch numerical fallback or checkpoint Python.
 
 The standalone command is a diagnostic entry point. Managed serving uses the
@@ -11,7 +11,9 @@ remains separate. Chat/Agent generation is not supported by this decision model.
 
 ## Build and run
 
-Requirements: CMake 3.26+, a C++17/CUDA compiler, CUDA 11.2+ Runtime/cuBLAS, and a CUDA
+### CUDA
+
+The CUDA build requires CMake 3.26+, a C++17/CUDA compiler, CUDA 11.2+ Runtime/cuBLAS, and a CUDA
 device supporting BF16 Tensor Core GEMM (compute capability 8.0 or newer). The
 executable rejects unsupported devices. No driver or toolkit is installed by
 this command.
@@ -29,12 +31,21 @@ and Windows generators may add a configuration directory and `.exe` suffix.
 The standard CUDA CMake build also builds this target beside the general runtime.
 Custom packages must keep the two executables together.
 
-Managed d1 serving defaults to `--jev-weights stream`: weights stay in RAM,
-with two reusable GPU layer buffers. The next layer is copied while the
-current layer computes. Embedding and answer rows are gathered from RAM.
-Select `--jev-weights vram` to keep all text weights in VRAM instead.
-The standalone command retains its resident default; use
-`--weights-placement stream` to select the same streaming implementation.
+### Apple Silicon Metal
+
+The standard Metal build includes the d1 companion alongside
+`mfq-decode-metal`. It uses the same bundled MLX libraries and
+`mlx.metallib`. For a standalone command, pass the Metal build’s
+`metal/tyloinfer-d1-native` path to `--executable`.
+
+Both backends support streamed and resident weights. Managed serving
+defaults to `--jev-weights stream`. CUDA overlaps transfers with compute
+using two GPU layer buffers. Metal keeps weights in host memory, stages
+one layer in GPU buffers at a time, and gathers only requested embedding
+and answer rows. The `vram` option keeps all language weights resident in
+GPU buffers. On Apple Silicon both placements use unified memory.
+The standalone command defaults to `vram`. Select `--weights-placement
+stream` for streamed execution.
 
 Prepare matching local HF assets (`config.json`, `tokenizer.json`,
 `calibration.json`) and weights. Nothing is downloaded automatically.
@@ -73,10 +84,11 @@ GGUF tokenizer entry against the HF tokenizer.
 - Fused Q/K/V/gate and FFN gate/up projections by default. `--unfused` selects
   the explicit non-fused baseline; no model-size or device-name whitelist.
 
-**GGUF matrices remain Q8_0-packed in RAM and on the GPU.** Projection calls reuse the
-shared GGUF grouped-GEMM backend with BF16 activations and FP32 accumulation.
-Only bounded 64-by-128 weight tiles are decoded into shared memory; no complete
-weight matrix or layer is expanded into a persistent or temporary BF16 image.
+**GGUF matrices remain Q8_0-packed in RAM and on the GPU.** Projection calls use BF16 activations and FP32 accumulation. CUDA reuses its
+shared GGUF grouped GEMM. Metal uses the packed Q8_0 projection with BF16
+tiles and uses matrix units on M5. Both decode weights in bounded GPU tiles
+and keep complete matrices and layers packed. Metal keeps the small candidate projection in FP32
+for calibrated readout.
 Block products use ordinary FP32 partial-sum accumulation without extra
 compensation. This is W8A16 weight-only execution, not an A8/integer-activation implementation.
 `weight_format=gguf-q8_0-packed-w8a16` identifies the actual path.
@@ -90,16 +102,17 @@ rows without changing their compressed byte count.
 
 Requests are processed sequentially, one packed question set per forward.
 There is no KV/conv/prefix reuse, SSD offload, continuous batching, generation,
-Metal/CPU backend, media, typed extraction or multiple-choice selection.
-All required language weights must fit the selected GPU. Set attention is not
+CPU backend, media, typed extraction or multiple-choice selection.
+Resident weights must fit the selected GPU. Set attention is not
 whole-model question isolation: convolution/sliding layers remain causal across
 preceding questions, as described in the reference contract.
 
 ## Managed serving
 
-Build the CUDA runtime with `tyloinfer build --backend cuda`. Its
-`tyloinfer-d1-native` companion must remain beside `mfq-runtime` (with `.exe`
-suffixes on Windows). No checkpoint Python is executed or downloaded.
+Build with `tyloinfer build --backend metal` on Apple Silicon or
+`tyloinfer build --backend cuda` on a CUDA system. Keep
+`tyloinfer-d1-native` beside `mfq-decode-metal` or `mfq-runtime`
+as appropriate. Windows executables use the `.exe` suffix.
 
 For HF BF16, keep the safetensors weights and matching `config.json`,
 `tokenizer.json`, `calibration.json` in one model directory. For Q8_0 GGUF, put
@@ -116,7 +129,7 @@ authentication and unloading use the ordinary server APIs. Score remains the
 official d1 median, while D3 retains its mean; there is no readout mode option.
 Both existing private HTTP and stdio transports are supported.
 
-Only CUDA text decisions are available. Chat generation returns `501`; media,
+CUDA and Metal support text decisions. Chat generation returns `501`; media,
 typed questions, multiple selection and nonempty template overrides are rejected.
 Weights use the selected device with streamed or full-VRAM placement.
 There is no prefix/KV reuse or dynamic offload budget. Cancelled callers
@@ -128,7 +141,8 @@ already contain the required native companion.
 ## Outputs and timing
 
 The output identifies `native_runtime=true`,
-`backend=native-cuda-cublas-lfm3`, `serving_integration=false`, actual
+`backend=native-cuda-cublas-lfm3` or `backend=native-metal-mlx-lfm3`,
+`serving_integration=false`, actual
 `weight_format` and `fused_projections`. Answers have `output_tokens=0`.
 `load_ms` covers language weight loading, transfers, floating-auxiliary conversion
 and fusion. `weight_conversion_ms` includes only floating auxiliary conversion;
@@ -149,8 +163,9 @@ process-wide or sampled device peak including CUDA context/workspace overhead.
 measured interval includes forward, candidate projection and in-interval
 allocation/synchronization; it is not a pure kernel-only figure. Input copies,
 Python/tokenizer/readout, process startup and loading are outside that interval.
-`benchmark_wall_ms` includes warmups and result transfer, so do not divide it by
-only the measured iteration count. These metrics are not end-to-end TTFT.
+`benchmark_wall_ms` includes warmups and result transfer. Metal reports
+synchronized host `forward_wall_ms` samples and their median. These
+measurements exclude tokenization and calibrated readout.
 
 ## Validation and licensing
 
@@ -158,9 +173,9 @@ only the measured iteration count. These metrics are not end-to-end TTFT.
 python -m pytest tests/test_d1_native.py tests/test_d1_native_gpu.py tests/test_d1_native_quantized.py tests/test_d1_native_real.py -q
 ```
 
-Protocol tests use a fake executable and do not prove CUDA correctness. The
-GPU test is opt-in via `TYLOINFER_D1_NATIVE_BINARY`; it compares real CUDA output
-with a small BF16 reference fixture. The quantized test adds real small Q8_0 GGUF
+Protocol tests exercise the child-process protocol. Set
+`TYLOINFER_D1_NATIVE_BINARY` to a built CUDA or Metal companion for numerical
+comparison with a small BF16 reference fixture. The quantized test adds real small Q8_0 GGUF
 matrices, incomplete output tiles, multiple question masks, 257/513-token chunk
 boundaries, packed-residency assertions and actual projection dispatch checks.
 Creating that fixture additionally requires the optional `gguf` Python package;

@@ -140,9 +140,9 @@ MTP 在有对应权重的模型上默认允许使用，会自适应决定是否�
 CUDA 决策模型默认 `--jev-weights stream`，使用 RAM 权重和两个 GPU 分层流式缓冲区；
 `--jev-weights vram` 改为全显存驻留，显存需求更高。API 加载对应字段为 `jev_weights`，
 默认同为 `"stream"`，详见[权重放置说明](cli/serve.md#jev-decision-model-weight-placement)。
-d1 文本模型也使用同一接口，但当前仅支持 CUDA 全显存驻留：CLI 启动时指定
-`--jev-weights vram`；API 加载时省略 `jev_weights` 自动选驻留，或显式设为 `"vram"`，
-显式 `"stream"` 会被拒绝。需配套 HF 配置、tokenizer、calibration 与原生 companion，
+d1 文本模型在 CUDA 和 Apple Silicon Metal 上使用同一接口，支持 `stream` 和
+`vram`。Metal 的 `stream` 每次只把一层权重放入 GPU 缓冲区。两种模式都使用统一内存。
+模型需配套 HF 配置、tokenizer、calibration 与同后端的原生可执行文件，
 详见 [d1 接入与限制](cli/d1-native.md#managed-serving)。Score 由模型定义：D3 保留均值，
 d1 保留官方中位数；通用接口不强制某一种读出。
 

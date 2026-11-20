@@ -19,6 +19,7 @@ mfq_tauri_target="aarch64-apple-darwin"
 mfq_output_dir="${TYLOINFER_RELEASE_OUTPUT_DIR:-${mfq_script_dir}/dist}"
 mfq_cli_name="tyloinfer-cli"
 mfq_runtime_name="mfq-decode-metal-aarch64-apple-darwin"
+mfq_d1_name="tyloinfer-d1-native-aarch64-apple-darwin"
 mfq_macos_deployment_target="${TYLOINFER_RELEASE_MACOS_DEPLOYMENT_TARGET:-26.2}"
 
 fail() {
@@ -101,11 +102,14 @@ cmake --build "${mfq_native_build_dir}" \
   --parallel "${TYLOINFER_RELEASE_JOBS:-$(sysctl -n hw.ncpu)}"
 
 mfq_runtime_source="${mfq_native_build_dir}/metal/mfq-decode-metal"
+mfq_d1_source="${mfq_native_build_dir}/metal/tyloinfer-d1-native"
 mfq_video_source="${mfq_native_build_dir}/metal/libmfq_avfoundation_video.dylib"
 [[ -x "${mfq_runtime_source}" ]] || fail "native build did not create mfq-decode-metal"
+[[ -x "${mfq_d1_source}" ]] || fail "native build did not create tyloinfer-d1-native"
 [[ -f "${mfq_video_source}" ]] || fail "native build did not create the AVFoundation video library"
 
 install -m 755 "${mfq_runtime_source}" "${mfq_sidecar_dir}/${mfq_runtime_name}"
+install -m 755 "${mfq_d1_source}" "${mfq_sidecar_dir}/${mfq_d1_name}"
 install -m 644 "${mfq_mlx_root}/lib/libmlx.dylib" "${mfq_framework_dir}/libmlx.dylib"
 install -m 644 "${mfq_mlx_root}/lib/libjaccl.dylib" "${mfq_framework_dir}/libjaccl.dylib"
 install -m 755 "${mfq_video_source}" "${mfq_framework_dir}/libmfq_avfoundation_video.dylib"
@@ -125,13 +129,16 @@ install -m 644 "${mfq_project_dir}"/LICENSES/*.txt "${mfq_license_dir}/"
 
 install_name_tool -add_rpath "@executable_path/../Frameworks" \
   "${mfq_sidecar_dir}/${mfq_runtime_name}"
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+  "${mfq_sidecar_dir}/${mfq_d1_name}"
 
 mfq_signing_identity="${TYLOINFER_RELEASE_SIGNING_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}"
 for mfq_signed_file in \
   "${mfq_framework_dir}/libjaccl.dylib" \
   "${mfq_framework_dir}/libmlx.dylib" \
   "${mfq_framework_dir}/libmfq_avfoundation_video.dylib" \
-  "${mfq_sidecar_dir}/${mfq_runtime_name}"; do
+  "${mfq_sidecar_dir}/${mfq_runtime_name}" \
+  "${mfq_sidecar_dir}/${mfq_d1_name}"; do
   codesign --force --sign "${mfq_signing_identity}" "${mfq_signed_file}"
   codesign --verify --strict --verbose=2 "${mfq_signed_file}"
 done
@@ -198,7 +205,8 @@ mfq_cli_path="${mfq_resource_dir}/${mfq_cli_name}/${mfq_cli_name}"
 [[ -x "${mfq_cli_path}" ]] || fail "PyInstaller did not create the unified mfq CLI"
 for mfq_arm64_file in \
   "${mfq_cli_path}" \
-  "${mfq_sidecar_dir}/${mfq_runtime_name}"; do
+  "${mfq_sidecar_dir}/${mfq_runtime_name}" \
+  "${mfq_sidecar_dir}/${mfq_d1_name}"; do
   lipo -archs "${mfq_arm64_file}" | tr ' ' '\n' | grep -qx arm64 \
     || fail "${mfq_arm64_file} is not arm64"
 done
@@ -244,6 +252,8 @@ hdiutil attach -readonly -nobrowse -mountpoint "${mfq_mount_dir}" "${mfq_release
 mfq_mounted=true
 mfq_packaged_app="${mfq_mount_dir}/TyloInfer.app"
 codesign --verify --deep --strict --verbose=2 "${mfq_packaged_app}"
+[[ -x "${mfq_packaged_app}/Contents/MacOS/tyloinfer-d1-native" ]] \
+  || fail "packaged Studio is missing the Metal d1 companion"
 "${mfq_venv_dir}/bin/python" "${mfq_script_dir}/check_release_paths.py" \
   "${mfq_packaged_app}" "${mfq_release_dmg}" \
   "${mfq_private_prefix_args[@]}" \

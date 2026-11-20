@@ -684,7 +684,7 @@ set_target_properties(mfq-decode-metal PROPERTIES
     INSTALL_RPATH "@executable_path/lib"
 )
 
-# Both native executables live in this binary directory and use the same
+# The native executables live in this binary directory and use the same
 # relocatable MLX runtime bundle. A single dependency target prevents parallel
 # links from copying the same runtime files at once.
 set(_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR
@@ -758,6 +758,27 @@ add_custom_command(
 add_custom_target(mfq-metal-runtime-bundle
     DEPENDS "${_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP}")
 add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
+
+add_executable(tyloinfer-d1-native
+    "${TYLOINFER_REPOSITORY_ROOT}/cpp_runtime/models/lfm3/main.cpp"
+    "${TYLOINFER_REPOSITORY_ROOT}/cpp_runtime/models/lfm3/input.cpp"
+    models/lfm3/engine.cpp
+)
+target_include_directories(tyloinfer-d1-native PRIVATE
+    "${TYLOINFER_REPOSITORY_ROOT}/cpp_runtime"
+    "${TYLOINFER_REPOSITORY_ROOT}/cpp_runtime/components/ggml/src"
+    "${TYLOINFER_METAL_ROOT}/ops/gguf"
+)
+target_link_libraries(tyloinfer-d1-native PRIVATE mfq-metal-runtime mfq-json)
+target_compile_features(tyloinfer-d1-native PRIVATE cxx_std_20)
+set_target_properties(tyloinfer-d1-native PROPERTIES
+    BUILD_RPATH "@executable_path/lib"
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "@executable_path/lib"
+)
+add_dependencies(tyloinfer-d1-native mfq-metal-runtime-bundle)
+add_dependencies(mfq-decode-metal tyloinfer-d1-native)
+
 
 add_executable(tyloinfer-metal-native-projection-test tests/mlx_mx_test.cpp)
 target_link_libraries(tyloinfer-metal-native-projection-test PRIVATE mfq-metal-runtime)

@@ -816,6 +816,8 @@ class ModelCatalog:
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
         if not is_gguf_path(path):
             artifact = self._inspect(root, path)
+            if is_d1_config(artifact.source_config):
+                return artifact
             decision = artifact.resource.structured_decisions
             if (artifact.resource.format != 'hf' or not artifact.resource.complete
                     or 'U32' not in artifact.resource.dtypes and not decision):
