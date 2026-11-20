@@ -676,9 +676,11 @@ void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head, 
             const int depth = std::min(7, c.block_size - 1);
             const MlxDFlash2TreeInput tree{depth, depth + 1, {}, {}};
             const std::array<MlxDFlash2TreeInput, 2> inputs{tree, tree};
-            const auto batch = tree_proposals(contexts, anchors,
-                zeros({2, c.block_size, c.hidden}, bfloat16), output_head, inputs);
-            preparation->add(batch.edges);
+            for (int lanes : {1, 2}) {
+                const auto batch = tree_proposals(std::span(contexts).first(lanes), std::span(anchors).first(lanes),
+                    zeros({lanes, c.block_size, c.hidden}, bfloat16), output_head, std::span(inputs).first(lanes));
+                preparation->add(batch.edges);
+            }
         }
         for (const auto dtype : {float16, bfloat16, float32})
             preparation->add(sample_greedy(zeros({c.block_size, c.vocabulary}, dtype)));

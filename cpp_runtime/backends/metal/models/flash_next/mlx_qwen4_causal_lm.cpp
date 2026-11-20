@@ -2675,6 +2675,11 @@ private:
                     const auto state = mlx::core::zeros(
                         Shape{1, static_cast<int>(config_.ple_conv_kernel_size - 1) *
                             static_cast<int>(config_.ngram_size), input.shape(2)}, mlx::core::float32);
+                    if ((rows == 1 || rows == 8) &&
+                        mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
+                        const auto taps = mlx::core::zeros({rows, static_cast<int>(config_.ple_conv_kernel_size)}, mlx::core::int32);
+                        preparation->add(tree_depthwise_conv_silu(normalized, convolution_weight_, state, taps));
+                    }
                     for (const auto& cached_state : {std::optional<array>{}, std::optional<array>{state}}) {
                         const auto convolution = cached_depthwise_conv_silu(normalized,
                             convolution_weight_, cached_state, static_cast<int>(config_.ngram_size));
@@ -3325,25 +3330,31 @@ private:
                     for (const auto& output : {decoded.output, decoded.convolution_state,
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
                     if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
-                        const std::array parents{-1, 0, 1, 1, 3, 4, 4, 6};
-                        const auto packed = mlx::core::zeros(
-                            {1, 16, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
-                        const auto projected = project_inputs(packed);
+                        const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6};
+                        const std::array<MlxGatedDeltaTreeLane, 2> full_lanes{{{parents, conv, state}, {parents, conv, state}}};
                         const int key_heads = static_cast<int>(config_.linear_num_key_heads);
                         const int value_heads = static_cast<int>(config_.linear_num_value_heads);
-                        const std::array<MlxGatedDeltaTreeLane, 2> lanes{{
-                            {parents, conv, state}, {parents, conv, state}}};
-                        auto result = gated_delta_decode_packed_trees(projected, lanes, convolution_weight_,
-                            dt_bias_, decay_scale_, output_norm_.weight(), key_heads, value_heads, output_norm_.eps(),
-                            config_.output_gate_silu, config_.linear_tiled_heads, packed.dtype());
-                        preparation->add(result.output);
-                        const auto part = [&](const array& value) {
-                            return mlx::core::slice(value, {0, 0, 0}, {1, 8, value.shape(2)});
-                        };
-                        const auto& tape = result.tapes.front();
-                        auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
-                            tape.keys, tape.values, tape.decay, tape.beta, array({0, 1}), config_.linear_tiled_heads);
-                        preparation->add(folded.recurrent);
+                        // Dispatch signatures differ as a cohort drains and its metadata fits in constant memory.
+                        for (int count : {1, 2}) for (int rows : {1, 8}) {
+                            auto lanes = full_lanes;
+                            for (auto& lane : lanes) lane.parents = lane.parents.first(rows);
+                            const auto packed = mlx::core::zeros(
+                                {1, count * rows, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
+                            const auto projected = project_inputs(packed);
+                            auto result = gated_delta_decode_packed_trees(projected, std::span(lanes).first(count),
+                                convolution_weight_, dt_bias_, decay_scale_, output_norm_.weight(),
+                                key_heads, value_heads, output_norm_.eps(), config_.output_gate_silu,
+                                config_.linear_tiled_heads, packed.dtype());
+                            preparation->add(result.output);
+                            const auto part = [&](const array& value) {
+                                return mlx::core::slice(value, {0, 0, 0}, {1, rows, value.shape(2)});
+                            };
+                            const auto& tape = result.tapes.front();
+                            const auto retained = rows == 1 ? array({0}) : array({0, 1, 2, 3, 4, 5, 6, 7});
+                            auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
+                                tape.keys, tape.values, tape.decay, tape.beta, retained, config_.linear_tiled_heads);
+                            preparation->add(folded.recurrent);
+                        }
                     }
                     for (const int lanes : {2, 3, 4}) {
                         const auto packed = mlx::core::zeros(
