@@ -44,9 +44,12 @@ mlx::core::array load_dense_array(
 
 class MlxLinear {
 public:
+    enum class GgufAccess { general, projection_only, row_lookup };
+
     static MlxLinear load(
         const MfqContainer& model,
-        const std::string& name);
+        const std::string& name,
+        GgufAccess gguf_access = GgufAccess::general);
 
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(MlxTqWeight weight);

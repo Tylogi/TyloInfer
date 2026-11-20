@@ -879,7 +879,8 @@ bool MlxGgufWeight::supports_native(const MfqContainer& model, const std::string
     return mlx_native_gguf_supported(format->id, int(shape[shape.size() - 2]), int(shape.back()));
 }
 
-MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& name, bool native_projection) {
+MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& name,
+    bool native_projection, bool retain_row_major) {
     Shape shape;
     for (const auto d : model.tensor_shape(name)) {
         if (d <= 0 || d > INT_MAX) throw std::invalid_argument("invalid GGUF tensor dimension");
@@ -922,10 +923,11 @@ MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& 
         eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
         for (const auto& plane : prepared.planes) MlxWeightResidency::track(plane);
         result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
+        if (!retain_row_major) result.bytes_ = zeros({0}, uint8);
     }
     if (!result.native_ && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    MlxWeightResidency::track(result.bytes_);
+    if (result.bytes_.size()) MlxWeightResidency::track(result.bytes_);
     if (result.planes_) for (const auto& plane : *result.planes_) MlxWeightResidency::track(plane);
     model.record_prepared(name);
     return result;
@@ -1026,6 +1028,7 @@ array MlxGgufWeight::embedding(const array& ids, Dtype dtype) const {
     auto shape = ids.shape(); shape.push_back(input_size());
     if (!ids.size()) return zeros(shape, dtype);
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return unrotate_rows(plain.embedding(ids, float32), dtype); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_) return MlxGgufStagedPrefill::embedding(*this, ids, dtype);
     return embedding_kernel()({bytes_, contiguous(astype(ids, int32)),
         parameters(input_size(), output_size(), checked_int(ids.size()), row_bytes_, 1)},
@@ -1052,7 +1055,8 @@ array MlxGgufWeight::swiglu(const MlxGgufWeight& up, const array& input) const {
         return moe_swiglu_pair(values[0], values[1]);
     }
     if (planes_ || up.planes_) return moe_swiglu_pair(matmul(input), up.matmul(input));
-    if (rows > 6) return moe_swiglu_pair(matmul(input), up.matmul(input));
+    if (rows > 6 || !bytes_.size() || !up.bytes_.size())
+        return moe_swiglu_pair(matmul(input), up.matmul(input));
     const auto [lanes, values] = swiglu_geometry(format_, up.format_, input_size(), output_size());
     return array(shape, input.dtype(), std::make_shared<GgufSwiGLU>(default_stream(Device::gpu),
         std::array<std::uint32_t, 10>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(rows), uint32_t(row_bytes_),
@@ -1065,6 +1069,7 @@ array MlxGgufWeight::dequantize(Dtype dtype) const {
     if (dtype != float16 && dtype != bfloat16 && dtype != float32)
         throw std::invalid_argument("GGUF dequantization requires floating output");
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return unrotate_rows(plain.dequantize(float32), dtype); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_) return MlxGgufStagedPrefill::dequantize(*this, dtype);
     const auto rows = checked_int(std::size_t(output_size()) * expert_count());
     const auto blocks = std::size_t(rows) * input_size() / 32;
@@ -1081,6 +1086,7 @@ array MlxGgufWeight::grouped_row_matmul(const array& input, int groups) const {
     auto shape = input.shape(); shape.back() = output_size() / groups;
     if (!rows) return zeros(shape, input.dtype());
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return plain.grouped_row_matmul(rotate_input(input), groups); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_ && (rows <= 8 || (output_size() / groups) % 64))
         return MlxGgufStagedPrefill::project(*this, input, groups);
     if (rows <= 8 && !planes_) {

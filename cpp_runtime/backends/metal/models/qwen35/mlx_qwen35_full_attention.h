@@ -16,7 +16,8 @@ class MlxQwen35DenseSwiGlu {
 public:
     static MlxQwen35DenseSwiGlu load(
         const MfqContainer& model,
-        const Qwen35ResolvedLayerNames& names);
+        const Qwen35ResolvedLayerNames& names,
+        MlxLinear::GgufAccess gguf_access = MlxLinear::GgufAccess::general);
 
     MlxQwen35DenseSwiGlu(
         MlxLinear gate,
@@ -71,7 +72,8 @@ public:
         const MfqContainer& model,
         const Qwen35Config& config,
         const Qwen35TensorNames& names,
-        std::size_t layer_index);
+        std::size_t layer_index,
+        MlxLinear::GgufAccess gguf_access = MlxLinear::GgufAccess::general);
 
     MlxQwen35FullAttentionBlock(
         Qwen35Config config,

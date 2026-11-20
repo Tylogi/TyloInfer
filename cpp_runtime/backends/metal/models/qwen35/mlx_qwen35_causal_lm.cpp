@@ -415,6 +415,8 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         names,
         trained_readout);
 
+    const auto projection_access = decision
+        ? MlxLinear::GgufAccess::projection_only : MlxLinear::GgufAccess::general;
     std::vector<MlxQwen35Layer> layers;
     layers.reserve(
         static_cast<std::size_t>(
@@ -430,14 +432,16 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
                     model,
                     runtime_config,
                     names,
-                    index));
+                    index,
+                    projection_access));
         } else if (type == "linear_attention") {
             layers.emplace_back(
                 MlxQwen35LinearAttentionBlock::load(
                     model,
                     runtime_config,
                     names,
-                    index));
+                    index,
+                    projection_access));
         } else {
             throw std::runtime_error(
                 "unsupported Qwen3.5 layer type at index " +
@@ -449,8 +453,9 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         Qwen35Embedding::load(model, names.token_embedding);
     std::optional<Qwen35Linear> output;
     if (!runtime_config.tie_word_embeddings && (!trained_readout || model.contains(names.output))) {
-        output.emplace(
-            Qwen35Linear::load(model, names.output));
+        const auto output_access = decision && decision->vocabulary_readout
+            ? MlxLinear::GgufAccess::row_lookup : MlxLinear::GgufAccess::general;
+        output.emplace(MlxLinear::load(model, names.output, output_access));
     }
     auto mtp = MlxQwen35MtpModule::load_if_present(
         model,

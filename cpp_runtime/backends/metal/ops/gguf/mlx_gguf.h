@@ -27,7 +27,8 @@ MlxGgufRoutePlan gguf_route_plan(const mlx::core::array& ids, int experts, bool 
 
 class MlxGgufWeight {
 public:
-    static MlxGgufWeight load(const MfqContainer& model, const std::string& name, bool native_projection = false);
+    static MlxGgufWeight load(const MfqContainer& model, const std::string& name,
+        bool native_projection = false, bool retain_row_major = true);
     static bool supports_native(const MfqContainer& model, const std::string& name);
     const MlxNativeGgufWeight* native_weight_ref() const noexcept { return native_.get(); }
     static MlxGgufWeight from_bytes(std::string_view dtype,

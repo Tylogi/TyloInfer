@@ -75,7 +75,8 @@ void validate_position_shape(
 
 MlxQwen35DenseSwiGlu MlxQwen35DenseSwiGlu::load(
     const MfqContainer& model,
-    const Qwen35ResolvedLayerNames& names) {
+    const Qwen35ResolvedLayerNames& names,
+    MlxLinear::GgufAccess gguf_access) {
     const auto gate_high = names.ffn_gate + ".in_high";
     const auto up_high = names.ffn_up + ".in_high";
     const auto down_high = names.ffn_down + ".in_high";
@@ -91,14 +92,14 @@ MlxQwen35DenseSwiGlu MlxQwen35DenseSwiGlu::load(
     std::shared_ptr<MlxQwen35DenseSwiGlu> high;
     if (has_gate) {
         high = std::make_shared<MlxQwen35DenseSwiGlu>(
-            MlxLinear::load(model, gate_high),
-            MlxLinear::load(model, up_high),
-            MlxLinear::load(model, down_high));
+            MlxLinear::load(model, gate_high, gguf_access),
+            MlxLinear::load(model, up_high, gguf_access),
+            MlxLinear::load(model, down_high, gguf_access));
     }
     return MlxQwen35DenseSwiGlu(
-        MlxLinear::load(model, names.ffn_gate),
-        MlxLinear::load(model, names.ffn_up),
-        MlxLinear::load(model, names.ffn_down),
+        MlxLinear::load(model, names.ffn_gate, gguf_access),
+        MlxLinear::load(model, names.ffn_up, gguf_access),
+        MlxLinear::load(model, names.ffn_down, gguf_access),
         std::move(high));
 }
 
@@ -172,7 +173,8 @@ MlxQwen35FullAttentionBlock::load(
     const MfqContainer& model,
     const Qwen35Config& config,
     const Qwen35TensorNames& names,
-    std::size_t layer_index) {
+    std::size_t layer_index,
+    MlxLinear::GgufAccess gguf_access) {
     const int layer_count =
         checked_int(config.num_hidden_layers, "num_hidden_layers");
     if (layer_index >= static_cast<std::size_t>(layer_count)) {
@@ -192,10 +194,10 @@ MlxQwen35FullAttentionBlock::load(
             resolved.attention_norm,
             config.rms_norm_eps,
             config.norm_weight_offset),
-        MlxLinear::load(model, resolved.attention_query),
-        MlxLinear::load(model, resolved.attention_key),
-        MlxLinear::load(model, resolved.attention_value),
-        MlxLinear::load(model, resolved.attention_output),
+        MlxLinear::load(model, resolved.attention_query, gguf_access),
+        MlxLinear::load(model, resolved.attention_key, gguf_access),
+        MlxLinear::load(model, resolved.attention_value, gguf_access),
+        MlxLinear::load(model, resolved.attention_output, gguf_access),
         load_optional_norm(
             model,
             resolved.attention_query_norm,
@@ -209,7 +211,7 @@ MlxQwen35FullAttentionBlock::load(
             resolved.ffn_norm,
             config.rms_norm_eps,
             config.norm_weight_offset),
-        MlxQwen35DenseSwiGlu::load(model, resolved));
+        MlxQwen35DenseSwiGlu::load(model, resolved, gguf_access));
 }
 
 MlxQwen35FullAttentionBlock::MlxQwen35FullAttentionBlock(

@@ -495,7 +495,8 @@ array load_dense_array(
 
 MlxLinear MlxLinear::load(
     const MfqContainer& model,
-    const std::string& name) {
+    const std::string& name,
+    GgufAccess gguf_access) {
     const auto finish = [](MlxLinear result) {
         if (mlx_predequantize_fp16_enabled()) {
             result.materialize_fp16();
@@ -526,7 +527,12 @@ MlxLinear MlxLinear::load(
     if (is_mxfp4_sq_dtype(record.dtype)) return finish(MlxLinear(MlxMxfp4SqWeight::from_blob(model.map_record(name).view())));
 #endif
     if (record.dtype == "TQ") return finish(MlxLinear(MlxTqWeight::load(model, name)));
-    if (is_gguf_dtype(record.dtype)) return finish(MlxLinear(MlxGgufWeight::load(model, name, true)));
+    if (is_gguf_dtype(record.dtype)) {
+        const bool retain_rows = gguf_access != GgufAccess::projection_only ||
+            record.dtype != "GGUF_Q8_0" || mlx_predequantize_fp16_enabled();
+        const bool native_projection = gguf_access != GgufAccess::row_lookup;
+        return finish(MlxLinear(MlxGgufWeight::load(model, name, native_projection, retain_rows)));
+    }
     if (record.dtype == "MLX-AFFINE") return finish(MlxLinear(MlxAffineWeight::load(model, name)));
     if (is_mx_dtype(record.dtype)) {
         return finish(MlxLinear(
