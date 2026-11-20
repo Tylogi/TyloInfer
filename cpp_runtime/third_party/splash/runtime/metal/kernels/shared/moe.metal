@@ -176,14 +176,15 @@ inline void moe_group_routes_phase(
   if (thread_index == Slots - 1)
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
-    tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+    tiles[tile_offset + tile] = MoeTileDescriptor{thread_index, params.uniform_expert_rows
+        ? params.tile_rows : min(params.tile_rows, count - tile * params.tile_rows)};
   }
   if (expert_tiles) {
     const uint last = tile_offset + expert_tiles - 1;
     const uint live = count - (expert_tiles - 1) * params.tile_rows;
+    const uint padded = params.uniform_expert_rows ? params.tile_rows : moe_matmul_rows(live, params.tile_rows);
     for (uint row = tile_offset * params.tile_rows + count;
-         row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
+         row < last * params.tile_rows + padded;
          ++row)
       grouped_routes[row] = ~0u;
   }
@@ -208,12 +209,12 @@ inline void moe_group_routes_phase(
   const uint shared_base = routed_tiles * params.tile_rows;
   const uint shared_rows =
       (shared_tiles - 1) * params.tile_rows +
-      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
-                      params.tile_rows);
+      (params.uniform_expert_rows ? params.tile_rows :
+       moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows, params.tile_rows));
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
-        min(params.tile_rows, params.rows - tile * params.tile_rows)};
+        params.uniform_expert_rows ? params.tile_rows : min(params.tile_rows, params.rows - tile * params.tile_rows)};
   }
   for (uint row = thread_index; row < shared_rows; row += Slots) {
     if (row < params.rows) {

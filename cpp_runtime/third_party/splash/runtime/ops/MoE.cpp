@@ -187,7 +187,7 @@ MoeGroupParams groupParams(const MoePlan &plan) {
   const bool oneGateUp = oneGateUpPass(plan);
   return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
           shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-          shape.hiddenSize / GGUF_TILE_COLUMNS, SPLASH_TARGET_VERIFY_ROWS};
+          shape.hiddenSize / GGUF_TILE_COLUMNS, SPLASH_TARGET_VERIFY_ROWS, plan.configuration().uniformExpertRows};
 }
 
 } // namespace

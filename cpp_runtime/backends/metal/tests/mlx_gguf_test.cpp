@@ -1963,6 +1963,15 @@ void check_native_stack() {
     const auto shared_projections = std::span(shared.data(), std::size_t(3));
     MlxNativeGgufMoe moe{{routed[0], routed[1], routed[2]}, {shared[0], shared[1], shared[2]},
         router, scalar, arange(E, uint32), top_k};
+    for (const int rows : {8, 18, 48}) {
+        const auto anchor = astype(reshape(cos(arange(K, float32) * .023f), {1, K}), bfloat16);
+        const auto same = broadcast_to(anchor, {rows, K});
+        const auto other = concatenate({anchor, broadcast_to(-anchor, {rows - 1, K})}, 0);
+        const auto one = slice(mlx_native_gguf_moe(moe, same, true), {0, 0}, {1, K});
+        const auto two = slice(mlx_native_gguf_moe(moe, other, true), {0, 0}, {1, K});
+        if (!all(one == two).item<bool>())
+            throw std::runtime_error("a verification MoE row changed with other rows' expert occupancy");
+    }
     std::array<int, 3> routed_order{0, 1, 2}, shared_order{0, 1, 2};
     const auto reference_moe = [&](const MlxNativeGgufMoe& weights, const array& input) {
         const int count = int(input.size() / K);

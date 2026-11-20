@@ -857,7 +857,7 @@ array mlx_native_gguf_ffn(const MlxNativeGgufWeight& gate, const MlxNativeGgufWe
     return astype(mlx_native_gguf_project(std::span(&down, 1), middle)[0], activation_dtype.value_or(input.dtype()));
 }
 
-array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
+array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input, bool uniform_expert_rows) {
     const int width = weights.routed[0].width, actual = int(input.size() / width);
     if (input.ndim() < 2 || input.shape(-1) != width || actual < 1)
         throw std::invalid_argument("native GGUF MoE input shape differs");
@@ -866,15 +866,16 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
         std::vector<array> chunks;
         for (int begin = 0; begin < actual; begin += SPLASH_PREFILL_TOKEN_BUDGET)
             chunks.push_back(mlx_native_gguf_moe(weights,
-                slice(flat, {begin, 0}, {std::min(actual, begin + int(SPLASH_PREFILL_TOKEN_BUDGET)), width})));
+                slice(flat, {begin, 0}, {std::min(actual, begin + int(SPLASH_PREFILL_TOKEN_BUDGET)), width}),
+                uniform_expert_rows));
         return reshape(concatenate(chunks, 0), input.shape());
     }
-    const bool single = single_row_moe(weights, actual);
+    const bool single = !uniform_expert_rows && single_row_moe(weights, actual);
     const bool vector = single && std::all_of(weights.routed.begin(), weights.routed.end(),
         [](const auto& weight) { return quant_affine_format(weight.format); }) &&
         std::all_of(weights.shared.begin(), weights.shared.end(),
             [](const auto& weight) { return quant_affine_format(weight.format); });
-    const bool pair = (actual == 2 || actual == 4) && weights.top_k < 16 && single_row_moe(weights, 1) &&
+    const bool pair = !uniform_expert_rows && (actual == 2 || actual == 4) && weights.top_k < 16 && single_row_moe(weights, 1) &&
         std::none_of(weights.routed.begin(), weights.routed.end(),
             [](const auto& weight) { return quant_affine_format(weight.format); });
     const int intermediate = weights.routed[0].outputs, experts = weights.routed[0].experts;
@@ -890,7 +891,8 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
     const auto shared_key = graph_key(4, rows, weights.shared);
     key.insert(key.end(), shared_key.begin(), shared_key.end());
     key.insert(key.end(), {std::uint64_t(weights.top_k), std::uint64_t(weights.router.dtype() == bfloat16),
-        weights.router.nbytes(), weights.scalar_gate.nbytes(), weights.slots.nbytes(), std::uint64_t(actual == 1)});
+        weights.router.nbytes(), weights.scalar_gate.nbytes(), weights.slots.nbytes(), std::uint64_t(actual == 1),
+        std::uint64_t(uniform_expert_rows)});
     auto graph = cached_graph(std::move(key), actual <= 32, [&] {
         const auto device = capabilities();
         Linear linear(device);
@@ -899,8 +901,9 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
         for (const auto* projection : {&weights.routed, &weights.shared})
             for (const auto& weight : *projection) shape.registerFormats &= quant_register_tensor(weight.format, weight.width);
         const auto tile = moeGgufTile(gpuFamilyClass(device.appleGpuFamily), shape);
-        const MoeConfig configuration{actual <= 32 ? MoeExpertTile::M8 : moeGgufPrefillTile(shape, rows, tile),
-            tile, linear.ggufFloatTile(rows, shape.experts)};
+        const MoeConfig configuration{actual <= 32 || uniform_expert_rows
+                ? MoeExpertTile::M8 : moeGgufPrefillTile(shape, rows, tile),
+            tile, linear.ggufFloatTile(rows, shape.experts), uniform_expert_rows};
         BlockMoeWeights block;
         block.router = QuantizedSegment::floats(shape.experts, width, {1, weights.router.nbytes()},
             weights.router.dtype() == bfloat16 ? QuantizedSegment::kBFloat16 : QuantizedSegment::kFloat32);
@@ -989,7 +992,7 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
             return result;
         }
         const auto plan = actual <= 32 ? MoE::decodeRowsPlan(shape, rows, configuration) : MoE::prefillPlan(shape, rows, configuration);
-        result->specialize_moe_columns = actual <= 8 && tile == MoeGgufTile::Staged;
+        result->specialize_moe_columns = !uniform_expert_rows && actual <= 8 && tile == MoeGgufTile::Staged;
         MoeScratch work;
         for (const auto& field : kMoeScratchFields)
             work.*field.buffer = result->temporary(plan.workspace().*field.bytes, field.buffer == &MoeScratch::routeRows);

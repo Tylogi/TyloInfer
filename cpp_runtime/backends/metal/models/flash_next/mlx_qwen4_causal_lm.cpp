@@ -1149,11 +1149,13 @@ public:
         const array& value,
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
         bool batched_decode = false,
-        Qwen4CachedRoute* deferred_route = nullptr) const {
+        Qwen4CachedRoute* deferred_route = nullptr,
+        bool verifying = false) const {
         if (native_moe_) {
             if (auto* lora = MlxMtpLora::current(); lora && lora->active())
                 throw std::invalid_argument("native GGUF routed weights do not support MTP LoRA training");
-            return mlx_native_gguf_moe(*native_moe_, value);
+            // Routes from later draft rows must not change the arithmetic of an earlier row.
+            return mlx_native_gguf_moe(*native_moe_, value, verifying);
         }
         const auto source_dtype = (gate_up_ && gate_up_->uses_affine()) ||
             (native_expert_cache_ && native_expert_cache_->preserves_activation_dtype())
@@ -4388,7 +4390,7 @@ public:
         }();
         auto fv = ffn_gr_.pre_after(attention, av);
         detail::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
-        auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode), fv);
+        auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode, nullptr, confirmed > 0), fv);
         detail::profile_eval("qwen4.ffn_mhc_post", result);
         return result;
     }
@@ -4593,7 +4595,7 @@ public:
             "qwen4.attention_mhc_post",
             ffn_values.residual);
         detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
-        branch = moe_(ffn_values.branch, prefetched, false, deferred_route);
+        branch = moe_(ffn_values.branch, prefetched, false, deferred_route, speculative_confirmed > 0);
         detail::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
         if (residual_state) residual_state->emplace(DeferredResidual{branch, ffn_values});
