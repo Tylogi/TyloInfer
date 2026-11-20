@@ -1578,7 +1578,7 @@ MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
     const array& norm_weight, int key_heads, int value_heads,
     float norm_eps, bool silu_gate, bool tiled_heads, Dtype output_dtype) {
     constexpr int dimension = 128;
-    if (lanes.empty() || lanes.size() > 2 || projections.size() != 5 ||
+    if (lanes.empty() || lanes.size() > 4 || projections.size() != 5 ||
         key_heads < 1 || value_heads < 1 || value_heads % key_heads)
         throw std::invalid_argument("invalid GDN verification tree geometry");
     const int key_width = key_heads * dimension, value_width = value_heads * dimension;
@@ -1628,24 +1628,31 @@ MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
         projections[4].shape() != projections[3].shape())
         throw std::invalid_argument("invalid GDN verification tree projections");
     const char* gates_setting = std::getenv("TYLOINFER_METAL_GDN_GATES");
-    const bool fuse_gates = lanes.size() == 2 && (!gates_setting || std::string_view(gates_setting) != "0");
+    const bool fuse_gates = lanes.size() > 1 && (!gates_setting || std::string_view(gates_setting) != "0");
     auto gates = fuse_gates
         ? MlxGatedDeltaGates{real_contiguous(projections[3]), real_contiguous(projections[4])}
         : gated_delta_gates(projections[3], projections[4], dt_bias, decay_scale);
     auto decay = fuse_gates ? gates.gate : mlx::core::exp(gates.gate);
     // As in Splash, a threadgroup verifies one value head of one request.
     // Keep its projected key/value and gate rows for the accepted-path fold.
-    static const auto decode = cached_metal_kernel("tyloinfer_gdn_tree_decode",
-        {"qk", "value", "history0", "state0", "history1", "state1", "weight", "taps", "paths",
-         "alpha", "beta", "gate", "norm", "eps", "layout", "bias", "scale"},
-        {"output", "keys", "values", "decays", "betas"}, R"METAL(
+    static const auto kernels = [] {
+        const auto make_decode = [](bool wide) {
+            std::vector<std::string> inputs{"qk", "value", "history0", "state0", "history1", "state1"};
+            if (wide) inputs.insert(inputs.end(), {"history2", "state2", "history3", "state3"});
+            inputs.insert(inputs.end(), {"weight", "taps", "paths", "alpha", "beta", "gate", "norm", "eps", "layout", "bias", "scale"});
+            const auto state_select = wide ? R"METAL(const device float* history = request < 2u ? (request == 0u ? history0 : history1)
+    : (request == 2u ? history2 : history3);
+const device float* state = request < 2u ? (request == 0u ? state0 : state1)
+    : (request == 2u ? state2 : state3);
+)METAL" : R"METAL(const device float* history = request == 0u ? history0 : history1;
+const device float* state = request == 0u ? state0 : state1;
+)METAL";
+            const auto source = std::string(R"METAL(
 const uint lane = thread_index_in_simdgroup, group = simdgroup_index_in_threadgroup;
 const uint request = threadgroup_position_in_grid.y;
 const uint begin = layout[2u * request], rows = layout[2u * request + 1u];
 const uint head = threadgroup_position_in_grid.x, total = layout[2u * LANES];
-const device float* history = request == 0u ? history0 : history1;
-const device float* state = request == 0u ? state0 : state1;
-const uint kh = TILED ? head % uint(HK) : head / uint(HV / HK);
+)METAL") + state_select + R"METAL(const uint kh = TILED ? head % uint(HK) : head / uint(HV / HK);
 const bool key_writer = TILED ? head < uint(HK) : head % uint(HV / HK) == 0u;
 constexpr uint QK = uint(2 * HK * 128), V = uint(HV * 128), C = QK + V;
 threadgroup float query[CAP * 128], key[CAP * 128], val[CAP * 128], coef[CAP * CAP];
@@ -1749,18 +1756,27 @@ for (uint row = group; row < rows; row += 8u) {
         output[out] = T(normalized[i] * inv * norm[c] * (SILU ? z * sigmoid : sigmoid));
     }
 }
-)METAL");
-    const auto& first = lanes.front();
-    const auto& last = lanes.back();
+)METAL";
+            return cached_metal_kernel("tyloinfer_gdn_tree_decode", inputs,
+                {"output", "keys", "values", "decays", "betas"}, source);
+        };
+        return std::array{make_decode(false), make_decode(true)};
+    }();
+    const bool wide = lanes.size() > 2;
     const Shape gate_tape{fuse_gates ? total_rows * value_heads : 1};
-    auto result = decode({real_contiguous(projections[0]), real_contiguous(projections[1]),
-        float32_contiguous(first.convolution), float32_contiguous(first.recurrent),
-        float32_contiguous(last.convolution), float32_contiguous(last.recurrent), weight.values,
-        array(taps.begin(), {total_rows, 4}, mlx::core::int32),
+    std::vector<array> inputs{real_contiguous(projections[0]), real_contiguous(projections[1])};
+    inputs.reserve(wide ? 21 : 17);
+    for (std::size_t i = 0; i < (wide ? 4u : 2u); ++i) {
+        const auto& lane = lanes[std::min(i, lanes.size() - 1)];
+        inputs.push_back(float32_contiguous(lane.convolution));
+        inputs.push_back(float32_contiguous(lane.recurrent));
+    }
+    inputs.insert(inputs.end(), {weight.values, array(taps.begin(), {total_rows, 4}, mlx::core::int32),
         array(paths.begin(), {total_rows}, mlx::core::uint32), decay, gates.beta,
         real_contiguous(projections[2]), float32_contiguous(norm_weight), array({norm_eps}),
         array(layout.begin(), {static_cast<int>(layout.size())}, mlx::core::uint32),
-        float32_contiguous(dt_bias), float32_contiguous(decay_scale)},
+        float32_contiguous(dt_bias), float32_contiguous(decay_scale)});
+    auto result = kernels[wide](inputs,
         {projections[2].shape(), {total_rows * key_width}, {total_rows * value_width}, gate_tape, gate_tape},
         {output_dtype, mlx::core::float32, mlx::core::float32, mlx::core::float32, mlx::core::float32},
         {value_heads * 256, static_cast<int>(lanes.size()), 1}, {256, 1, 1},

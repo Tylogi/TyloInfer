@@ -1037,38 +1037,51 @@ void test_packed_gdn_trees() {
             full({1, 3, channels}, offset, float32),
             full({1, heads, width, width}, offset * .005f, float32)};
     };
-    const auto first = lane_input(first_parents.size(), .1f);
-    const auto second = lane_input(second_parents.size(), -.2f);
-    const auto pack = [](const array& a, const array& b) { return concatenate({a, b}, 1); };
-    const std::array<MlxGatedDeltaTreeLane, 2> lanes{{
-        {first_parents, first.convolution_state, first.recurrent_state},
-        {second_parents, second.convolution_state, second.recurrent_state},
-    }};
-    const auto packed = gated_delta_decode_packed_trees(
-        {pack(first.qk, second.qk), pack(first.value, second.value), pack(first.output_gate, second.output_gate),
-         pack(first.alpha, second.alpha), pack(first.beta, second.beta)},
-        lanes, weight, bias, scale, norm, key_heads, heads, 1.e-6f, true, false, bfloat16);
-    const auto first_ref = gated_delta_decode_tree(first, first_parents, weight, bias, scale, norm,
-        key_heads, heads, 1.e-6f, true, false, bfloat16);
-    const auto second_ref = gated_delta_decode_tree(second, second_parents, weight, bias, scale, norm,
-        key_heads, heads, 1.e-6f, true, false, bfloat16);
-    require_bit_exact(packed.output, pack(first_ref.output, second_ref.output), "packed GDN verify output");
-    for (int i = 0; i < 2; ++i) {
-        const auto& state = i == 0 ? first : second;
-        const auto& expected = i == 0 ? first_ref : second_ref;
-        const auto retained = i == 0 ? array({0, 2}) : array({0, 3, 4});
-        const auto fold = [&](const auto& tape) {
-            return fold_gated_delta_tree({state.convolution_state, state.recurrent_state}, state.qk, state.value,
-                tape.keys, tape.values, tape.decay, tape.beta, retained, false);
+    const std::array third_parents{-1, 0};
+    const std::array fourth_parents{-1, 0, 0, 2, 3, 0};
+    const std::array<std::span<const int>, 4> parents{first_parents, second_parents, third_parents, fourth_parents};
+    const std::array inputs{lane_input(first_parents.size(), .1f), lane_input(second_parents.size(), -.2f),
+        lane_input(third_parents.size(), .3f), lane_input(fourth_parents.size(), -.4f)};
+    std::vector<MlxGatedDeltaTreeLane> lanes;
+    std::vector<MlxGatedDeltaTreeResult> reference;
+    std::vector<array> outputs;
+    for (std::size_t i = 0; i < parents.size(); ++i) {
+        const auto& input = inputs[i];
+        lanes.push_back({parents[i], input.convolution_state, input.recurrent_state});
+        reference.push_back(gated_delta_decode_tree(input, parents[i], weight, bias, scale, norm,
+            key_heads, heads, 1.e-6f, true, false, bfloat16));
+        outputs.push_back(reference.back().output);
+    }
+    for (std::size_t width = 2; width <= inputs.size(); ++width) {
+        const auto pack = [&](auto member) {
+            std::vector<array> cases;
+            for (std::size_t i = 0; i < width; ++i) cases.push_back(inputs[i].*member);
+            return concatenate(cases, 1);
         };
-        require_bit_exact(packed.tapes[i].keys, expected.keys, "packed GDN keys");
-        require_bit_exact(packed.tapes[i].values, expected.values, "packed GDN values");
-        require_bit_exact(packed.tapes[i].decay, expected.decay, "packed GDN decay");
-        require_bit_exact(packed.tapes[i].beta, expected.beta, "packed GDN beta");
-        const auto actual_fold = fold(packed.tapes[i]);
-        const auto expected_fold = fold(expected);
-        require_bit_exact(actual_fold.convolution, expected_fold.convolution, "packed GDN committed convolution");
-        require_bit_exact(actual_fold.recurrent, expected_fold.recurrent, "packed GDN committed recurrence");
+        using Input = MlxGatedDeltaDecodeInput;
+        const auto packed = gated_delta_decode_packed_trees(
+            {pack(&Input::qk), pack(&Input::value), pack(&Input::output_gate), pack(&Input::alpha), pack(&Input::beta)},
+            std::span(lanes).first(width), weight, bias, scale, norm, key_heads, heads, 1.e-6f, true, false, bfloat16);
+        require_bit_exact(packed.output, concatenate(std::vector<array>(outputs.begin(), outputs.begin() + width), 1),
+            "packed GDN verify output");
+        for (std::size_t i = 0; i < width; ++i) {
+            const auto& state = inputs[i];
+            const auto& expected = reference[i];
+            const auto& tape = packed.tapes[i];
+            const auto retained = i == 1 ? array({0, 3, 4}) : array({0, 1});
+            const auto fold = [&](const auto& tape) {
+                return fold_gated_delta_tree({state.convolution_state, state.recurrent_state}, state.qk, state.value,
+                    tape.keys, tape.values, tape.decay, tape.beta, retained, false);
+            };
+            require_bit_exact(tape.keys, expected.keys, "packed GDN keys");
+            require_bit_exact(tape.values, expected.values, "packed GDN values");
+            require_bit_exact(tape.decay, expected.decay, "packed GDN decay");
+            require_bit_exact(tape.beta, expected.beta, "packed GDN beta");
+            const auto actual_fold = fold(tape);
+            const auto expected_fold = fold(expected);
+            require_bit_exact(actual_fold.convolution, expected_fold.convolution, "packed GDN committed convolution");
+            require_bit_exact(actual_fold.recurrent, expected_fold.recurrent, "packed GDN committed recurrence");
+        }
     }
 }
 

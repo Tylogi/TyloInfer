@@ -2854,8 +2854,8 @@ public:
             return Qwen4Attention::forward_packed_requests(grouped, caches, positions, offsets, confirmed, tree);
         auto projected = project_inputs(grouped);
         detail::profile_eval("qwen4.batch.attention.inputs", projected);
-        if (tree && tree->lanes.size() == 2) {
-            // Submit both request trees together while binding each cache's state directly.
+        if (tree && tree->lanes.size() >= 2 && tree->lanes.size() <= 4) {
+            // Submit the request trees together while binding each cache's state directly.
             std::vector<MlxGatedDeltaTreeLane> lanes;
             lanes.reserve(tree->lanes.size());
             for (const auto& lane : tree->lanes) {
@@ -3331,19 +3331,19 @@ private:
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
                     if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
                         const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6};
-                        const std::array<MlxGatedDeltaTreeLane, 2> full_lanes{{{parents, conv, state}, {parents, conv, state}}};
+                        const MlxGatedDeltaTreeLane full_lane{parents, conv, state};
                         const int key_heads = static_cast<int>(config_.linear_num_key_heads);
                         const int value_heads = static_cast<int>(config_.linear_num_value_heads);
                         // Dispatch signatures differ as a cohort drains and its metadata fits in constant memory.
-                        constexpr std::array<std::pair<int, int>, 5> layouts{{
-                            {1, 1}, {1, 3}, {1, 8}, {2, 1}, {2, 8}}};
+                        constexpr std::array<std::pair<int, int>, 9> layouts{{
+                            {1, 1}, {1, 3}, {1, 8}, {2, 1}, {2, 8}, {3, 1}, {3, 8}, {4, 1}, {4, 8}}};
                         for (const auto& [count, rows] : layouts) {
-                            auto lanes = full_lanes;
+                            std::vector<MlxGatedDeltaTreeLane> lanes(count, full_lane);
                             for (auto& lane : lanes) lane.parents = lane.parents.first(rows);
                             const auto packed = mlx::core::zeros(
                                 {1, count * rows, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
                             const auto projected = project_inputs(packed);
-                            auto result = gated_delta_decode_packed_trees(projected, std::span(lanes).first(count),
+                            auto result = gated_delta_decode_packed_trees(projected, lanes,
                                 convolution_weight_, dt_bias_, decay_scale_, output_norm_.weight(),
                                 key_heads, value_heads, output_norm_.eps(), config_.output_gate_silu,
                                 config_.linear_tiled_heads, packed.dtype());

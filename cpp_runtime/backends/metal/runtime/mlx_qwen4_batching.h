@@ -3,6 +3,7 @@
 #include "continuous_batch.h"
 #include "../models/dflash2/mlx_dflash2.h"
 #include "mlx_dflash2_serving.h"
+#include "mlx_platform.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_resident_budget.h"
 #include "mlx_stream_sync.h"
@@ -12,6 +13,7 @@
 
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <map>
 #include <unordered_map>
@@ -74,18 +76,21 @@ private:
 
 class MlxDFlashTreeBudget {
 public:
-    void choose(std::span<MlxDFlash2Tree> trees) const {
+    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false) const {
         const int lanes = static_cast<int>(trees.size());
         if (lanes == 0 || lanes > static_cast<int>(costs_.size())) return;
         const auto& cost = costs_[lanes - 1];
-        if (cost.samples < 4 || cost.samples % 16 == 15) return;
+        if (!calibrated && (cost.samples < 4 || cost.samples % 16 == 15)) return;
+        const auto step_cost = [&](int rows) {
+            return calibrated ? three_lane_price(rows) : price(cost, lanes, rows);
+        };
         // Splash StepCosts pools the next row of every lane by path reach,
         // then chooses the prefix with the most expected tokens per cost.
         std::array<std::size_t, 8> kept{}, best{};
         kept.fill(1);
         best = kept;
         double tokens = lanes;
-        double rate = tokens / price(cost, lanes, lanes);
+        double rate = tokens / step_cost(lanes);
         for (int rows = lanes + 1;; ++rows) {
             int next = -1;
             for (int lane = 0; lane < lanes; ++lane) {
@@ -96,7 +101,7 @@ public:
             }
             if (next < 0) break;
             tokens += trees[next].reach[kept[next]++];
-            const double candidate = tokens / price(cost, lanes, rows);
+            const double candidate = tokens / step_cost(rows);
             if (candidate > rate) { rate = candidate; best = kept; }
         }
         for (int lane = 0; lane < lanes; ++lane) {
@@ -124,6 +129,17 @@ private:
         int samples = 0;
         double weight = 0.0, rows = 0.0, rows_squared = 0.0, wall = 0.0, rows_wall = 0.0;
     };
+
+    static double three_lane_price(int rows) {
+        // Resident Flash-Next on M5 Max: median verification plus draft
+        // time at 2, 4, 6 and 8 rows per lane, with one row extrapolated.
+        // Only the relative costs affect the row allocation.
+        constexpr std::array knots{3, 6, 12, 18, 24};
+        constexpr std::array costs{27.3, 30.8, 38.0, 44.0, 49.1};
+        const auto end = std::lower_bound(knots.begin() + 1, knots.end() - 1, rows);
+        const auto i = static_cast<std::size_t>(end - knots.begin());
+        return std::lerp(costs[i - 1], costs[i], double(rows - knots[i - 1]) / (knots[i] - knots[i - 1]));
+    }
 
     static double price(const Cost& c, int lanes, int rows) {
         // Use Splash's per-width cost shape until the local observations
@@ -871,10 +887,11 @@ private:
         std::vector<std::size_t> draft_lanes;
         std::vector<MlxDFlash2Tree> trees;
         const auto width = cohort.active.size();
-        bool two_way = true;
+        bool two_way = true, three_way = true;
         for (const auto& request : cohort.active) {
             request->dflash_max_verify_width = std::max(request->dflash_max_verify_width, width);
             two_way = two_way && request->dflash_max_verify_width == 2;
+            three_way = three_way && request->dflash_max_verify_width == 3;
             const auto anchor = request->target_work->pending_token;
             const int position = runtime_.request_cache_position(*request->cache);
             const int depth = std::min({draft_cap(*request), request->generation_limit - request->produced - 1,
@@ -903,7 +920,11 @@ private:
         // budget at two active lanes adds work to the end of a wider batch.
         const bool adaptive = trees.size() == plans.size() &&
             mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
-        if (adaptive) dflash_tree_budget_.choose(trees);
+        const auto& target = runtime_.config();
+        const bool calibrated = three_way && target.hidden_size == 2560 && target.hc_count == 4 &&
+            !target.ple_layer_ids.empty() && mlx_apple_chip_is("Apple M5 Max");
+        // Use full trees once a calibrated three-request group drains.
+        if (adaptive && (!calibrated || width == 3)) dflash_tree_budget_.choose(trees, calibrated);
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
         const auto verification = std::chrono::steady_clock::now();
@@ -949,7 +970,7 @@ private:
         mlx::core::eval(selected);
         const auto finished = std::chrono::steady_clock::now();
         dflash_tree_verify_ms_ += std::chrono::duration<double, std::milli>(finished - verification).count();
-        if (adaptive) dflash_tree_budget_.observe(static_cast<int>(caches.size()), start,
+        if (adaptive && !calibrated) dflash_tree_budget_.observe(static_cast<int>(caches.size()), start,
             std::chrono::duration<double, std::milli>(finished - started).count());
         ++decode_batches_;
         decode_rows_ += caches.size();
