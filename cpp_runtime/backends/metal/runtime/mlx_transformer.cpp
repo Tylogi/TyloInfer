@@ -852,6 +852,13 @@ void MlxKvCache::append_only(const array& key, const array& value) {
     }
 }
 
+MlxKvCache MlxKvCache::fork() const {
+    auto result = *this;
+    result.resources_ = {};
+    result.resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
+    return result;
+}
+
 void MlxKvCache::reserve_append(int tokens) {
     if (quantized()) throw std::runtime_error("direct KV writes cannot target a quantized cache");
     if (tokens <= 0 || position_ > maximum_sequence_ - tokens) {
@@ -1100,6 +1107,13 @@ array MlxSequenceCache::view() const {
         *values_,
         Shape{0, 0, 0},
         Shape{batch_, position_, width_});
+}
+
+MlxSequenceCache MlxSequenceCache::fork() const {
+    auto result = *this;
+    result.resources_ = {};
+    result.resources_.set({storage_bytes(), static_cast<std::size_t>(batch_)});
+    return result;
 }
 
 void MlxSequenceCache::trim(int tokens) {

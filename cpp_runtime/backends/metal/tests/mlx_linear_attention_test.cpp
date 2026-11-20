@@ -997,6 +997,26 @@ void test_cached_depthwise_dilated_decode() {
 
 } // namespace
 
+void test_bfloat16_gdn_tree() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    constexpr int heads = 2, key_heads = 1, rows = 3, width = 128, channels = 4 * width;
+    const std::array parents{-1, 0, 0};
+    const MlxGatedDeltaDecodeInput input{full({1, rows, 2 * width}, .25f, bfloat16),
+        full({1, rows, heads * width}, .5f, bfloat16), zeros({1, rows, heads * width}, bfloat16),
+        zeros({1, rows, heads}, bfloat16), zeros({1, rows, heads}, bfloat16),
+        zeros({1, 3, channels}, float32), zeros({1, heads, width, width}, float32)};
+    const auto weights = full({channels, 4}, .25f, float32);
+    const auto bias = zeros({heads}, float32);
+    const auto norm = ones({width}, float32);
+    const auto result = gated_delta_decode_tree(input, parents, weights, bias, bias, norm,
+        key_heads, heads, 1.e-6f, false, false, bfloat16);
+    const auto reference = gated_delta_decode_tree(input, parents, weights, bias, bias, norm,
+        key_heads, heads, 1.e-6f, false, false, float32);
+    if (result.output.dtype() != bfloat16 || !all(result.output == astype(reference.output, bfloat16)).item<bool>())
+        throw std::runtime_error("GDN tree output rounding disagrees");
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace mlx::core;
@@ -1012,6 +1032,7 @@ int main(int argc, char** argv) {
         test_gdn_gates();
         test_runtime_token_kernel_reuse();
         test_gdn_output_norm();
+        test_bfloat16_gdn_tree();
         test_mixed_gdn_projection_types();
         test_linear_conv_prefill();
         test_linear_conv_prefill(48);

@@ -107,6 +107,10 @@ struct MlxQwen4TextSessionState {
 };
 
 struct MlxQwen4RequestCache;
+struct MlxQwen4RequestTree {
+    std::vector<std::int64_t> tokens;
+    std::vector<int> parents;
+};
 
 std::pair<std::int32_t, mlx::core::array> qwen4_mtp_logits_from_state(
     const MfqContainer& model, const MfqContainer& predictor_source,
@@ -155,6 +159,11 @@ public:
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
         const std::vector<std::vector<std::int64_t>>& tokens,
         std::optional<mlx::core::array>* packed_logits = nullptr);
+    bool can_verify_request_tree(const MlxQwen4RequestCache& cache) const;
+    mlx::core::array forward_request_trees(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes = nullptr);
+    void resolve_request_tree(MlxQwen4RequestCache& cache, int node);
     void resolve_request(MlxQwen4RequestCache& cache, int accepted_drafts);
     int request_cache_position(const MlxQwen4RequestCache& cache) const;
     MlxMtpEngineCallbacks request_mtp_callbacks(const std::shared_ptr<MlxQwen4RequestCache>& cache,

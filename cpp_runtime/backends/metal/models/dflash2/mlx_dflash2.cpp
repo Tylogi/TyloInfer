@@ -13,7 +13,9 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <queue>
 #include <stdexcept>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 
 namespace mfq::metal {
@@ -303,35 +305,75 @@ void MlxDFlash2::reset(MlxDFlash2Context& context) const {
 }
 
 void MlxDFlash2::append_context(MlxDFlash2Context& context, const array& target_hidden, int start_position) const {
+    const ContextCommit commit{&context, target_hidden, start_position};
+    append_context_batch({&commit, 1});
+}
+
+void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) const {
+    if (commits.empty()) return;
     const auto& c = config();
-    impl_->validate_context(context);
-    if (target_hidden.ndim() != 3 || target_hidden.shape(0) != 1 || target_hidden.shape(1) < 1 ||
-        target_hidden.shape(2) != c.hidden * int(c.target_layers.size()) || start_position != context.position ||
-        target_hidden.shape(1) > std::numeric_limits<int>::max() - start_position ||
-        context.layers.size() != std::size_t(c.layers) || !context.window)
-        throw std::invalid_argument("DFlash2 context position or hidden features differ");
-    const int count = target_hidden.shape(1), retained = std::min(count, c.window), offset = count - retained;
-    auto features = astype(slice(target_hidden, {0, offset, 0}, {1, count, target_hidden.shape(2)}), bfloat16);
-    auto hidden = normalized(impl_->context_projection(features), impl_->hidden_norm, c.epsilon);
-    auto slots = remainder(arange(start_position + offset, start_position + count, int32), array(c.window, int32));
-    auto index = broadcast_to(reshape(slots, {1, 1, retained, 1}), {1, c.kv_heads, retained, c.head_dimension});
-    std::vector<MlxDFlash2Context::Layer> layers;
-    std::vector<array> outputs;
+    struct Lane {
+        int begin, retained, position, end_position;
+        array slots, index;
+        std::vector<MlxDFlash2Context::Layer> layers;
+    };
+    std::vector<Lane> lanes;
+    std::vector<array> features, outputs;
+    std::unordered_set<MlxDFlash2Context*> seen;
+    int begin = 0;
+    for (const auto& [context, hidden, start] : commits) {
+        if (!context || !seen.insert(context).second) throw std::invalid_argument("invalid DFlash2 context lane");
+        impl_->validate_context(*context);
+        if (hidden.ndim() != 3 || hidden.shape(0) != 1 || hidden.shape(1) < 1 ||
+            hidden.shape(2) != c.hidden * int(c.target_layers.size()) || start != context->position ||
+            hidden.shape(1) > std::numeric_limits<int>::max() - start)
+            throw std::invalid_argument("DFlash2 context position or hidden features differ");
+        const int count = hidden.shape(1), retained = std::min(count, c.window), offset = count - retained;
+        features.push_back(astype(slice(hidden, {0, offset, 0}, {1, count, hidden.shape(2)}), bfloat16));
+        auto slots = remainder(arange(start + offset, start + count, int32), array(c.window, int32));
+        auto index = broadcast_to(reshape(slots, {1, 1, retained, 1}), {1, c.kv_heads, retained, c.head_dimension});
+        lanes.push_back({begin, retained, start + offset, start + count, std::move(slots), std::move(index), {}});
+        if (begin > std::numeric_limits<int>::max() - retained)
+            throw std::invalid_argument("DFlash2 context batch is too large");
+        begin += retained;
+    }
+    auto hidden = normalized(impl_->context_projection(features.size() == 1 ? features[0] : concatenate(features, 1)),
+        impl_->hidden_norm, c.epsilon);
+    const auto part = [](const array& packed, const Lane& lane) {
+        if (!lane.begin && lane.retained == packed.shape(1)) return packed;
+        return slice(packed, {0, lane.begin, 0}, {1, lane.begin + lane.retained, packed.shape(2)});
+    };
     for (int layer = 0; layer < c.layers; ++layer) {
         auto projected = impl_->layers[layer]->kv(hidden);
-        auto key = transpose(reshape(projected[0], {1, retained, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
-        key = rotated(normalized(key, impl_->layers[layer]->k_norm, c.epsilon), c.head_dimension, c.rope_theta, start_position + offset);
-        auto value = transpose(reshape(projected[1], {1, retained, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
-        auto keys = put_along_axis(*context.layers[layer].keys, index, key, 2);
-        auto values = put_along_axis(*context.layers[layer].values, index, value, 2);
-        outputs.push_back(keys); outputs.push_back(values);
-        layers.push_back({std::move(keys), std::move(values)});
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            auto& lane = lanes[i];
+            const auto& state = commits[i].context->layers[layer];
+            const Shape shape{1, lane.retained, c.kv_heads, c.head_dimension};
+            auto key = transpose(reshape(part(projected[0], lane), shape), {0, 2, 1, 3});
+            key = rotated(normalized(key, impl_->layers[layer]->k_norm, c.epsilon),
+                c.head_dimension, c.rope_theta, lane.position);
+            auto value = transpose(reshape(part(projected[1], lane), shape), {0, 2, 1, 3});
+            auto keys = put_along_axis(*state.keys, lane.index, key, 2);
+            auto values = put_along_axis(*state.values, lane.index, value, 2);
+            outputs.push_back(keys);
+            outputs.push_back(values);
+            lane.layers.push_back({std::move(keys), std::move(values)});
+        }
     }
-    auto window = put_along_axis(*context.window,
-        broadcast_to(reshape(slots, {1, retained, 1}), {1, retained, c.hidden}), hidden, 1);
-    outputs.push_back(window);
+    std::vector<array> windows;
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const auto& lane = lanes[i];
+        auto index = broadcast_to(reshape(lane.slots, {1, lane.retained, 1}), {1, lane.retained, c.hidden});
+        windows.push_back(put_along_axis(*commits[i].context->window, index, part(hidden, lane), 1));
+        outputs.push_back(windows.back());
+    }
     if (!MlxKernelPreparation::collecting()) async_eval(outputs);
-    context.layers = std::move(layers); context.window = std::move(window); context.position += count;
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        auto& context = *commits[i].context;
+        context.layers = std::move(lanes[i].layers);
+        context.window = std::move(windows[i]);
+        context.position = lanes[i].end_position;
+    }
 }
 
 MlxDFlash2Proposal MlxDFlash2::propose(const MlxDFlash2Context& context, int anchor,
@@ -343,7 +385,13 @@ MlxDFlash2Proposal MlxDFlash2::propose(const MlxDFlash2Context& context, int anc
     return {reshape(result.tokens, {-1}), reshape(result.confidence, {-1})};
 }
 
-MlxDFlash2Proposal MlxDFlash2::propose_batch(std::span<const MlxDFlash2Context* const> contexts,
+struct MlxDFlash2::ProposalLattice {
+    array logits, selector;
+    std::vector<int> offsets;
+    int maximum_depth;
+};
+
+MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFlash2Context* const> contexts,
     std::span<const std::int32_t> anchors, const array& embeddings,
     const std::function<array(const array&)>& output_head,
     std::span<const int> depths,
@@ -438,9 +486,159 @@ MlxDFlash2Proposal MlxDFlash2::propose_batch(std::span<const MlxDFlash2Context* 
         throw std::invalid_argument("DFlash2 target output head vocabulary differs");
     auto selector = impl_->selector_projection(head_hidden);
     if (trace) { trace("final_hidden", head_hidden); trace("logits", logits); trace("selector_hidden", selector); }
-    return select_proposals(depths.empty() ? pack(logits) : logits, depths.empty() ? pack(selector) : selector,
-        impl_->predecessor, impl_->successor, array(anchors.begin(), {batch}, int32),
-        array(row_offsets.begin(), {batch + 1}, int32), maximum_depth, c);
+    return {depths.empty() ? pack(logits) : logits, depths.empty() ? pack(selector) : selector,
+        std::move(row_offsets), maximum_depth};
+}
+
+MlxDFlash2Proposal MlxDFlash2::propose_batch(std::span<const MlxDFlash2Context* const> contexts,
+    std::span<const std::int32_t> anchors, const array& embeddings,
+    const std::function<array(const array&)>& output_head, std::span<const int> depths,
+    const std::function<void(std::string_view, const array&)>& trace) const {
+    auto lattice = proposal_lattice(contexts, anchors, embeddings, output_head, depths, trace);
+    return select_proposals(lattice.logits, lattice.selector, impl_->predecessor, impl_->successor,
+        array(anchors.begin(), {static_cast<int>(anchors.size())}, int32),
+        array(lattice.offsets.begin(), {static_cast<int>(lattice.offsets.size())}, int32),
+        lattice.maximum_depth, config());
+}
+
+std::vector<MlxDFlash2Tree> MlxDFlash2::propose_tree_batch(
+    std::span<const MlxDFlash2Context* const> contexts, std::span<const std::int32_t> anchors,
+    const array& embeddings, const std::function<array(const array&)>& output_head,
+    std::span<const MlxDFlash2TreeInput> inputs) const {
+    if (inputs.size() != contexts.size() || inputs.size() != anchors.size())
+        throw std::invalid_argument("DFlash2 tree batch geometry disagrees");
+    constexpr int choices = 16;
+    const int vocab = config().vocabulary;
+    std::vector<int> depths;
+    std::vector<std::int32_t> previous_rows, first_anchors;
+    for (std::size_t lane = 0; lane < inputs.size(); ++lane) {
+        const auto& input = inputs[lane];
+        if (input.rows < 2 || input.rows > 16 || input.depth < 1 || input.depth > 7 ||
+            input.lookup.size() > static_cast<std::size_t>(input.depth) ||
+            input.lookup.size() != input.lookup_rates.size() ||
+            std::any_of(input.lookup.begin(), input.lookup.end(), [vocab](auto id) { return id < 0 || id >= vocab; }) ||
+            std::any_of(input.lookup_rates.begin(), input.lookup_rates.end(), [](const auto& rates) {
+                return std::any_of(rates.begin(), rates.end(), [](float p) { return !std::isfinite(p) || p < 0.f || p > 1.f; });
+            }))
+            throw std::invalid_argument("invalid DFlash2 tree bounds or lookup chain");
+        depths.push_back(input.depth);
+        for (int depth = 0; depth < input.depth; ++depth) {
+            previous_rows.push_back(depth ? static_cast<int>(previous_rows.size()) - 1 : -1);
+            first_anchors.push_back(anchors[lane]);
+        }
+    }
+    auto draft = proposal_lattice(contexts, anchors, embeddings, output_head, depths, {});
+    const int rows = draft.offsets.back();
+    auto [unary, ids] = candidates(contiguous(draft.logits), rows, vocab);
+    static const auto kernel = cached_metal_kernel("tinfer_dflash2_tree_edges",
+        {"unary", "ids", "features", "predecessor", "successor", "previous", "anchors", "params"},
+        {"edges"}, R"METAL(
+const uint pair = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
+const uint row = pair / 256u, candidate = pair % 16u, parent = (pair / 16u) % 16u;
+const uint lane = thread_index_in_simdgroup;
+if (row >= params[0]) return;
+const int earlier = previous[row];
+const int from = earlier >= 0 ? int(ids[16u * uint(earlier) + parent]) : parent == 0 ? anchors[row] : -1;
+const uint to = ids[16u * row + candidate];
+if (from < 0 || to >= params[1]) {
+    if (lane == 0u) edges[pair] = -INFINITY;
+    return;
+}
+float edge = 0.f;
+for (uint c = lane; c < uint(RANK); c += 32u)
+    edge += (float(predecessor[ulong(from) * RANK + c]) * float(features[ulong(row) * RANK + c])) *
+        float(successor[ulong(to) * RANK + c]);
+edge = simd_sum(edge);
+if (lane == 0u) edges[pair] = unary[16u * row + candidate] + edge;
+)METAL");
+    const int groups = (rows * choices * choices + 3) / 4;
+    auto edges = kernel({unary, ids, contiguous(draft.selector), impl_->predecessor, impl_->successor,
+        array(previous_rows.begin(), {rows}, int32), array(first_anchors.begin(), {rows}, int32),
+        array({static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(vocab)})},
+        {{rows, choices, choices}}, {float32}, {groups * 128, 1, 1}, {128, 1, 1},
+        {{"RANK", config().selector_rank}}, std::nullopt, false, {})[0];
+    eval(ids, edges);
+
+    // Greedy portion of Splash's draft_select_tree. Lookup tokens and draft
+    // candidates enter independently. A draft can join a lookup node once.
+    struct Candidate {
+        float score;
+        int order, parent, position, slot;
+        bool operator<(const Candidate& other) const {
+            return score != other.score ? score < other.score : order > other.order;
+        }
+    };
+    const auto* candidate_ids = ids.data<std::uint32_t>();
+    const auto* scores = edges.data<float>();
+    constexpr float intercept[] = {0.f, -.35f, -.8f, -.75f, -.75f, -.85f, -.45f};
+    std::vector<MlxDFlash2Tree> result;
+    for (std::size_t lane = 0; lane < inputs.size(); ++lane) {
+        const auto& input = inputs[lane];
+        const int begin = draft.offsets[lane], chain = static_cast<int>(input.lookup.size());
+        auto& tree = result.emplace_back();
+        tree.tokens.push_back(anchors[lane]);
+        tree.parents.push_back(-1);
+        tree.reach.push_back(1.f);
+        std::array<bool, 16> on_lookup{true};
+        std::priority_queue<Candidate> frontier;
+        int order = 0;
+        const auto lookup_rate = [&](int position) {
+            const auto* options = candidate_ids + (begin + position) * choices;
+            const auto* found = std::find(options, options + choices, static_cast<std::uint32_t>(input.lookup[position]));
+            return input.lookup_rates[position][found == options ? 0 : found == options + choices ? 2 : 1];
+        };
+        const auto expand = [&](int parent, int position, int predecessor, float score) {
+            const int row = begin + position;
+            const auto* options = candidate_ids + row * choices;
+            const auto* logits = scores + (row * choices + predecessor) * choices;
+            const auto lookup = on_lookup[parent] && position < chain ? input.lookup[position] : -1;
+            const float reserved = lookup >= 0 ? lookup_rate(position) : 0.f;
+            const float best = *std::max_element(logits, logits + choices);
+            std::array<float, choices> weights;
+            float total = 0.f;
+            for (int i = 0; i < choices; ++i) {
+                weights[i] = std::exp(logits[i] - best);
+                total += weights[i];
+            }
+            float left = 1.f - reserved, bound = score;
+            for (int child = 0; child < 4 && total > 0.f; ++child) {
+                auto ranked = std::max_element(weights.begin(), weights.end());
+                if (*ranked == 0.f) break;
+                const int slot = static_cast<int>(ranked - weights.begin());
+                const float q = std::clamp(*ranked / total, 1.e-6f, 1.f - 1.e-6f);
+                *ranked = 0.f;
+                const bool joins = static_cast<int>(options[slot]) == lookup;
+                const float cap = left + (joins ? reserved : 0.f);
+                const float p = std::min(cap, 1.f / (1.f + std::exp(-(.7f * std::log(q / (1.f - q)) + intercept[position]))));
+                left = cap - (joins ? std::max(p, reserved) : p);
+                bound = std::min(bound, score * p);
+                if (bound > 0.f) frontier.push({bound, order++, parent, position, slot});
+            }
+        };
+        expand(0, 0, 0, 1.f);
+        if (chain) frontier.push({lookup_rate(0), order++, 0, 0, -1});
+        while (!frontier.empty() && tree.tokens.size() < static_cast<std::size_t>(input.rows)) {
+            const auto node = frontier.top();
+            frontier.pop();
+            const bool lookup = node.slot < 0;
+            const std::int64_t token = lookup ? input.lookup[node.position] :
+                candidate_ids[(begin + node.position) * choices + node.slot];
+            int row = 1;
+            for (; row < static_cast<int>(tree.tokens.size()); ++row)
+                if (tree.parents[row] == node.parent && tree.tokens[row] == token) break;
+            if (row == static_cast<int>(tree.tokens.size())) {
+                tree.tokens.push_back(token);
+                tree.parents.push_back(node.parent);
+                tree.reach.push_back(node.score);
+                on_lookup[row] = on_lookup[node.parent] && node.position < chain && token == input.lookup[node.position];
+            }
+            const int next = node.position + 1;
+            if (next >= input.depth) continue;
+            if (!lookup) expand(row, next, node.slot, node.score);
+            else if (next < chain) frontier.push({node.score * lookup_rate(next), order++, row, next, -1});
+        }
+    }
+    return result;
 }
 
 void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head) const {

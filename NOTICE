@@ -145,6 +145,21 @@ License: Apache-2.0 (`LICENSE`)
 Source: https://github.com/jundot/omlx
 Reference: omlx/patches/mlx_lm_mtp/batch_policy.py
 
+Splash
+------
+The ancestor-query transform and recurrent scan in the Flash-Next Gated
+DeltaNet verification kernel are adapted from Splash's
+`gdn_decode_prologue`, `gdn_decode_transform`, `gdn_decode_scan`,
+`gdn_decode_gate` and `gdn_fold_rows`. Flash-Next
+PLE also adapts its tree convolution and retained history from
+`runtime/metal/kernels/shared/ngram_embedding.metal`.
+The greedy DFlash2 tree growth and history lookup priors also adapt
+`runtime/metal/kernels/decode/sampling.metal` and `runtime/model/LookupProposals.hpp`.
+Packed row allocation adapts `runtime/model/StepCosts.cpp`.
+License: Apache-2.0 (`LICENSE`)
+Source: https://github.com/incoai/splash
+Reference: release 1.7.0, runtime/metal/kernels/decode/gdn.metal
+
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.
 

@@ -8,12 +8,142 @@
 #include "mlx_stream_sync.h"
 #include "mtp_batch_policy.h"
 #include "mtp_policy.h"
+#include "runtime_config.h"
 
+#include <bit>
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <unordered_map>
 
 namespace mfq::metal {
+
+inline bool mlx_dflash_tree_enabled() {
+    static const bool enabled = mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false);
+    return enabled;
+}
+
+class MlxDFlashLookup {
+public:
+    void append(std::span<const std::int64_t> tokens) {
+        for (auto token : tokens) {
+            tokens_.push_back(static_cast<std::int32_t>(token));
+            if (tokens_.size() >= 3) endings_[suffix()].push_back(tokens_.size());
+        }
+    }
+
+    MlxDFlash2TreeInput propose(int depth, int rows) const {
+        MlxDFlash2TreeInput result{depth, rows, {}, {}};
+        if (tokens_.size() < 4) return result;
+        const auto& ends = endings_.at(suffix());
+        std::size_t best = 2, end = 0;
+        const auto limit = std::min<std::size_t>(tokens_.size() - 1, 64);
+        for (auto it = std::next(ends.rbegin()); it != ends.rend(); ++it) {
+            const auto candidate = *it;
+            std::size_t length = 3;
+            while (length < std::min(limit, candidate) &&
+                tokens_[candidate - length - 1] == tokens_[tokens_.size() - length - 1]) ++length;
+            if (length > best) { best = length; end = candidate; }
+            if (best == limit) break;
+        }
+        if (!end) return result;
+        const auto count = std::min<std::size_t>(depth, tokens_.size() - end);
+        result.lookup.assign(tokens_.begin() + end, tokens_.begin() + end + count);
+        // Splash LookupAcceptance's greedy prior, through DFlash2's seven positions.
+        static constexpr std::array<float, 4> rates[6][4] = {
+            {{0.966F, 0.214F, 0.125F, 0.648F}, {0.973F, 0.307F, 0.232F, 0.709F}, {0.980F, 0.516F, 0.559F, 0.787F}, {0.979F, 0.652F, 0.732F, 0.830F}},
+            {{0.975F, 0.249F, 0.153F, 0.749F}, {0.980F, 0.349F, 0.276F, 0.798F}, {0.985F, 0.564F, 0.614F, 0.857F}, {0.984F, 0.694F, 0.775F, 0.888F}},
+            {{0.981F, 0.307F, 0.163F, 0.812F}, {0.985F, 0.419F, 0.292F, 0.851F}, {0.989F, 0.634F, 0.633F, 0.897F}, {0.988F, 0.753F, 0.789F, 0.920F}},
+            {{0.987F, 0.327F, 0.220F, 0.867F}, {0.990F, 0.441F, 0.374F, 0.896F}, {0.992F, 0.655F, 0.714F, 0.929F}, {0.992F, 0.770F, 0.844F, 0.946F}},
+            {{0.995F, 0.648F, 0.439F, 0.935F}, {0.996F, 0.750F, 0.624F, 0.950F}, {0.997F, 0.878F, 0.874F, 0.967F}, {0.997F, 0.927F, 0.937F, 0.975F}},
+            {{0.999F, 0.955F, 0.859F, 0.993F}, {1.000F, 0.972F, 0.928F, 0.995F}, {1.000F, 0.988F, 0.982F, 0.997F}, {1.000F, 0.993F, 0.992F, 0.997F}}};
+        const auto length_bucket = std::bit_width(best) - 2;
+        for (std::size_t row = 0; row < count; ++row)
+            result.lookup_rates.push_back(rates[length_bucket][std::bit_width(row)]);
+        return result;
+    }
+
+private:
+    std::array<std::int32_t, 3> suffix() const {
+        const auto end = tokens_.size();
+        return {tokens_[end - 3], tokens_[end - 2], tokens_[end - 1]};
+    }
+    std::vector<std::int32_t> tokens_;
+    std::map<std::array<std::int32_t, 3>, std::vector<std::size_t>> endings_;
+};
+
+class MlxDFlashTreeBudget {
+public:
+    void choose(std::span<MlxDFlash2Tree> trees) const {
+        const int lanes = static_cast<int>(trees.size());
+        if (lanes == 0 || lanes > static_cast<int>(costs_.size())) return;
+        const auto& cost = costs_[lanes - 1];
+        if (cost.samples < 4 || cost.samples % 16 == 15) return;
+        // Splash StepCosts pools the next row of every lane by path reach,
+        // then chooses the prefix with the most expected tokens per cost.
+        std::array<std::size_t, 8> kept{}, best{};
+        kept.fill(1);
+        best = kept;
+        double tokens = lanes;
+        double rate = tokens / price(cost, lanes, lanes);
+        for (int rows = lanes + 1;; ++rows) {
+            int next = -1;
+            for (int lane = 0; lane < lanes; ++lane) {
+                if (kept[lane] >= trees[lane].reach.size()) continue;
+                const auto value = trees[lane].reach[kept[lane]];
+                if (next < 0 || value > trees[next].reach[kept[next]] ||
+                    (value == trees[next].reach[kept[next]] && kept[lane] < kept[next])) next = lane;
+            }
+            if (next < 0) break;
+            tokens += trees[next].reach[kept[next]++];
+            const double candidate = tokens / price(cost, lanes, rows);
+            if (candidate > rate) { rate = candidate; best = kept; }
+        }
+        for (int lane = 0; lane < lanes; ++lane) {
+            trees[lane].tokens.resize(best[lane]);
+            trees[lane].parents.resize(best[lane]);
+            trees[lane].reach.resize(best[lane]);
+        }
+    }
+
+    void observe(int lanes, int rows, double ms) {
+        if (lanes < 1 || lanes > static_cast<int>(costs_.size()) || ms <= 0.0) return;
+        auto& c = costs_[lanes - 1];
+        const double wall = c.samples ? std::min(ms, 2.0 * price(c, lanes, rows)) : ms;
+        constexpr double decay = .95;
+        ++c.samples;
+        c.weight = c.weight * decay + 1.0;
+        c.rows = c.rows * decay + rows;
+        c.rows_squared = c.rows_squared * decay + double(rows) * rows;
+        c.wall = c.wall * decay + wall;
+        c.rows_wall = c.rows_wall * decay + rows * wall;
+    }
+
+private:
+    struct Cost {
+        int samples = 0;
+        double weight = 0.0, rows = 0.0, rows_squared = 0.0, wall = 0.0, rows_wall = 0.0;
+    };
+
+    static double price(const Cost& c, int lanes, int rows) {
+        // Use Splash's per-width cost shape until the local observations
+        // establish how much the target runtime pays for additional rows.
+        constexpr double anchor_cost[] = {.60, .50, .45, .40};
+        const double anchor = anchor_cost[std::min(lanes, 4) - 1];
+        const double prior = (1.0 - anchor) / (7.0 * lanes);
+        if (c.weight == 0.0) return anchor + prior * (rows - lanes);
+        const double mean = c.wall / c.weight, pivot = c.rows / c.weight;
+        const double spread = std::max(0.0, c.rows_squared - c.rows * pivot);
+        const double covariance = c.rows_wall - c.rows * mean;
+        const double scale = mean / (anchor + prior * (pivot - lanes));
+        const double ridge = 6.0 * lanes * lanes;
+        const double slope = std::clamp((covariance + ridge * scale * prior) / (spread + ridge),
+            0.0, mean / pivot);
+        return mean + slope * (rows - pivot);
+    }
+
+    std::array<Cost, 8> costs_{};
+};
 
 struct MlxMtpBatchRound {
     std::shared_ptr<mfq::engine::mtp::BatchDepthPolicy> policy;
@@ -54,6 +184,9 @@ struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
     std::optional<MlxMtpTargetBatch> target_result;
     MlxMtpGenerationStats mtp_stats;
     std::optional<MlxDFlash2Context> dflash_context;
+    std::optional<MlxDFlashLookup> dflash_lookup;
+    std::optional<MlxDFlash2Tree> dflash_tree;
+    std::optional<mlx::core::array> pending_dflash_features;
     int next_depth = 0, budget_depth = 0, budget_rows = 0;
     int scheduled_budget = 0, scheduled_rows = 0;
     std::array<std::uint64_t, mfq::engine::mtp::kMaximumReportedDraftDepth> reached{}, hits{};
@@ -313,7 +446,8 @@ public:
     void retire(const std::vector<std::shared_ptr<Request>>& requests, std::int64_t) {
         for (const auto& request : requests) {
             runtime_.record_mtp_stats(request->mtp_stats);
-            if (request->target_result && request->target_work && request->target_work->draft_count) {
+            if (request->dflash_tree) runtime_.resolve_request_tree(*request->cache, -1);
+            else if (request->target_result && request->target_work && request->target_work->draft_count) {
                 runtime_.resolve_request(*request->cache, 0);
                 request->cache_length = runtime_.request_cache_position(*request->cache);
             }
@@ -321,6 +455,7 @@ public:
             request->cache.reset();
             request->target_work.reset();
             request->target_result.reset();
+            request->dflash_tree.reset();
             request->dflash_context.reset();
             request->round.reset();
         }
@@ -352,6 +487,13 @@ public:
             {"continuous_batching_dflash2_draft_batches", double(dflash_draft_batches_)},
             {"continuous_batching_dflash2_draft_rows", double(dflash_draft_rows_)},
             {"continuous_batching_dflash2_draft_maximum_batch", double(dflash_draft_maximum_)},
+            {"continuous_batching_dflash2_tree_batches", double(dflash_tree_batches_)},
+            {"continuous_batching_dflash2_tree_branch_rows", double(dflash_branch_rows_)},
+            {"continuous_batching_dflash2_tree_qsa_lane_layers", double(dflash_tree_qsa_lanes_)},
+            {"continuous_batching_dflash2_tree_draft_ms", dflash_tree_draft_ms_},
+            {"continuous_batching_dflash2_tree_verify_ms", dflash_tree_verify_ms_},
+            {"continuous_batching_dflash2_tree_context_submit_ms", dflash_tree_context_ms_},
+            {"continuous_batching_dflash2_tree_resolve_submit_ms", dflash_tree_resolve_ms_},
             {"continuous_batching_prefill_batches", double(prefill_batches_)},
             {"continuous_batching_prefill_rows", double(prefill_rows_)},
             {"continuous_batching_prefill_maximum_batch", double(prefill_maximum_)},
@@ -580,6 +722,11 @@ private:
         auto delta = output.append({pending});
         request->produced += delta.token_ids.size();
         stats.standard_tokens = request->produced;
+        if (mlx_dflash_tree_enabled() && request->sampler.params().greedy() && !request->counts && !request->token_constraint) {
+            request->dflash_lookup.emplace();
+            request->dflash_lookup->append(request->prompt);
+            request->dflash_lookup->append(delta.token_ids);
+        }
         for (;;) {
             const int position = runtime_.request_cache_position(*request->cache);
             if (output.stopped() || request->produced >= request->generation_limit ||
@@ -588,12 +735,14 @@ private:
                 if (!delta.token_ids.empty()) co_yield std::move(delta);
                 co_return;
             }
-            if (position != context.position) throw std::logic_error("DFlash2 request cache positions diverged");
-            const int depth = std::min({select_draft_depth(*request),
+            const int pending_rows = request->pending_dflash_features ? request->pending_dflash_features->shape(1) : 0;
+            if (position != context.position + pending_rows)
+                throw std::logic_error("DFlash2 request cache positions diverged");
+            const int scheduled_depth = std::min({select_draft_depth(*request),
                 request->generation_limit - request->produced - 1, runtime_.context_capacity() - position - 1});
             request->draft_started = std::chrono::steady_clock::now();
             request->draft_epoch = prefill_epoch_;
-            request->target_work.emplace(MlxMtpTargetRequest{pending, mlx::core::zeros({0}, mlx::core::int32), depth});
+            request->target_work.emplace(MlxMtpTargetRequest{pending, mlx::core::zeros({0}, mlx::core::int32), scheduled_depth});
             schedule();
             publish_mtp_metrics(*request, output);
             co_yield std::move(delta);
@@ -601,33 +750,66 @@ private:
             if (output.stopped()) co_return;
             check();
 
+            const int depth = request->target_work->draft_count;
             auto& verified = *request->target_result;
             auto predictions = verified.greedy_tokens ? *verified.greedy_tokens : request->sampler.sample(verified.logits);
             predictions.eval();
             const auto* target = predictions.data<std::int32_t>();
-            const auto* drafts = depth ? request->target_work->draft_tokens.data<std::int32_t>() : nullptr;
+            const auto* drafts = depth && !request->dflash_tree
+                ? request->target_work->draft_tokens.data<std::int32_t>() : nullptr;
             int matched = 0;
             pending = target[0];
-            if (depth) {
+            std::vector<std::int64_t> tokens;
+            std::vector<int> retained_nodes;
+            const bool tree = request->dflash_tree.has_value();
+            if (tree) {
+                retained_nodes.push_back(0);
+                const auto& tree = *request->dflash_tree;
+                int node = 0;
+                for (;;) {
+                    pending = target[node];
+                    int child = node + 1;
+                    while (child < static_cast<int>(tree.tokens.size()) &&
+                        (tree.parents[child] != node || tree.tokens[child] != pending)) ++child;
+                    if (child == static_cast<int>(tree.tokens.size())) break;
+                    tokens.push_back(pending);
+                    retained_nodes.push_back(child);
+                    node = child;
+                }
+                matched = static_cast<int>(tokens.size());
+            } else if (depth) {
                 const auto decision = mfq::engine::mtp::verify_greedy(
                     {drafts, static_cast<std::size_t>(depth)}, {target, static_cast<std::size_t>(depth + 1)});
                 matched = static_cast<int>(decision.accepted_drafts);
                 pending = decision.next_token;
+                tokens.assign(drafts, drafts + matched);
             }
-            std::vector<std::int64_t> tokens;
-            if (matched) tokens.assign(drafts, drafts + matched);
             tokens.push_back(pending);
             delta = output.append(tokens);
             const int retained = std::min(matched, static_cast<int>(delta.token_ids.size()));
-            if (depth) runtime_.resolve_request(*request->cache, retained);
             auto features = std::move(verified.hidden);
+            if (tree) {
+                const auto started = std::chrono::steady_clock::now();
+                runtime_.resolve_request_tree(*request->cache, retained_nodes[retained]);
+                auto indices = mlx::core::array(retained_nodes.begin(), {retained + 1}, mlx::core::int32);
+                features = mlx::core::take(features, indices, 1);
+                request->dflash_tree.reset();
+                dflash_tree_resolve_ms_ += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+            } else {
+                if (depth) runtime_.resolve_request(*request->cache, retained);
+                features = feature_rows(features, 0, retained + 1);
+            }
+            if (request->dflash_lookup) request->dflash_lookup->append(delta.token_ids);
             request->target_result.reset();
             request->target_work.reset();
             request->cache_length = runtime_.request_cache_position(*request->cache);
             request->produced += delta.token_ids.size();
             if (!output.stopped() && request->produced < request->generation_limit &&
-                request->cache_length < runtime_.context_capacity())
-                hooks_.dflash2->append_context(context, feature_rows(features, 0, retained + 1), position);
+                request->cache_length < runtime_.context_capacity()) {
+                if (tree) request->pending_dflash_features = std::move(features);
+                else hooks_.dflash2->append_context(context, features, position);
+            }
 
             stats.selected_depth = depth;
             ++stats.depth_cycles[depth];
@@ -676,7 +858,114 @@ private:
         dflash_draft_maximum_ = std::max(dflash_draft_maximum_, lanes.size());
     }
 
+    Decoded decode_dflash_trees(const State& cohort) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto& draft = *hooks_.dflash2;
+        const auto& config = draft.config();
+        std::vector<std::shared_ptr<MlxQwen4RequestCache>> caches;
+        std::vector<MlxQwen4RequestTree> plans;
+        std::vector<const MlxDFlash2Context*> contexts;
+        std::vector<std::int32_t> anchors, embeddings;
+        std::vector<MlxDFlash2TreeInput> inputs;
+        std::vector<std::size_t> draft_lanes;
+        std::vector<MlxDFlash2Tree> trees;
+        for (const auto& request : cohort.active) {
+            const auto anchor = request->target_work->pending_token;
+            const int position = runtime_.request_cache_position(*request->cache);
+            const int depth = std::min({draft_cap(*request), request->generation_limit - request->produced - 1,
+                runtime_.context_capacity() - position - 1});
+            caches.push_back(request->cache);
+            plans.push_back({{anchor}, {-1}});
+            if (!depth) continue;
+            draft_lanes.push_back(plans.size() - 1);
+            contexts.push_back(&*request->dflash_context);
+            anchors.push_back(anchor);
+            inputs.push_back(request->dflash_lookup->propose(depth, depth + 1));
+            embeddings.push_back(anchor);
+            embeddings.insert(embeddings.end(), config.block_size - 1, config.mask_token);
+        }
+        if (!contexts.empty()) {
+            const auto ids = mlx::core::array(embeddings.begin(),
+                {static_cast<int>(contexts.size()), config.block_size}, mlx::core::int32);
+            trees = draft.propose_tree_batch(contexts, anchors, runtime_.embed_token_ids(ids),
+                [this](const auto& hidden) { return runtime_.project_hidden_logits(hidden); }, inputs);
+            ++dflash_draft_batches_;
+            dflash_draft_rows_ += contexts.size();
+            dflash_draft_maximum_ = std::max(dflash_draft_maximum_, contexts.size());
+        }
+
+        const bool adaptive = trees.size() == plans.size() &&
+            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", true);
+        if (adaptive) dflash_tree_budget_.choose(trees);
+        for (std::size_t lane = 0; lane < trees.size(); ++lane)
+            plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
+        const auto verification = std::chrono::steady_clock::now();
+        dflash_tree_draft_ms_ += std::chrono::duration<double, std::milli>(verification - started).count();
+        DFlashCapture capture(runtime_, &draft);
+        auto logits = runtime_.forward_request_trees(caches, plans, &dflash_tree_qsa_lanes_);
+        ++dflash_tree_batches_;
+        for (std::size_t lane = 0; lane < plans.size(); ++lane) {
+            auto& work = *cohort.active[lane];
+            std::array<bool, 16> seen_parents{};
+            for (const auto parent : std::span(plans[lane].parents).subspan(1)) {
+                dflash_branch_rows_ += seen_parents[parent];
+                seen_parents[parent] = true;
+            }
+            work.dflash_tree.emplace(MlxDFlash2Tree{std::move(plans[lane].tokens), std::move(plans[lane].parents)});
+        }
+        auto features = capture.take();
+        if (!features) throw std::logic_error("DFlash2 tree verification omitted target features");
+        auto predictions = sample_greedy(mlx::core::reshape(logits, {logits.shape(1), logits.shape(2)}));
+        auto round = std::make_shared<MlxMtpBatchRound>();
+        round->expected = caches.size();
+        round->maximum_drafts = 0;
+        round->started = std::chrono::steady_clock::now();
+        std::vector<mlx::core::array> selected;
+        int start = 0, verify_rows = 0;
+        for (const auto& request : cohort.active) {
+            const int rows = static_cast<int>(request->dflash_tree->tokens.size());
+            const int depth = rows - 1;
+            const int end = start + rows;
+            request->target_work->draft_count = depth;
+            request->round_depth = depth;
+            request->round = round;
+            round->started = std::min(round->started, request->draft_started);
+            round->maximum_drafts = std::max(round->maximum_drafts, depth);
+            auto chosen = mlx::core::slice(predictions, {start}, {end});
+            selected.push_back(chosen);
+            request->target_result.emplace(MlxMtpTargetBatch{
+                mlx::core::reshape(feature_rows(logits, start, end), {rows, logits.shape(2)}),
+                feature_rows(*features, start, end), std::move(chosen)});
+            start = end;
+            verify_rows += depth;
+        }
+        mlx::core::eval(selected);
+        const auto finished = std::chrono::steady_clock::now();
+        dflash_tree_verify_ms_ += std::chrono::duration<double, std::milli>(finished - verification).count();
+        if (adaptive) dflash_tree_budget_.observe(static_cast<int>(caches.size()), start,
+            std::chrono::duration<double, std::milli>(finished - started).count());
+        ++decode_batches_;
+        decode_rows_ += caches.size();
+        maximum_batch_ = std::max(maximum_batch_, caches.size());
+        ++mtp_batches_;
+        mtp_rows_ += caches.size();
+        mtp_maximum_batch_ = std::max(mtp_maximum_batch_, caches.size());
+        mtp_verify_rows_ += verify_rows;
+        mtp_ragged_batches_ += verify_rows != static_cast<int>(caches.size()) * round->maximum_drafts;
+        return {mlx::core::zeros({0, 1, logits.shape(2)}), {}, {}};
+    }
+
     Decoded decode_mtp(const State& state) {
+        std::vector<MlxDFlash2::ContextCommit> commits;
+        for (const auto& request : state.active) if (request->eligible && request->pending_dflash_features)
+            commits.push_back({&*request->dflash_context, *request->pending_dflash_features, request->dflash_context->position});
+        if (!commits.empty()) {
+            const auto started = std::chrono::steady_clock::now();
+            hooks_.dflash2->append_context_batch(commits);
+            dflash_tree_context_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+            for (const auto& request : state.active) if (request->eligible) request->pending_dflash_features.reset();
+        }
         std::vector<std::shared_ptr<MlxQwen4RequestCache>> draft_caches;
         std::vector<std::optional<mlx::core::array>> previous;
         for (const auto& request : state.active) if (request->eligible && request->mtp &&
@@ -708,6 +997,11 @@ private:
             }
         }
         if (!cohort.active.empty()) park_memory_.tick();
+        if (mlx_dflash_tree_enabled() && capture_dflash && std::all_of(cohort.active.begin(), cohort.active.end(),
+                [this](const auto& request) {
+                    return request->dflash_lookup && runtime_.can_verify_request_tree(*request->cache);
+                }))
+            return decode_dflash_trees(cohort);
         draft_dflash2(dflash_lanes, drafts);
         if (!drafts.empty()) mlx::core::eval(drafts);
         Decoded result{mlx::core::zeros({0, 1, static_cast<int>(runtime_.config().vocab_size)}), {}, {}};
@@ -863,6 +1157,11 @@ private:
     std::size_t mtp_verify_rows_ = 0, mtp_ragged_batches_ = 0;
     std::size_t mtp_draft_batches_ = 0, mtp_draft_rows_ = 0, mtp_draft_maximum_ = 0;
     std::size_t dflash_draft_batches_ = 0, dflash_draft_rows_ = 0, dflash_draft_maximum_ = 0;
+    MlxDFlashTreeBudget dflash_tree_budget_;
+    std::size_t dflash_tree_batches_ = 0, dflash_branch_rows_ = 0;
+    std::size_t dflash_tree_qsa_lanes_ = 0;
+    double dflash_tree_draft_ms_ = 0, dflash_tree_verify_ms_ = 0;
+    double dflash_tree_context_ms_ = 0, dflash_tree_resolve_ms_ = 0;
     std::size_t prefill_batches_ = 0, prefill_rows_ = 0, prefill_maximum_ = 0;
     double prefill_compute_ms_ = 0, prefill_checkpoint_ms_ = 0, prefill_maximum_ms_ = 0;
     std::array<std::uint64_t, mfq::engine::mtp::kMaximumReportedDraftDepth + 1> mtp_cycle_counts_{};

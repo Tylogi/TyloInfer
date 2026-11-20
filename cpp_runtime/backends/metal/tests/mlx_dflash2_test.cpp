@@ -136,6 +136,37 @@ int main() {
                         slice(solo.tokens, {0}, {depths[lane]})).item<bool>())
                     throw std::runtime_error("batched DFlash2 lane differs from its independent proposal");
             }
+            const std::array<MlxDFlash2TreeInput, 2> inputs{{
+                {2, 6, {123, 234}, {{.999f, .999f, .999f, .999f}, {.999f, .999f, .999f, .999f}}},
+                {3, 6, {}, {}}}};
+            auto trees = draft.propose_tree_batch(contexts, anchors, concatenate({first, second}, 0),
+                [&](const array&) { return concatenate({slice(logits, {0, 1, 0}, {1, 3, 1024}),
+                    slice(other_logits, {0, 1, 0}, {1, 4, 1024})}, 1); }, inputs);
+            if (trees[0].tokens.size() < 3 || trees[0].tokens[1] != 123 || trees[0].tokens[2] != 234 ||
+                trees[0].parents[1] != 0 || trees[0].parents[2] != 1 || trees[1].tokens.front() != 42 ||
+                std::count(trees[1].parents.begin(), trees[1].parents.end(), 0) < 2)
+                throw std::runtime_error("DFlash2 proposal tree lost lookup or alternative draft paths");
+
+            auto expected_first = context, expected_second = other;
+            auto actual_first = context, actual_second = other;
+            const auto left = broadcast_to(pattern, {1, 3, 64});
+            const auto right = broadcast_to(pattern, {1, 7, 64});
+            draft.append_context(expected_first, left, context.position);
+            draft.append_context(expected_second, right, other.position);
+            const std::array<MlxDFlash2::ContextCommit, 2> commits{{
+                {&actual_first, left, context.position}, {&actual_second, right, other.position}}};
+            draft.append_context_batch(commits);
+            const std::array<const MlxDFlash2Context*, 2> actual_contexts{&actual_first, &actual_second};
+            const std::array<const MlxDFlash2Context*, 2> expected_contexts{&expected_first, &expected_second};
+            for (std::size_t lane = 0; lane < contexts.size(); ++lane) {
+                const auto& actual = *actual_contexts[lane];
+                const auto& expected = *expected_contexts[lane];
+                if (actual.position != expected.position ||
+                    !allclose(*actual.window, *expected.window, 1e-3, 1e-5).item<bool>() ||
+                    !allclose(*actual.layers[0].keys, *expected.layers[0].keys, 1e-3, 1e-5).item<bool>() ||
+                    !allclose(*actual.layers[0].values, *expected.layers[0].values, 1e-3, 1e-5).item<bool>())
+                    throw std::runtime_error("batched DFlash2 context commit differs from independent rings");
+            }
         }
         auto invalid = context; invalid.layers[0].keys.reset();
         bool rejected = false;

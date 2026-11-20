@@ -2633,7 +2633,7 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
         rotary_dimension > std::min(head_dimension, index_dimension) ||
         !std::isfinite(rope_theta) || rope_theta <= 0.0f ||
         !std::isfinite(eps) || eps <= 0.0f ||
-        rows < 1 || rows > 8 ||
+        rows < 1 ||
         query_gate.shape() != Shape{1, rows, query_heads * (separate_gate ? 1 : 2) * head_dimension} ||
         key.shape() != Shape{1, rows, key_heads * head_dimension} ||
         index_query_key.shape() !=

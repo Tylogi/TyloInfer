@@ -169,6 +169,7 @@ public:
     // recreates the original allocation capacity without aliasing the saved
     // arrays, so a resumed decode cannot mutate another session snapshot.
     MlxKvCacheSnapshot snapshot(bool detached = true) const;
+    MlxKvCache fork() const;
     void restore_snapshot(const MlxKvCacheSnapshot& snapshot);
     // A freshly decoded persistent snapshot has no other owner. Adopt its
     // compact K/V allocations directly; the normal growth path reserves more
@@ -218,6 +219,7 @@ public:
     std::pair<mlx::core::array, int> append(
         const mlx::core::array& value);
     mlx::core::array view() const;
+    MlxSequenceCache fork() const;
     void trim(int tokens);
     void clear() noexcept;
 
