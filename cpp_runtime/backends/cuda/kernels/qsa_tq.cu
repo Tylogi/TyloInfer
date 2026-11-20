@@ -50,8 +50,10 @@ __device__ float warp_max(float value) {
 }
 
 template<int W> __global__ void restore_modes(const float* keys,const float* values,
-    const float* ks,const float* vs,float* out_k,float* out_v,int heads,int width) {
+    const float* ks,const float* vs,float* out_k,float* out_v,int heads,int width,RestoreTailIndex index) {
     const int d=threadIdx.x,head=blockIdx.x,block=blockIdx.y,kind=blockIdx.z;
+    if(!head && !block && !kind)
+        for(int i=d;i<index.elements;i+=W)index.destination[i]=__half2float(__ushort_as_half(index.source[i]));
     const float* input=kind?values:keys;const float* signs=kind?vs:ks;
     float* output=kind?out_v:out_k;
     __shared__ float work[4*W];
@@ -1329,10 +1331,11 @@ int tq8_fit_online(const float* rows,const uint16_t* codebook,const uint8_t* can
     return int(cudaGetLastError());
 }
 int tq_restore_modes(const float* keys,const float* values,const float* ks,const float* vs,
-    float* out_k,float* out_v,int blocks,int heads,int width,int padded,cudaStream_t stream) {
-    if(!keys || !values || !ks || !vs || !out_k || !out_v || blocks<=0 || heads<=0 || width<=0 || width>padded)
+    float* out_k,float* out_v,int blocks,int heads,int width,int padded,cudaStream_t stream,const RestoreTailIndex* index) {
+    if(!keys || !values || !ks || !vs || !out_k || !out_v || blocks<=0 || heads<=0 || width<=0 || width>padded ||
+        (index && (!index->source || !index->destination || index->elements<=0 || blocks!=1)))
         return int(cudaErrorInvalidValue);
-#define RESTORE(W) restore_modes<W><<<dim3(heads,blocks,2),W,0,stream>>>(keys,values,ks,vs,out_k,out_v,heads,width)
+#define RESTORE(W) restore_modes<W><<<dim3(heads,blocks,2),W,0,stream>>>(keys,values,ks,vs,out_k,out_v,heads,width,index?*index:RestoreTailIndex{})
     switch(padded){case 256:RESTORE(256);break;case 512:RESTORE(512);break;case 1024:RESTORE(1024);break;default:return int(cudaErrorInvalidValue);}
 #undef RESTORE
     return int(cudaGetLastError());

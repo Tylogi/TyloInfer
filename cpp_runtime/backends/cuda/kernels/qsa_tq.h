@@ -61,9 +61,14 @@ int tq_prepare_affine8(const void* keys,const void* values,bool fp16,
 // Unpack H4/RHT modes to [blocks, heads, 4, padded_width] for each K/V kind.
 int tq_decode_modes(const TqBlockView* blocks,float* keys,float* values,
     const std::uint16_t* relative,int count,int heads,int padded_width,cudaStream_t stream);
+struct RestoreTailIndex {
+    const std::uint16_t* source;
+    float* destination;
+    int elements;
+};
 int tq_restore_modes(const float* keys,const float* values,const float* key_signs,
     const float* value_signs,float* restored_keys,float* restored_values,
-    int blocks,int heads,int width,int padded_width,cudaStream_t stream);
+    int blocks,int heads,int width,int padded_width,cudaStream_t stream,const RestoreTailIndex* index=nullptr);
 // The native QSA selector returns contiguous four-token groups plus a tail.
 int tq_group_selected(const std::int32_t* tokens,SelectedBlock* blocks,
     int queries,int columns,cudaStream_t stream);
