@@ -1656,7 +1656,10 @@ class Qsa {
                 auto buffer=history_only?Tensor{}:tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
                     hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
                 auto output=adaptive_->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,buffer,
-                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions);
+                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions,
+                    [this](const Tensor& raw,const Tensor& absolute,const Tensor& physical) {
+                        return rotary_->pool_normalized(raw,w_.index_key_norm,absolute,4,c_.eps,physical);
+                    });
                 if(history_only)return {};
                 output=output.to(hidden.scalar_type());
                 return project_output?w_.output(execution,output):output;

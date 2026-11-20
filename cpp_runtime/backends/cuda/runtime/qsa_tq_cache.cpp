@@ -974,7 +974,7 @@ struct QsaTqCache::Impl {
     }
     tb::Tensor forward_pending_graph(const tb::Tensor& query,const tb::Tensor& key,const tb::Tensor& value,const tb::Tensor& iq,
         const tb::Tensor& raw,const tb::Tensor& positions,const tb::Tensor& gate,tb::Tensor output,
-        const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions) {
+        const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions,const QsaTqCache::CompletePool& complete_pool) {
         if(key.size(1)>1)return forward_pending_batch(query,key,value,iq,raw,positions,gate,std::move(output),pool,absolute_positions);
         if(!pending_graph || key.size(1)!=1)throw std::logic_error("QSA device graph was not prepared");
         const auto mark=[](const char* phase){if(auto* window=DecodeWindow::recording())window->mark_current(phase);};
@@ -1004,9 +1004,20 @@ struct QsaTqCache::Impl {
                 graph_destination_slots(),mfq_current_cuda_stream(),true));
             auto starts=absolute_positions.defined()?absolute_positions:positions;
             if(starts.dim()==1)starts=starts.reshape({1,1});
-            // All rotary axes share the cache position within this microblock.
-            starts=starts-positions.remainder(4);
-            auto pooled=pool(tail_storage_index,starts).to(tb::kFloat32).contiguous();
+            auto pooled=complete_pool?complete_pool(tail_storage_index,starts,positions):tb::Tensor{};
+            if(pooled.defined() && std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH")) {
+                static thread_local bool reported=false;
+                if(!reported) {
+                    reported=true;
+                    std::fprintf(stderr,"native_qsa_indexer_pool_complete actual_match=1 position_offset_in_kernel=1\n");
+                }
+            }
+            if(!pooled.defined()) {
+                // All rotary axes share the cache position within this microblock.
+                starts=starts-positions.remainder(4);
+                pooled=pool(tail_storage_index,starts);
+            }
+            pooled=pooled.to(tb::kFloat32).contiguous();
             check(tq::indexer_affine16_append(pooled.data_ptr<float>(),device_index.codes,device_index.scales,
                 device_index.zero,positions.data_ptr<int64_t>(),index_width,mfq_current_cuda_stream(),true));
             if(ram)check(tq::tq_archive_indexer(device_index.codes,device_index.scales,device_index.zero,
@@ -1972,8 +1983,8 @@ void QsaTqCache::advance_graph(int64_t tokens){
     impl_->update_history(start);
 }
 QsaTqCache::Tensor QsaTqCache::forward_pending_graph(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
-    const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute){
-    return impl_->forward_pending_graph(q,k,v,iq,raw,positions,gate,std::move(output),pool,absolute);}
+    const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute,const CompletePool& complete_pool){
+    return impl_->forward_pending_graph(q,k,v,iq,raw,positions,gate,std::move(output),pool,absolute,complete_pool);}
 QsaTqCache::Tensor QsaTqCache::forward(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
     const Tensor& positions,const Pool& pool,bool history_only,const Tensor& gate,Tensor output,bool fp16_math,CudaProfiler* profiler) {
     return impl_->forward(q,k,v,iq,raw,positions,pool,history_only,gate,std::move(output),fp16_math,profiler);
