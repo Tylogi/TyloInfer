@@ -1,8 +1,8 @@
 #pragma once
 
-#include "engine/models/common/check.h"
 #include "engine/ops/ops.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <span>
@@ -30,9 +30,9 @@ public:
 
     Tensor finish(Tensor fallback) {
         if (layers_.empty()) return fallback;
-        require_model(std::all_of(values_.begin(), values_.end(),
-            [](const Tensor& value) { return value.defined(); }),
-            "DFlash2 target hidden states were not fully captured");
+        if (!(std::all_of(values_.begin(), values_.end(),
+            [](const Tensor& value) { return value.defined(); })))
+            throw std::runtime_error("DFlash2 target hidden states were not fully captured");
         ops::DeviceScope scope(device_);
         return ops::contiguous(ops::cat(values_, -1));
     }

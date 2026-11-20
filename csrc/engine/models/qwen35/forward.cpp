@@ -12,10 +12,6 @@
 namespace tyloi::models::qwen35 {
 namespace {
 
-void require_forward(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
-
 void capture_target(std::span<const std::int64_t> layers, std::size_t index,
                     const Tensor& hidden, Device primary, std::vector<Tensor>& values) {
     if (values.size() < layers.size() && layers[values.size()] == std::int64_t(index)) {
@@ -25,15 +21,17 @@ void capture_target(std::span<const std::int64_t> layers, std::size_t index,
 }
 
 Tensor target_raw(std::span<const std::int64_t> layers, std::vector<Tensor>& values) {
-    require_forward(values.size() == layers.size(), "DFlash2 target hidden states were not fully captured");
+    if (!(values.size() == layers.size()))
+        throw std::runtime_error("DFlash2 target hidden states were not fully captured");
     return ops::contiguous(ops::cat(values, -1));
 }
 
 Tensor normalize_ids(Tensor ids, Device primary) {
-    require_forward(ids.dim() == 1 || ids.dim() == 2,
-                    "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     if (ids.dim() == 1) ids = ops::unsqueeze(ids, 0);
-    require_forward(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return ops::contiguous(ops::copy(ops::cast(ids, kInt64), primary));
 }
 
@@ -83,43 +81,54 @@ struct PreparedRow {
 PreparedRow prepare_row(const Model& model, ForwardRow row,
                         const models::ForwardOptions& options, bool prepare_pages,
                         bool capture = false) {
-    require_forward(row.state != nullptr, "Qwen3.5 forward row has no state");
-    require_forward(row.state->belongs_to(model),
-                    "Qwen3.5 state belongs to another model");
+    if (!(row.state != nullptr))
+        throw std::runtime_error("Qwen3.5 forward row has no state");
+    if (!(row.state->belongs_to(model)))
+        throw std::runtime_error("Qwen3.5 state belongs to another model");
     auto& state = *row.state;
     auto input = std::move(row.input);
-    require_forward(!input.suffix, "Qwen3.5 does not support speculative suffix forwarding");
+    if (input.suffix)
+        throw std::runtime_error("Qwen3.5 does not support speculative suffix forwarding");
     const Device primary{model.device.type, options.primary};
     const auto [B, T] = input.shape();
     auto ids = input.ids && input.ids.defined() ? normalize_ids(input.ids, primary) : Tensor{};
     auto embeddings = input.embeddings && input.embeddings.defined()
         ? input.embeddings
         : model.embedding(ids, options.primary);
-    require_forward(embeddings.dim() == 3 && embeddings.size(0) == B &&
-                        embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
-                    "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    require_forward(B > 0 && T > 0, "Qwen3.5 input batch and tokens must be positive");
-    require_forward(input.confirmed >= 0 &&
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(B > 0 && T > 0))
+        throw std::runtime_error("Qwen3.5 input batch and tokens must be positive");
+    if (!(input.confirmed >= 0 &&
         (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 &&
-         (capture || (!input.positions && !input.cache_positions)) && model.supports_speculation())),
-        "unsupported speculative backbone geometry");
-    require_forward(state.speculative_start < 0,
-                    "commit or roll back the pending speculative pass before forwarding");
-    require_forward(state.cache_pos + T <= model.metadata.max_position_embeddings,
-                    "Qwen3.5 history exceeds context capacity");
+        (capture || (!input.positions && !input.cache_positions)) && model.supports_speculation()))))
+        throw std::runtime_error("unsupported speculative backbone geometry");
+    if (!(state.speculative_start < 0))
+        throw std::runtime_error("commit or roll back the pending speculative pass before forwarding");
+    if (!(state.cache_pos + T <= model.metadata.max_position_embeddings))
+        throw std::runtime_error("Qwen3.5 history exceeds context capacity");
+    if (input.bidirectional_prefix) {
+        if (input.bidirectional_prefix < 1 || capture || input.confirmed || B != 1 ||
+            input.positions || input.cache_positions || input.lengths ||
+            (state.cache_pos == 0 ? input.bidirectional_prefix > T
+                                  : input.bidirectional_prefix != state.cache_pos))
+            throw std::invalid_argument("bidirectional attention requires a complete state window");
+    }
     if (state.cache_pos == 0) state.reset(B);
-    else require_forward(state.batch == B, "Qwen3.5 cache batch does not match input batch");
+    else if (state.batch != B)
+        throw std::runtime_error("Qwen3.5 cache batch does not match input batch");
     if (prepare_pages) state.prepare_pages(state.cache_pos + T);
     if (input.lengths)
-        require_forward(input.lengths.dim() == 1 && input.lengths.size(0) == B,
-                        "sequence lengths must have shape [batch]");
+        if (!(input.lengths.dim() == 1 && input.lengths.size(0) == B))
+            throw std::runtime_error("sequence lengths must have shape [batch]");
     auto physical = input.cache_positions
         ? ops::copy(ops::cast(input.cache_positions, kInt64), primary)
         : ops::arange(state.cache_pos, state.cache_pos + T, primary);
     physical = ops::contiguous(physical);
-    require_forward((physical.dim() == 1 && physical.numel() == T) ||
-                    (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-                    "cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
     const bool has_mrope = model.rope.sections && model.rope.sections.numel() > 0;
     auto semantic = input.positions
         ? ops::copy(ops::cast(input.positions, kInt64), primary)
@@ -127,9 +136,9 @@ PreparedRow prepare_row(const Model& model, ForwardRow row,
                                             : ops::add(physical, state.decode_position_delta));
     semantic = ops::contiguous(semantic);
     const auto rank = semantic.dim();
-    require_forward(Config::valid_positions(rank, rank > 1 ? semantic.size(0) : 0,
-                                           semantic.size(-1), B, T, has_mrope),
-                    "position_ids must have shape [tokens], [batch,tokens], or configured grid-MRoPE [3,tokens]");
+    if (!(Config::valid_positions(rank, rank > 1 ? semantic.size(0) : 0,
+        semantic.size(-1), B, T, has_mrope)))
+        throw std::runtime_error("position_ids must have shape [tokens], [batch,tokens], or configured grid-MRoPE [3,tokens]");
     Tensor lengths;
     if (input.lengths) lengths = ops::contiguous(ops::copy(ops::cast(input.lengths, kInt64), primary));
     else if (state.cache_pos > 0 && T == 1) {
@@ -139,6 +148,7 @@ PreparedRow prepare_row(const Model& model, ForwardRow row,
     models::AttentionStep step{semantic, lengths,
         has_mrope || input.positions || input.cache_positions ? physical : Tensor{},
         state.cache_pos, input.kv_length, input.attention_parts};
+    step.bidirectional_prefix = input.bidirectional_prefix;
     if (capture) step.contiguous_tail = true;
     if (input.confirmed > 0) {
         state.speculative_start = state.cache_pos;
@@ -171,7 +181,8 @@ static AttentionResult forward_attention(const Layer& layer, LayerState& state, 
                             : nullptr;
     if (full != nullptr) {
         auto* cache = std::get_if<tyloi::state::KvView>(&state);
-        require_forward(cache != nullptr, "Qwen3.5 full layer state kind mismatch");
+        if (!(cache != nullptr))
+            throw std::runtime_error("Qwen3.5 full layer state kind mismatch");
         const auto& attention = full->attention;
         const auto capacity = kv_capacity_for(attention.sliding,
             attention.sliding ? attention.attention_window : attention.max_position_embeddings,
@@ -191,18 +202,18 @@ static AttentionResult forward_attention(const Layer& layer, LayerState& state, 
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
     auto* linear_state = std::get_if<LinearState>(&state);
-    require_forward(linear != nullptr && linear_state != nullptr,
-                    "Qwen3.5 linear layer state kind mismatch");
+    if (!(linear != nullptr && linear_state != nullptr))
+        throw std::runtime_error("Qwen3.5 linear layer state kind mismatch");
     const auto& attention = linear->attention;
     prepare_linear_state(attention, *linear_state, input, transposed);
     if (confirmed_prefix == 0) {
-        require_forward(!linear_state->mixer.pending(),
-                        "linear attention has a pending speculative pass");
+        if (linear_state->mixer.pending())
+            throw std::runtime_error("linear attention has a pending speculative pass");
     } else {
-        require_forward(!input.device().is_cpu() && !linear_state->mixer.pending() &&
-                            linear_state->mixer.defined() && confirmed_prefix > 0 &&
-                            confirmed_prefix < input.size(1),
-                        "invalid Qwen3.5 speculative linear-attention transaction");
+        if (!(!input.device().is_cpu() && !linear_state->mixer.pending() &&
+            linear_state->mixer.defined() && confirmed_prefix > 0 &&
+            confirmed_prefix < input.size(1)))
+            throw std::runtime_error("invalid Qwen3.5 speculative linear-attention transaction");
         linear_state->mixer.begin(local_step.cache_position, confirmed_prefix, input.size(1));
     }
     auto& state_view = linear_state->mixer.view();
@@ -226,7 +237,7 @@ static Tensor finish_layer(const Layer& layer, AttentionResult attention,
     ops::DeviceScope scope(layer.device);
     const auto* full = std::get_if<Full>(&layer.weights);
     if (full != nullptr) {
-        const auto* trace = options.trace_layer >= 0 &&
+        auto* trace = options.trace_layer >= 0 &&
                                     options.trace_layer == full->attention.layer
                                 ? options.trace
                                 : nullptr;
@@ -237,17 +248,18 @@ static Tensor finish_layer(const Layer& layer, AttentionResult attention,
             full->attention.attention_output_gate, trace, options.serial_experts);
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
-    require_forward(linear != nullptr, "Qwen3.5 layer weight kind mismatch");
+    if (!(linear != nullptr))
+        throw std::runtime_error("Qwen3.5 layer weight kind mismatch");
     auto pair = attention.normalized
         ? std::array<Tensor, 2>{std::move(attention.residual), std::move(attention.normalized)}
         : prepare_ffn(*linear, attention);
     return ::tyloi::models::linear_ffn(linear->ffn, pair, options.serial_experts);
 }
 
-static models::Decoded forward_one(const Model& model, State& selected, models::Input input,
+static StepSequence<models::Decoded> forward_one(const Model& model, State& selected, models::Input input,
                                    const models::ForwardOptions& options, bool capture) {
     const Device primary{model.device.type, options.primary};
-    ops::DeviceScope scope(primary);
+    std::optional<ops::DeviceScope> scope(std::in_place, primary);
     auto prepared = prepare_row(model, ForwardRow{&selected, std::move(input)}, options, !capture, capture);
     auto& state = *prepared.state;
     const auto targets = model.mtp && (capture || prepared.input.raw_hidden)
@@ -260,6 +272,11 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
     if (prepared.input.trace) prepared.input.trace->push_back(snapshot(hidden));
     try {
         for (std::size_t index = 0; index < model.layers.size(); ++index) {
+            if (model.layer_stream) {
+                scope.reset();
+                co_yield LayerEvent{LayerEvent::Phase::begin, LayerEvent::Mode::single, static_cast<std::int64_t>(index)};
+                scope.emplace(primary);
+            }
             const auto& layer = model.layers[index];
             auto attention = forward_attention(layer, state.layers[index], hidden,
                                                prepared.step, prepared.input.confirmed,
@@ -272,6 +289,11 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
                 ++linear.speculative_ffn_batches;
             }
             if (prepared.input.trace) prepared.input.trace->push_back(snapshot(hidden));
+            if (model.layer_stream) {
+                scope.reset();
+                co_yield LayerEvent{LayerEvent::Phase::end, LayerEvent::Mode::single};
+                scope.emplace(primary);
+            }
         }
     } catch (...) {
         state.abort_speculative();
@@ -283,13 +305,33 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
     result.hidden = model.normalize(hidden, prepared.batch, prepared.tokens);
     result.raw = targets.empty() ? std::move(hidden) : target_raw(targets, captured);
     if (prepared.input.raw_hidden) *prepared.input.raw_hidden = result.raw;
-    return result;
+    scope.reset();
+    co_yield std::move(result);
 }
 
 Tensor Model::forward(models::Input input, models::State& value, const models::ForwardOptions& options) const {
     auto* selected = dynamic_cast<State*>(&value);
-    require_forward(selected && selected->belongs_to(*this), "Qwen3.5 state belongs to another model");
-    return forward_one(*this, *selected, std::move(input), options, false).hidden;
+    if (!(selected && selected->belongs_to(*this)))
+        throw std::runtime_error("Qwen3.5 state belongs to another model");
+    return finish_steps(forward_one(*this, *selected, std::move(input), options, false)).hidden;
+}
+
+StepSequence<models::Prefill> Model::prefill(models::Input input, models::State& state,
+        const models::ForwardOptions& options, const models::PrefillOptions&) const {
+    if (!layer_stream) co_return;
+    auto* selected = dynamic_cast<State*>(&state);
+    if (!(selected && selected->belongs_to(*this)))
+        throw std::runtime_error("Qwen3.5 state belongs to another model");
+    auto job = forward_one(*this, *selected, std::move(input), options, false);
+    while (auto step = job.next()) {
+        if (step.layer) co_yield *step.layer;
+        else if (step.value) {
+            models::Prefill result;
+            result.hidden = std::move(step.value->hidden);
+            result.raw = std::move(step.value->raw);
+            co_yield std::move(result);
+        }
+    }
 }
 
 models::Decoded capture_forward(const Model& model, State& state, models::Input input,
@@ -300,38 +342,41 @@ models::Decoded capture_forward(const Model& model, State& state, models::Input 
         return tensor.defined() && tensor.device() == primary && tensor.scalar_type() == kInt64 &&
                tensor.is_contiguous();
     };
-    require_forward(primary.is_cuda() && state.belongs_to(model) && state.cache_pos > 0 &&
-                        state.batch == 1 && batch == 1 &&
-                        tokens <= 8 && input.confirmed >= 0 && input.confirmed < tokens &&
-                        input.kv_length >= state.cache_pos + tokens &&
-                        input.attention_parts > 0 && stable(input.positions) &&
-                        stable(input.cache_positions) && stable(input.lengths),
-                    "invalid Qwen3.5 capture geometry");
-    require_forward(state.layers.size() == model.layers.size(), "invalid Qwen3.5 capture state");
+    if (!(primary.is_cuda() && state.belongs_to(model) && state.cache_pos > 0 &&
+        state.batch == 1 && batch == 1 &&
+        tokens <= 8 && input.confirmed >= 0 && input.confirmed < tokens &&
+        input.kv_length >= state.cache_pos + tokens &&
+        input.attention_parts > 0 && stable(input.positions) &&
+        stable(input.cache_positions) && stable(input.lengths)))
+        throw std::runtime_error("invalid Qwen3.5 capture geometry");
+    if (!(state.layers.size() == model.layers.size()))
+        throw std::runtime_error("invalid Qwen3.5 capture state");
     for (std::size_t index = 0; index < state.layers.size(); ++index) {
-        require_forward(model.layers[index].device == primary, "Qwen3.5 capture requires one CUDA device");
+        if (!(model.layers[index].device == primary))
+            throw std::runtime_error("Qwen3.5 capture requires one CUDA device");
         if (const auto* cache = std::get_if<tyloi::state::KvView>(&state.layers[index])) {
-            require_forward(cache->defined() && !cache->paged() && !cache->ring && cache->batch == batch &&
-                                cache->physical_key.device() == primary && cache->physical_value.device() == primary &&
-                                cache->physical_key.dim() == 4 && cache->physical_value.dim() == 4 &&
-                                cache->physical_key.size(2) >= input.kv_length &&
-                                cache->physical_value.size(2) >= input.kv_length,
-                            "Qwen3.5 capture requires preallocated nonpaged KV state");
+            if (!(cache->defined() && !cache->paged() && !cache->ring && cache->batch == batch &&
+                cache->physical_key.device() == primary && cache->physical_value.device() == primary &&
+                cache->physical_key.dim() == 4 && cache->physical_value.dim() == 4 &&
+                cache->physical_key.size(2) >= input.kv_length &&
+                cache->physical_value.size(2) >= input.kv_length))
+                throw std::runtime_error("Qwen3.5 capture requires preallocated nonpaged KV state");
         } else {
             const auto& mixer = std::get<LinearState>(state.layers[index]).mixer;
-            require_forward(mixer.defined() && !mixer.pending() &&
-                                mixer.view().convolution.device() == primary &&
-                                mixer.view().recurrent.device() == primary,
-                            "Qwen3.5 capture requires prefilled recurrent state");
+            if (!(mixer.defined() && !mixer.pending() &&
+                mixer.view().convolution.device() == primary &&
+                mixer.view().recurrent.device() == primary))
+                throw std::runtime_error("Qwen3.5 capture requires prefilled recurrent state");
         }
     }
-    return forward_one(model, state, std::move(input), options, true);
+    return finish_steps(forward_one(model, state, std::move(input), options, true));
 }
 
 StepSequence<std::vector<models::Decoded>> forward_batch(
     const Model& model, std::vector<ForwardRow> rows,
     const models::ForwardOptions& options, bool advance) {
-    require_forward(!rows.empty(), "Qwen3.5 packed forward requires at least one row");
+    if (rows.empty())
+        throw std::runtime_error("Qwen3.5 packed forward requires at least one row");
     const Device primary{model.device.type, options.primary};
     ops::DeviceScope scope(primary);
     std::vector<PreparedRow> prepared;
@@ -339,8 +384,8 @@ StepSequence<std::vector<models::Decoded>> forward_batch(
         prepared.reserve(rows.size());
         for (auto& row : rows) {
             auto value = prepare_row(model, std::move(row), options, advance);
-            require_forward(value.batch == 1,
-                            "Qwen3.5 packed forward requires B=1 rows");
+            if (!(value.batch == 1))
+                throw std::runtime_error("Qwen3.5 packed forward requires B=1 rows");
             prepared.push_back(std::move(value));
         }
 
@@ -442,7 +487,7 @@ StepSequence<std::vector<models::Decoded>> forward_batch(
 }
 
 bool Model::supports_speculation() const noexcept {
-    return !layers.empty() && std::all_of(layers.begin(), layers.end(), [](const Layer& layer) {
+    return !layer_stream && !layers.empty() && std::all_of(layers.begin(), layers.end(), [](const Layer& layer) {
         if (const auto* full = std::get_if<Full>(&layer.weights)) return !full->attention.sliding;
         return true;
     });
@@ -462,7 +507,8 @@ void replay_layers(const Model& model, State& state, std::int64_t retained) {
         const auto& block = model.layers[index];
         ops::DeviceScope scope(block.device);
         const auto* layer = std::get_if<Linear>(&block.weights);
-        require_forward(layer != nullptr, "Qwen3.5 recurrent layer weight kind mismatch");
+        if (!(layer != nullptr))
+            throw std::runtime_error("Qwen3.5 recurrent layer weight kind mismatch");
         auto& view = linear->mixer.view();
         const models::LinearView linear_view{view.convolution, view.recurrent, view.transposed};
         layer->attention.replay(linear_view, linear->projected, retained);
@@ -470,8 +516,10 @@ void replay_layers(const Model& model, State& state, std::int64_t retained) {
 }
 
 StepSequence<bool> Model::replay(State& state, std::int64_t accepted, [[maybe_unused]] bool capture) const {
-    require_forward(state.belongs_to(*this), "Qwen3.5 state belongs to another model");
-    require_forward(state.speculative_start >= 0 && accepted >= 0, "no speculative transaction");
+    if (!state.belongs_to(*this))
+        throw std::runtime_error("Qwen3.5 state belongs to another model");
+    if (!(state.speculative_start >= 0 && accepted >= 0))
+        throw std::runtime_error("no speculative transaction");
     struct Rollback {
         State& state;
         ~Rollback() { if (state.speculating()) state.abort_speculative(); }

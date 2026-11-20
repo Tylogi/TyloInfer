@@ -8,6 +8,7 @@
 #include "engine/backends/cuda/ops/projection/tq/layout.h"
 #include "engine/backends/cuda/ops/ffn/tq/routed.h"
 #include "engine/backends/cuda/native/memory.h"
+#include "components/error.h"
 #include "env.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
@@ -47,7 +48,7 @@ struct TqMoeGraphStage {
     std::vector<int64_t> widened_routes;
     int routes,type,tokens;
     std::size_t slots=0,route_bytes=0,plan_bytes=0;
-    bool wide=false;
+    bool wide=false,resident=false;
     struct Plane {std::size_t offset=0;unsigned capacity=0,count=0;int tile=0,kind=0;};
     std::array<Plane,13> planes{};
     struct KernelChunk {int plane;std::size_t first,segment;unsigned capacity;cudaGraphNode_t node;};
@@ -59,6 +60,22 @@ struct TqMoeGraphStage {
          routes(count),type(tq_detail::dtype(source.scalar_type())),tokens(int(source.size(0))) {
         slots=std::size_t(tokens)*routes;
         if(slots>INT_MAX)throw std::overflow_error("TQ graph route count exceeds plan limits");
+        input=::tyloi::cuda::empty_like(source);
+        ids=::tyloi::cuda::empty({tokens,count},source.options().dtype(::tyloi::kInt64));
+        weights=::tyloi::cuda::empty({tokens,count},source.options().dtype(::tyloi::kFloat32));
+        hidden=::tyloi::cuda::empty({int64_t(slots),b.up->out},source.options());
+        pairs=::tyloi::cuda::empty({tokens,count,b.down->out},source.options());
+        result=::tyloi::cuda::empty({tokens,b.down->out},source.options());
+        if(tokens<=8 && count<=32 && banks[0]->experts<=INT_MAX) {
+            for(int role=0;role<3;++role)views[role]=banks[role]->cache->resident_views(
+                banks[role]->source_id,source.get_device());
+            resident=std::all_of(views.begin(),views.end(),[](const auto& view){return view.defined();});
+            if(resident) {
+                plan=::tyloi::cuda::empty({int64_t(2*slots*sizeof(TrellisIndexedProjectionJob))},
+                    source.options().dtype(::tyloi::kUInt8));
+                return;
+            }
+        }
         route_bytes=slots*sizeof(int64_t);
         if(tokens>1) {
             wide=type==0 && exec.get(source.get_device())->indexed_mma();
@@ -93,12 +110,6 @@ struct TqMoeGraphStage {
             route_snapshot=::tyloi::cuda::empty({tokens,count},source.options().dtype(route_dtype));
             if(route_dtype==::tyloi::kInt32)widened_routes.resize(slots);
         }
-        input=::tyloi::cuda::empty_like(source);
-        ids=::tyloi::cuda::empty({tokens,count},source.options().dtype(::tyloi::kInt64));
-        weights=::tyloi::cuda::empty({tokens,count},source.options().dtype(::tyloi::kFloat32));
-        hidden=::tyloi::cuda::empty({int64_t(slots),b.up->out},source.options());
-        pairs=::tyloi::cuda::empty({tokens,count,b.down->out},source.options());
-        result=::tyloi::cuda::empty({tokens,b.down->out},source.options());
         if(tokens==1)for(int role=0;role<3;++role)views[role]=banks[role]->cache->views(
             banks[role]->source_id,nullptr,{},source.get_device());
         tyloi::cuda::charge_tensor_host_bytes(host_ids->size());
@@ -123,12 +134,32 @@ struct TqMoeGraphStage {
         TYLOINFER_CUDA_CHECK(cudaGetLastError());
     }
     ~TqMoeGraphStage() {
+        if(!host_ids)return;
         // The D2H destination belongs to this stage, rather than the tensor
         // allocator. A window destroys its graphs before releasing the stage.
         int previous=0;const bool restore=cudaGetDevice(&previous)==cudaSuccess;
         (void)cudaSetDevice(stream.device());(void)cudaStreamSynchronize(stream.stream());
         tyloi::cuda::tensor_host_bytes.fetch_sub(host_ids->size());
         if(restore)(void)cudaSetDevice(previous);
+    }
+    void compute_resident(const void* input_values,const int64_t* device_ids,float limit,
+                          tyloi::cuda::DecodeWindow& window) {
+        auto* gate_up=reinterpret_cast<TrellisIndexedProjectionJob*>(plan.data_ptr());
+        auto* down=gate_up+slots;
+        const int tile=std::min(tokens,4);
+        const auto native=stream.stream();
+        pairs.zero_();
+        tq_detail::status(mfq_tq_prepare_resident_indexed(
+            reinterpret_cast<const TrellisProjectionView*>(views[0].data_ptr()),
+            reinterpret_cast<const TrellisProjectionView*>(views[1].data_ptr()),
+            reinterpret_cast<const TrellisProjectionView*>(views[2].data_ptr()),device_ids,
+            gate_up,down,int(slots),routes,int(banks[0]->experts),int(banks[0]->input),
+            int(banks[1]->out),int(banks[2]->out),tile,native));
+        tq_detail::status(mfq_tq_indexed_swiglu(gate_up,input_values,hidden.data_ptr(),
+            int(slots),int(banks[1]->out),type,tile,limit,native));
+        window.mark_current("gate_up_end");
+        tq_detail::status(mfq_tq_indexed(down,hidden.data_ptr(),pairs.data_ptr(),
+            int(slots),int(banks[2]->out),type,tile,native));
     }
     void load(tyloi::cuda::DecodeWindow* window=nullptr, int row_offset=0,
               int row_total=0, bool independent=false, bool observe=false) {
@@ -260,36 +291,41 @@ struct TqMoeGraphStage {
     else if(stage->tokens==1 || !stage->mapped_routes || !views) {
         stage->ids.copy_(ids);device_ids=stage->ids.data_ptr<int64_t>();
     }
-    stage->publish_routes(ids,views,device_ids);
-    window.mark_current("cpu_wait_begin");
-    cudaStreamCaptureStatus capture;
-    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stage->stream.stream(),&capture));
-    if(capture==cudaStreamCaptureStatusNone) {
-        // DecodeWindow also calls the body during preparation/warmup. Execute
-        // real transfers there; host_barrier itself only records a callback.
-        if(stage->mapped_routes)tyloi::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
-        else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stage->stream.stream()));
-        stage->load();
-    }
-    window.enroll({stage.get(),[stage]{stage->reset_routes();},[stage,&window,row_offset,row_total,independent,observe] {
-        if(!stage->mapped_routes)return;
-        tyloi::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
-        stage->load(&window,row_offset,row_total,independent,observe);
-    },[lease]{lease->clear();},[]{},[lease]{lease->clear();},{}});
-    window.host_barrier([stage,&window,row_offset,row_total,independent,observe] {
-        if(!stage->mapped_routes)stage->load(&window,row_offset,row_total,independent,observe);
-    });
-    window.mark_current("hot_begin");
     const auto* input_values=views?source.data_ptr():stage->input.data_ptr();
-    if(stage->tokens>1)stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values);
-    else {
-    tq_detail::status(mfq_tq_routed_swiglu(reinterpret_cast<const TrellisProjectionView*>(stage->views[0].data_ptr()),
-        reinterpret_cast<const TrellisProjectionView*>(stage->views[1].data_ptr()),device_ids,
-        input_values,stage->hidden.data_ptr(),stage->routes,int(banks.up->out),stage->type,limit,stage->stream.stream()));
-    window.mark_current("gate_up_end");
-    tq_detail::status(mfq_tq_routed_down(reinterpret_cast<const TrellisProjectionView*>(stage->views[2].data_ptr()),
-        device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),stage->routes,
-        int(banks.down->out),int(banks.up->out),stage->type,stage->stream.stream()));
+    if(stage->resident) {
+        window.mark_current("hot_begin");
+        stage->compute_resident(input_values,device_ids,limit,window);
+    } else {
+        stage->publish_routes(ids,views,device_ids);
+        window.mark_current("cpu_wait_begin");
+        cudaStreamCaptureStatus capture;
+        TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stage->stream.stream(),&capture));
+        if(capture==cudaStreamCaptureStatusNone) {
+            // DecodeWindow also calls the body during preparation/warmup. Execute
+            // real transfers there; host_barrier itself only records a callback.
+            if(stage->mapped_routes)tyloi::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
+            else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stage->stream.stream()));
+            stage->load();
+        }
+        window.enroll({stage.get(),[stage]{stage->reset_routes();},[stage,&window,row_offset,row_total,independent,observe] {
+            if(!stage->mapped_routes)return;
+            tyloi::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
+            stage->load(&window,row_offset,row_total,independent,observe);
+        },[lease]{lease->clear();},[]{},[lease]{lease->clear();},{}});
+        window.host_barrier([stage,&window,row_offset,row_total,independent,observe] {
+            if(!stage->mapped_routes)stage->load(&window,row_offset,row_total,independent,observe);
+        });
+        window.mark_current("hot_begin");
+        if(stage->tokens>1)stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values);
+        else {
+            tq_detail::status(mfq_tq_routed_swiglu(reinterpret_cast<const TrellisProjectionView*>(stage->views[0].data_ptr()),
+                reinterpret_cast<const TrellisProjectionView*>(stage->views[1].data_ptr()),device_ids,
+                input_values,stage->hidden.data_ptr(),stage->routes,int(banks.up->out),stage->type,limit,stage->stream.stream()));
+            window.mark_current("gate_up_end");
+            tq_detail::status(mfq_tq_routed_down(reinterpret_cast<const TrellisProjectionView*>(stage->views[2].data_ptr()),
+                device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),stage->routes,
+                int(banks.down->out),int(banks.up->out),stage->type,stage->stream.stream()));
+        }
     }
     window.mark_current("down_end");
     tq_detail::status(mfq_tq_weighted_reduce(stage->pairs.data_ptr(),views?weights.data_ptr<float>():stage->weights.data_ptr<float>(),stage->result.data_ptr(),
@@ -354,6 +390,11 @@ struct TqMoeGraphStage {
     }
     const auto resources=exec.get(source.get_device());
     auto* blas=&resources->blas();
+    const auto context=tyloi::cuda::default_context(source.get_device());
+    const auto free_bytes=[&] {
+        return phase("tq.moe.capacity",[&] { return context->available_memory(); });
+    };
+    const std::array source_banks{gate->source_id,up->source_id,down->source_id};
     std::size_t prefill_groups=0;
     if(type==0 && width==up->input && hidden<=INT_MAX/2) {
         // Batch up to two 128-token reuse tiles to amortize expert dispatch.
@@ -378,23 +419,24 @@ struct TqMoeGraphStage {
         const auto stream=mfq_get_current_cuda_stream(source.get_device());
         resources->retain(stream);
         std::size_t gemm_groups=0;
-        while(gemm_groups<prefill_groups && (!resources->prefill_mma() || slots[gemm_groups].size()>128))++gemm_groups;
+        while(gemm_groups<prefill_groups &&
+            (tokens>32 || !resources->prefill_mma() || slots[gemm_groups].size()>128))++gemm_groups;
+        const bool compact_gemm=gemm_groups && resources->prefill_mma();
         const auto job_bytes=(prefill_groups*sizeof(TrellisPrefillMoeJob)+15)&~std::size_t(15);
-        TqPrefillPlanLease lease{resources->prefill_plan(job_bytes+selected_slots*sizeof(int64_t)),stream.stream()};
+        const auto bounds_offset=job_bytes+selected_slots*sizeof(int64_t);
+        const auto plan_bytes=bounds_offset+(prefill_groups+1)*sizeof(int64_t);
+        TqPrefillPlanLease lease{resources->prefill_plan(plan_bytes),stream.stream()};
         auto* host_bytes=static_cast<std::uint8_t*>(lease.plan->host.data_ptr());
         auto* device_bytes=static_cast<std::uint8_t*>(lease.plan->device.data_ptr());
         auto* host_slots=reinterpret_cast<int64_t*>(host_bytes+job_bytes);
-        std::size_t first=0;
+        auto* bounds=reinterpret_cast<int64_t*>(host_bytes+bounds_offset);
+        bounds[0]=0;
         for(std::size_t i=0;i<prefill_groups;++i) {
-            std::memcpy(host_slots+first,slots[i].data(),slots[i].size()*sizeof(int64_t));first+=slots[i].size();
+            std::memcpy(host_slots+bounds[i],slots[i].data(),slots[i].size()*sizeof(int64_t));
+            bounds[i+1]=bounds[i]+slots[i].size();
         }
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+job_bytes,host_slots,selected_slots*sizeof(int64_t),
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+job_bytes,host_slots,plan_bytes-job_bytes,
             cudaMemcpyHostToDevice,stream.stream()));
-        const auto free_bytes=[&] {
-            return phase("tq.moe.capacity",[&] {
-                std::size_t available=0,total=0;TYLOINFER_CUDA_CHECK(cudaMemGetInfo(&available,&total));return available;
-            });
-        };
         const auto available=free_bytes();
         const auto max_width=std::uint64_t(std::max(up->input,hidden));
         const auto output_width=std::uint64_t(std::max(up->input,2*hidden));
@@ -405,8 +447,7 @@ struct TqMoeGraphStage {
         if(gemm_groups<prefill_groups) {
             const auto short_capacity=(slots[gemm_groups].size()+15)&~std::size_t(15);
             const auto useful=short_capacity*(4*max_width+2*hidden)*(prefill_groups-gemm_groups)+32;
-            useful_activations=std::max<std::uint64_t>(useful_activations,
-                std::min<std::uint64_t>(std::uint64_t(16)<<20,useful));
+            useful_activations=std::max(useful_activations,useful);
         }
         const auto activation_budget=std::max<std::uint64_t>(minimum_activations,
             std::min<std::uint64_t>({std::uint64_t(gemm_groups?64:16)<<20,available/16,useful_activations}));
@@ -418,46 +459,92 @@ struct TqMoeGraphStage {
             const auto bytes=std::max<std::uint64_t>(max_width*2,
                 std::min<std::uint64_t>({std::uint64_t(128)<<20,available/16,useful}));
             decoded=::tyloi::cuda::empty({static_cast<int64_t>(bytes)},source.options().dtype(::tyloi::kUInt8));
-            blas=resources->get();
+            if(!compact_gemm)blas=resources->get();
         }
-        const auto image_per_expert=gate->cache->prefill_peak(
-            {gate->source_id,up->source_id,down->source_id},{unique.data(),prefill_groups});
+        const auto image_per_expert=gate->cache->peak_expert_bytes(source_banks,{unique.data(),prefill_groups});
         // Image leases and compute scratch have independent live budgets.
         // Account for allocated scratch before admitting compressed misses.
+        const auto image_available=free_bytes();
         const auto image_batch=tyloi::weights::routed_prefill_group_capacity(
-            prefill_groups,image_per_expert,free_bytes());
+            prefill_groups,image_per_expert,image_available);
         const auto group_ends=tyloi::weights::routed_prefill_group_ends(
             {slots.data(),prefill_groups},image_batch);
         if(tyloi::cuda::env_lookup("TYLOINFER_TQ_PROFILE_CACHE"))std::fprintf(stderr,
             "tq_prefill_moe jobs=%zu gemm_jobs=%zu scratch=%lld decoded=%lld image_batch=%zu\n",
             prefill_groups,gemm_groups,static_cast<long long>(activations.numel()),
             static_cast<long long>(decoded.defined()?decoded.numel():0),image_batch);
-        first=0;
+        const auto transfer=tyloi::cuda::stream_from_pool(false,source.get_device());
+        const std::size_t stage_count=group_ends.size()>1 && image_per_expert<=image_available/2 ? 2 : 1;
+        struct Stage {
+            std::array<std::vector<::tyloi::encoding::TqTensor>,3> banks;
+            TqCache::UploadArena arena;
+            tyloi::cuda::Event gate_up,down,used;
+        };
+        std::array<Stage,2> stages;
+        const auto stage_bytes=image_batch*image_per_expert;
+        if(stage_bytes<=INT64_MAX && !gate->cache->resident_views(gate->source_id,source.get_device()).defined() &&
+            context->workspace_allocations_fit(std::vector<std::size_t>(stage_count,stage_bytes),
+                image_available,stream.stream())) {
+            try {
+                for(std::size_t i=0;i<stage_count;++i)stages[i].arena.image=::tyloi::cuda::empty(
+                    {static_cast<int64_t>(stage_bytes)},source.options().dtype(::tyloi::kUInt8));
+            } catch(const MfqResourceExhausted&) {
+                for(auto& stage:stages)stage.arena={};
+            }
+            if(stages[0].arena.image.defined()) {
+                tyloi::cuda::Event allocated;
+                allocated.record(stream.stream());
+                TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(transfer.stream(),allocated.get(),0));
+                for(std::size_t i=0;i<stage_count;++i)stages[i].arena.image.record_stream(
+                    reinterpret_cast<std::uintptr_t>(transfer.stream()),transfer.lifetime());
+            }
+        }
+        std::size_t group=0;
         std::size_t begin=0;
         for(const auto end:group_ends) {
             const auto count=end-begin;
-            const auto banks=phase("tq.moe.weights",[&] {
-                return std::array<std::vector<::tyloi::encoding::TqTensor>,3>{
-                    gate->cache->get(gate->source_id,unique.data()+begin,count,source.get_device()),
-                    up->cache->get(up->source_id,unique.data()+begin,count,source.get_device()),
-                    down->cache->get(down->source_id,unique.data()+begin,count,source.get_device())};
+            auto& stage=stages[group++%stage_count];
+            if(!stage.banks[0].empty()) {
+                stage.used.synchronize();
+                stage.banks={};
+            }
+            stage.arena.used=0;
+            auto* arena=stage.arena.image.defined()?&stage.arena:nullptr;
+            phase("tq.moe.weights",[&] {
+                const MfqCudaStreamGuard guard(transfer);
+                stage.banks[0]=gate->cache->get(gate->source_id,unique.data()+begin,count,source.get_device(),arena);
+                stage.banks[1]=up->cache->get(up->source_id,unique.data()+begin,count,source.get_device(),arena);
+                stage.gate_up.record(transfer.stream());
+                stage.banks[2]=down->cache->get(down->source_id,unique.data()+begin,count,source.get_device(),arena);
+                stage.down.record(transfer.stream());
+                return 0;
             });
+            const auto& banks=stage.banks;
+            for(const auto& bank:banks)for(const auto& image:bank)
+                image.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()),stream.lifetime());
             for(std::size_t i=0;i<count;++i) {
                 const auto index=begin+i;
                 const TrellisPrefillMoeJob job{tyloi::cuda::tq::view(banks[0][i]),tyloi::cuda::tq::view(banks[1][i]),tyloi::cuda::tq::view(banks[2][i]),
-                    static_cast<int64_t>(first),static_cast<int>(slots[index].size())};
-                std::memcpy(host_bytes+index*sizeof(job),&job,sizeof(job));first+=slots[index].size();
+                    bounds[index],static_cast<int>(slots[index].size())};
+                std::memcpy(host_bytes+index*sizeof(job),&job,sizeof(job));
             }
             const auto offset=begin*sizeof(TrellisPrefillMoeJob);
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+offset,host_bytes+offset,count*sizeof(TrellisPrefillMoeJob),
                 cudaMemcpyHostToDevice,stream.stream()));
+            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),stage.gate_up.get(),0));
             for(std::size_t tile=begin;tile<begin+count;) {
                 const bool gemm=tile<gemm_groups;
                 const auto capacity=(slots[tile].size()+15)&~std::size_t(15);
-                const auto per_expert=capacity*(gemm?2*max_width+4*output_width:4*max_width+2*hidden);
+                const auto bytes_per_row=gemm?2*max_width+4*output_width:4*max_width+2*hidden;
                 const auto act_limit=gemm?activation_budget:std::min<std::uint64_t>(activation_budget,std::uint64_t(16)<<20);
+                const auto rows=(act_limit-std::min<std::uint64_t>(32,act_limit))/bytes_per_row;
+                auto by_activations=std::size_t(rows/capacity);
+                if(gemm && compact_gemm) {
+                    const auto last=std::upper_bound(bounds+tile+1,bounds+end+1,bounds[tile]+rows);
+                    by_activations=last-(bounds+tile+1);
+                }
                 auto tile_count=std::min<std::size_t>({begin+count-tile,65535,
-                    std::max<std::uint64_t>(1,(act_limit-std::min<std::uint64_t>(32,act_limit))/per_expert)});
+                    std::max<std::size_t>(1,by_activations)});
                 if(gemm) {
                     // Bound independent GEMMs while keeping full weight tiles
                     // when possible; larger matrices still use row tiling.
@@ -467,16 +554,26 @@ struct TqMoeGraphStage {
                 }
                 const auto* plan=reinterpret_cast<const TrellisPrefillMoeJob*>(device_bytes+tile*sizeof(TrellisPrefillMoeJob));
                 const auto* device_slots=reinterpret_cast<const int64_t*>(device_bytes+job_bytes);
-                if(gemm)phase("tq.moe.prefill_gemm",[&] {tq_detail::status(mfq_tq_prefill_moe_gemm(plan,device_slots,
+                if(gemm && compact_gemm)phase("tq.moe.prefill_gemm",[&] {
+                    const auto* device_bounds=reinterpret_cast<const int64_t*>(device_bytes+bounds_offset)+tile;
+                    tq_detail::status(mfq_tq_prefill_moe_compact(plan,device_slots,device_bounds,
+                        source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
+                        bounds[tile],bounds[tile+tile_count]-bounds[tile],static_cast<int>(up->input),
+                        static_cast<int>(hidden),static_cast<int>(routes),limit,decoded.data_ptr(),decoded.nbytes(),
+                        activations.data_ptr(),activations.nbytes(),stage.down.get(),stream.stream()));
+                    return 0;
+                });
+                else if(gemm)phase("tq.moe.prefill_gemm",[&] {tq_detail::status(mfq_tq_prefill_moe_gemm(plan,device_slots,
                     source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
                     static_cast<int>(up->input),static_cast<int>(hidden),static_cast<int>(routes),limit,
-                    decoded.data_ptr(),decoded.nbytes(),activations.data_ptr(),activations.nbytes(),blas,stream.stream()));return 0;});
+                    decoded.data_ptr(),decoded.nbytes(),activations.data_ptr(),activations.nbytes(),blas,stage.down.get(),stream.stream()));return 0;});
                 else phase("tq.moe.prefill",[&] {tq_detail::status(mfq_tq_prefill_moe(plan,device_slots,
                     source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
                     static_cast<int>(up->input),static_cast<int>(hidden),static_cast<int>(routes),limit,
-                    activations.data_ptr(),activations.nbytes(),stream.stream()));return 0;});
+                    activations.data_ptr(),activations.nbytes(),stage.down.get(),stream.stream()));return 0;});
                 tile+=tile_count;
             }
+            stage.used.record(stream.stream());
             begin=end;
         }
     }
@@ -495,19 +592,11 @@ struct TqMoeGraphStage {
     }
     if(long_groups<unique.size()) {
         auto activated=::tyloi::cuda::empty({tokens,routes,hidden},source.options());
-        // The live batch is bounded by current free VRAM, not a device or
-        // model whitelist. FP16-sized images conservatively bound every
-        // supported 1..8-bit compressed row plus metadata and scale data.
-        const auto image_bound=[](const tyloi::TqBank& w) {
-            return std::uint64_t(w.out)*(((std::uint64_t(w.input)+255)&~std::uint64_t(255))*2+16)+512;
-        };
-        const auto per_expert=image_bound(*gate)+image_bound(*up)+image_bound(*down);
+        const auto per_expert=gate->cache->peak_expert_bytes(source_banks,
+            {unique.data()+long_groups,unique.size()-long_groups});
         for(std::size_t begin=long_groups;begin<unique.size();) {
-            const auto free=phase("tq.moe.capacity",[&] {
-                std::size_t available=0,total=0;TYLOINFER_CUDA_CHECK(cudaMemGetInfo(&available,&total));return available;
-            });
-            const auto count=std::min<std::size_t>(std::min<std::size_t>(65535,unique.size()-begin),
-                std::max<std::uint64_t>(1,(free/2)/per_expert));
+            const auto count=tyloi::weights::routed_prefill_group_capacity(
+                unique.size()-begin,per_expert,free_bytes());
             const auto banks=phase("tq.moe.weights",[&] {
                 return std::array<std::vector<::tyloi::encoding::TqTensor>,3>{
                     gate->cache->get(gate->source_id,unique.data()+begin,count,source.get_device()),

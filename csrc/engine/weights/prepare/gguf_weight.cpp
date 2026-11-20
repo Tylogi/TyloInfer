@@ -2,8 +2,11 @@
 
 #include "engine/backends/cuda/native/allocation.h"
 #include "engine/backends/cuda/native/device.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/backends/cuda/kernels/projection/gguf/quad/storage.h"
+#include "engine/weights/cache/ggml.h"
+#include "engine/weights/cache/resources.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/weights/source/row_residual.h"
 #include "engine/weights/source/transform.h"
@@ -29,7 +32,7 @@ DenseTensor read_bytes(const source::Source& source, const std::string& name,
     return result;
 }
 
-std::optional<GgufRotation> rotation_for(const source::Source& source,
+std::optional<GgmlInputRotation> rotation_for(const source::Source& source,
         const std::string& name, std::int64_t width, std::int64_t first,
         std::int64_t last, Device target) {
     const auto transform = source::hadamard(source, name);
@@ -43,7 +46,7 @@ std::optional<GgufRotation> rotation_for(const source::Source& source,
                 return sign != 1 && sign != -1;
             }))
         throw std::invalid_argument("GGUF Hadamard basis is incompatible with the projection slice");
-    GgufRotation result;
+    GgmlInputRotation result;
     result.block = static_cast<int>(block);
     if (!signs.empty()) result.signs_cpu.assign(signs.begin() + first, signs.begin() + last);
     if (std::all_of(result.signs_cpu.begin(), result.signs_cpu.end(), [](int sign) {
@@ -74,7 +77,7 @@ std::optional<GgufRotation> rotation_for(const source::Source& source,
     return result;
 }
 
-std::optional<GgufCorrection> correction_for(const source::Source& source,
+std::optional<GgmlRowCorrection> correction_for(const source::Source& source,
         const std::string& name, std::int64_t row_begin, std::int64_t row_end,
         std::int64_t column_begin, std::int64_t column_end, Device target) {
     const auto file = source.row_residual(name);
@@ -85,7 +88,7 @@ std::optional<GgufCorrection> correction_for(const source::Source& source,
     if (row_begin < 0 || row_end > static_cast<std::int64_t>(file->row_count()) ||
             column_begin < 0 || column_end > static_cast<std::int64_t>(file->columns()))
         throw std::out_of_range("GGUF row correction slice is out of bounds");
-    GgufCorrection result;
+    GgmlRowCorrection result;
     result.source_columns = static_cast<std::int64_t>(file->columns());
     result.first = row_begin;
     result.rows = row_end - row_begin;
@@ -122,12 +125,12 @@ std::optional<GgufCorrection> correction_for(const source::Source& source,
 
 namespace tyloi {
 
-std::shared_ptr<TensorImpl> GgufTensor::relocated(Device target) const {
+std::shared_ptr<TensorImpl> GgmlQuantizedTensor::relocated(Device target) const {
     if (!target.is_cpu() && !target.is_cuda())
         throw std::invalid_argument("GGUF weights require CPU or CUDA");
     if (target.is_cpu() && target.index != 0)
         throw std::invalid_argument("CPU tensor device index must be zero");
-    auto moved = std::static_pointer_cast<GgufTensor>(cloned());
+    auto moved = std::static_pointer_cast<GgmlQuantizedTensor>(cloned());
     if (target.is_cpu() && moved->quad_storage_rows != 0) {
         if (!moved->packed.is_cuda() || !moved->packed.is_contiguous() ||
                 moved->packed.scalar_type() != kUInt8 || moved->out <= 0 ||
@@ -165,7 +168,7 @@ std::shared_ptr<TensorImpl> GgufTensor::relocated(Device target) const {
 
 namespace tyloi::weights {
 
-GgufTensor load_gguf(const source::Source& source, const std::string& name,
+GgmlQuantizedTensor load_gguf(const source::Source& source, const std::string& name,
         Device target, std::int64_t row_begin, std::int64_t row_end,
         std::int64_t column_begin, std::int64_t column_end) {
     if (!target.is_cpu() && !target.is_cuda())
@@ -216,7 +219,7 @@ GgufTensor load_gguf(const source::Source& source, const std::string& name,
         cuda::DeviceGuard guard(target.index);
         packed = packed.to(target);
     }
-    GgufTensor result;
+    GgmlQuantizedTensor result;
     result.packed = std::move(packed);
     result.type = type;
     result.out = out;
@@ -250,6 +253,71 @@ GgufTensor load_gguf(const source::Source& source, const std::string& name,
         result.quad_row_begin = 0;
     }
     return result;
+}
+
+Tensor Cache::routed_gguf(const source::Source& source, const std::string& name, Device target) {
+    if (!target.is_cuda()) throw std::invalid_argument("GGUF expert banks require CUDA execution");
+    const auto* record = source.find_tensor(name);
+    if (!record || !record->shape || record->shape->size() != 3)
+        throw std::invalid_argument("GGUF expert bank must be [experts,out,in]: " + name);
+    const auto& shape = *record->shape;
+    const auto experts = shape[0], out = shape[1], input = shape[2];
+    const auto type = gguf::quant_type(record->dtype);
+    const auto stride = gguf::row_bytes(type, input);
+    if (experts <= 0 || experts > INT_MAX || out <= 0 || out > INT_MAX || input > INT_MAX ||
+        stride > std::uint64_t(INT64_MAX) / out / experts ||
+        record->nbytes != stride * static_cast<std::uint64_t>(out) * experts)
+        throw std::invalid_argument("invalid GGUF expert bank payload: " + name);
+
+    auto bank = std::make_shared<GgmlExpertBank>();
+    bank->target = target;
+    bank->experts = experts;
+    bank->expert_bytes = static_cast<std::int64_t>(stride * out);
+    bank->image.type = type;
+    bank->image.row_bytes = stride;
+    bank->image.out = out;
+    bank->image.neuron_len = input;
+    const auto device_guard = cuda::DeviceGuard(target.index);
+    const cuda::AllocationScope weight_memory;
+    const cuda::ResidentAllocationScope permanent;
+    bank->image.rotation = rotation_for(source, name, input, 0, input, target);
+    bank->image.correction = correction_for(source, name, 0, experts * out, 0, input, target);
+    auto reader = source.tensor_reader(name);
+    if (!reader) throw std::invalid_argument("GGUF expert bank has no retained reader: " + name);
+    const bool resident = name.starts_with("predictor.");
+    if (resident) {
+        const auto size = static_cast<std::int64_t>(record->nbytes);
+        auto host = cuda::empty({std::min<std::int64_t>(size, 4 << 20)}, TensorOptions{}.device(kCPU).dtype(kUInt8));
+        bank->image.packed = cuda::empty({size}, TensorOptions{}.device(target).dtype(kUInt8));
+        const auto stream = mfq_get_current_cuda_stream(target.index);
+        for (std::int64_t offset = 0; offset < size;) {
+            const auto bytes = std::min<std::int64_t>(size - offset, host.numel());
+            reader(offset, host.data_ptr<std::byte>(), bytes);
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(bank->image.packed.data_ptr<std::byte>() + offset,
+                host.data_ptr(), bytes, cudaMemcpyHostToDevice, stream.stream()));
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+            offset += bytes;
+        }
+        if (!bank->image.rotation && !bank->image.correction &&
+                !(type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4)) {
+            auto addresses = cuda::empty({experts}, TensorOptions{}.device(kCPU).dtype(kInt64));
+            const auto base = reinterpret_cast<std::uintptr_t>(bank->image.packed.data_ptr());
+            for (std::int64_t expert = 0; expert < experts; ++expert)
+                addresses.data_ptr<std::uint64_t>()[expert] = base + expert * bank->expert_bytes;
+            bank->resident_addresses = addresses.to(target);
+        }
+    }
+    if (!data_->ggml) {
+        auto cache = std::make_shared<GgmlExpertCache>(data_->device_bytes.value_or(0),
+            data_->host_bytes, data_->host_limit);
+        register_host_cache(cache);
+        data_->ggml = std::move(cache);
+    }
+    bank->cache = data_->ggml;
+    bank->source_id = bank->cache->register_source(bank,
+        resident ? source::Source::TensorReader{} : std::move(reader),
+        resident ? source::Source::TensorBatchReader{} : source.tensor_batch_reader(name));
+    return bank;
 }
 
 } // namespace tyloi::weights

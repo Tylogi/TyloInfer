@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -37,6 +38,8 @@ struct LoadOptions {
     bool optional_components = true;
     tyloi::state::KvQuantization kv_quantization;
     std::string dflash2_draft_path;
+    std::optional<bool> stream_layer_weights;
+    bool prefetch_layer_weights = true;
 };
 
 /** Assemble the model into an owner retained by the caller. */

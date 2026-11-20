@@ -7,8 +7,9 @@
 #include "engine/weights/loader.h"
 #include "engine/weights/prepare/quant.h"
 #include "engine/weights/tq/routed.h"
-#include "engine/backends/cuda/ops/ffn/experts/moe.h"
 
+#include <stdexcept>
+#include <string>
 #include <cstdio>
 
 std::vector<std::int64_t> TransformerWeightLoader::shape(const ::tyloi::DenseTensor& value) { return value.sizes().vec(); }
@@ -31,13 +32,13 @@ tyloi::models::Moe load_moe_weights(const tyloi::weights::Loader& weights,
             result.gate_up.size() == 2 ? result.gate_up[1].implementation() : result.gate_up[0].implementation());
     down = std::dynamic_pointer_cast<const tyloi::TqBank>(result.down.implementation());
     if (gate || up || down) {
-        TYLOINFER_RUNTIME_CHECK(up && down && (options.ungated_experts || gate),
-            "TQ expert banks cannot be mixed with legacy routed formats");
-        TYLOINFER_RUNTIME_CHECK(up->experts==down->experts &&
+        if (!(up && down && (options.ungated_experts || gate)))
+            throw std::runtime_error("TQ expert banks cannot be mixed with legacy routed formats");
+        if (!(up->experts==down->experts &&
             up->out==down->input && up->input==down->out &&
             (!gate || (gate->experts==up->experts &&
-                gate->out==up->out && gate->input==up->input)),
-            "TQ Gate/Up/Down expert dimensions disagree");
+                gate->out==up->out && gate->input==up->input))))
+            throw std::runtime_error("TQ Gate/Up/Down expert dimensions disagree");
     }
     return result;
 }

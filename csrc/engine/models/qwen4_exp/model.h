@@ -1,11 +1,11 @@
 #pragma once
 
-#include "engine/models/common/check.h"
 #include "engine/models/qwen4_exp/ngram.h"
 #include "engine/ops/ops.h"
 #include "engine/ops/ple.h"
 #include "engine/weights/rows/stage.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -41,19 +41,21 @@ public:
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
           offsets_(std::move(offsets)), vocab_(std::move(vocab)),
           source_(weights::RowReader::source(shards_, rows)) {
-        require_model(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 && heads_ > 0 &&
+        if (!(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 && heads_ > 0 &&
             multipliers_.size() == size_t(ngram_) && offsets_.size() == size_t((ngram_ - 1) * heads_) &&
-            vocab_.size() == offsets_.size(), "invalid Qwen4 ngram metadata geometry");
+            vocab_.size() == offsets_.size()))
+            throw std::runtime_error("invalid Qwen4 ngram metadata geometry");
         for (size_t h = 0; h < vocab_.size(); ++h)
-            require_model(vocab_[h] > 0 && offsets_[h] >= 0 &&
-                offsets_[h] <= int64_t(shards_.size()) * rows_ - vocab_[h],
-                "Qwen4 ngram vocabulary lies outside embedding shards");
+            if (!(vocab_[h] > 0 && offsets_[h] >= 0 &&
+                offsets_[h] <= int64_t(shards_.size()) * rows_ - vocab_[h]))
+                throw std::runtime_error("Qwen4 ngram vocabulary lies outside embedding shards");
     }
     void reset(State& state) const { state.context = {}; state.hash_ready = false; }
     bool graph_supported() const { return bool(source_); }
     std::pair<std::size_t, std::size_t> context_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
-        require_model(batch > 0 && tokens > 0 && ngram_ > 1 &&
-            tokens <= std::numeric_limits<int64_t>::max() - (ngram_ - 1), "invalid ngram growth geometry");
+        if (!(batch > 0 && tokens > 0 && ngram_ > 1 &&
+            tokens <= std::numeric_limits<int64_t>::max() - (ngram_ - 1)))
+            throw std::runtime_error("invalid ngram growth geometry");
         const std::array<int64_t, 2> next{batch, ngram_ - 1};
         const std::array<int64_t, 2> history{batch, ngram_ - 1 + tokens};
         const auto retained = make_contiguous_view(nullptr, next, kInt64, {}).nbytes();
@@ -66,15 +68,16 @@ public:
     const Context& context(const State& state) const { return state.context; }
     void restore(State& state, Context context) const { state.context = std::move(context); state.hash_ready = false; }
     Context prefix_context(const State& state, const Tensor& host_ids, int64_t count) const {
-        require_model(host_ids.is_cpu() && host_ids.dim() == 2 && count > 0 && count <= host_ids.size(1),
-            "PLE prefix requires host token IDs");
+        if (!(host_ids.is_cpu() && host_ids.dim() == 2 && count > 0 && count <= host_ids.size(1)))
+            throw std::runtime_error("PLE prefix requires host token IDs");
         const auto host = ops::read_integers(ops::contiguous(ops::slice(host_ids, 1, 0, count)));
         return ngram_hashes(host.data(), host_ids.size(0), count, ngram_, heads_, eos_,
             multipliers_, offsets_, vocab_, state.context, true).next;
     }
     void prefetch(State& state, const Tensor& host_ids, bool early_prefix = false) const {
         if (!source_) return;
-        require_model(host_ids.is_cpu() && host_ids.dim() == 2, "PLE prefetch requires host token IDs");
+        if (!(host_ids.is_cpu() && host_ids.dim() == 2))
+            throw std::runtime_error("PLE prefetch requires host token IDs");
         if (!state.reader) state.reader = std::make_shared<weights::RowReader>(source_);
         const auto host = ops::read_integers(host_ids);
         const auto b = host_ids.size(0), t = host_ids.size(1);
@@ -88,17 +91,19 @@ public:
         }
     }
     std::shared_ptr<RowStage> graph_stage(State& state, int64_t b, int64_t t, const Device& device) const {
-        require_model(bool(source_), "PLE graph requires prepared range rows");
+        if (!bool(source_))
+            throw std::runtime_error("PLE graph requires prepared range rows");
         if (!state.reader) state.reader = std::make_shared<weights::RowReader>(source_);
         return state.reader->stage({b, t, (ngram_ - 1) * heads_}, device);
     }
     std::vector<std::pair<Device, std::size_t>> graph_stage_growth(int64_t b, int64_t t, const Device& device) const {
-        require_model(bool(source_), "PLE graph requires prepared range rows");
+        if (!bool(source_))
+            throw std::runtime_error("PLE graph requires prepared range rows");
         return weights::RowReader::stage_growth(source_, {b, t, (ngram_ - 1) * heads_}, device);
     }
     void upload_graph(State& state, const Tensor& host_ids, RowStage& stage) const {
-        require_model(graph_supported() && host_ids.is_cpu() && host_ids.dim() == 2,
-            "PLE graph requires host token IDs");
+        if (!(graph_supported() && host_ids.is_cpu() && host_ids.dim() == 2))
+            throw std::runtime_error("PLE graph requires host token IDs");
         const auto host = ops::read_integers(host_ids);
         const auto b = host_ids.size(0), t = host_ids.size(1);
         if (cacheable_hashes(b, t)) {
@@ -114,11 +119,12 @@ public:
     }
     Tensor forward(State& state, const Tensor& ids, bool cache, Tensor* hashed_ids = nullptr,
                    const Tensor& host_ids = {}) const {
-        require_model(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0,
-            "Qwen4 ngram IDs must be [B,T]");
+        if (!(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0))
+            throw std::runtime_error("Qwen4 ngram IDs must be [B,T]");
         const auto b = ids.size(0), t = ids.size(1), nh = (ngram_ - 1) * heads_;
-        if (host_ids) require_model(host_ids.is_cpu() && host_ids.dim() == 2 &&
-            host_ids.size(0) == b && host_ids.size(1) == t, "PLE host token mirror differs");
+        if (host_ids && !(host_ids.is_cpu() && host_ids.dim() == 2 &&
+            host_ids.size(0) == b && host_ids.size(1) == t))
+            throw std::runtime_error("PLE host token mirror differs");
         const auto host = ops::read_integers(host_ids ? host_ids : ids);
         auto hashes = ngram_hashes(host.data(), b, t, ngram_, heads_, eos_,
             multipliers_, offsets_, vocab_, state.context, cache);
@@ -142,8 +148,9 @@ public:
                 }
                 auto indices = ops::reshape(ops::tensor(local, ids.device()), {b, t, nh});
                 auto values = ops::embedding(indices, shards_.at(shard));
-                require_model(values.dim() == 4 && values.size(0) == b && values.size(1) == t &&
-                    values.size(2) == nh && values.size(3) == dimension_, "Qwen4 ngram embedding shape mismatch");
+                if (!(values.dim() == 4 && values.size(0) == b && values.size(1) == t &&
+                    values.size(2) == nh && values.size(3) == dimension_))
+                    throw std::runtime_error("Qwen4 ngram embedding shape mismatch");
                 auto select = ops::reshape(ops::tensor(mask, ids.device()), {b, t, nh, 1});
                 values = ops::multiply(values, ops::cast(select, values.scalar_type()));
                 result = result ? ops::add(result, values) : values;
@@ -197,11 +204,12 @@ public:
         state.saved_prefix_conv.clear(); state.saved_prefix_context.clear(); state.saved_prefix_position = -1;
     }
     void rollback(State& state, int64_t keep = -1) const {
-        require_model(state.saved, "Qwen4 PLE has no speculative checkpoint");
+        if (!state.saved)
+            throw std::runtime_error("Qwen4 PLE has no speculative checkpoint");
         if (keep >= 0 && state.saved_prefix_position >= 0) {
             const auto index = keep - state.saved_prefix_position;
-            require_model(index >= 0 && index < int64_t(state.saved_prefix_conv.size()),
-                "Qwen4 PLE prefix checkpoint is out of range");
+            if (!(index >= 0 && index < int64_t(state.saved_prefix_conv.size())))
+                throw std::runtime_error("Qwen4 PLE prefix checkpoint is out of range");
             state.saved_conv = state.saved_prefix_conv[index]; state.saved_context = state.saved_prefix_context[index];
         }
         if (state.conv) ops::copy_into(state.conv, state.saved_conv); else state.conv = state.saved_conv;
@@ -211,12 +219,15 @@ public:
     const Tensor& conv_state(const State& state) const { return state.conv; }
     std::vector<Tensor*> graph_state(State& state) const { return {&state.conv}; }
     std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
-        if (state.conv) require_model(state.conv.size(0) == batch, "PLE batch changed");
+        if (state.conv && !(state.conv.size(0) == batch))
+            throw std::runtime_error("PLE batch changed");
         const auto kernel = w_.conv.size(-1);
-        require_model(batch > 0 && tokens > 0 && kernel > 0 && dilation_ > 0 &&
-            kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_, "invalid PLE growth geometry");
+        if (!(batch > 0 && tokens > 0 && kernel > 0 && dilation_ > 0 &&
+            kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_))
+            throw std::runtime_error("invalid PLE growth geometry");
         const auto history = (kernel - 1) * dilation_;
-        require_model(tokens <= std::numeric_limits<int64_t>::max() - history, "PLE growth overflow");
+        if (!(tokens <= std::numeric_limits<int64_t>::max() - history))
+            throw std::runtime_error("PLE growth overflow");
         const std::array<int64_t, 4> joined{batch, history + tokens, streams_, hidden_};
         const std::array<int64_t, 4> conv{batch, history, streams_, hidden_};
         const auto a = make_contiguous_view(nullptr, joined, kFloat32, w_.conv.device()).nbytes();
@@ -226,10 +237,11 @@ public:
         return batch == 1 ? std::pair{a, b} : std::pair{b, a + b};
     }
     std::size_t checkpoint_growth_bytes(const State& state, int64_t batch, int64_t tokens, int64_t confirmed) const {
-        if (tokens <= 8) require_model(bool(state.conv), "PLE verification requires committed convolution state");
+        if (tokens <= 8 && !bool(state.conv))
+            throw std::runtime_error("PLE verification requires committed convolution state");
         const auto kernel = w_.conv.size(-1);
-        require_model(kernel > 0 && dilation_ > 0 && kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_,
-            "invalid PLE checkpoint geometry");
+        if (!(kernel > 0 && dilation_ > 0 && kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_))
+            throw std::runtime_error("invalid PLE checkpoint geometry");
         const auto count = tokens <= 8 ? tokens - confirmed : 1;
         const std::array<int64_t, 4> shape{batch, (kernel - 1) * dilation_, streams_, hidden_};
         const auto bytes = make_contiguous_view(nullptr, shape, kFloat32, w_.conv.device()).nbytes();
@@ -244,11 +256,14 @@ public:
     const NgramEmbedding::Context& session_context(const State& state) const { return embedding_.context(state.embedding); }
     void restore_graph_context(State& state, NgramEmbedding::Context context) const { embedding_.restore(state.embedding, std::move(context)); }
     void restore_session(State& state, const Tensor& convolution, NgramEmbedding::Context context, bool retain_storage = false) const {
-        require_model(bool(convolution), "missing Qwen4 PLE session state");
+        if (!bool(convolution))
+            throw std::runtime_error("missing Qwen4 PLE session state");
         if (retain_storage) {
-            require_model(state.conv && state.conv.dim() == convolution.dim(), "Qwen4 PLE graph session geometry changed");
+            if (!(state.conv && state.conv.dim() == convolution.dim()))
+                throw std::runtime_error("Qwen4 PLE graph session geometry changed");
             for (int64_t i = 0; i < convolution.dim(); ++i)
-                require_model(state.conv.size(i) == convolution.size(i), "Qwen4 PLE graph session geometry changed");
+                if (!(state.conv.size(i) == convolution.size(i)))
+                    throw std::runtime_error("Qwen4 PLE graph session geometry changed");
             auto prepared = convolution.device() == state.conv.device() ? convolution : ops::copy(convolution, state.conv.device());
             commit(state); ops::copy_into(state.conv, ops::contiguous(prepared));
         } else { reset(state); state.conv = ops::clone(convolution); }
@@ -266,8 +281,10 @@ public:
     }
     void bind_graph_checkpoint(State& state, const std::vector<Tensor>& conv,
         std::vector<NgramEmbedding::Context> context, int64_t position) const {
-        require_model(!state.saved, "resolve previous PLE checkpoint");
-        require_model(!conv.empty() && conv.size() == context.size(), "invalid PLE prefix checkpoints");
+        if (state.saved)
+            throw std::runtime_error("resolve previous PLE checkpoint");
+        if (!(!conv.empty() && conv.size() == context.size()))
+            throw std::runtime_error("invalid PLE prefix checkpoints");
         state.saved = true; state.saved_conv = conv.front(); state.saved_context = context.front();
         state.saved_prefix_conv = conv; state.saved_prefix_context = std::move(context); state.saved_prefix_position = position;
     }
@@ -286,11 +303,13 @@ public:
     void prefetch_tokens(State& state, const Tensor& ids, bool early_prefix = false) const { embedding_.prefetch(state.embedding, ids, early_prefix); }
     Tensor forward(State& state, const Tensor& x, const Tensor& ids, bool cache,
         int64_t confirmed = 0, const Tensor& host_ids = {}, int64_t cache_position = -1) const {
-        require_model(x.dim() == 3 && ids.dim() == 2 && x.size(0) == ids.size(0) &&
+        if (!(x.dim() == 3 && ids.dim() == 2 && x.size(0) == ids.size(0) &&
             x.size(1) == ids.size(1) && x.size(2) == hidden_ * streams_ && confirmed >= 0 &&
-            confirmed <= x.size(1) && (!confirmed || cache), "invalid Qwen4 PLE input");
+            confirmed <= x.size(1) && (!confirmed || cache)))
+            throw std::runtime_error("invalid Qwen4 PLE input");
         if (cache && cache_position >= 0 && confirmed > 0 && confirmed < x.size(1) && x.size(1) <= 8) {
-            require_model(!state.saved && state.conv, "PLE verification requires committed convolution state");
+            if (!(!state.saved && state.conv))
+                throw std::runtime_error("PLE verification requires committed convolution state");
             auto host = host_ids ? host_ids : ops::cast(ids, kInt64, Device(kCPU));
             std::vector<Tensor> conv;
             std::vector<NgramEmbedding::Context> context;
@@ -305,14 +324,16 @@ public:
             bind_graph_checkpoint(state, conv, std::move(context), cache_position + confirmed);
             return result;
         }
-        require_model(x.size(1) > 0 && confirmed >= 0 && confirmed <= x.size(1) &&
-            (!confirmed || cache), "invalid recurrent verification window");
+        if (!(x.size(1) > 0 && confirmed >= 0 && confirmed <= x.size(1) &&
+            (!confirmed || cache)))
+            throw std::runtime_error("invalid recurrent verification window");
         if (confirmed == 0 || confirmed == x.size(1))
             return forward_chunk(state, ops::slice(x, 1, 0, x.size(1)),
                 ops::slice(ids, 1, 0, ids.size(1)), cache,
                 host_ids ? ops::slice(host_ids, 1, 0, x.size(1)) : Tensor{});
 
-        require_model(!state.saved, "resolve previous recurrent checkpoint");
+        if (state.saved)
+            throw std::runtime_error("resolve previous recurrent checkpoint");
         auto prefix = forward_chunk(state, ops::slice(x, 1, 0, confirmed),
             ops::slice(ids, 1, 0, confirmed), cache,
             host_ids ? ops::slice(host_ids, 1, 0, confirmed) : Tensor{});

@@ -130,8 +130,10 @@ struct Plain {
             models::DecodeOptions policy;
             policy.projection = sampler.greedy() && !penalties && !input.token_constraint
                 ? models::DecodeOptions::Projection::greedy : models::DecodeOptions::Projection::logits;
-            policy.routed = weights.decode() == weights::Cache::Decode::routed;
-            policy.enabled = weights.decode() != weights::Cache::Decode::none;
+            const auto routing = weights.routing();
+            policy.routed = routing.fixed_views;
+            policy.enabled = policy.routed ||
+                (routing.host_ids_required && info.graph == models::GraphOwner::model);
             policy.reserve_until = std::min<std::int64_t>(info.max_context,
                 std::int64_t(input.prompt.size()) + std::min<std::int64_t>(input.sampling.max_tokens, 256));
             if (auto result = engine::decode(model, state, executor, weights, budget, forward_options, std::move(model_input), policy)) {
@@ -151,7 +153,10 @@ struct Plain {
             exit_unmanaged_graph(state, weights, budget);
             reserve(model_input);
             auto profile = config.profile_decode ? executor.profile("runtime.decode") : nullptr;
-            auto hidden = model.forward(std::move(model_input), state, forward_options);
+            auto hidden = info.streamed_weights
+                ? engine::prefill(model, state, executor, weights, budget, forward_options,
+                    std::move(model_input), 1, output).hidden
+                : model.forward(std::move(model_input), state, forward_options);
             executor.submit(state.storage());
             pending = sample_logits(sampler,
                 project(hidden, !(sampler.greedy() && !penalties && !input.token_constraint)),
@@ -267,7 +272,7 @@ struct Native {
         const auto& prompt = input.prompt;
         const auto chunk_size = budget.prefill(prompt.size() - reused, config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
-        const auto logical_chunk = prefill_span(model, state, weights, prompt.size(), chunk_size, reused,
+        const auto logical_chunk = prefill_span(model, state, weights, budget, prompt.size(), chunk_size, reused,
             stable, prepared && prepared->transformed());
         auto full_ids = ops::reshape(ops::tensor(std::span<const int64_t>(prompt),
             config.device), {1, -1});
@@ -306,7 +311,7 @@ struct Native {
         if (!predictor_execution) throw std::invalid_argument("predictor executor is unavailable");
         const auto chunk_size = budget.prefill(input.prompt.size() - reused, config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
-        const auto logical_chunk = prefill_span(model, state, weights, input.prompt.size(), chunk_size, reused,
+        const auto logical_chunk = prefill_span(model, state, weights, budget, input.prompt.size(), chunk_size, reused,
             prefix_boundary, prepared && prepared->transformed());
         return generate_mtp(model, state, executor, *predictor_execution, weights, budget, source,
             mtp_state, input, output, logical_chunk, chunk_size, prepared ? &*prepared : nullptr, reused, restored,
@@ -474,6 +479,7 @@ Generation generate_prepared(Native ops, InferenceRequest& input, InferenceOutpu
 } // namespace
 
 StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) {
+    if (request.decisions) return generate_decisions(request);
     if (request.batched) {
         if (!batch_) throw std::logic_error("batch generation is unavailable");
         return batch_->generate(id, request.input, *request.output);

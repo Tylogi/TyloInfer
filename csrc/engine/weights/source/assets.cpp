@@ -78,16 +78,17 @@ bool Assets::has(std::string_view name) const noexcept {
     return inline_.find(key) != inline_.end() || paths_.find(key) != paths_.end();
 }
 
-std::vector<std::byte> Assets::read(std::string_view name) const {
+std::vector<std::byte> Assets::read(std::string_view name, std::size_t maximum) const {
     const auto key = std::string(name);
     if (const auto found = inline_.find(key); found != inline_.end()) {
+        if (found->second.size() > maximum) throw std::runtime_error("asset exceeds read limit: " + key);
         return found->second;
     }
     const auto found = paths_.find(key);
     if (found == paths_.end()) {
         throw std::runtime_error("model asset not found: " + std::string(name));
     }
-    return read_file(found->second);
+    return read_file(found->second, maximum);
 }
 
 std::vector<std::string> Assets::names() const {

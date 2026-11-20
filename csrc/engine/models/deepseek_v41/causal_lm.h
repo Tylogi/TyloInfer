@@ -1,7 +1,7 @@
 #pragma once
 #include "config.h"
 #include "engine/models/metadata.h"
-#include "../common/check.h"
+#include <stdexcept>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -20,7 +20,8 @@ template <class Embed, class Expand, class InitialPre, class Layer, class Collap
 auto dspark_draft(int64_t width, int64_t requested, size_t stages, Embed embed, Expand expand,
                   InitialPre initial_pre, Layer layer, Collapse collapse, Logits logits,
                   Slice slice) {
-    require_model(requested > 0 && requested <= width && stages > 0, "invalid DSpark draft width");
+    if (!(requested > 0 && requested <= width && stages > 0))
+        throw std::runtime_error("invalid DSpark draft width");
     auto embedded = embed(width);
     auto hidden = expand(embedded);
     auto previous_pre = initial_pre(embedded);
@@ -46,7 +47,8 @@ template <class Query, class Key, class Cache, class Plan, class Attend, class I
           class Output>
 auto dspark_attention(int64_t context, Query query, Key key, Cache cache, Plan plan, Attend attend,
                       Inverse inverse, Output output) {
-    require_model(context > 0, "DeepSeek-V4.1 DSpark draft requires committed context");
+    if (!(context > 0))
+        throw std::runtime_error("DeepSeek-V4.1 DSpark draft requires committed context");
     auto q = query();
     auto keys = cache(key());
     auto indices = plan(keys);

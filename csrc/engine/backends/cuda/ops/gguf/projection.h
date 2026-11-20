@@ -1,8 +1,11 @@
 #pragma once
 
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/tensor/encoding/ggml.h"
 #include <cstdint>
+#include <span>
 #include <vector>
+
+namespace tyloi::weights { struct ExpertRows; }
 
 namespace tyloi::cuda::gguf {
 
@@ -14,21 +17,27 @@ struct ProjectionInput {
     bool aligned_m1 = false;
 };
 
-DenseTensor project(const GgufTensor&, DenseTensor, bool allow_mmq = true);
-DenseTensor embedding(const GgufTensor&, DenseTensor);
-DenseTensor dequantize(const GgufTensor&);
-DenseTensor gated_residual(const GgufTensor&, const DenseTensor& gate,
+DenseTensor project(const GgmlQuantizedTensor&, DenseTensor, bool allow_mmq = true);
+bool can_prefill_residual(const GgmlQuantizedTensor&, std::int64_t tokens, const DenseTensor& residual);
+DenseTensor project_prefill_residual(const GgmlQuantizedTensor&, DenseTensor, const DenseTensor& residual);
+void project_routed(std::span<const GgmlQuantizedTensor> images, const weights::ExpertRows&,
+    std::size_t first, const DenseTensor& input, DenseTensor& output);
+DenseTensor project_indexed(const GgmlQuantizedTensor& weight, const DenseTensor& addresses,
+    const weights::ExpertRows& rows, const DenseTensor& input);
+DenseTensor embedding(const GgmlQuantizedTensor&, DenseTensor);
+DenseTensor dequantize(const GgmlQuantizedTensor&);
+DenseTensor gated_residual(const GgmlQuantizedTensor&, const DenseTensor& gate,
     const DenseTensor& up, const DenseTensor& residual);
-std::vector<DenseTensor> project_group(const std::vector<GgufTensor>&, DenseTensor);
-bool same_input_basis(const GgufTensor&, const GgufTensor&);
-bool original_input(const GgufTensor&);
-DenseTensor project_q8(const GgufTensor&, const DenseTensor&, std::int64_t, ScalarType, bool);
-bool position_major_q8(const GgufTensor&, std::int64_t);
-bool m1_aligned(const std::vector<GgufTensor>&, std::int64_t);
-DenseTensor canonical_packed(const GgufTensor&);
-ProjectionInput prepare_input(const std::vector<GgufTensor>&, DenseTensor);
-ProjectionInput prepare_rms_input(const std::vector<GgufTensor>&, const DenseTensor& input,
+std::vector<DenseTensor> project_group(const std::vector<GgmlQuantizedTensor>&, DenseTensor);
+bool same_input_basis(const GgmlQuantizedTensor&, const GgmlQuantizedTensor&);
+bool original_input(const GgmlQuantizedTensor&);
+DenseTensor project_q8(const GgmlQuantizedTensor&, const DenseTensor&, std::int64_t, ScalarType, bool);
+bool position_major_q8(const GgmlQuantizedTensor&, std::int64_t);
+bool m1_aligned(const std::vector<GgmlQuantizedTensor>&, std::int64_t);
+DenseTensor canonical_packed(const GgmlQuantizedTensor&);
+ProjectionInput prepare_input(const std::vector<GgmlQuantizedTensor>&, DenseTensor);
+ProjectionInput prepare_rms_input(const std::vector<GgmlQuantizedTensor>&, const DenseTensor& input,
     const DenseTensor& norm, double eps, double offset, DenseTensor& normalized);
-std::vector<DenseTensor> project_input(const ProjectionInput&, const std::vector<GgufTensor>&);
+std::vector<DenseTensor> project_input(const ProjectionInput&, const std::vector<GgmlQuantizedTensor>&);
 
 } // namespace tyloi::cuda::gguf

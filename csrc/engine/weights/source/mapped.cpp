@@ -118,6 +118,17 @@ public:
 #endif
         return true;
     }
+    std::pair<std::uintptr_t, std::uintptr_t> pages_for(std::uint64_t offset, std::size_t size) const {
+        const auto address = reinterpret_cast<std::uintptr_t>(view_) + prefix_ + std::size_t(offset);
+        return {address / page_bytes_ * page_bytes_, (address + size + page_bytes_ - 1) / page_bytes_ * page_bytes_};
+    }
+    static void release_pages(std::uintptr_t begin, std::uintptr_t end) noexcept {
+#ifdef _WIN32
+        (void)VirtualUnlock(reinterpret_cast<void*>(begin),end-begin);
+#else
+        (void)::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_DONTNEED);
+#endif
+    }
     void release_read_pages(const std::vector<ReadSpan>& spans) const {
         if(spans.empty())return;
         // Large prefill batches benefit from one view-wide trim. For sparse
@@ -126,29 +137,17 @@ public:
         if(spans.size()>1024 || !page_bytes_) {release_pages();return;}
         std::vector<std::pair<std::uintptr_t,std::uintptr_t>> pages;
         pages.reserve(spans.size());
-        for(const auto& span:spans)if(span.size) {
-            const auto address=reinterpret_cast<std::uintptr_t>(view_)+prefix_+std::size_t(span.offset);
-            const auto begin=address/page_bytes_*page_bytes_;
-            const auto end=(address+span.size+page_bytes_-1)/page_bytes_*page_bytes_;
-            pages.emplace_back(begin,end);
-        }
+        for(const auto& span:spans)if(span.size)pages.push_back(pages_for(span.offset,span.size));
         if(pages.empty())return;
         std::sort(pages.begin(),pages.end());
-        const auto release=[](std::uintptr_t begin,std::uintptr_t end) {
-#ifdef _WIN32
-            (void)VirtualUnlock(reinterpret_cast<void*>(begin),end-begin);
-#else
-            (void)::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_DONTNEED);
-#endif
-        };
         auto begin=pages.front().first,end=pages.front().second;
         for(std::size_t i=1;i<pages.size();++i) {
             if(pages[i].first<=end)end=std::max(end,pages[i].second);
-            else {release(begin,end);begin=pages[i].first;end=pages[i].second;}
+            else {release_pages(begin,end);begin=pages[i].first;end=pages[i].second;}
         }
-        release(begin,end);
+        release_pages(begin,end);
     }
-    void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
+    void copy_range(std::uint64_t offset,std::byte* destination,std::size_t size)const {
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
         if(!size)return;
         if(!destination)throw std::invalid_argument("mapped tensor destination is null");
@@ -159,6 +158,16 @@ public:
             mapped_read_totals[2].fetch_add(size,std::memory_order_relaxed);
             mapped_read_totals[3].fetch_add(1,std::memory_order_relaxed);
         }
+    }
+    void read(std::uint64_t offset, std::byte* destination, std::size_t size) const {
+        copy_range(offset, destination, size);
+        if (!mapped_release_context || !size) return;
+        if (!page_bytes_) {
+            release_pages();
+            return;
+        }
+        const auto [begin, end] = pages_for(offset, size);
+        release_pages(begin, end);
     }
     void read_batch(const std::vector<ReadSpan>& spans)const {
         // Check the complete batch before touching any destination. A failed
@@ -199,7 +208,7 @@ public:
             mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
             mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
         }
-        for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
+        for(const auto& span:spans)if(span.size)copy_range(span.offset,span.destination,span.size);
         // Selected rows now belong to the bounded row cache/packet. Keeping
         // a second working-set copy of sparse pages across all Engram tables
         // can exhaust RAM despite a bounded expert cache.

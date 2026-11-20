@@ -97,7 +97,6 @@ std::optional<int> nint_route_warps();
 std::optional<bool> nvq1_group_records();
 std::optional<bool> nvq1_integer_delta();
 bool nvq_dense_reference();
-std::optional<bool> prefill_expert_batch_audit();
 std::optional<bool> prefill_layer_major_trace();
 std::optional<bool> qsa_prefill_fused();
 std::optional<bool> qsa_select_fused();

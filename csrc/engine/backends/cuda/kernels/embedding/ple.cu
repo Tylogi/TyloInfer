@@ -1,4 +1,5 @@
 #include "ple.h"
+#include <stdexcept>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <algorithm>
@@ -83,11 +84,12 @@ std::vector<DenseTensor> ple_gate_norm_cuda(const DenseTensor& key,const DenseTe
     const auto valid=[](const DenseTensor& x) {return x.is_cuda() && x.is_contiguous() &&
         (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kBFloat16 ||
          x.scalar_type()==::tyloi::kFloat32);};
-    TYLOINFER_RUNTIME_CHECK(valid(key) && valid(query) && valid(value) && key.sizes()==query.sizes() &&
+    if (!(valid(key) && valid(query) && valid(value) && key.sizes()==query.sizes() &&
         hidden>0 && hidden<=8192 && streams>0 && key.numel()==value.numel()*streams &&
         value.numel()%hidden==0 && key.device()==query.device() && key.device()==value.device() &&
         norm.is_cuda() && norm.is_contiguous() && norm.scalar_type()==::tyloi::kFloat32 &&
-        norm.numel()==hidden*streams && norm.device()==key.device(),"PLE fused gate geometry/dtype invalid");
+        norm.numel()==hidden*streams && norm.device()==key.device()))
+        throw std::runtime_error("PLE fused gate geometry/dtype invalid");
     MfqCudaGuard guard(key.device());
     auto gated=::tyloi::cuda::empty(key.sizes(),key.options().dtype(::tyloi::kFloat32));
     auto normalized=::tyloi::cuda::empty(key.sizes(),key.options().dtype(::tyloi::kFloat32));
@@ -117,19 +119,21 @@ std::vector<DenseTensor> ple_gate_norm_cuda(const DenseTensor& key,const DenseTe
 
 std::vector<DenseTensor> ple_conv_add_cuda(const DenseTensor& input,const DenseTensor& source_weight,
         const std::optional<DenseTensor>& previous,int64_t dilation,const DenseTensor& gated,bool half_output) {
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
+    if (!(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
         input.scalar_type()==::tyloi::kFloat32 && gated.is_contiguous() && gated.scalar_type()==::tyloi::kFloat32 &&
-        gated.sizes()==input.sizes() && gated.device()==input.device() && dilation>0,
-        "PLE fused convolution input invalid");
+        gated.sizes()==input.sizes() && gated.device()==input.device() && dilation>0))
+        throw std::runtime_error("PLE fused convolution input invalid");
     auto weight=source_weight;
     if(weight.dim()==3 && weight.size(1)==1)weight=weight.select(1,0);
-    TYLOINFER_RUNTIME_CHECK(weight.is_cuda() && weight.dim()==2 && weight.size(0)==input.size(2) &&
-        weight.size(1)>0 && weight.size(1)<=32 && weight.device()==input.device(),"PLE convolution weights invalid");
+    if (!(weight.is_cuda() && weight.dim()==2 && weight.size(0)==input.size(2) &&
+        weight.size(1)>0 && weight.size(1)<=32 && weight.device()==input.device()))
+        throw std::runtime_error("PLE convolution weights invalid");
     const int64_t history=(weight.size(1)-1)*dilation;
     const std::vector<int64_t> shape{input.size(0),history,input.size(2)};
-    TYLOINFER_RUNTIME_CHECK(!previous || (previous->is_cuda() && previous->is_contiguous() &&
+    if (!(!previous || (previous->is_cuda() && previous->is_contiguous() &&
         previous->scalar_type()==::tyloi::kFloat32 && previous->sizes().vec()==shape &&
-        previous->device()==input.device()),"PLE convolution state invalid");
+        previous->device()==input.device())))
+        throw std::runtime_error("PLE convolution state invalid");
     MfqCudaGuard guard(input.device());weight=weight.to(::tyloi::kFloat32).contiguous();
     auto output=::tyloi::cuda::empty(input.sizes(),input.options().dtype(half_output?::tyloi::kFloat16: ::tyloi::kFloat32));
     auto next=::tyloi::cuda::empty(shape,input.options());

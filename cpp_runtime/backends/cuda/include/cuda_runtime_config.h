@@ -48,8 +48,6 @@ struct CudaLoadOptions {
     int64_t context_size = 0;
     bool parallel_test_duplicates = false;
     bool yarn_context_extension = false;
-    bool jev_weights_set = false;
-    bool jev_full_vram = false;
     bool n_gpu_layers_set = false;
     bool cpu_threads_set = false;
     int n_gpu_layers = -1;

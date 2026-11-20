@@ -1,5 +1,4 @@
 #include "engine/models/common/moe.h"
-#include "engine/models/common/ffn_internal.h"
 #include "engine/weights/moe/batch.h"
 #include "engine/weights/moe/experts.h"
 
@@ -115,28 +114,6 @@ Tensor moe(const Moe& weights, const Tensor& input, bool serial_experts,
         outputs.push_back(routed(weights, values, row_bias, row_ids, row, input.size(0)));
     }
     return ops::cat(outputs, 0);
-}
-
-Tensor ffn_internal::feed_forward(const Moe& weights, const Tensor& input, bool bf16, bool serial_experts) {
-    if (bf16) throw std::runtime_error("BF16 routed FFN is unsupported");
-    return moe(weights, input, serial_experts);
-}
-
-Tensor full_ffn(const Ffn& weights, const Tensor& norm,
-    const Tensor& residual, const Tensor& attention_output,
-    double epsilon, double offset, bool bf16, bool trace,
-    ops::Trace* trace_output, bool serial_experts) {
-    return std::visit([&](const auto& value) {
-        return ffn_internal::full(value, norm,
-            residual, attention_output, epsilon, offset, bf16, trace, trace_output,
-            serial_experts);
-    }, weights);
-}
-
-Tensor linear_ffn(const Ffn& weights, const std::array<Tensor, 2>& prepared, bool serial_experts) {
-    return std::visit([&](const auto& value) {
-        return ffn_internal::linear(value, prepared, serial_experts);
-    }, weights);
 }
 
 } // namespace tyloi::models

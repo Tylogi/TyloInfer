@@ -26,6 +26,8 @@ struct LoadOptions {
     bool load_layers = true;
     bool load_input_output = true;
     tyloi::state::KvQuantization kv_quantization;
+    std::optional<bool> stream_layer_weights;
+    bool prefetch_layer_weights = true;
 };
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source,

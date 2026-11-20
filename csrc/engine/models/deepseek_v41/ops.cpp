@@ -1,10 +1,11 @@
+#include <stdexcept>
+#include <sstream>
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/moe/experts.h"
 #include "ops.h"
 #include "vision.h"
-#include "engine/models/common/check.h"
 #include "engine/models/session/codec.h"
 
 namespace tyloi::cuda::deepseek_v41_runtime {
@@ -101,8 +102,8 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
         result->vision_router_bias=std::make_shared<DenseTensor>(
             weights.tensor(prefix+"mlp.router.vision_bias").dense()
                 .to(::tyloi::kFloat32).contiguous());
-        TYLOINFER_RUNTIME_CHECK(result->vision_router_bias.dim()==1 && result->vision_router_bias.size(0)==config.n_experts,
-                          "DeepSeek-V4.1 vision router bias shape mismatch");
+        if (!(result->vision_router_bias.dim()==1 && result->vision_router_bias.size(0)==config.n_experts))
+            throw std::runtime_error("DeepSeek-V4.1 vision router bias shape mismatch");
     }
     result->rope = ::tyloi::ops::tail_rope_table(
         config.max_position_embeddings, config.rope_theta, result->ratio,
@@ -150,11 +151,14 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
          result->index_query.size(0) == config.index_n_heads * config.index_head_dim &&
          result->index_score.size(1) == config.hidden &&
          result->index_score.size(0) == config.index_n_heads);
-    TYLOINFER_RUNTIME_CHECK(config.hc_mult == 4 && config.n_heads == 64 && config.head_dim == 512 &&
+    if (!(config.hc_mult == 4 && config.n_heads == 64 && config.head_dim == 512 &&
                           config.rope_head_dim == 64 && config.index_n_heads == 32 &&
                           config.index_head_dim == 128 && base_shapes && source_shapes &&
-                          index_shapes,
-                      "DeepSeek-V4.1 CUDA tensor geometry disagrees at layer ", layer);
+                          index_shapes)) {
+        std::ostringstream failure;
+        failure << "DeepSeek-V4.1 CUDA tensor geometry disagrees at layer " << layer;
+        throw std::runtime_error(failure.str());
+    }
     return result;
 }
 
@@ -169,7 +173,6 @@ DenseTensor finalize_hidden(const SharedState &state, const DenseTensor &hidden)
 namespace tyloi::cuda::deepseek_v41 {
 
 using deepseek_v41_runtime::Block;
-using tyloi::models::require_model;
 
 void Model::load_config(std::string_view payload) {
     auto& config = this->config;
@@ -297,10 +300,9 @@ bool Model::prefetch_token_rows(State& state, const ::tyloi::Tensor& input_ids) 
 
 void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cache_position,
                                      bool has_position_override, bool has_cache_position_override) const {
-    require_model(
-        tokens > 0 && cache_position + tokens <= metadata.max_position_embeddings &&
-            !has_position_override && !has_cache_position_override,
-        "DeepSeek-V4.1 currently requires contiguous causal cache positions");
+    if (!(tokens > 0 && cache_position + tokens <= metadata.max_position_embeddings &&
+        !has_position_override && !has_cache_position_override))
+        throw std::runtime_error("DeepSeek-V4.1 currently requires contiguous causal cache positions");
 }
 
 // The decode forward, ported from the retired generic causal loop. The block
@@ -310,9 +312,9 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
                                     const tyloi::models::ForwardOptions&) const {
     auto& state = static_cast<State&>(state_value);
     if (input.suffix) {
-        require_model(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
-                          !state.speculative_suffix_forward,
-                      "speculative suffix is not active");
+        if (!(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
+            !state.speculative_suffix_forward))
+            throw std::runtime_error("speculative suffix is not active");
     }
     struct SuffixScope {
         State& state;
@@ -321,26 +323,27 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
     } suffix_scope{state, input.suffix};
     if (input.suffix) state.speculative_suffix_forward = true;
     const auto primary = ::tyloi::Device(::tyloi::kCUDA, primary_device);
-    require_model(input.ids && input.ids.defined(), "token ids are required");
+    if (!(input.ids && input.ids.defined()))
+        throw std::runtime_error("token ids are required");
     auto ids = device_ids(input.ids.dense());
     auto embeddings = input.embeddings
         ? tyloi::ops::contiguous(tyloi::ops::copy(input.embeddings, primary)).dense()
         : embed_tokens(ids);
     const auto B = ids.size(0), T = ids.size(1);
-    require_model(embeddings.dim() == 3 && embeddings.size(0) == B && embeddings.size(1) == T &&
-                      embeddings.size(2) == hidden_size(),
-                  "inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B && embeddings.size(1) == T &&
+        embeddings.size(2) == hidden_size()))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
     validate_forward(B, T, state.cache_pos, bool(input.positions),
                              bool(input.cache_positions));
-    require_model(state.speculative_start < 0 || state.speculative_suffix_forward,
-                  "commit or roll back the pending speculative pass before forwarding");
+    if (!(state.speculative_start < 0 || state.speculative_suffix_forward))
+        throw std::runtime_error("commit or roll back the pending speculative pass before forwarding");
     const auto confirmed = input.confirmed;
-    require_model(confirmed >= 0 && (confirmed == 0 ||
-                      (confirmed < T && B == 1 && state.cache_pos > 0 && supports_speculation())),
-                  "unsupported speculative backbone geometry");
+    if (!(confirmed >= 0 && (confirmed == 0 ||
+        (confirmed < T && B == 1 && state.cache_pos > 0 && supports_speculation()))))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (confirmed > 0) {
-        require_model(state.cache_pos + T <= max_position_embeddings(),
-                      "speculative pass exceeds context capacity");
+        if (!(state.cache_pos + T <= max_position_embeddings()))
+            throw std::runtime_error("speculative pass exceeds context capacity");
         state.speculative_start = state.cache_pos;
         state.speculative_confirmed = confirmed;
     }

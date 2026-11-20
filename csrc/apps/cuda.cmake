@@ -6,6 +6,10 @@ if(TARGET mfq-transport)
     )
     target_link_libraries(tyloi-engine PRIVATE
         mfq-cuda-engine mfq-transport)
+    if(CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
+        target_link_libraries(tyloi-engine PRIVATE
+            "$<LINK_GROUP:RESCAN,mfq-cuda-engine,mfq-engine,mfq-cuda-core,mfq-tensor>")
+    endif()
     target_compile_definitions(tyloi-engine PRIVATE TYLOINFER_CLI_CUDA=1 TYLOINFER_CLI_METAL=0)
 endif()
 

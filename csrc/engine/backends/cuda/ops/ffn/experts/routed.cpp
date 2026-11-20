@@ -8,7 +8,9 @@
 #include "engine/backends/cuda/ops/activation.h"
 #include "engine/backends/cuda/ops/ffn/experts/launch.h"
 #include "engine/weights/encoding/mfe.h"
+#include "engine/weights/moe/ggml_bank.h"
 #include "engine/weights/moe/experts.h"
+#include "engine/weights/moe/prepare/projection.h"
 #include "engine/weights/tq/routed.h"
 
 #include <climits>
@@ -42,6 +44,8 @@ tyloi::ops::RoutedGeglu routed_geglu(tyloi::DenseTensor input, tyloi::DenseTenso
     const auto* dense_down = down_bank.representation<DenseTensor>();
     const auto* tq_gate = gate_bank.representation<TqBank>();
     const auto* tq_down = down_bank.representation<TqBank>();
+    const auto* gguf_gate = gate_bank.representation<GgmlExpertBank>();
+    const auto* gguf_down = down_bank.representation<GgmlExpertBank>();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     const auto* gate = gate_bank.representation<MfeTensor>();
     const auto* down = down_bank.representation<MfeTensor>();
@@ -53,7 +57,7 @@ tyloi::ops::RoutedGeglu routed_geglu(tyloi::DenseTensor input, tyloi::DenseTenso
     constexpr const MfeTensor* gate = nullptr;
     constexpr const MfeTensor* down = nullptr;
 #endif
-    if ((!dense_gate && !tq_gate && !gate) || (!dense_down && !tq_down && !down))
+    if ((!dense_gate && !tq_gate && !gguf_gate && !gate) || (!dense_down && !tq_down && !gguf_down && !down))
         throw std::invalid_argument("unsupported routed GEGLU expert tensor layout");
     for (const auto* bank : {dense_gate, dense_down}) {
         if (!bank) continue;
@@ -124,6 +128,8 @@ tyloi::ops::RoutedGeglu routed_geglu(tyloi::DenseTensor input, tyloi::DenseTenso
     }
 #endif
     tyloi::ops::RoutedGeglu result;
+    std::optional<weights::ExpertRows> gguf_rows;
+    if (gguf_gate || gguf_down) gguf_rows = weights::group_expert_rows(ids, gate_bank.size(0));
     if (tq_gate || tq_down) {
         const auto host_ids = ids.contiguous().cpu().to(kInt64);
         const auto* selected = host_ids.data_ptr<std::int64_t>();
@@ -141,6 +147,7 @@ tyloi::ops::RoutedGeglu routed_geglu(tyloi::DenseTensor input, tyloi::DenseTenso
     else
 #endif
     if (dense_gate) packed = dense_routed_projection(*dense_gate, input, ids);
+    else if (gguf_gate) packed = project.run(gate_bank, input, *gguf_rows);
     else packed = tq_ops::routed_projection(*tq_gate, input, ids);
     if (trace) result.gate_up = std::make_shared<DenseTensor>(packed.to(kFloat32).contiguous().clone());
     auto hidden = moe_geglu_split_cuda(packed.to(kFloat16).contiguous());
@@ -151,6 +158,7 @@ tyloi::ops::RoutedGeglu routed_geglu(tyloi::DenseTensor input, tyloi::DenseTenso
     else
 #endif
     if (dense_down) pairs = dense_routed_projection(*dense_down, hidden, ids);
+    else if (gguf_down) pairs = project.run(down_bank, hidden, *gguf_rows);
     else pairs = tq_ops::routed_projection(*tq_down, hidden, ids);
     result.pairs = std::make_shared<DenseTensor>(std::move(pairs));
     return result;

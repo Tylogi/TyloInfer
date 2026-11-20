@@ -1,11 +1,11 @@
 #include "engine/models/qwen35/batch.h"
 #include "engine/models/qwen35/forward.h"
-#include "engine/models/common/check.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/executor/graph/decode.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/attention/scratch.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <exception>
 #include <limits>
@@ -99,7 +99,8 @@ StepSequence<std::optional<Tensor>> CudaBatch::capture(std::span<const BatchRow>
         metadata_=window_->buffer({3,count},TensorOptions().device(model_.device).dtype(kInt64));
         length_=plan.length; states_=states;
     }
-    require_model(window_ && states_==states,"Qwen batch graph membership changed");
+    if (!(window_ && states_==states))
+        throw std::runtime_error("Qwen batch graph membership changed");
     std::vector<std::int64_t> values(std::size_t(3*count));
     std::size_t index=0;
     for (const auto& row:rows) if (row.eligible) {
@@ -139,7 +140,8 @@ StepSequence<std::optional<Tensor>> CudaBatch::capture(std::span<const BatchRow>
                         if (step.value) for (const auto& row:*step.value) hidden.push_back(row.hidden);
                         else if (!step.layer) throw std::logic_error("unexpected Qwen batch graph event");
                     }
-                    require_model(hidden.size()==states.size(),"Qwen batch graph returned no hidden rows");
+                    if (!(hidden.size()==states.size()))
+                        throw std::runtime_error("Qwen batch graph returned no hidden rows");
                     auto logits=model_.logits(ops::cat(hidden,0));
                     output_=ops::reshape(ops::sample_greedy(ops::contiguous(logits)),{count,1});
                     warm=recording->finish();
@@ -173,6 +175,7 @@ StepSequence<std::optional<Tensor>> CudaBatch::capture(std::span<const BatchRow>
 } // namespace
 
 std::unique_ptr<models::Batch> Model::make_batch(const BatchConfig& config) const {
+    if (layer_stream) return {};
     return std::make_unique<CudaBatch>(*this,config);
 }
 } // namespace tyloi::models::qwen35

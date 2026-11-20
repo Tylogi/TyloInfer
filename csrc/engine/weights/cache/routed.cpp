@@ -1,4 +1,5 @@
 #include "engine/weights/cache/resources.h"
+#include "engine/weights/cache/ggml.h"
 #include "engine/memory/host.h"
 
 #include "engine/backends/cuda/native/context.h"
@@ -22,14 +23,22 @@ namespace tyloi::weights {
 struct Cache::Routes::Impl {
     std::shared_ptr<MoeExpertCache> cache;
     std::shared_ptr<TqCache> tq;
+    std::shared_ptr<GgmlExpertCache> ggml;
+    std::shared_ptr<GgmlExpertCache::Prefill> prompt;
     int rows = 0;
 
     void discard() noexcept {
         discard_moe_speculative_routes(cache);
         if (tq) tq->discard_routes();
+        if (ggml) {
+            if (prompt) ggml->detach_prefill(*prompt);
+            else ggml->discard_routes();
+        }
         cache.reset();
         tq.reset();
+        ggml.reset();
         rows = 0;
+        prompt.reset();
     }
 };
 
@@ -41,24 +50,64 @@ Cache::Routes::~Routes() {
 
 void Cache::Routes::begin(Cache& owner, int rows) {
     if (!impl_) impl_ = std::make_unique<Impl>();
-    if (impl_->cache || impl_->tq)
+    if (impl_->cache || impl_->tq || impl_->ggml)
         throw std::logic_error("speculative routes already pending");
     auto cache = owner.data_->moe;
     auto tq = owner.data_->tq;
+    auto ggml = owner.data_->ggml;
+    bool tq_started = false;
     try {
         begin_moe_speculative_routes(cache, rows);
-        if (tq) tq->begin_routes(rows);
+        if (tq) {
+            tq->begin_routes(rows);
+            tq_started = true;
+        }
+        if (ggml) ggml->begin_routes(rows);
     } catch (...) {
+        if (tq_started) tq->discard_routes();
         discard_moe_speculative_routes(cache);
         throw;
     }
     impl_->cache = std::move(cache);
     impl_->tq = std::move(tq);
+    impl_->ggml = std::move(ggml);
     impl_->rows = rows;
 }
 
+void Cache::Routes::begin_prefill(Cache& owner, int rows) {
+    if (rows < 0) throw std::invalid_argument("invalid prefill row count");
+    begin_prefill(owner, rows ? std::span<const int>{&rows, 1} : std::span<const int>{});
+}
+
+bool Cache::Routes::begin_prefill(Cache& owner, std::span<const int> request_rows) {
+    const auto& cache = owner.data_->ggml;
+    if (!cache || !cache->has_cached_sources()) return false;
+    if (impl_) throw std::logic_error("route journal already started");
+    impl_ = std::make_unique<Impl>();
+    impl_->prompt = cache->begin_prefill(request_rows);
+    impl_->ggml = cache;
+    return true;
+}
+
+void Cache::Routes::detach_prefill() noexcept {
+    if (impl_ && impl_->prompt) impl_->ggml->detach_prefill(*impl_->prompt);
+}
+
+void Cache::Routes::finish_prefill(bool complete) {
+    if (!impl_ || !impl_->prompt) return;
+    const std::uint8_t keep = complete;
+    finish_prefill(std::span<const std::uint8_t>{&keep, 1});
+}
+
+void Cache::Routes::finish_prefill(std::span<const std::uint8_t> accepted) {
+    if (!impl_ || !impl_->prompt) return;
+    detach_prefill();
+    impl_->ggml->finish_prefill(*impl_->prompt, accepted);
+    impl_.reset();
+}
+
 void Cache::Routes::resolve(int rows, bool cancelled) {
-    if (!impl_ || (!impl_->cache && !impl_->tq)) return;
+    if (!impl_ || (!impl_->cache && !impl_->tq && !impl_->ggml)) return;
     if (cancelled) {
         impl_->discard();
         return;
@@ -80,39 +129,46 @@ void Cache::Routes::resolve(std::span<const std::uint8_t> keep) {
 }
 
 void Cache::Routes::commit(std::span<const std::uint8_t> keep, bool single_sequence) {
-    if (!impl_ || (!impl_->cache && !impl_->tq)) return;
+    if (!impl_ || (!impl_->cache && !impl_->tq && !impl_->ggml)) return;
     try {
         if (keep.size() != std::size_t(impl_->rows))
             throw std::invalid_argument("speculative route mask row count is out of range");
         commit_moe_speculative_routes(impl_->cache, keep, single_sequence);
         if (impl_->tq) impl_->tq->commit_routes(keep, single_sequence);
+        if (impl_->ggml) impl_->ggml->commit_routes(keep, single_sequence);
     } catch (...) {
         impl_->discard();
         throw;
     }
     impl_->cache.reset();
     impl_->tq.reset();
+    impl_->ggml.reset();
     impl_->rows = 0;
 }
 
 struct Cache::Warmup::Impl {
     std::shared_ptr<MoeExpertCache> cache;
     std::shared_ptr<TqCache> tq;
+    std::shared_ptr<GgmlExpertCache> ggml;
     bool suspended = false;
     bool previous_residency = false;
     bool previous_learning = false;
     bool previous_tq_learning = false;
+    bool previous_ggml_learning = false;
 };
 
 Cache::Warmup::Warmup(Cache& owner, bool suspend_residency) : impl_(std::make_unique<Impl>()) {
     impl_->cache = owner.data_->moe;
     impl_->tq = owner.data_->tq;
+    impl_->ggml = owner.data_->ggml;
     impl_->suspended = suspend_residency;
     if (suspend_residency) impl_->previous_residency = suspend_moe_residency(impl_->cache, true);
     impl_->previous_learning = set_moe_reuse_learning(impl_->cache, false);
     try {
         if (impl_->tq) impl_->previous_tq_learning = impl_->tq->set_learning(false);
+        if (impl_->ggml) impl_->previous_ggml_learning = impl_->ggml->set_learning(false);
     } catch (...) {
+        if (impl_->tq) impl_->tq->set_learning(impl_->previous_tq_learning);
         set_moe_reuse_learning(impl_->cache, impl_->previous_learning);
         if (impl_->suspended) suspend_moe_residency(impl_->cache, impl_->previous_residency);
         throw;
@@ -120,6 +176,7 @@ Cache::Warmup::Warmup(Cache& owner, bool suspend_residency) : impl_(std::make_un
 }
 
 Cache::Warmup::~Warmup() {
+    if (impl_->ggml) impl_->ggml->set_learning(impl_->previous_ggml_learning);
     if (impl_->tq) impl_->tq->set_learning(impl_->previous_tq_learning);
     set_moe_reuse_learning(impl_->cache, impl_->previous_learning);
     if (impl_->suspended) suspend_moe_residency(impl_->cache, impl_->previous_residency);
@@ -160,7 +217,18 @@ void Cache::configure(std::size_t bytes, const CachePolicy& policy, bool preload
 }
 
 std::vector<std::pair<std::string, double>> Cache::metrics() const {
-    auto result = data_->tq ? data_->tq->metrics() : moe_expert_memory_metrics(data_->moe);
+    auto result = moe_expert_cache_has_sources(data_->moe) ? moe_expert_memory_metrics(data_->moe)
+        : std::vector<std::pair<std::string, double>>{};
+    const auto merge = [&](auto counters) {
+        for (auto& [name, value] : counters) {
+            const auto match = std::find_if(result.begin(), result.end(), [&](const auto& entry) { return entry.first == name; });
+            if (match == result.end()) result.emplace_back(std::move(name), value);
+            else if (name.ends_with("_enabled")) match->second = std::max(match->second, value);
+            else match->second += value;
+        }
+    };
+    if (data_->tq) merge(data_->tq->metrics());
+    if (data_->ggml) merge(data_->ggml->metrics());
     append_workspace_metrics(result);
     return result;
 }
@@ -170,12 +238,15 @@ void Cache::report(std::ostream& output) const {
 }
 
 Cache::Activity Cache::activity() const {
-    if (data_->tq) return {data_->tq->streamed_bytes(), 0};
-    return {moe_expert_streamed_bytes(data_->moe), moe_expert_graph_captures(data_->moe)};
+    const auto gguf = data_->ggml ? data_->ggml->streamed_bytes() : 0;
+    const auto tq = data_->tq ? data_->tq->streamed_bytes() : 0;
+    return {gguf + tq + moe_expert_streamed_bytes(data_->moe), moe_expert_graph_captures(data_->moe)};
 }
 
 std::size_t Cache::budget() const {
-    return data_->tq ? data_->tq->budget() : moe_expert_cache_budget_bytes(data_->moe);
+    return (data_->tq ? data_->tq->budget() : 0) +
+        (data_->ggml ? data_->ggml->budget() : 0) +
+        (moe_expert_cache_has_sources(data_->moe) ? moe_expert_cache_budget_bytes(data_->moe) : 0);
 }
 
 std::size_t Cache::minimum() const {
@@ -183,20 +254,13 @@ std::size_t Cache::minimum() const {
 }
 
 bool Cache::empty() const {
-    return !data_->moe && !data_->tq;
+    return !data_->moe && !data_->tq && !data_->ggml;
 }
 
-bool Cache::graph_safe(Graph kind, bool parallel) const {
-    if (kind == Graph::model_parallel) return !(data_->tq && parallel);
-    return !data_->moe && !(data_->tq && (parallel || kind == Graph::legacy));
-}
-
-Cache::Transfer Cache::transfer() const {
-    return data_->moe ? Transfer::coordinated : Transfer::automatic;
-}
-
-Cache::Decode Cache::decode() const {
-    return data_->tq ? Decode::routed : Decode::none;
+Cache::Routing Cache::routing() const {
+    return {moe_expert_cache_has_sources(data_->moe), bool(data_->tq),
+        data_->ggml && data_->ggml->host_routes_required(),
+        moe_expert_cache_ssd_experts(data_->moe)};
 }
 
 bool Cache::legacy_experts_resident() const {
@@ -209,40 +273,22 @@ bool Cache::legacy_experts_resident() const {
 #endif
 }
 
-bool Cache::split_prefill(std::int64_t rows) const {
-    return !data_->tq || rows <= 8;
-}
-
-bool Cache::prepare_graph(Device device) {
-    if (!device.is_cuda() || device.index < 0)
-        throw std::invalid_argument("graph requires a CUDA device");
-    if (prepare_moe_graph_pool(data_->moe)) return true;
-    if (!data_->tq) return false;
-    data_->exec->get(device.index)->prepare_graph();
-    return true;
-}
-
-Cache::Prefill Cache::prefill_mode(std::size_t tokens, bool resumed) const {
-    if (resumed && tokens <= 128 && moe_expert_cache_ssd_experts(data_->moe)) return Prefill::retained;
-    if (tokens > 8 && moe_expert_cache_ssd_experts(data_->moe)) return Prefill::streamed;
-    return Prefill::regular;
-}
-
 Cache::PrefillBudget Cache::prefill_budget(bool allow_borrow) const {
-    if(data_->tq)return {std::size_t(1)<<30,allow_borrow?data_->tq->resident_bytes():0,0};
     const auto budget = moe_prefill_workspace_budget(data_->moe, allow_borrow);
+    const auto tq_bytes = allow_borrow && data_->tq && !moe_expert_cache_has_sources(data_->moe)
+        ? data_->tq->lendable_bytes(mfq_current_cuda_device()) : 0;
     const auto reserve = moe_expert_cache_ssd_experts(data_->moe)
         ? std::max(std::size_t(1) << 30, cuda::options::workspace_reserve_bytes())
         : std::size_t(1) << 30;
-    return {reserve, budget.lendable_bytes, budget.transfer_bytes};
+    return {reserve, budget.lendable_bytes + tq_bytes, budget.transfer_bytes};
 }
 
 void Cache::workspace(std::size_t bytes) {
+    if (data_->ggml) data_->ggml->reclaim_device(Device(kCUDA, mfq_current_cuda_device()), bytes);
     if (data_->tq) {
         int device = 0;
         TYLOINFER_CUDA_CHECK(cudaGetDevice(&device));
         data_->tq->reclaim(device, bytes);
-        return;
     }
     reserve_moe_workspace(data_->moe, bytes);
 }
@@ -253,27 +299,12 @@ void Cache::request(bool retire_decode) {
     else retire_prefill();
 }
 
-std::optional<std::size_t> Cache::prepare_prefill(Device device, std::size_t tokens,
-        std::int64_t limit, Prefill mode, bool retire_decode) {
-    if (!device.is_cuda() || device.index < 0)
-        throw std::invalid_argument("budget requires a CUDA device");
-    // TQ lends the concrete workspace requested by the prefill plan.
-    if(data_->tq)return std::nullopt;
-    if (mode == Prefill::retained) {
-        std::cerr << "runtime_streamed_prefill retained_decode=1 tokens=" << tokens
-                  << " chunk=" << std::min<std::int64_t>(4, limit) << '\n';
-        return std::nullopt;
-    }
-    if (mode == Prefill::streamed) {
-        const bool retained = lend_moe_decode_cache_for_prefill(data_->moe, cuda::options::workspace_reserve_bytes());
-        if (!retained && retire_decode) {
-            release_moe_decode_buffers(data_->moe);
-            cuda::default_context(device.index)->reclaim_idle_memory();
-        }
-    }
-    if (tokens > 1024 || moe_expert_cache_ssd_experts(data_->moe))
-        return cuda::options::workspace_reserve_bytes();
-    return std::nullopt;
+std::size_t Cache::storage_workspace_reserve() const {
+    return cuda::options::workspace_reserve_bytes();
+}
+
+bool Cache::lend_decode_storage(std::size_t workspace) {
+    return lend_moe_decode_cache_for_prefill(data_->moe, workspace);
 }
 
 void Cache::prepare(Stage stage, Device device, const source::Source* source) {
@@ -281,13 +312,13 @@ void Cache::prepare(Stage stage, Device device, const source::Source* source) {
         retire_prefill();
         return;
     }
+    if (data_->ggml) data_->ggml->reclaim_device(device, cuda::options::workspace_reserve_bytes());
     if (data_->tq) {
         const auto reserve=cuda::options::workspace_reserve_bytes();
         if (stage == Stage::loaded)
             data_->tq->preload(device.index, reserve);
         else if (stage == Stage::decode)
             data_->tq->prepare_decode(device.index, reserve);
-        return;
     }
     if (stage == Stage::decode && !data_->moe) return;
     if (!device.is_cuda() || device.index < 0)
@@ -298,25 +329,63 @@ void Cache::prepare(Stage stage, Device device, const source::Source* source) {
 }
 
 void Cache::resize(std::size_t bytes) {
-    if (data_->tq) data_->tq->resize(bytes);
-    else resize_moe_expert_cache(data_->moe, bytes);
+    const bool legacy = moe_expert_cache_has_sources(data_->moe);
+    const bool tq = data_->tq && data_->tq->has_cached_sources();
+    const bool gguf = data_->ggml && data_->ggml->has_cached_sources();
+    const auto required = minimum();
+    if (bytes < required || bytes > std::size_t(INT64_MAX))
+        throw std::invalid_argument("invalid routed weight cache budget");
+    const auto groups = std::size_t(legacy) + std::size_t(tq) + std::size_t(gguf);
+    const auto share = groups ? (bytes - required) / groups : 0;
+    auto extra = groups ? (bytes - required) % groups : 0;
+    const auto grant = [&](bool active) {
+        if (!active) return std::size_t{0};
+        if (!extra) return share;
+        --extra;
+        return share + 1;
+    };
+    const auto old_tq = data_->tq ? data_->tq->budget() : 0;
+    const auto old_gguf = data_->ggml ? data_->ggml->budget() : 0;
+    const auto next_tq = grant(tq);
+    const auto next_gguf = grant(gguf);
+    const auto next_legacy = grant(legacy);
+
+    // Shrink before admitting the new MFE arenas so growth fits the aggregate ceiling.
+    if (data_->tq && old_tq > next_tq) data_->tq->resize(next_tq);
+    if (data_->ggml && old_gguf > next_gguf) data_->ggml->resize(next_gguf);
+    try {
+        if (legacy) resize_moe_expert_cache(data_->moe, required + next_legacy);
+    } catch (...) {
+        if (data_->tq && old_tq > next_tq) data_->tq->resize(old_tq);
+        if (data_->ggml && old_gguf > next_gguf) data_->ggml->resize(old_gguf);
+        throw;
+    }
+    if (data_->tq && old_tq < next_tq) data_->tq->resize(next_tq);
+    if (data_->ggml && old_gguf < next_gguf) data_->ggml->resize(next_gguf);
+    data_->device_bytes = bytes;
 }
 
 std::size_t Cache::reserve(std::size_t bytes) {
-    reclaim_host(bytes, data_->host_limit);
-    return data_->tq ? data_->tq->reserve(bytes) : reclaim_moe_optional_host(data_->moe, bytes);
+    auto reclaimed = reclaim_host(bytes, data_->host_limit);
+    if (data_->tq) reclaimed += data_->tq->reserve(bytes);
+    return reclaimed + reclaim_moe_optional_host(data_->moe, bytes);
 }
 
 std::size_t Cache::reclaim_host_duplicates(std::size_t bytes) {
-    return data_->tq ? data_->tq->reclaim_duplicates(bytes) : reclaim_moe_expert_duplicates(data_->moe, bytes);
+    std::size_t reclaimed = 0;
+    if (data_->tq) reclaimed = data_->tq->reclaim_duplicates(bytes);
+    if (reclaimed < bytes && data_->ggml) reclaimed += data_->ggml->reclaim_duplicates(bytes - reclaimed);
+    if (reclaimed < bytes) reclaimed += reclaim_moe_expert_duplicates(data_->moe, bytes - reclaimed);
+    return reclaimed;
 }
 
 std::size_t Cache::reserve_host_capacity(std::size_t bytes) {
-    reclaim_host(bytes, data_->host_limit);
-    return data_->tq ? data_->tq->reserve(bytes) : reserve_moe_expert_host(data_->moe, bytes);
+    const auto reclaimed = reclaim_host(bytes, data_->host_limit);
+    return reclaimed + reserve_moe_expert_host(data_->moe, bytes);
 }
 
 void Cache::share_host(std::size_t bytes) {
+    if (data_->ggml) data_->ggml->share_host(bytes);
     if (data_->tq) data_->tq->share_host(bytes);
     else share_moe_expert_host(data_->moe, bytes);
 }
@@ -332,6 +401,8 @@ void Cache::finish_exchange() const {
 void Cache::admit_routes(Device device) {
     if (data_->tq && device.is_cuda())
         data_->tq->admit_routes(device.index, cuda::options::workspace_reserve_bytes());
+    if (data_->ggml && device.is_cuda())
+        data_->ggml->admit_routes(device, cuda::options::workspace_reserve_bytes());
 }
 
 void Cache::retire_prefill() {
@@ -371,6 +442,7 @@ void Cache::reset() noexcept {
     clear_workspace();
     data_->moe.reset();
     data_->tq.reset();
+    data_->ggml.reset();
     data_->device_bytes.reset();
     data_->exec.reset();
     data_->kv.reset();

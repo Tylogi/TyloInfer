@@ -207,8 +207,8 @@ Duplex::StepOutput Duplex::step(StepInput input, const ForwardOptions& mode) {
         StepOutput output;
         output.decision_logits = result.decision_logits; output.audio_embeddings = result.audio_embeddings;
         output.generated_ids = result.generated_ids; output.tts_codes = result.tts_codes;
-        output.result.generated_tokens = ops::read_integers(result.generated_ids);
-        const auto codes = ops::read_integers(result.tts_codes);
+        output.result.generated_tokens = ::tyloi::ops::read_integers(result.generated_ids);
+        const auto codes = ::tyloi::ops::read_integers(result.tts_codes);
         output.result.audio_tokens.reserve(codes.size());
         for (auto code : codes) output.result.audio_tokens.push_back(static_cast<int32_t>(code));
         output.result.is_listen = result.is_listen; output.result.end_of_turn = result.end_of_turn;

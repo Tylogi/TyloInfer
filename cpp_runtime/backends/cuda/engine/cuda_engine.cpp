@@ -2,7 +2,6 @@
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "generation.h"
-#include "decision_readout.h"
 #include "core/full_block.h"
 #include "models/qwen35/linear_attention.h"
 #include "storage/model_loader.h"
@@ -46,8 +45,6 @@ struct CudaEngineState {
     TextSessionCache cache;
     std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
-    std::optional<mfq::DecisionModelSpec> decision_model;
-    QuantLinear decision_readout;
     std::size_t resident_budget=0, weight_budget=0, initial_expert_budget=0, allocation_ceiling=0;
     std::shared_ptr<KvExpertLoan> graph_expert_loan;
     mfq_tensor_backend::Tensor graph_expert_storage;
@@ -283,15 +280,6 @@ struct CudaEngineState {
             if(std::getenv("TYLOINFER_TRACE_ENGINE_LOAD"))std::cerr<<"cuda_engine_load phase="<<phase<<'\n';
         };
         trace_load("resources");
-        decision_model=mfq::decision_model_spec(*language.source);
-        if(decision_model) {
-            if constexpr(std::is_same_v<Model,Qwen35CausalLm>) {
-                if(!decision_model->vocabulary_readout)
-                    decision_readout=load_decision_readout(*language.source,language.hidden_size(),
-                        mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,execution->layer_placement.primary_device()));
-            }
-            else throw std::invalid_argument("trained D3 decisions require a Qwen3.5/Qwen3.8 backbone");
-        }
         initial_expert_budget=routed_expert_cache_budget_bytes(*execution);
         if (execution->qsa_kv_store)
             execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) {
@@ -527,108 +515,7 @@ struct CudaEngineState {
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     template <class T> ControlResult control(T value) {
-        if constexpr(std::is_same_v<T,DecisionTokens>) {
-            if constexpr(std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>) {
-                if(value.reads.empty() || value.reads.size()>64)
-                    throw std::invalid_argument("decision requests require 1 to 64 reads");
-                const auto vocabulary=language.vocab_size();
-                std::size_t total=0;
-                for(const auto& read:value.reads) {
-                    if(read.prompt.empty() || read.prompt.size()>std::size_t(language.max_position_embeddings()) ||
-                            read.labels.empty() || read.labels.size()>255)
-                        throw std::invalid_argument("invalid decision prompt or label count");
-                    if(decision_model && decision_model->max_tokens && read.prompt.size()>*decision_model->max_tokens)
-                        throw std::invalid_argument("decision prompt exceeds the model input limit");
-                    if(decision_model && decision_model->attention==mfq::DecisionAttention::prefix_bidirectional &&
-                        (!read.state_tokens || read.state_tokens>=read.prompt.size()))
-                        throw std::invalid_argument("decision state boundary is outside the prompt");
-                    for(const auto token:read.prompt)if(token<0 || token>=vocabulary)
-                        throw std::invalid_argument("decision prompt token is outside the vocabulary");
-                    std::unordered_set<int64_t> unique;
-                    for(const auto token:read.labels) {
-                        if(token<0 || token>=vocabulary || !unique.insert(token).second)
-                            throw std::invalid_argument("decision labels must be distinct vocabulary tokens");
-                        if(decision_model && !decision_model->vocabulary_readout &&
-                            std::find(decision_model->token_ids.begin(),decision_model->token_ids.end(),token)==decision_model->token_ids.end())
-                            throw std::invalid_argument("decision label is absent from trained codebook");
-                    }
-                    if(read.prompt.size()>1048576-total)
-                        throw std::invalid_argument("decision request exceeds the aggregate token limit");
-                    total+=read.prompt.size();
-                }
-                auto common=value.reads.front().prompt.size();
-                for(const auto& read:value.reads) {
-                    common=std::min(common,read.prompt.size());
-                    std::size_t i=0;
-                    while(i<common && read.prompt[i]==value.reads.front().prompt[i])++i;
-                    common=i;
-                }
-                MfqCudaGuard guard(execution->layer_placement.primary_device());
-                graph.invalidate();
-                if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
-                    qwen4_release_decode_graphs(language,components.mtp.get());
-                if(components.mtp)components.mtp->reset(1);
-                const bool previous_mtp=planning_mtp;planning_mtp=false;
-                bool cleaned=false;
-                const auto cleanup=[&] {
-                    if(std::exchange(cleaned,true))return;
-                    language.reset(1);
-                    if(language.restore_decode_workspace)language.restore_decode_workspace();
-                    planning_mtp=previous_mtp;
-                };
-                try {
-                    DecisionResult result;
-                    for(const auto& read:value.reads) {
-                        DecisionAttentionScope attention_scope(*execution,decision_model?&*decision_model:nullptr,read.state_tokens);
-                        auto prepared=prefill_readout(language,graph,cache,config,read.prompt,common,
-                            "decision:"+value.cache_salt,value.prefix_cache);
-                        std::vector<double> selected;
-                        std::optional<double> normalizer;
-                        std::optional<int64_t> argmax;
-                        if(decision_model) {
-                            auto logits=(decision_model->vocabulary_readout
-                                ? language.lm_head.forward_rows(*execution,prepared.hidden,read.labels)
-                                : decision_readout.forward(*execution,prepared.hidden.to(mfq_tensor_backend::kFloat32)))
-                                    .to(mfq_tensor_backend::kFloat32).reshape({-1}).cpu().contiguous();
-                            if(logits.numel()!=int64_t(decision_model->vocabulary_readout?read.labels.size():decision_model->codes.size()))
-                                throw std::runtime_error("trained decision readout size changed");
-                            for(std::size_t i=0;i<read.labels.size();++i) {
-                                const auto token=read.labels[i];
-                                const auto found=std::find(decision_model->token_ids.begin(),decision_model->token_ids.end(),token);
-                                if(!decision_model->vocabulary_readout && found==decision_model->token_ids.end())
-                                    throw std::invalid_argument("decision label is absent from trained codebook");
-                                const auto row=decision_model->vocabulary_readout?i:std::size_t(found-decision_model->token_ids.begin());
-                                selected.push_back(logits.template data_ptr<float>()[row]/decision_model->temperature_for(read.type));
-                            }
-                        } else if(value.full_vocabulary) {
-                            auto logits=language.logits_from_hidden(prepared.hidden).to(mfq_tensor_backend::kFloat32)
-                                .reshape({-1}).cpu().contiguous();
-                            if(logits.numel()!=vocabulary)throw std::runtime_error("decision head vocabulary changed");
-                            std::vector<double> all(logits.numel());
-                            for(int64_t i=0;i<logits.numel();++i)all[i]=logits.template data_ptr<float>()[i];
-                            normalizer=decision_logsumexp(all);
-                            argmax=std::max_element(all.begin(),all.end())-all.begin();
-                            for(const auto id:read.labels)selected.push_back(all[id]);
-                        } else {
-                            auto logits=language.apply_final_logit_softcap(language.lm_head.forward_rows(
-                                *execution,prepared.hidden,read.labels)).to(mfq_tensor_backend::kFloat32)
-                                .reshape({-1}).cpu().contiguous();
-                            for(int64_t i=0;i<logits.numel();++i)selected.push_back(logits.template data_ptr<float>()[i]);
-                        }
-                        auto answer=normalize_decision(read.labels,selected,normalizer,argmax);
-                        answer.prompt_tokens=read.prompt.size();answer.cached_tokens=prepared.cached_tokens;
-                        answer.prefill_ms=prepared.prefill_ms;
-                        result.reads.push_back(std::move(answer));
-                    }
-                    cleanup();return result;
-                }catch(...) {
-                    auto failure=std::current_exception();
-                    try{cleanup();}catch(...){planning_mtp=previous_mtp;graph.invalidate();throw;}
-                    planning_mtp=previous_mtp;
-                    std::rethrow_exception(failure);
-                }
-            } else throw std::invalid_argument("decision reads are unavailable for this model architecture");
-        } else if constexpr (std::is_same_v<T, RuntimeMetrics>) {
+        if constexpr (std::is_same_v<T, RuntimeMetrics>) {
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
             Metrics metrics{
@@ -666,12 +553,7 @@ struct CudaEngineState {
             std::size_t resident_weights=weight_memory->resident_bytes();
             for(const auto& metric:experts)
                 if(metric.first=="resident_expert_cache_bytes")resident_weights+=std::size_t(metric.second);
-            const auto embedding=weight_memory->embedding_bytes();
-            const bool jev=bool(decision_model);
-            const auto streamed_weights=(language.layer_weights?language.layer_weights->host_bytes():0)+(jev?embedding:0);
-            metrics.insert(metrics.end(),{{"ram_embedding_bytes",double(jev?0:embedding)},
-                {"ram_weight_bytes",double(streamed_weights)},
-                {"jev_weights_streamed",language.layer_weights?1.0:0.0}});
+            metrics.emplace_back("ram_embedding_bytes", double(weight_memory->embedding_bytes()));
             const auto ple=weight_memory->ple_bytes();
             metrics.insert(metrics.end(),{{"resident_weight_bytes",double(resident_weights)},
                 {"ssd_ple_enabled",ple>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple)}});
@@ -861,8 +743,6 @@ struct CudaBackend {
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();
-            using Language=std::decay_t<decltype(state.language)>;
-            info.decisions=std::is_same_v<Language,Qwen35CausalLm> || std::is_same_v<Language,Qwen4CausalLm>;
             info.multimodal = state.components.grid_vision.has_value() ||
                 state.components.deepseek_vision.has_value() ||
                 state.components.radio_vision.has_value() || bool(state.components.composite);

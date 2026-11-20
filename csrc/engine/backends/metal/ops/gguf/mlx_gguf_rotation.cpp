@@ -14,7 +14,7 @@
 namespace tyloi::metal {
 using namespace mlx::core;
 namespace {
-array rotate128(const array& input, const MlxGgufRotation& rotation, int width, bool inverse, Dtype dtype) {
+array rotate128(const array& input, const MlxGgmlInputRotation& rotation, int width, bool inverse, Dtype dtype) {
     static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_hadamard128", {"x", "signs", "params"}, {"y"}, R"METAL(
 uint block = thread_position_in_grid.x / 32u, lane = thread_index_in_simdgroup;
 if (block >= params[0]) return;
@@ -81,7 +81,7 @@ void MlxGgufWeight::set_hadamard(std::int64_t block, std::vector<float> pattern)
     auto signs = pattern.empty() ? array(1.f) : array(pattern.begin(), Shape{input_size()}, float32);
     tyloi::metal::AllocationScope::record(signs);
     if (observe_weight_) tyloi::weights::observe_weight(tyloi::metal::tensor(signs));
-    rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{int(block), std::move(pattern), std::move(signs)});
+    rotation_ = std::make_shared<MlxGgmlInputRotation>(MlxGgmlInputRotation{int(block), std::move(pattern), std::move(signs)});
 }
 
 bool MlxGgufWeight::same_rotation(const MlxGgufWeight& other) const {

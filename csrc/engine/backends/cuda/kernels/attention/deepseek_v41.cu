@@ -1,5 +1,7 @@
 #include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
 
+#include <stdexcept>
+#include <string>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -134,16 +136,13 @@ void require_input(
     const ::tyloi::DenseTensor& input,
     std::int64_t group,
     const char* operation) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
             input.scalar_type() == ::tyloi::kFloat16 &&
             input.dim() >= 1 && input.numel() > 0 &&
-            input.size(-1) % group == 0,
-        operation,
-        ": expected contiguous CUDA f16 with a grouped last dimension");
-    TYLOINFER_RUNTIME_CHECK(
-        input.numel() / group <= std::numeric_limits<int>::max(),
-        operation, ": input is too large");
+            input.size(-1) % group == 0))
+        throw std::runtime_error(std::string(operation) + ": expected contiguous CUDA f16 with a grouped last dimension");
+    if (!(input.numel() / group <= std::numeric_limits<int>::max()))
+        throw std::runtime_error(std::string(operation) + ": input is too large");
 }
 
 } // namespace
@@ -151,22 +150,22 @@ void require_input(
 static std::vector<::tyloi::DenseTensor> hc_prepare_impl(
     ::tyloi::DenseTensor residual, ::tyloi::DenseTensor previous_pre,
     ::tyloi::DenseTensor norm, double epsilon, bool projection) {
-    TYLOINFER_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() &&
+    if (!(residual.is_cuda() && residual.is_contiguous() &&
                           residual.scalar_type() == ::tyloi::kFloat16 &&
                           residual.dim() == 4 && residual.size(2) == 4 &&
-                          residual.size(3) > 0 && residual.size(3) <= INT_MAX,
-                      "deepseek_v41_hc_prepare: expected CUDA f16 [B,T,4,H]");
-    TYLOINFER_RUNTIME_CHECK(previous_pre.is_cuda() && previous_pre.is_contiguous() &&
+                          residual.size(3) > 0 && residual.size(3) <= INT_MAX))
+        throw std::runtime_error("deepseek_v41_hc_prepare: expected CUDA f16 [B,T,4,H]");
+    if (!(previous_pre.is_cuda() && previous_pre.is_contiguous() &&
                           previous_pre.scalar_type() == ::tyloi::kFloat32 &&
                           previous_pre.dim() == 3 && previous_pre.size(0) == residual.size(0) &&
                           previous_pre.size(1) == residual.size(1) && previous_pre.size(2) == 4 &&
                           norm.is_cuda() && norm.is_contiguous() &&
                           norm.scalar_type() == ::tyloi::kFloat32 &&
-                          norm.numel() == residual.size(3) && std::isfinite(epsilon) && epsilon > 0,
-                      "deepseek_v41_hc_prepare: invalid previous weights, norm, or epsilon");
+                          norm.numel() == residual.size(3) && std::isfinite(epsilon) && epsilon > 0))
+        throw std::runtime_error("deepseek_v41_hc_prepare: invalid previous weights, norm, or epsilon");
     const auto rows = residual.size(0) * residual.size(1), hidden = residual.size(3);
-    TYLOINFER_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX,
-                      "deepseek_v41_hc_prepare: row count is out of range");
+    if (!(rows > 0 && rows <= INT_MAX))
+        throw std::runtime_error("deepseek_v41_hc_prepare: row count is out of range");
     ::tyloi::DenseTensor normalized;
     if (projection) normalized = ::tyloi::cuda::empty(
         {residual.size(0), residual.size(1), 4 * hidden}, previous_pre.options());
@@ -293,13 +292,14 @@ __global__ void engram_gate_add_kernel(const half* source, const Projected* proj
 
 ::tyloi::DenseTensor deepseek_v41_engram_rows_cuda(
     ::tyloi::DenseTensor packed, ::tyloi::DenseTensor inverse, int64_t width) {
-    TYLOINFER_RUNTIME_CHECK(packed.is_cuda() && packed.is_contiguous() && packed.scalar_type() == ::tyloi::kUInt8 &&
+    if (!(packed.is_cuda() && packed.is_contiguous() && packed.scalar_type() == ::tyloi::kUInt8 &&
         packed.dim() == 2 && packed.size(0) > 0 && width > 0 && width <= INT_MAX && width % 32 == 0 &&
         packed.size(1) == width + width / 32 && inverse.is_cuda() && inverse.is_contiguous() &&
         inverse.scalar_type() == ::tyloi::kInt64 && inverse.dim() == 1 && inverse.numel() > 0 &&
-        packed.device() == inverse.device(), "invalid Engram MXFP8 row packet");
-    TYLOINFER_RUNTIME_CHECK(inverse.numel() <= int64_t(INT_MAX) * 256 / width,
-                      "Engram row output exceeds launch bounds");
+        packed.device() == inverse.device()))
+        throw std::runtime_error("invalid Engram MXFP8 row packet");
+    if (!(inverse.numel() <= int64_t(INT_MAX) * 256 / width))
+        throw std::runtime_error("Engram row output exceeds launch bounds");
     auto output = ::tyloi::cuda::empty({inverse.numel(), width}, packed.options().dtype(::tyloi::kFloat16));
     engram_rows_kernel<<<int((output.numel() + 255) / 256), 256, 0, mfq_current_cuda_stream()>>>(
         packed.data_ptr<uint8_t>(), inverse.data_ptr<int64_t>(),
@@ -311,7 +311,7 @@ __global__ void engram_gate_add_kernel(const half* source, const Projected* proj
 ::tyloi::DenseTensor deepseek_v41_engram_gate_add_cuda(
     ::tyloi::DenseTensor hidden, ::tyloi::DenseTensor projected,
     ::tyloi::DenseTensor query_key_weight, double epsilon) {
-    TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.is_contiguous() && hidden.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(hidden.is_cuda() && hidden.is_contiguous() && hidden.scalar_type() == ::tyloi::kFloat16 &&
         hidden.dim() == 4 && hidden.size(2) > 0 && hidden.size(3) > 0 && hidden.size(3) <= INT_MAX &&
         projected.is_cuda() && projected.is_contiguous() && projected.dim() == 3 &&
         (projected.scalar_type() == ::tyloi::kFloat16 || projected.scalar_type() == ::tyloi::kFloat32) &&
@@ -321,9 +321,11 @@ __global__ void engram_gate_add_kernel(const half* source, const Projected* proj
         query_key_weight.scalar_type() == ::tyloi::kFloat32 &&
         query_key_weight.numel() == hidden.size(2) * hidden.size(3) &&
         hidden.device() == projected.device() && hidden.device() == query_key_weight.device() &&
-        std::isfinite(epsilon) && epsilon > 0, "invalid Engram gate/add tensors");
+        std::isfinite(epsilon) && epsilon > 0))
+        throw std::runtime_error("invalid Engram gate/add tensors");
     const auto rows = hidden.size(0) * hidden.size(1) * hidden.size(2);
-    TYLOINFER_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX, "Engram gate/add launch exceeds bounds");
+    if (!(rows > 0 && rows <= INT_MAX))
+        throw std::runtime_error("Engram gate/add launch exceeds bounds");
     auto output = ::tyloi::cuda::empty_like(hidden);
     if (projected.scalar_type() == ::tyloi::kFloat16)
         engram_gate_add_kernel<<<int(rows), 256, 0, mfq_current_cuda_stream()>>>(
@@ -380,16 +382,18 @@ __global__ void hc_project_partial_kernel(const half* residual, const float* pre
 
 ::tyloi::DenseTensor deepseek_v41_hc_project_cuda(::tyloi::DenseTensor residual,
     ::tyloi::DenseTensor previous, ::tyloi::DenseTensor function) {
-    TYLOINFER_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() && residual.scalar_type()==::tyloi::kFloat16 &&
+    if (!(residual.is_cuda() && residual.is_contiguous() && residual.scalar_type()==::tyloi::kFloat16 &&
         residual.dim()==4 && residual.size(2)==4 && residual.size(3)>0 && residual.size(3)<=INT_MAX/4 &&
         previous.is_cuda() && previous.is_contiguous() && previous.scalar_type()==::tyloi::kFloat32 &&
         previous.dim()==3 && previous.size(0)==residual.size(0) && previous.size(1)==residual.size(1) &&
         previous.size(2)==4 && function.is_cuda() && function.is_contiguous() &&
         function.scalar_type()==::tyloi::kFloat32 && function.dim()==2 && function.size(0)==24 &&
         function.size(1)==4*residual.size(3) && residual.device()==function.device() &&
-        residual.device()==previous.device(), "invalid mHC split projection tensors");
+        residual.device()==previous.device()))
+        throw std::runtime_error("invalid mHC split projection tensors");
     const auto rows=residual.size(0)*residual.size(1), hidden=residual.size(3), parts=(4*hidden+63)/64;
-    TYLOINFER_RUNTIME_CHECK(rows>0 && rows<=65535,"mHC split projection row count exceeds launch bounds");
+    if (!(rows>0 && rows<=65535))
+        throw std::runtime_error("mHC split projection row count exceeds launch bounds");
     auto partials=::tyloi::cuda::empty({rows,parts,26},previous.options());
     hc_project_partial_kernel<<<dim3(int(parts),int(rows)),64,0,mfq_current_cuda_stream()>>>(
         reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()),previous.data_ptr<float>(),

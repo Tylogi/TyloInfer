@@ -34,6 +34,7 @@ struct Info {
     bool streamed_kv = false;
     GraphOwner graph = GraphOwner::executor;
     std::size_t raw_row_bytes = 0;
+    bool decision_readout = false, streamed_weights = false;
 };
 
 struct CausalLmMetadata {

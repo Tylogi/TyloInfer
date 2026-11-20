@@ -3,6 +3,11 @@
 #include "engine/weights/moe/prepare/dispatch.h"
 #include "engine/weights/moe/prepare/prepare.h"
 #include "engine/weights/moe/prepare/projection.h"
+#include "engine/weights/cache/ggml.h"
+#include "engine/weights/moe/routed_groups.h"
+#include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/kernels/projection/gguf/linear.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/weights/encoding/format_features.h"
 #include "engine/backends/cuda/ops/ffn/tq/banks.h"
 
@@ -12,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -312,6 +318,15 @@ void prepare_experts(std::span<const ::tyloi::Tensor> gate_up,
         throw std::invalid_argument("TQ MoE Gate, Up and Down geometry differs");
 }
 
+void PreparedExperts::wait() const {
+    if (ready_.empty()) return;
+    assert(device.is_cuda());
+    const cuda::DeviceGuard guard(device.index);
+    const auto stream = cuda::current_stream(device.index);
+    for (const auto& event : ready_)
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), event->get(), 0));
+}
+
 void PreparedExperts::retire() {
     if (retired_) return;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -319,6 +334,11 @@ void PreparedExperts::retire() {
             (mode == Mode::gpu || mode == Mode::hybrid))
         source_->cache_->record_compute_use();
 #endif
+    if (!ggml.empty()) {
+        const auto stream = cuda::current_stream(device.index);
+        for (const auto& image : ggml)
+            image.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()), stream.lifetime());
+    }
     retired_ = true;
 }
 
@@ -360,6 +380,86 @@ PreparedExperts prepare_cached_projection(
     (void)heterogeneous;
     throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
+}
+
+ExpertRows group_expert_rows(const DenseTensor& ids, std::int64_t experts, bool device_resident) {
+    if (!ids.is_cuda() || ids.dim() != 2 || ids.size(1) <= 0 || experts <= 0 ||
+        (ids.scalar_type() != kInt32 && ids.scalar_type() != kInt64))
+        throw std::invalid_argument("invalid GGUF route IDs");
+    const auto device = ids.device();
+    const cuda::DeviceGuard guard(device.index);
+    const auto stream = mfq_get_current_cuda_stream(device.index);
+    ExpertRows result{};
+    result.tokens = ids.size(0);
+    result.routes = ids.size(1);
+    result.experts = experts;
+    if (device_resident) {
+        result.device_ids = ids.to(kInt64).contiguous();
+        if (result.tokens > 1) {
+            const auto slots = result.device_ids.numel();
+            const auto bytes = (slots + 1) * static_cast<std::int64_t>(sizeof(cuda::gguf::RouteGroup));
+            result.device_groups = cuda::empty({bytes}, ids.options().dtype(kUInt8));
+            cuda::gguf::prepare_route_groups(result.device_ids.data_ptr<std::int64_t>(), slots,
+                static_cast<int>(result.tokens), result.device_groups.data_ptr<cuda::gguf::RouteGroup>(),
+                stream.stream());
+        }
+        return result;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone)
+        throw std::invalid_argument("GGUF routed projection requires eager execution");
+    if (!result.tokens) return result;
+    result.host_ids = ids.contiguous().cpu();
+    const auto host_ids = result.host_ids.to(kInt64);
+    std::vector<std::int64_t> unique;
+    std::vector<std::vector<std::int64_t>> groups;
+    weights::group_routed_experts({host_ids.data_ptr<std::int64_t>(), std::size_t(host_ids.numel())},
+        experts, unique, &groups);
+    std::vector<std::int64_t> inputs, slots;
+    inputs.reserve(host_ids.numel());
+    slots.reserve(host_ids.numel());
+    result.groups.reserve(unique.size());
+    for (std::size_t i = 0; i < unique.size(); ++i) {
+        result.groups.push_back({unique[i], std::int64_t(slots.size()), std::int64_t(groups[i].size())});
+        for (const auto slot : groups[i]) {
+            inputs.push_back(slot / result.routes);
+            slots.push_back(slot);
+        }
+    }
+    const auto upload = [&](std::vector<std::int64_t>& values) {
+        return cuda::from_blob(values.data(), {static_cast<std::int64_t>(values.size())},
+            TensorOptions{}.device(kCPU).dtype(kInt64)).to(device, false, false);
+    };
+    result.inputs = upload(inputs);
+    result.slots = upload(slots);
+    return result;
+}
+
+PreparedExperts prepare_cached_projection(const GgmlExpertBank& bank,
+        std::span<const ExpertRows::Group> selected) {
+    if (!bank.cache || selected.empty() || bank.expert_bytes <= 0)
+        throw std::invalid_argument("invalid GGUF expert preparation");
+    if (!bank.image.packed.defined()) {
+        const auto available = cuda::default_context(bank.device().index)->available_memory();
+        selected = selected.first(routed_prefill_group_capacity(selected.size(), bank.expert_bytes, available));
+    }
+    std::vector<std::int64_t> ids;
+    ids.reserve(selected.size());
+    for (const auto& group : selected) ids.push_back(group.expert);
+    return bank.cache->prepare(bank, ids);
+}
+
+PreparedExperts prepare_indexed_projection(const GgmlExpertBank& bank,
+        std::span<const std::int64_t> selected) {
+    if (!bank.cache || selected.empty())
+        throw std::invalid_argument("invalid indexed GGML expert preparation");
+    return bank.cache->prepare(bank, selected, true);
+}
+
+void observe_ggml_routes(std::span<const GgmlExpertBank* const> banks,
+        const DenseTensor& host_ids, int row_offset, int row_total, bool prefill) {
+    banks.back()->cache->observe_routes(banks, host_ids, row_offset, row_total, prefill);
 }
 
 bool cached(const ::tyloi::Tensor& bank) {

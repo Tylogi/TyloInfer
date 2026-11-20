@@ -4,14 +4,20 @@
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/ops/ffn/options.h"
 #include "engine/backends/cuda/ops/ffn/experts/launch.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
+#include "engine/backends/cuda/ops/gguf/projection.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/tensor.h"
 #include "engine/weights/moe/batch_internal.h"
+#include "engine/weights/moe/ggml_bank.h"
+#include "engine/weights/moe/routed_groups.h"
 
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -21,6 +27,99 @@ namespace tyloi::ops {
 namespace {
 
 using DenseTensor = ::tyloi::DenseTensor;
+
+using ExpertImages = std::array<weights::PreparedExperts, 3>;
+
+struct StreamedExperts {
+    std::array<const GgmlExpertBank*, 3> banks{};
+    std::array<DenseTensor, 3> addresses, host_addresses;
+    DenseTensor host_ids;
+    std::shared_ptr<ExpertImages> images;
+    std::vector<std::int64_t> selected;
+    std::size_t count = 0;
+
+    void load_gate_up() {
+        *images = {};
+        const auto ids = host_ids.to(kInt64);
+        weights::group_routed_experts({ids.data_ptr<std::int64_t>(), std::size_t(ids.numel())},
+            banks[0]->experts, selected);
+        for (std::size_t i = 0; i < count - 1; ++i) load(i);
+    }
+
+    void load(std::size_t i) const {
+        if (!host_addresses[i].defined()) return;
+        const auto stream = cuda::current_stream(addresses[0].get_device());
+        auto& projection = (*images)[i];
+        projection = weights::prepare_indexed_projection(*banks[i], selected);
+        auto* table = host_addresses[i].data_ptr<std::uint64_t>();
+        std::fill_n(table, banks[i]->experts, 0);
+        assert(projection.ggml.size() == selected.size());
+        for (std::size_t j = 0; j < selected.size(); ++j)
+            table[selected[j]] = reinterpret_cast<std::uintptr_t>(projection.ggml[j].packed.data_ptr());
+        projection.wait();
+        projection.retire();
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(addresses[i].data_ptr(), table,
+            addresses[i].nbytes(), cudaMemcpyHostToDevice, stream.stream()));
+    }
+};
+
+std::shared_ptr<StreamedExperts> stage_experts(cuda::DecodeWindow& window,
+        std::span<const Tensor> gate_up, const Tensor& down, const DenseTensor& ids) {
+    std::array<const GgmlExpertBank*, 3> banks{
+        gate_up[0].representation<GgmlExpertBank>(),
+        (gate_up.size() == 2 ? gate_up[1] : down).representation<GgmlExpertBank>(),
+        down.representation<GgmlExpertBank>()};
+    const auto selected_banks = std::span{banks}.first(gate_up.size() + 1);
+    if (std::all_of(selected_banks.begin(), selected_banks.end(),
+            [](const auto* bank) { return bank->resident_addresses.defined(); })) return {};
+
+    static const char window_images{};
+    auto images = window.workspace<ExpertImages>(&window_images, [] { return std::make_shared<ExpertImages>(); });
+    auto stage = window.workspace<StreamedExperts>(banks[0], [&] {
+        const cuda::ResidentAllocationScope fixed;
+        auto result = std::make_shared<StreamedExperts>();
+        result->banks = banks;
+        result->count = selected_banks.size();
+        result->images = images;
+        const auto host_options = TensorOptions{}.device(kCPU).pinned_memory(true);
+        result->host_ids = cuda::empty({1, ids.size(1)}, host_options.dtype(kInt32));
+        for (std::size_t i = 0; i < result->count; ++i) {
+            const auto& bank = *banks[i];
+            result->addresses[i] = bank.resident_addresses;
+            if (result->addresses[i].defined()) continue;
+            result->addresses[i] = cuda::empty({bank.experts}, ids.options().dtype(kInt64));
+            result->host_addresses[i] = cuda::empty({bank.experts}, host_options.dtype(kInt64));
+        }
+        return result;
+    });
+    const auto stream = cuda::current_stream(ids.get_device());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(stage->host_ids.data_ptr(), ids.data_ptr(),
+        ids.nbytes(), cudaMemcpyDeviceToHost, stream.stream()));
+    // The preceding segment completes before the next layer can replace the images.
+    window.host_barrier([stage] { stage->load_gate_up(); });
+    if (capture == cudaStreamCaptureStatusNone) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        stage->load_gate_up();
+    }
+    window.enroll({stage.get(), [] {}, [stage] { stage->load(stage->count - 1); }, [stage] {
+        *stage->images = {};
+        weights::observe_ggml_routes(std::span{stage->banks}.first(stage->count),
+            stage->host_ids, 0, 1, false);
+    }, [] {}, {}, [images] { *images = {}; }});
+    return stage;
+}
+
+void stage_down(cuda::DecodeWindow& window, const StreamedExperts& stage) {
+    if (!stage.host_addresses[stage.count - 1].defined()) return;
+    const auto stream = cuda::current_stream(stage.addresses[0].get_device());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    // The host task submits the Down upload while the Gate/Up segment runs.
+    window.host_barrier([] {});
+    if (capture == cudaStreamCaptureStatusNone) stage.load(stage.count - 1);
+}
 
 DenseTensor project_rows(const DenseTensor& input, const Tensor& weight,
                          std::int64_t rows) {
@@ -40,8 +139,8 @@ DenseTensor tiled_rows(const DenseTensor& source, Work work) {
     auto& executor = cuda::Executor::current();
     const auto option = cuda::options::continuous_ffn_tile();
     const auto rows = option ? *option : 8;
-    TYLOINFER_RUNTIME_CHECK(rows == 8 || rows == 16,
-                            "continuous FFN tile must be 8 or 16 rows");
+    if (!(rows == 8 || rows == 16))
+        throw std::runtime_error("continuous FFN tile must be 8 or 16 rows");
     auto* window = cuda::DecodeWindow::recording();
     const int previous_profile_tile = window ? window->set_profile_tile(-1) : -1;
     auto& mode = executor.mode().ffn;
@@ -160,7 +259,14 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
         auto shared = cuda::MoeSharedExpert(shared_gate_up[0], shared_gate_up[1],
                                             shared_down, gate_weight)
                           .forward(shared_source, projection_rows);
-        selected.ready();
+        std::shared_ptr<StreamedExperts> streamed;
+        std::optional<weights::ExpertRows> indexed_rows;
+        auto* window = cuda::DecodeWindow::recording();
+        if (window && selected.ggml && !selected.route.prefill && selected_ids.size(0) == 1) {
+            streamed = stage_experts(*window, selected.gate_up_weights, selected.down_weight, selected_ids);
+            if (streamed) indexed_rows = weights::group_expert_rows(selected_ids, streamed->banks[0]->experts, true);
+        }
+        if (!streamed) selected.ready();
         auto project = executor.projector(cuda::Executor::current_ffn());
         DenseTensor routed;
         if (selected.tq.gate) {
@@ -170,16 +276,22 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
                     cuda::Executor::current_ffn().batch_serial);
             });
         } else {
-            const auto expert = [&](const Tensor& bank, DenseTensor value) {
+            const auto expert = [&](const Tensor& bank, DenseTensor value, std::size_t index) {
+                if (streamed)
+                    return cuda::gguf::project_indexed(streamed->banks[index]->image,
+                        streamed->addresses[index], *indexed_rows, value);
+                if (selected.ggml_rows) return project.run(bank, std::move(value), *selected.ggml_rows);
                 if (selected.down) return project.run(bank, std::move(value), selected.route);
                 return project.run(bank, std::move(value), selected_ids);
             };
             const auto width = selected.down_weight.size(2);
-            auto gu = expert(selected.gate_up_weights[0], source);
+            auto gu = expert(selected.gate_up_weights[0], source, 0);
             if (selected.gate_up_weights.size() == 2)
-                gu = cuda::cat({gu, expert(selected.gate_up_weights[1], source)}, -1);
+                gu = cuda::cat({gu, expert(selected.gate_up_weights[1], source, 1)}, -1);
             auto gate = gu.narrow(-1, 0, width), up = gu.narrow(-1, width, width);
-            auto pairs = expert(selected.down_weight, (gate * cuda::sigmoid(gate)) * up);
+            auto activation = (gate * cuda::sigmoid(gate)) * up;
+            if (streamed) stage_down(*window, *streamed);
+            auto pairs = expert(selected.down_weight, std::move(activation), selected.gate_up_weights.size());
             routed = cuda::zeros({source.size(0), source.size(1)}, source.options().dtype(kFloat32));
             for (std::int64_t route = 0; route < selected_ids.size(1); ++route)
                 routed = routed + pairs.select(1, route).to(kFloat32) * weights.select(1, route).unsqueeze(-1);
@@ -195,8 +307,8 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
     }
     const auto option = cuda::options::continuous_ffn_tile();
     const auto rows = option ? *option : 8;
-    TYLOINFER_RUNTIME_CHECK(rows == 8 || rows == 16,
-                            "continuous FFN tile must be 8 or 16 rows");
+    if (!(rows == 8 || rows == 16))
+        throw std::runtime_error("continuous FFN tile must be 8 or 16 rows");
     auto* window = cuda::DecodeWindow::recording();
     const int previous_profile_tile = window ? window->set_profile_tile(-1) : -1;
     auto& ffn_mode = executor.mode().ffn;
@@ -224,9 +336,9 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
         const auto count = std::min(rows, input.size(0) - start);
         auto tile_ids = ids.narrow(0, start, count).contiguous();
         std::optional<weights::ExpertBatch> tile;
-        if (b.down || b.tq.gate)
+        if (b.down || b.tq.gate || b.ggml)
             tile.emplace(b.gate_up_weights, b.down_weight, Tensor{tile_ids},
-                         b.route.row_offset + start, b.route.row_total, b.activation);
+                         b.route.row_offset + start, b.route.row_total, b.activation, b.route.prefill);
         outputs.push_back(run(tile ? *tile->impl_ : b, input.narrow(0, start, count).contiguous(),
                               route_weights.narrow(0, start, count).contiguous(),
                               gate_input.narrow(0, start, count).contiguous(),

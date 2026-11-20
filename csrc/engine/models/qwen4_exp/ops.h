@@ -29,7 +29,7 @@ struct Components;
 // The model record owns weights and load-time state.
 struct Model : tyloi::models::CausalModel {
     using CausalConfig = tyloi::models::qwen4_exp::Config;
-    static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp"; }
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp" || backbone == "qwen4"; }
 
     // ---- tyloi::models::CausalModel
     tyloi::models::Info info() const override;

@@ -34,8 +34,7 @@ pip install -e ".[metal,minicpmo45-realtime]"
 The legacy NINT/MFQ examples below require the corresponding reference path or
 an explicit [native compatibility build](../cli/build.md#native-format-profiles).
 They are not the default GGUF/TQ quick-start recipe. Retained native executable
-names and the `MFQTNSR1` envelope are internal interfaces, not old public CLI
-aliases.
+names are internal interfaces, not old public CLI aliases.
 
 ```python
 from tyloinfer.runtime import load_minicpmo45
@@ -56,8 +55,8 @@ and arguments used by the official repository.
 
 ## Native C++ composite graph
 
-`tyloi-engine` has a CUDA-native tensor interface for SigLIP, the Resampler,
-Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
+The native CUDA model implements SigLIP, the Resampler, Whisper, the audio
+projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
 server loads the full visual graph for MiniCPM-o models.
 
@@ -79,77 +78,16 @@ The converter embeds the NumPy-generated Resampler position table as a
 versioned BF16 runtime asset, avoiding platform-dependent sin/cos rounding in
 cross-attention.
 
-The CUDA diagnostic interface reads files with a shared prefix:
-
-- `<prefix>.input_ids.pt` is required.
-- `<prefix>.position_ids.pt` and `<prefix>.attention_mask.pt` are optional.
-  Supplying them preserves per-batch RoPE positions and the padding mask;
-  omitted position IDs use consecutive cache positions.
-- Image input uses `pixel_values`, `patch_mask`, `target_sizes`, and
-  `image_bounds` files. Bounds have rows `[batch, source, begin, end]`.
-- Audio input uses `audio_features`, `audio_lengths`, and `audio_bounds` files
-  with the same bound layout.
-- TTS accepts `tts_inputs_embeds` directly, or derives the condition from LLM
-  hidden states selected by the two-element `tts_bound` tensor.
-
-The `.pt` suffix is kept for CLI compatibility. The self-contained CUDA runtime
-uses MFQ's `MFQTNSR1` envelope, not Python pickle. Files written by `torch.save`
-work only with the optional `mfq-runtime-torch` A/B runtime. Normal TyloInfer Server image,
-audio, and video requests do not use this diagnostic interface.
-
-```bash
-tyloi-engine \
-  --model /models/MiniCPM-o-4_5-Q4KM-table.mfq \
-  --minicpmo-input-prefix /data/request \
-  --minicpmo-output-prefix /data/result \
-  --minicpmo-tts-steps 2
-```
-
-The output prefix contains component states, merged input embeddings, Qwen3
-hidden states and logits, and—when enabled—TTS logits and generated codes.
-Qwen3 and TTS keep the BF16 projection, SDPA, residual, and KV-cache boundaries.
-TTS uses the model's default temperature, top-p, top-k, 16-token repetition
-penalty, minimum length, and multinomial sampling. The graph produces S3 audio
-codes; Token2wav renders them with assets from the official model directory.
+The former CUDA tensor-file diagnostic CLI and its Program owner have been
+removed. Native requests use the Engine and transport interfaces below.
 
 ## Native full-duplex session
 
-The native CUDA runtime also accepts a sequence of processor-produced units in
-one process. The Apple runtime exposes the equivalent state machine through
+The native CUDA Engine accepts processor-produced units through its MiniCPM
+duplex controls. The Apple runtime exposes the equivalent state machine through
 `prepare_duplex()` and `duplex_step()`. Both preserve the official streaming
 Whisper, Qwen3, and TTS caches across units and follow the listen/speak,
 chunk-end, and turn-end state transitions used by `MiniCPMODuplex`.
-
-The session prefix contains:
-
-- `<prefix>.special_ids.pt`: 15 token IDs in this order: unit start/end,
-  image start/end, slice start/end, listen, speak, TTS BOS/EOS, chunk EOS,
-  chunk TTS EOS, turn EOS, TTS pad, and audio BOS.
-- `<prefix>.forbidden_ids.pt`: optional tokenizer `bad_token_ids`.
-- `<prefix>.system_ids.pt`: optional tokenized system prompt.
-
-Each zero-based unit uses `<prefix>.stepNNNN` and may contain image tensors
-(`pixel_values`, `patch_mask`, `target_sizes`, and optional
-`image_slice_counts`), `audio_features`, or `text_ids`. Streaming audio features
-come from the official processor. Optional `audio_prefix_extra_frames`,
-`audio_suffix_extra_frames`, and `force_listen` scalar tensors override their
-official defaults. A `reset_session` scalar clears the Whisper, Qwen3, TTS,
-sampling, and turn state before processing that unit.
-
-```bash
-tyloi-engine \
-  --model models/MiniCPM-o-4_5-Q4KM-table.mfq \
-  --minicpmo-duplex-input-prefix fixtures/session \
-  --minicpmo-duplex-output-prefix outputs/result \
-  --minicpmo-duplex-steps 4
-```
-
-Every output unit contains decision logits, generated text token IDs, S3 TTS
-codes, and a state tensor. Audio units also contain the pooled Whisper
-embeddings. The six state values are listen, end-of-turn, Qwen cache length,
-Whisper cache length, TTS cache length, and the official streaming time index.
-`--minicpmo-duplex-greedy` and `--minicpmo-duplex-seed` provide deterministic
-validation modes.
 
 On Apple, `MlxMiniCPMO45DuplexResult` reports all three cache positions and the
 streaming audio index after every unit. TTS only returns codes that have already

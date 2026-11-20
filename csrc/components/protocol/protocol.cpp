@@ -848,6 +848,13 @@ void CompletionStream::cancel() {
     cancel_();
     result.client_connected = false;
 }
+void throw_request_failure(const engine::Failed& failure) {
+    if (failure.code == "invalid_request") throw ApiError(400, "invalid_request_error", failure.message);
+    if (failure.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", failure.message);
+    if (failure.code == "resource_exhausted") throw ApiError(503, "resource_exhausted", failure.message);
+    throw ApiError(500, failure.code, failure.message);
+}
+
 std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
     if (terminal_) return {};
     std::vector<common_chat_msg_diff> diffs;
@@ -891,10 +898,7 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
                 metrics = data.metrics; terminal_ = true;
             } else if constexpr (std::is_same_v<T, tyloi::engine::Failed>) {
                 terminal_ = true;
-                if (data.code == "invalid_request") throw ApiError(400, "invalid_request_error", data.message);
-                if (data.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", data.message);
-                if (data.code == "resource_exhausted") throw ApiError(503, "resource_exhausted", data.message);
-                throw ApiError(500, data.code, data.message);
+                throw_request_failure(data);
             }
         }, event.data);
     }

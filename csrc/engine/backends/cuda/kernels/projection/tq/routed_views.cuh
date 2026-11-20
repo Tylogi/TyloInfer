@@ -1,5 +1,40 @@
 #pragma once
 
+__global__ void tq_prepare_resident_indexed_kernel(const TrellisProjectionView* gate,const TrellisProjectionView* up,
+        const TrellisProjectionView* down,const int64_t* ids,TrellisIndexedProjectionJob* gate_up,
+        TrellisIndexedProjectionJob* output_jobs,int slots,int routes,int experts,int input,int hidden,int output,int tile) {
+    const auto slot=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(slot>=slots)return;
+    TrellisIndexedProjectionJob g{},d{};
+    const auto expert=ids[slot];
+    if(expert>=0 && expert<experts) {
+        int preceding=0;
+        for(int64_t i=0;i<slot;++i)preceding+=ids[i]==expert;
+        if(preceding%tile==0) {
+            g.weight=gate[expert];g.second=up[expert];d.weight=down[expert];
+            for(int64_t i=slot;i<slots && g.count<tile;++i)if(ids[i]==expert) {
+                const auto at=g.count++;
+                g.input_offsets[at]=(i/routes)*input;g.output_offsets[at]=i*hidden;
+                d.input_offsets[at]=i*hidden;d.output_offsets[at]=i*output;
+            }
+            d.count=g.count;
+        }
+    }
+    gate_up[slot]=g;output_jobs[slot]=d;
+}
+
+extern "C" int mfq_tq_prepare_resident_indexed(const TrellisProjectionView* gate,const TrellisProjectionView* up,
+        const TrellisProjectionView* down,const int64_t* ids,TrellisIndexedProjectionJob* gate_up,
+        TrellisIndexedProjectionJob* output_jobs,int slots,int routes,int experts,int input,int hidden,int output,
+        int tile,cudaStream_t stream) {
+    if(!gate || !up || !down || !ids || !gate_up || !output_jobs || gate_up==output_jobs ||
+        slots<1 || routes<1 || slots%routes || experts<1 || input<1 || hidden<1 || output<1 || tile<1 || tile>4)
+        return -1;
+    tq_prepare_resident_indexed_kernel<<<(uint64_t(slots)+127)/128,128,0,stream>>>(gate,up,down,ids,
+        gate_up,output_jobs,slots,routes,experts,input,hidden,output,tile);
+    return int(cudaGetLastError());
+}
+
 template<int DT>
 __global__ __launch_bounds__(256)
 void tq_routed_gu_kernel(const TrellisProjectionView* gate,const TrellisProjectionView* up,

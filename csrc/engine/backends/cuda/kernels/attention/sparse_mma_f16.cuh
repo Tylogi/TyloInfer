@@ -14,6 +14,9 @@
 #include "selected.h"
 #include "engine/backends/cuda/kernels/kernel_dispatch_trace.h"
 
+#include <stdexcept>
+#include <string>
+#include <sstream>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -40,14 +43,17 @@ struct RuntimeInput {
 inline int selection_alignment(int query_width,int value_width,int columns,int device) {
     cudaDeviceProp properties{};
     const auto status=cudaGetDeviceProperties(&properties,device);
-    TYLOINFER_RUNTIME_CHECK(status==cudaSuccess,"selected attention device query failed: ",cudaGetErrorString(status));
+    if (!(status==cudaSuccess))
+        throw std::runtime_error(std::string("selected attention device query failed: ") + cudaGetErrorString(status));
     const int cc=properties.major*100+properties.minor*10;
-    TYLOINFER_RUNTIME_CHECK(turing_mma_available(cc),"selected attention requires Turing-class tensor cores or newer");
+    if (!turing_mma_available(cc))
+        throw std::runtime_error("selected attention requires Turing-class tensor cores or newer");
     const auto base=ampere_mma_available(cc)?
         ggml_cuda_fattn_mma_get_config_ampere(query_width,value_width,columns):
         ggml_cuda_fattn_mma_get_config_turing(query_width,value_width,columns);
     const auto config=mfq_fattn_mma_select_config(base,query_width,value_width,columns,true);
-    TYLOINFER_RUNTIME_CHECK(config.nbatch_fa>0,"selected attention MMA geometry is unsupported");
+    if (!(config.nbatch_fa>0))
+        throw std::runtime_error("selected attention MMA geometry is unsupported");
     return config.nbatch_fa;
 }
 
@@ -310,76 +316,79 @@ DenseTensor launch(
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
     constexpr int ncols = ncols1 * ncols2;
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+    if (!(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
         q.size(0) <= INT_MAX && q.size(1) <= INT_MAX && q.size(2) <= INT_MAX &&
-        k.size(1) <= INT_MAX && k.size(2) <= INT_MAX,
-        name, ": attention dimensions exceed 32-bit indexing");
+        k.size(1) <= INT_MAX && k.size(2) <= INT_MAX))
+        throw std::runtime_error(std::string(name) + ": attention dimensions exceed 32-bit indexing");
     const int B = static_cast<int>(q.size(0));
     const int heads = static_cast<int>(q.size(1));
     const int M = static_cast<int>(q.size(2));
     const int kv_heads = static_cast<int>(k.size(1));
     const int max_seq = static_cast<int>(k.size(2));
     const bool causal = positions.defined();
-    TYLOINFER_RUNTIME_CHECK(!causal || (causal_columns > 0 && causal_columns <= INT_MAX),
-        name, ": causal selection exceeds 32-bit indexing");
+    if (!(!causal || (causal_columns > 0 && causal_columns <= INT_MAX)))
+        throw std::runtime_error(std::string(name) + ": causal selection exceeds 32-bit indexing");
     const int alignment=selection_alignment(DKQ,DV,ncols,q.get_device());
     const int64_t padded_selection=causal?((causal_columns+alignment-1)/alignment)*alignment:indices.size(2);
-    TYLOINFER_RUNTIME_CHECK(padded_selection<=INT_MAX && padded_selection%alignment==0,
-        name, ": selected indices and mask must cover complete MMA key tiles");
+    if (!(padded_selection<=INT_MAX && padded_selection%alignment==0))
+        throw std::runtime_error(std::string(name) + ": selected indices and mask must cover complete MMA key tiles");
     const int selected=static_cast<int>(padded_selection);
 
-    TYLOINFER_RUNTIME_CHECK(B > 0 && M > 0 && heads > 0 && kv_heads > 0 &&
-        heads % kv_heads == 0 && max_seq > 0 && selected > 0,
-        name, ": invalid attention geometry");
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && q.size(3) == DKQ &&
+    if (!(B > 0 && M > 0 && heads > 0 && kv_heads > 0 &&
+        heads % kv_heads == 0 && max_seq > 0 && selected > 0))
+        throw std::runtime_error(std::string(name) + ": invalid attention geometry");
+    if (!(q.dim() == 4 && q.size(3) == DKQ &&
         k.dim() == 4 && k.size(0) == B && k.size(3) == DKQ &&
         v.dim() == 4 && v.size(0) == B && v.size(1) == kv_heads &&
         v.size(2) == max_seq &&
         v.size(3) == (V_is_K_view ? DKQ : DV) &&
-        (causal || (indices.dim() == 3 && indices.size(0) == B && indices.size(1) == M)),
-        name, ": tensor shapes disagree");
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
+        (causal || (indices.dim() == 3 && indices.size(0) == B && indices.size(1) == M))))
+        throw std::runtime_error(std::string(name) + ": tensor shapes disagree");
+    if (!(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
         (causal || indices.is_cuda()) && q.device() == k.device() &&
-        q.device() == v.device() && (causal || q.device() == indices.device()),
-        name, ": tensors must share one CUDA device");
-    TYLOINFER_RUNTIME_CHECK(k.is_contiguous() &&
-        v.is_contiguous() && (causal || indices.is_contiguous()),
-        name, ": tensors must be contiguous");
-    TYLOINFER_RUNTIME_CHECK((q.scalar_type() == ::tyloi::kFloat32 ||
+        q.device() == v.device() && (causal || q.device() == indices.device())))
+        throw std::runtime_error(std::string(name) + ": tensors must share one CUDA device");
+    if (!(k.is_contiguous() &&
+        v.is_contiguous() && (causal || indices.is_contiguous())))
+        throw std::runtime_error(std::string(name) + ": tensors must be contiguous");
+    if (!((q.scalar_type() == ::tyloi::kFloat32 ||
         q.scalar_type() == ::tyloi::kFloat16) &&
         k.scalar_type() == ::tyloi::kFloat16 &&
         v.scalar_type() == ::tyloi::kFloat16 &&
-        (causal || indices.scalar_type() == ::tyloi::kInt32),
-        name, ": expected f32/f16/f16/i32 tensors");
+        (causal || indices.scalar_type() == ::tyloi::kInt32)))
+        throw std::runtime_error(std::string(name) + ": expected f32/f16/f16/i32 tensors");
     if (causal) {
-        TYLOINFER_RUNTIME_CHECK(positions.is_cuda() && positions.device() == q.device() &&
+        if (!(positions.is_cuda() && positions.device() == q.device() &&
             positions.is_contiguous() && positions.dim() == 1 && positions.numel() == M &&
             (positions.scalar_type() == ::tyloi::kInt32 || positions.scalar_type() == ::tyloi::kInt64) &&
-            !mask.defined() && !indices.defined(), name, ": invalid implicit causal selection");
+            !mask.defined() && !indices.defined()))
+            throw std::runtime_error(std::string(name) + ": invalid implicit causal selection");
     }
     if (mask.defined()) {
-        TYLOINFER_RUNTIME_CHECK(mask.is_cuda() && mask.device() == q.device() &&
+        if (!(mask.is_cuda() && mask.device() == q.device() &&
             mask.is_contiguous() &&
             mask.scalar_type() == ::tyloi::kFloat16 &&
-            mask.sizes() == indices.sizes(), name, ": invalid mask");
+            mask.sizes() == indices.sizes()))
+            throw std::runtime_error(std::string(name) + ": invalid mask");
     }
     if (sinks.defined()) {
-        TYLOINFER_RUNTIME_CHECK(sinks.is_cuda() && sinks.device() == q.device() &&
+        if (!(sinks.is_cuda() && sinks.device() == q.device() &&
             sinks.is_contiguous() &&
             sinks.scalar_type() == ::tyloi::kFloat32 &&
-            sinks.numel() == heads, name, ": invalid sinks");
+            sinks.numel() == heads))
+            throw std::runtime_error(std::string(name) + ": invalid sinks");
     }
 
     const MfqCudaGuard guard(q.device());
     int device = 0;
     cudaDeviceProp properties{};
-    TYLOINFER_RUNTIME_CHECK(cudaGetDevice(&device) == cudaSuccess,
-        name, ": cudaGetDevice failed");
-    TYLOINFER_RUNTIME_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
-        name, ": cudaGetDeviceProperties failed");
+    if (!(cudaGetDevice(&device) == cudaSuccess))
+        throw std::runtime_error(std::string(name) + ": cudaGetDevice failed");
+    if (!(cudaGetDeviceProperties(&properties, device) == cudaSuccess))
+        throw std::runtime_error(std::string(name) + ": cudaGetDeviceProperties failed");
     const int cc = properties.major * 100 + properties.minor * 10;
-    TYLOINFER_RUNTIME_CHECK(turing_mma_available(cc),
-        name, ": requires Turing-class tensor cores or newer");
+    if (!turing_mma_available(cc))
+        throw std::runtime_error(std::string(name) + ": requires Turing-class tensor cores or newer");
     const auto base_config = ampere_mma_available(cc)
         ? ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols)
         : ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
@@ -391,9 +400,9 @@ DenseTensor launch(
     const int nbatch_v2 = config.nbatch_V2;
     const int nbatch_combine = config.nbatch_combine;
     const bool q_in_reg = config.Q_in_reg;
-    TYLOINFER_RUNTIME_CHECK(nthreads > 0 && nbatch_fa > 0 && nbatch_k2 > 0 &&
-        nbatch_v2 > 0 && nbatch_combine > 0,
-        name, ": unsupported MMA geometry");
+    if (!(nthreads > 0 && nbatch_fa > 0 && nbatch_k2 > 0 &&
+        nbatch_v2 > 0 && nbatch_combine > 0))
+        throw std::runtime_error(std::string(name) + ": unsupported MMA geometry");
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const size_t shared_kv = static_cast<size_t>(nbatch_fa) *
         std::max(nbatch_k2 + 4, nbatch_v2 + 4) * sizeof(half2);
@@ -422,8 +431,8 @@ DenseTensor launch(
             const cudaError_t status = cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(shmem));
-            TYLOINFER_RUNTIME_CHECK(status == cudaSuccess,
-                name, ": shared-memory attribute failed: ", cudaGetErrorString(status));
+            if (!(status == cudaSuccess))
+                throw std::runtime_error(std::string(name) + ": shared-memory attribute failed: " + cudaGetErrorString(status));
             configured_devices.insert(device);
         }
     }
@@ -434,15 +443,15 @@ DenseTensor launch(
     const int64_t ntiles_dst64 =
         static_cast<int64_t>(B) * kv_heads * iter_z_gqa * iter_j;
     const int ntiles_kv = (selected + nbatch_fa - 1) / nbatch_fa;
-    TYLOINFER_RUNTIME_CHECK(ntiles_dst64 > 0 &&
-        ntiles_dst64 <= std::numeric_limits<int>::max(),
-        name, ": CUDA grid is too large");
+    if (!(ntiles_dst64 > 0 &&
+        ntiles_dst64 <= std::numeric_limits<int>::max()))
+        throw std::runtime_error(std::string(name) + ": CUDA grid is too large");
     const int ntiles_dst = static_cast<int>(ntiles_dst64);
     int max_blocks_per_sm = 0;
     cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, nthreads, shmem);
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
-        name, ": occupancy query failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess && max_blocks_per_sm > 0))
+        throw std::runtime_error(std::string(name) + ": occupancy query failed: " + cudaGetErrorString(status));
     const int resident_blocks =
         max_blocks_per_sm * properties.multiProcessorCount;
     const int64_t total_tiles = ntiles_dst64 * ntiles_kv;
@@ -469,19 +478,21 @@ DenseTensor launch(
         ncols * (2 + DV / 2);
     const size_t required_meta = blocks_per_tile > 1 ? 2 * meta_float2 : 1;
     if (!meta.defined()) {
-        TYLOINFER_RUNTIME_CHECK(required_meta <=
-            static_cast<size_t>(std::numeric_limits<int64_t>::max()),
-            name, ": meta workspace is too large");
+        if (!(required_meta <=
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())))
+            throw std::runtime_error(std::string(name) + ": meta workspace is too large");
         meta = ::tyloi::cuda::empty(
             {static_cast<int64_t>(required_meta)},
             q.options().dtype(::tyloi::kFloat32));
     }
-    TYLOINFER_RUNTIME_CHECK(meta.is_cuda() && meta.device() == q.device() &&
+    if (!(meta.is_cuda() && meta.device() == q.device() &&
         meta.is_contiguous() &&
         meta.scalar_type() == ::tyloi::kFloat32 &&
-        static_cast<size_t>(meta.numel()) >= required_meta,
-        name, ": meta workspace too small, need ", required_meta,
-        " float elements");
+        static_cast<size_t>(meta.numel()) >= required_meta)) {
+        std::ostringstream failure;
+        failure << name << ": meta workspace too small, need " << required_meta << " float elements";
+        throw std::runtime_error(failure.str());
+    }
 
     DenseTensor out = ::tyloi::cuda::empty({B, M, heads, DV}, q.options().dtype(::tyloi::kFloat32));
     const auto stream = mfq_current_cuda_stream();
@@ -503,8 +514,8 @@ DenseTensor launch(
         static_cast<float>(scale), B, M, heads, kv_heads, max_seq, selected,
         sparse_fastdiv_values(static_cast<uint32_t>(M)), input);
     status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess,
-        name, " launch failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string(name) + " launch failed: " + cudaGetErrorString(status));
 
     if (tyloi::cuda::dispatch_trace::enabled()) tyloi::cuda::dispatch_trace::record(
         stream, "selected_attention_mma", reinterpret_cast<const void*>(kernel),
@@ -535,8 +546,8 @@ DenseTensor launch(
                 M, heads, kv_heads, rounded_blocks, gqa_ratio,
                 blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
-        TYLOINFER_RUNTIME_CHECK(status == cudaSuccess,
-            name, " fixup failed: ", cudaGetErrorString(status));
+        if (!(status == cudaSuccess))
+            throw std::runtime_error(std::string(name) + " fixup failed: " + cudaGetErrorString(status));
     }
     return out;
 }

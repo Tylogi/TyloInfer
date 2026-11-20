@@ -12,7 +12,7 @@
 
 namespace tyloi::weights {
 
-struct TqRetention {
+struct ExpertRetention {
     std::uint64_t key;
     int device;
     std::size_t bytes;
@@ -21,12 +21,12 @@ struct TqRetention {
 };
 
 // Items belong to one budget and have finite heat. Only retained flags change.
-inline void select_tq_retention(std::span<TqRetention> items, std::size_t budget, bool rebuild) {
-    const auto hotter = [](const TqRetention* a, const TqRetention* b) {
+inline void select_expert_retention(std::span<ExpertRetention> items, std::size_t budget, bool rebuild) {
+    const auto hotter = [](const ExpertRetention* a, const ExpertRetention* b) {
         return a->heat != b->heat ? a->heat > b->heat :
             std::tie(a->key, a->device) < std::tie(b->key, b->device);
     };
-    std::vector<TqRetention*> candidates, victims;
+    std::vector<ExpertRetention*> candidates, victims;
     std::size_t used = 0;
     for (auto& item : items) {
         if (item.retained) {

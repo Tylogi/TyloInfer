@@ -17,7 +17,7 @@ void Capture::step(GraphRequest request) {
     switch (request.phase) {
     case GraphPhase::admit: break;
     case GraphPhase::prepare: {
-        const bool prepared = weights_.prepare_graph(device_);
+        const bool prepared = weights_.routing().fixed_views && executor_.prepare_routed_graph(device_);
         if (request.prepared) *request.prepared = prepared;
         break;
     }

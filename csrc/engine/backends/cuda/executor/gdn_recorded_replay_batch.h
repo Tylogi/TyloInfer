@@ -3,6 +3,7 @@
 #include "engine/backends/cuda/ops/attention/gdn/replay.h"
 #include "engine/backends/cuda/executor/recurrent_copy_kernel.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -163,8 +164,8 @@ public:
     }
 
     void run(int64_t retained_tokens) {
-        TYLOINFER_RUNTIME_CHECK(retained_tokens > 0 && retained_tokens <= tokens_,
-            "recorded GDN replay prefix exceeds the verified window");
+        if (!(retained_tokens > 0 && retained_tokens <= tokens_))
+            throw std::runtime_error("recorded GDN replay prefix exceeds the verified window");
         const MfqCudaGuard guard(descriptors_.device());
         const auto stream = mfq_get_current_cuda_stream(descriptors_.get_device());
         // These owners live with the batch. Recording a stream once also

@@ -6,6 +6,7 @@
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
+#include <stdexcept>
 #include <cmath>
 #include <optional>
 
@@ -26,7 +27,8 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
     };
     const auto save_prefixes = [&](const DenseTensor& normalized) {
         if (!checkpoints) return;
-        TYLOINFER_RUNTIME_CHECK(cache && conv.defined(), "PLE prefix history is unavailable");
+        if (!(cache && conv.defined()))
+            throw std::runtime_error("PLE prefix history is unavailable");
         const auto lookback = conv.size(1);
         for (std::int64_t count = 1; count < t; ++count) {
             auto& saved = checkpoints->at(checkpoint_offset + std::size_t(count - 1)).dense();

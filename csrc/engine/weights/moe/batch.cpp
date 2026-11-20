@@ -2,11 +2,13 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/weights/encoding/format_features.h"
+#include "engine/weights/moe/ggml_bank.h"
 #include "engine/weights/moe/experts.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/moe/residency/cached_source_internal.h"
 #endif
 
+#include <algorithm>
 #include <climits>
 #include <stdexcept>
 #include <utility>
@@ -82,14 +84,21 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     b.cpu_gate_up = cpu_expert(b.gate_up);
     b.cpu_down = cpu_expert(b.down);
     b.sharded = !b.split && expert_parallel(banks[0], down);
+    b.ggml = down.representation<GgmlExpertBank>() != nullptr;
+    if (b.ggml && row_total > INT_MAX)
+        throw std::invalid_argument("GGML route sample row count exceeds the route history limit");
+    for (const auto& bank : banks)
+        if ((bank.representation<GgmlExpertBank>() != nullptr) != b.ggml ||
+            (b.ggml && (bank.device() != ids.device() || down.device() != ids.device())))
+            throw std::invalid_argument("GGUF routed banks must share an encoding family and route device");
     const bool tq_routed = bool(b.tq.gate || b.tq.up || b.tq.down);
-    if ((tq_routed && (b.ungated ? (b.split || b.tq.gate || !b.tq.up || !b.tq.down)
+    if (!b.ggml && ((tq_routed && (b.ungated ? (b.split || b.tq.gate || !b.tq.up || !b.tq.down)
                                   : (!b.split || !b.tq.gate || !b.tq.up || !b.tq.down))) ||
         (!tq_routed && b.split && !((b.gate && b.up && b.down) ||
                                     (b.dense_gate && b.dense_up && b.dense_down))) ||
         (!tq_routed && !b.split &&
             (b.ungated ? !((b.up && b.down) || (b.dense_up && b.dense_down))
-                       : !((b.gate_up && b.down) || (b.dense_gate_up && b.dense_down)))))
+                       : !((b.gate_up && b.down) || (b.dense_gate_up && b.dense_down))))))
         throw std::invalid_argument("unsupported selected expert bank representations");
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -109,7 +118,7 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     }
     MfqCudaGuard guard(ids.device().index);
     auto& executor = cuda::Executor::current();
-    if (!tq_routed) {
+    if (!tq_routed && !b.ggml) {
         b.route = executor.profiler().measure("moe.route_map", [&] {
             return build_moe_route_plan(ids.dense(), static_cast<int>(banks[0].size(0)),
                 prefill && bool(b.down && b.down->cached_source));
@@ -118,7 +127,7 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     b.route.row_offset = row_offset;
     b.route.row_total = row_total;
     b.route.prefill = prefill;
-    if (!cuda::Executor::current_ffn().batch_serial) b.prepare();
+    if (!cuda::Executor::current_ffn().batch_serial && !b.ggml) b.prepare();
 }
 
 ExpertBatch::~ExpertBatch() = default;
@@ -127,6 +136,14 @@ ExpertBatch& ExpertBatch::operator=(ExpertBatch&&) noexcept = default;
 
 void ExpertBatch::Impl::prepare() {
     if (prepared) return;
+    if (ggml) {
+        const auto resident = [](const Tensor& weight) {
+            return weight.representation<GgmlExpertBank>()->resident_addresses.defined();
+        };
+        const bool device_resident = ids.size(0) <= 32 && resident(down_weight) &&
+            std::all_of(gate_up_weights.begin(), gate_up_weights.end(), resident);
+        ggml_rows = group_expert_rows(ids.dense(), down_weight.size(0), device_resident);
+    }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     const bool tq_routed = bool(tq.gate || tq.up || tq.down);
     if (!sharded && !tq_routed) {
@@ -178,6 +195,13 @@ void ExpertBatch::Impl::ready() {
 }
 
 void ExpertBatch::Impl::retire() {
+    if (ggml_rows && ggml_rows->host_ids.defined()) {
+        const auto* output = down_weight.representation<GgmlExpertBank>();
+        const GgmlExpertBank* banks[] = {gate_up_weights.front().representation<GgmlExpertBank>(),
+            split ? gate_up_weights.back().representation<GgmlExpertBank>() : output, output};
+        observe_ggml_routes(std::span{banks}.first(split ? 3 : 2), ggml_rows->host_ids,
+            static_cast<int>(route.row_offset), static_cast<int>(route.row_total), route.prefill);
+    }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (!sharded && !tq.gate && !tq.up && !tq.down && down && down->cached_source)
         down->cached_source->finish_routes(route);

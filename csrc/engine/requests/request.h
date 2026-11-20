@@ -4,6 +4,7 @@
 #include "media.h"
 #include "sampling.h"
 #include "constraint.h"
+#include "decision.h"
 
 #include <chrono>
 #include <cstddef>
@@ -95,6 +96,7 @@ struct EngineRequest {
     // Diagnostics only. Production submits owned text/media and is tokenized
     // on admission, never against a tokenizer from before a queued reload.
     std::vector<std::int64_t> token_ids;
+    std::optional<DecisionText> decision;
 };
 
 struct SessionCommand {

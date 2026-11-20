@@ -6,7 +6,6 @@
 #include "quant_linear.h"
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
-#include "runtime/layer_weight_stream.h"
 
 #include <cstdint>
 #include <functional>
@@ -148,7 +147,6 @@ template <typename Model> struct CudaCausalOps : Model {
     std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
-    std::shared_ptr<LayerWeightStream> layer_weights;
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
     std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
@@ -282,7 +280,6 @@ template <typename Model> struct CudaCausalOps : Model {
         }
         Tensor layer(std::unique_ptr<Block> &b, Tensor x) {
             MfqCudaGuard block_guard(b->cuda_device);
-            auto weights=model.layer_weights?model.layer_weights->enter(b.get()):LayerWeightStream::Lease{};
             auto local_ids =
                 b->cpu_offloaded
                     ? cpu_ids
@@ -357,7 +354,6 @@ template <typename Model> struct CudaCausalOps : Model {
                         .clone());
         }
         Tensor finish(Tensor x, int64_t B, int64_t T) {
-            if(model.layer_weights)model.layer_weights->report_timings();
             x = tensor_to_cuda_device(model.execution->model_parallel_collectives, x, primary);
             auto finalized = model.finalize_hidden(x, B, T);
             if (raw_hidden)

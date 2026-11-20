@@ -65,7 +65,6 @@ struct EngineInfo {
     MfqModelCapabilities capabilities;
     bool probability = false;
     std::unordered_set<std::int64_t> stop_token_ids;
-    bool decisions = false;
 };
 struct EngineStatus {
     std::size_t available = 0;
@@ -123,10 +122,10 @@ struct LikelihoodResult {
 };
 using ControlRequest = std::variant<DecodeTokens, PrepareDuplex,
     PrepareDuplexStep, MfqDuplexSessionParams, MfqDuplexStepInput, StopDuplex,
-    RuntimeMetrics, CountTokens, ScoreText, ScoreTokens, DecisionText, DecisionTokens>;
+    RuntimeMetrics, CountTokens, ScoreText, ScoreTokens>;
 using ControlResult = std::variant<std::monostate,
     std::string, MfqDuplexSessionParams, MfqDuplexStepInput, MfqDuplexStepResult,
-    Metrics, TokenCount, LikelihoodResult, DecisionResult>;
+    Metrics, TokenCount, LikelihoodResult>;
 
 class ControlBusyError final : public std::runtime_error {
 public:

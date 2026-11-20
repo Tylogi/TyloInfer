@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include <cuda_fp16.h>
 #include "engine/backends/cuda/kernels/ffn/hyperconnection.h"
 #include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
@@ -273,33 +275,29 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_pre_cuda(
     int64_t iterations,
     double eps)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        x.is_cuda() && x.is_contiguous() &&
+    if (!(x.is_cuda() && x.is_contiguous() &&
             x.scalar_type() == ::tyloi::kFloat16 &&
             x.dim() == 4 && x.size(2) == kHyperConnections &&
-            x.size(3) > 0 && x.size(3) <= INT_MAX,
-        "dsv4_hc_pre: x must be contiguous CUDA f16 [B,T,4,H]");
-    TYLOINFER_RUNTIME_CHECK(
-        mixes.is_cuda() && mixes.is_contiguous() &&
+            x.size(3) > 0 && x.size(3) <= INT_MAX))
+        throw std::runtime_error("dsv4_hc_pre: x must be contiguous CUDA f16 [B,T,4,H]");
+    if (!(mixes.is_cuda() && mixes.is_contiguous() &&
             mixes.scalar_type() == ::tyloi::kFloat32 &&
             mixes.dim() == 3 && mixes.size(0) == x.size(0) &&
             mixes.size(1) == x.size(1) &&
-            mixes.size(2) == kHyperMixWidth,
-        "dsv4_hc_pre: mixes must be contiguous CUDA f32 [B,T,24]");
-    TYLOINFER_RUNTIME_CHECK(
-        scale.is_cuda() && scale.is_contiguous() &&
+            mixes.size(2) == kHyperMixWidth))
+        throw std::runtime_error("dsv4_hc_pre: mixes must be contiguous CUDA f32 [B,T,24]");
+    if (!(scale.is_cuda() && scale.is_contiguous() &&
             scale.scalar_type() == ::tyloi::kFloat32 &&
             scale.numel() == 3 &&
             base.is_cuda() && base.is_contiguous() &&
             base.scalar_type() == ::tyloi::kFloat32 &&
             base.numel() == kHyperMixWidth &&
             iterations > 0 && iterations <= INT_MAX &&
-            std::isfinite(eps) && eps > 0.0,
-        "dsv4_hc_pre: invalid scale, base, iterations, or epsilon");
+            std::isfinite(eps) && eps > 0.0))
+        throw std::runtime_error("dsv4_hc_pre: invalid scale, base, iterations, or epsilon");
     const int64_t rows64 = x.size(0) * x.size(1);
-    TYLOINFER_RUNTIME_CHECK(
-        rows64 > 0 && rows64 <= INT_MAX,
-        "dsv4_hc_pre: row count is out of range");
+    if (!(rows64 > 0 && rows64 <= INT_MAX))
+        throw std::runtime_error("dsv4_hc_pre: row count is out of range");
     const int rows = static_cast<int>(rows64);
     const int hidden = static_cast<int>(x.size(3));
     auto reduced = ::tyloi::cuda::empty(
@@ -322,9 +320,8 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_pre_cuda(
         rows, hidden, static_cast<int>(iterations), static_cast<float>(eps),
         nullptr, 0, nullptr, nullptr, 0.f);
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_hc_pre launch failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_hc_pre launch failed: ") + cudaGetErrorString(status));
     return {reduced, post, combination};
 }
 
@@ -334,20 +331,20 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_coefficients_cuda(
     ::tyloi::DenseTensor base,
     int64_t iterations,
     double eps) {
-    TYLOINFER_RUNTIME_CHECK(mixes.is_cuda() && mixes.is_contiguous() &&
+    if (!(mixes.is_cuda() && mixes.is_contiguous() &&
                           mixes.scalar_type() == ::tyloi::kFloat32 &&
-                          mixes.dim() == 3 && mixes.size(2) == kHyperMixWidth,
-                      "dsv4_hc_coefficients: expected CUDA f32 [B,T,24]");
-    TYLOINFER_RUNTIME_CHECK(scale.is_cuda() && scale.is_contiguous() &&
+                          mixes.dim() == 3 && mixes.size(2) == kHyperMixWidth))
+        throw std::runtime_error("dsv4_hc_coefficients: expected CUDA f32 [B,T,24]");
+    if (!(scale.is_cuda() && scale.is_contiguous() &&
                           scale.scalar_type() == ::tyloi::kFloat32 && scale.numel() == 3 &&
                           base.is_cuda() && base.is_contiguous() &&
                           base.scalar_type() == ::tyloi::kFloat32 &&
                           base.numel() == kHyperMixWidth && iterations > 0 && iterations <= INT_MAX &&
-                          std::isfinite(eps) && eps > 0,
-                      "dsv4_hc_coefficients: invalid coefficient parameters");
+                          std::isfinite(eps) && eps > 0))
+        throw std::runtime_error("dsv4_hc_coefficients: invalid coefficient parameters");
     const auto rows = mixes.size(0) * mixes.size(1);
-    TYLOINFER_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX,
-                      "dsv4_hc_coefficients: row count is out of range");
+    if (!(rows > 0 && rows <= INT_MAX))
+        throw std::runtime_error("dsv4_hc_coefficients: row count is out of range");
     auto pre = ::tyloi::cuda::empty({mixes.size(0), mixes.size(1), kHyperConnections}, mixes.options());
     auto post = ::tyloi::cuda::empty_like(pre);
     auto combination = ::tyloi::cuda::empty(
@@ -367,22 +364,19 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_coefficients_cuda(
     ::tyloi::DenseTensor post,
     ::tyloi::DenseTensor combination)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        x.is_cuda() && x.is_contiguous() &&
+    if (!(x.is_cuda() && x.is_contiguous() &&
             x.scalar_type() == ::tyloi::kFloat16 &&
-            x.dim() == 3 && x.size(2) > 0 && x.size(2) <= INT_MAX,
-        "dsv4_hc_post: x must be contiguous CUDA f16 [B,T,H]");
-    TYLOINFER_RUNTIME_CHECK(
-        residual.is_cuda() && residual.is_contiguous() &&
+            x.dim() == 3 && x.size(2) > 0 && x.size(2) <= INT_MAX))
+        throw std::runtime_error("dsv4_hc_post: x must be contiguous CUDA f16 [B,T,H]");
+    if (!(residual.is_cuda() && residual.is_contiguous() &&
             residual.scalar_type() == ::tyloi::kFloat16 &&
             residual.dim() == 4 &&
             residual.size(0) == x.size(0) &&
             residual.size(1) == x.size(1) &&
             residual.size(2) == kHyperConnections &&
-            residual.size(3) == x.size(2),
-        "dsv4_hc_post: residual shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(
-        post.is_cuda() && post.is_contiguous() &&
+            residual.size(3) == x.size(2)))
+        throw std::runtime_error("dsv4_hc_post: residual shape mismatch");
+    if (!(post.is_cuda() && post.is_contiguous() &&
             post.scalar_type() == ::tyloi::kFloat32 &&
             post.dim() == 3 &&
             post.size(0) == x.size(0) &&
@@ -394,12 +388,11 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_coefficients_cuda(
             combination.size(0) == x.size(0) &&
             combination.size(1) == x.size(1) &&
             combination.size(2) == kHyperConnections &&
-            combination.size(3) == kHyperConnections,
-        "dsv4_hc_post: post or combination shape mismatch");
+            combination.size(3) == kHyperConnections))
+        throw std::runtime_error("dsv4_hc_post: post or combination shape mismatch");
     const int64_t rows64 = x.size(0) * x.size(1);
-    TYLOINFER_RUNTIME_CHECK(
-        rows64 > 0 && rows64 <= 65535,
-        "dsv4_hc_post: row count is out of range");
+    if (!(rows64 > 0 && rows64 <= 65535))
+        throw std::runtime_error("dsv4_hc_post: row count is out of range");
     const int rows = static_cast<int>(rows64);
     const int hidden = static_cast<int>(x.size(2));
     auto output = ::tyloi::cuda::empty(
@@ -414,9 +407,8 @@ std::vector<::tyloi::DenseTensor> dsv4_hc_coefficients_cuda(
         reinterpret_cast<half *>(output.data_ptr<mfq_half>()),
         rows, hidden);
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_hc_post launch failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_hc_post launch failed: ") + cudaGetErrorString(status));
     return output;
 }
 
@@ -425,11 +417,11 @@ std::vector<::tyloi::DenseTensor> deepseek_v41_hc_finalize_cuda(
     ::tyloi::DenseTensor norm, ::tyloi::DenseTensor partials,
     ::tyloi::DenseTensor scale, ::tyloi::DenseTensor base,
     int64_t iterations, double rms_epsilon, double hc_epsilon) {
-    TYLOINFER_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() && residual.scalar_type()==::tyloi::kFloat16 &&
-        residual.dim()==4 && residual.size(2)==4 && residual.size(3)>0 && residual.size(3)<=INT_MAX/4,
-        "invalid mHC finalize residual");
+    if (!(residual.is_cuda() && residual.is_contiguous() && residual.scalar_type()==::tyloi::kFloat16 &&
+        residual.dim()==4 && residual.size(2)==4 && residual.size(3)>0 && residual.size(3)<=INT_MAX/4))
+        throw std::runtime_error("invalid mHC finalize residual");
     const auto rows=residual.size(0)*residual.size(1),hidden=residual.size(3),parts=(4*hidden+63)/64;
-    TYLOINFER_RUNTIME_CHECK(rows>0 && rows<=INT_MAX && partials.is_contiguous() && partials.is_cuda() &&
+    if (!(rows>0 && rows<=INT_MAX && partials.is_contiguous() && partials.is_cuda() &&
         partials.scalar_type()==::tyloi::kFloat32 && partials.dim()==3 && partials.size(0)==rows &&
         partials.size(1)==parts && partials.size(2)==26 && previous.is_cuda() && previous.is_contiguous() &&
         previous.scalar_type()==::tyloi::kFloat32 && previous.dim()==3 && previous.size(0)==residual.size(0) &&
@@ -439,7 +431,8 @@ std::vector<::tyloi::DenseTensor> deepseek_v41_hc_finalize_cuda(
         base.scalar_type()==::tyloi::kFloat32 && base.numel()==24 && iterations>0 && iterations<=INT_MAX &&
         std::isfinite(rms_epsilon) && rms_epsilon>0 && std::isfinite(hc_epsilon) && hc_epsilon>0 &&
         previous.device()==residual.device() && norm.device()==residual.device() && partials.device()==residual.device() &&
-        scale.device()==residual.device() && base.device()==residual.device(),"invalid mHC finalize inputs");
+        scale.device()==residual.device() && base.device()==residual.device()))
+        throw std::runtime_error("invalid mHC finalize inputs");
     auto branch=::tyloi::cuda::empty({residual.size(0),residual.size(1),hidden},residual.options());
     auto pre=::tyloi::cuda::empty({residual.size(0),residual.size(1),4},previous.options()),post=::tyloi::cuda::empty_like(pre);
     auto combination=::tyloi::cuda::empty({residual.size(0),residual.size(1),4,4},previous.options());

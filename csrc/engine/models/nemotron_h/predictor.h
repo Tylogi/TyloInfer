@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/models/common/check.h"
 
+#include <stdexcept>
 #include <cstdint>
 #include <utility>
 
@@ -34,24 +34,24 @@ auto mtp_predictor(Ops &ops, typename Ops::DenseTensor hidden, typename Ops::Den
                    typename Ops::DenseTensor positions, int64_t depth, bool cache) {
     auto &model = ops.model;
     const auto &config = model.config;
-    require_model(
-        ops.rank(hidden) == 3 && ops.rank(ids) == 2 && ops.size(hidden, 0) == ops.size(ids, 0) &&
-            ops.size(hidden, 1) == ops.size(ids, 1) && ops.size(hidden, 2) == config.hidden_size &&
-            ops.size(hidden, 1) > 0,
-        "Nemotron-H MTP inputs must be matching [B,T] hidden states and [B,T] next-token IDs");
-    require_model(config.num_nextn_predict_layers == 1 && !config.mtp_mixers.empty(),
-                  "Nemotron-H MTP requires one declared predictor stage");
+    if (!(ops.rank(hidden) == 3 && ops.rank(ids) == 2 && ops.size(hidden, 0) == ops.size(ids, 0) &&
+        ops.size(hidden, 1) == ops.size(ids, 1) && ops.size(hidden, 2) == config.hidden_size &&
+        ops.size(hidden, 1) > 0))
+        throw std::runtime_error("Nemotron-H MTP inputs must be matching [B,T] hidden states and [B,T] next-token IDs");
+    if (!(config.num_nextn_predict_layers == 1 && !config.mtp_mixers.empty()))
+        throw std::runtime_error("Nemotron-H MTP requires one declared predictor stage");
     const auto batch = ops.size(hidden, 0), tokens = ops.size(hidden, 1);
     const auto capacity = model.predictor_capacity();
     auto &state = ops.state;
     const auto count = int64_t(state.lengths.size());
-    tyloi::models::require_model(count > 0 && batch > 0 && tokens > 0, "invalid predictor geometry");
+    if (!(count > 0 && batch > 0 && tokens > 0))
+        throw std::runtime_error("invalid predictor geometry");
     const auto layer = (depth % count + count) % count;
     if (cache && state.batch && state.batch != batch)
         model.reset(state, batch);
     const auto start = cache ? state.lengths[layer] : 0;
-    tyloi::models::require_model(start >= 0 && tokens <= capacity - start,
-                                 "predictor history exceeds context capacity");
+    if (!(start >= 0 && tokens <= capacity - start))
+        throw std::runtime_error("predictor history exceeds context capacity");
     auto embeds = ops.embed(std::move(ids), hidden);
     auto pos = ops.positions(std::move(positions), start, tokens);
     auto e = ops.normalize(std::move(embeds), PredictorNorm::embedding);

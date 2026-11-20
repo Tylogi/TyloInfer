@@ -22,7 +22,7 @@ class MfqContainer;
 class MlxGgufPrefillPlan;
 class MlxGgufStagedPrefill;
 struct MlxNativeGgufWeight;
-struct MlxGgufRotation;
+struct MlxGgmlInputRotation;
 
 bool is_gguf_dtype(std::string_view dtype) noexcept;
 inline bool gguf_gate_up_reversed(int gate, int up) noexcept {
@@ -113,6 +113,6 @@ private:
     std::optional<tyloi::Tensor> mixed_layout_;
     int mixed_mask_ = 0;
     std::size_t mixed_payload_bytes_ = 0;
-    std::shared_ptr<const MlxGgufRotation> rotation_;
+    std::shared_ptr<const MlxGgmlInputRotation> rotation_;
 };
 } // namespace tyloi::metal

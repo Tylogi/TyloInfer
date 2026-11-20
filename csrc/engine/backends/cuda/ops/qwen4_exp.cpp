@@ -4,6 +4,7 @@
 
 #include "engine/backends/cuda/kernels/attention/selected.h"
 
+#include <stdexcept>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -18,7 +19,7 @@ static ::tyloi::cuda::NumericType raw_type(const DenseTensor& x) { return x.scal
 
 std::vector<DenseTensor> live_index_pool(const DenseTensor& index,const DenseTensor& positions,
         const DenseTensor& cache_positions,int64_t pool,int64_t maximum) {
-    TYLOINFER_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 &&
+    if (!(index.is_cuda() && index.dim()==3 && index.size(0)==1 &&
         (index.scalar_type()==::tyloi::kFloat16 || index.scalar_type()==::tyloi::kFloat32) &&
         positions.device()==index.device() && cache_positions.device()==index.device() &&
         positions.dim()>=1 && positions.dim()<=3 &&
@@ -26,8 +27,8 @@ std::vector<DenseTensor> live_index_pool(const DenseTensor& index,const DenseTen
         cache_positions.dim()==1 && cache_positions.numel()>0 && cache_positions.is_contiguous() &&
         cache_positions.scalar_type()==::tyloi::kInt64 && positions.size(-1)==cache_positions.numel() &&
         pool>0 && pool<=INT_MAX && maximum>0 && maximum<=index.size(1) &&
-        index.size(2)>0 && index.size(2)<=INT_MAX && cache_positions.numel()<=INT_MAX,
-        "live QSA pool has incompatible index/position geometry");
+        index.size(2)>0 && index.size(2)<=INT_MAX && cache_positions.numel()<=INT_MAX))
+        throw std::runtime_error("live QSA pool has incompatible index/position geometry");
     const MfqCudaGuard guard(index.device());
     auto pos=positions.contiguous();
     auto pooled=::tyloi::cuda::empty({1,cache_positions.numel(),index.size(2)},index.options());
@@ -38,11 +39,12 @@ std::vector<DenseTensor> live_index_pool(const DenseTensor& index,const DenseTen
 }
 
 void fill_decode_positions(const DenseTensor& cache,const DenseTensor& positions,int64_t start,int64_t delta) {
-    TYLOINFER_RUNTIME_CHECK(cache.is_cuda() && positions.is_cuda() && cache.is_contiguous() &&
+    if (!(cache.is_cuda() && positions.is_cuda() && cache.is_contiguous() &&
         positions.is_contiguous() && cache.scalar_type()==::tyloi::kInt64 && cache.numel()>0 &&
-        positions.numel()%cache.numel()==0 && positions.numel()>=cache.numel(),
-        "decode position buffers have incompatible geometry");
-    TYLOINFER_RUNTIME_CHECK(positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64,"decode positions must use int32 or int64");
+        positions.numel()%cache.numel()==0 && positions.numel()>=cache.numel()))
+        throw std::runtime_error("decode position buffers have incompatible geometry");
+    if (!(positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64))
+        throw std::runtime_error("decode positions must use int32 or int64");
     raw::fill_positions(cache.data_ptr<int64_t>(),positions.data_ptr(),cache.numel(),positions.numel(),start,delta,positions.scalar_type()==::tyloi::kInt64,mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -50,7 +52,8 @@ void fill_decode_positions(const DenseTensor& cache,const DenseTensor& positions
 template<bool Injection>
 DenseTensor gated_residual_activation(const DenseTensor& input,int64_t streams) {
     mfq_selected_attention::values({&input});
-    TYLOINFER_RUNTIME_CHECK(streams>0,"gated-residual stream count must be positive");
+    if (!(streams>0))
+        throw std::runtime_error("gated-residual stream count must be positive");
     if(input.is_contiguous() && (input.scalar_type()==::tyloi::kFloat16 || input.scalar_type()==::tyloi::kFloat32)) {
         MfqCudaGuard guard(input.device());
         auto output=::tyloi::cuda::empty_like(input);const auto count=input.numel();
@@ -73,8 +76,9 @@ DenseTensor gated_residual_injection(const DenseTensor& input,int64_t streams) {
 
 DenseTensor gated_residual_mix(const DenseTensor& projection,const DenseTensor& normalized,int64_t streams) {
     mfq_selected_attention::values({&projection,&normalized});
-    TYLOINFER_RUNTIME_CHECK(projection.sizes()==normalized.sizes() && streams>0 && normalized.dim()>0 &&
-        normalized.size(-1)>0 && normalized.size(-1)%streams==0,"gated-residual mix shape disagrees");
+    if (!(projection.sizes()==normalized.sizes() && streams>0 && normalized.dim()>0 &&
+        normalized.size(-1)>0 && normalized.size(-1)%streams==0))
+        throw std::runtime_error("gated-residual mix shape disagrees");
     auto shape=normalized.sizes().vec();const int hidden=int(shape.back()/streams);shape.back()=hidden;
     const auto half_or_float=[](const DenseTensor& x){return x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32;};
     if(projection.is_contiguous() && normalized.is_contiguous() && half_or_float(projection) && half_or_float(normalized)) {
@@ -93,9 +97,9 @@ using ::tyloi::DenseTensor;
 DenseTensor grouped_rms_norm(const DenseTensor& value, const DenseTensor& weight,
                         int64_t group, double eps) {
     mfq_selected_attention::values({&value, &weight});
-    TYLOINFER_RUNTIME_CHECK(value.dim() >= 1 && group > 0 && value.size(-1) > 0 &&
-        value.size(-1) % group == 0 && weight.dim() == 1 && weight.size(0) == value.size(-1),
-        "Qwen4 grouped RMSNorm dimensions disagree");
+    if (!(value.dim() >= 1 && group > 0 && value.size(-1) > 0 &&
+        value.size(-1) % group == 0 && weight.dim() == 1 && weight.size(0) == value.size(-1)))
+        throw std::runtime_error("Qwen4 grouped RMSNorm dimensions disagree");
     MfqCudaGuard guard(value.device());
     if (value.is_contiguous() && (value.scalar_type() == ::tyloi::kFloat16 || value.scalar_type() == ::tyloi::kFloat32))
         return grouped_rms_norm_cuda(value, weight.to(::tyloi::kFloat32).contiguous(), group, eps, 1.0);
@@ -112,15 +116,16 @@ std::vector<DenseTensor> gated_residual_pre(
     const DenseTensor& input, const DenseTensor& norm, const DenseTensor& down, const DenseTensor& up,
     const std::optional<DenseTensor>& inject, int64_t hidden, int64_t streams, double eps) {
     mfq_selected_attention::values({&input, &norm, &down, &up});
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && hidden > 0 && streams > 0 &&
+    if (!(input.dim() >= 1 && hidden > 0 && streams > 0 &&
         input.size(-1) / streams == hidden && input.size(-1) % streams == 0 &&
         down.dim() == 2 && up.dim() == 2 && down.size(1) == input.size(-1) &&
-        up.size(0) == input.size(-1) && up.size(1) == down.size(0),
-        "Qwen4 gated-residual projection dimensions disagree");
+        up.size(0) == input.size(-1) && up.size(1) == down.size(0)))
+        throw std::runtime_error("Qwen4 gated-residual projection dimensions disagree");
     if (inject) {
         mfq_selected_attention::values({&input, &*inject});
-        TYLOINFER_RUNTIME_CHECK(inject->dim() == 2 && inject->size(0) == streams &&
-            inject->size(1) == input.size(-1), "Qwen4 injection projection dimensions disagree");
+        if (!(inject->dim() == 2 && inject->size(0) == streams &&
+            inject->size(1) == input.size(-1)))
+            throw std::runtime_error("Qwen4 injection projection dimensions disagree");
     }
     MfqCudaGuard guard(input.device());
     auto normalized = grouped_rms_norm(input, norm, hidden, eps);
@@ -175,13 +180,16 @@ bool try_gated_residual_post_out(const DenseTensor& branch,const DenseTensor& re
 DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& residual,
                            const DenseTensor& injection, int64_t streams) {
     mfq_selected_attention::values({&branch, &residual, &injection});
-    TYLOINFER_RUNTIME_CHECK(branch.dim() >= 1 && streams > 0 && branch.dim() == residual.dim() &&
-        branch.dim() == injection.dim(), "Qwen4 residual ranks disagree");
+    if (!(branch.dim() >= 1 && streams > 0 && branch.dim() == residual.dim() &&
+        branch.dim() == injection.dim()))
+        throw std::runtime_error("Qwen4 residual ranks disagree");
     auto shape = branch.sizes().vec();
     shape.back() *= streams;
-    TYLOINFER_RUNTIME_CHECK(residual.sizes().vec() == shape, "Qwen4 residual width disagrees");
+    if (!(residual.sizes().vec() == shape))
+        throw std::runtime_error("Qwen4 residual width disagrees");
     shape.back() = streams;
-    TYLOINFER_RUNTIME_CHECK(injection.sizes().vec() == shape, "Qwen4 injection shape disagrees");
+    if (!(injection.sizes().vec() == shape))
+        throw std::runtime_error("Qwen4 injection shape disagrees");
     MfqCudaGuard guard(branch.device());
     const auto value=[](const DenseTensor& t){return t.scalar_type()==::tyloi::kFloat16 || t.scalar_type()==::tyloi::kFloat32;};
     if(branch.is_contiguous() && residual.is_contiguous() && injection.is_contiguous() &&
@@ -197,14 +205,15 @@ DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& re
 std::vector<DenseTensor> gated_residual_post_norm(const DenseTensor& branch,const DenseTensor& residual,
     const DenseTensor& injection,const DenseTensor& norm,int64_t streams,double eps) {
     mfq_selected_attention::values({&branch,&residual,&injection,&norm});
-    TYLOINFER_RUNTIME_CHECK(branch.dim()>=1 && streams>0 && branch.size(-1)>0 &&
-        branch.dim()==residual.dim() && branch.dim()==injection.dim(),
-        "Qwen4 residual/norm ranks disagree");
+    if (!(branch.dim()>=1 && streams>0 && branch.size(-1)>0 &&
+        branch.dim()==residual.dim() && branch.dim()==injection.dim()))
+        throw std::runtime_error("Qwen4 residual/norm ranks disagree");
     auto shape=branch.sizes().vec();shape.back()*=streams;
-    TYLOINFER_RUNTIME_CHECK(residual.sizes().vec()==shape && norm.dim()==1 && norm.size(0)==shape.back(),
-        "Qwen4 residual/norm width disagrees");
+    if (!(residual.sizes().vec()==shape && norm.dim()==1 && norm.size(0)==shape.back()))
+        throw std::runtime_error("Qwen4 residual/norm width disagrees");
     shape.back()=streams;
-    TYLOINFER_RUNTIME_CHECK(injection.sizes().vec()==shape,"Qwen4 residual/norm injection shape disagrees");
+    if (!(injection.sizes().vec()==shape))
+        throw std::runtime_error("Qwen4 residual/norm injection shape disagrees");
     const auto supported=[](const DenseTensor& x){return x.is_contiguous() &&
         (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32);};
     if(!supported(branch) || !supported(residual) || !supported(injection)) {
@@ -242,10 +251,11 @@ DenseTensor block_scores(const DenseTensor& query, const DenseTensor& pooled) {
 
 DenseTensor live_block_scores(const DenseTensor& query,const DenseTensor& pooled,const DenseTensor& positions,int64_t pool) {
     mfq_selected_attention::values({&query,&pooled});
-    TYLOINFER_RUNTIME_CHECK(query.dim()==4 && query.size(0)==1 && pooled.dim()==3 && pooled.size(0)==1 &&
+    if (!(query.dim()==4 && query.size(0)==1 && pooled.dim()==3 && pooled.size(0)==1 &&
         query.size(3)==pooled.size(2) && query.size(2)>0 && query.size(3)>0 && pool>0 &&
         positions.is_cuda() && positions.is_contiguous() && positions.scalar_type()==::tyloi::kInt64 &&
-        positions.numel()==query.size(1),"invalid live QSA score geometry");
+        positions.numel()==query.size(1)))
+        throw std::runtime_error("invalid live QSA score geometry");
     const bool supported=(query.scalar_type()==::tyloi::kFloat16 || query.scalar_type()==::tyloi::kFloat32) &&
         (pooled.scalar_type()==::tyloi::kFloat16 || pooled.scalar_type()==::tyloi::kFloat32);
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_QSA_LIVE_SCORES");
@@ -262,8 +272,9 @@ DenseTensor live_block_scores(const DenseTensor& query,const DenseTensor& pooled
 }
 
 static DenseTensor live_topk_impl(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget,bool emit_blocks=false) {
-    TYLOINFER_RUNTIME_CHECK(!budget || (pool>0 && pool<=INT_MAX && budget>0 &&
-        budget<=INT_MAX-pool && count<=budget/pool),"invalid live QSA token selection geometry");
+    if (!(!budget || (pool>0 && pool<=INT_MAX && budget>0 &&
+        budget<=INT_MAX-pool && count<=budget/pool)))
+        throw std::runtime_error("invalid live QSA token selection geometry");
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_QSA_LIVE_TOPK");
     if((option && option[0]=='0') || count>1024) {
         auto ids=std::get<1>(::tyloi::cuda::topk(scores,count,-1,true,false));
@@ -275,11 +286,11 @@ static DenseTensor live_topk_impl(const DenseTensor& scores,const DenseTensor& p
         }
         return budget?mfq_selected_attention::block_indices_to_tokens(ids,positions,pool,budget):ids;
     }
-    TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
+    if (!(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
         scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && pool>0 &&
-        count>0 && count<=scores.size(2) && scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX,
-        "invalid live QSA top-k geometry");
+        count>0 && count<=scores.size(2) && scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX))
+        throw std::runtime_error("invalid live QSA top-k geometry");
     MfqCudaGuard guard(scores.device());
     const int rows=int(scores.size(1)),pools=int(scores.size(2));
     const auto* compact_option=tyloi::cuda::env_lookup("TYLOINFER_QSA_TOPK_LIVE_TILE");
@@ -314,34 +325,36 @@ DenseTensor live_topk_selected_tokens(const DenseTensor& scores,const DenseTenso
 }
 
 DenseTensor live_topk_selected_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget) {
-    TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
+    if (!(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
         scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && count<=scores.size(2) &&
         scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX && pool>0 && pool<=32 && budget>0 && budget%pool==0 &&
-        budget<=INT_MAX-2*pool && count>0 && count<=budget/pool,
-        "invalid live QSA block-mask geometry");
+        budget<=INT_MAX-2*pool && count>0 && count<=budget/pool))
+        throw std::runtime_error("invalid live QSA block-mask geometry");
     return live_topk_impl(scores,positions,pool,count,budget,true);
 }
 
 std::vector<DenseTensor> ple_dilated_conv_silu(const DenseTensor& input,
     const DenseTensor& weight, const std::optional<DenseTensor>& state, int64_t dilation) {
     mfq_selected_attention::values({&input, &weight});
-    TYLOINFER_RUNTIME_CHECK(input.dim() == 3, "Qwen4 PLE input must have [B,T,C] shape");
+    if (!(input.dim() == 3))
+        throw std::runtime_error("Qwen4 PLE input must have [B,T,C] shape");
     auto w = weight;
     if (w.dim() == 3) {
-        TYLOINFER_RUNTIME_CHECK(w.size(0) == input.size(2) && w.size(1) == 1,
-            "Qwen4 PLE packed weight dimensions disagree");
+        if (!(w.size(0) == input.size(2) && w.size(1) == 1))
+            throw std::runtime_error("Qwen4 PLE packed weight dimensions disagree");
         w = w.select(1, 0);
     }
-    TYLOINFER_RUNTIME_CHECK(w.dim() == 2 && w.size(0) == input.size(2) &&
+    if (!(w.dim() == 2 && w.size(0) == input.size(2) &&
         w.size(1) > 0 && dilation > 0 && w.size(1) - 1 <=
-            std::numeric_limits<int64_t>::max() / dilation,
-        "Qwen4 PLE kernel/dilation dimensions disagree");
+            std::numeric_limits<int64_t>::max() / dilation))
+        throw std::runtime_error("Qwen4 PLE kernel/dilation dimensions disagree");
     const auto length = (w.size(1) - 1) * dilation;
     const std::vector<int64_t> state_shape{input.size(0), length, input.size(2)};
     if (state) {
         mfq_selected_attention::values({&input, &*state});
-        TYLOINFER_RUNTIME_CHECK(state->sizes().vec() == state_shape, "Qwen4 PLE state shape disagrees");
+        if (!(state->sizes().vec() == state_shape))
+            throw std::runtime_error("Qwen4 PLE state shape disagrees");
     }
     MfqCudaGuard guard(input.device());
     auto previous = state ? state->to(input.scalar_type()) : ::tyloi::cuda::zeros(state_shape, input.options());

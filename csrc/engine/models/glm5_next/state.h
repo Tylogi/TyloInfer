@@ -4,6 +4,7 @@
 #include "engine/state/sequence.h"
 #include "engine/models/state.h"
 #include "engine/models/session/snapshot.h"
+#include <stdexcept>
 #include <cstdint>
 #include <variant>
 #include <vector>
@@ -19,7 +20,8 @@ struct KdaState {
     bool pending() const { return rollback_conv.defined(); }
     void commit() { rollback_conv = DenseTensor(); rollback_recurrent = DenseTensor(); }
     void rollback() {
-        TYLOINFER_RUNTIME_CHECK(pending(), "GLM KDA has no speculative checkpoint");
+        if (!pending())
+            throw std::runtime_error("GLM KDA has no speculative checkpoint");
         conv = rollback_conv;
         recurrent = rollback_recurrent;
         commit();
@@ -33,8 +35,8 @@ struct MlaState {
     void reset() { latent.reset(); index.reset(); }
     int64_t position() const { return latent.position(); }
     void truncate(int64_t keep) {
-        TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= latent.position() && keep <= index.position(),
-                               "invalid Flash-Next MLA cache truncation");
+        if (!(keep >= 0 && keep <= latent.position() && keep <= index.position()))
+            throw std::runtime_error("invalid Flash-Next MLA cache truncation");
         latent.truncate(keep);
         index.truncate(keep);
     }

@@ -9,11 +9,27 @@ namespace tyloi::models::qwen35 {
 
 tyloi::models::Info Model::info() const {
     auto result = tyloi::models::model_info(metadata);
+    result.decision_readout = device.is_cuda();
+    if (layer_stream) {
+        result.streamed_weights = true;
+        result.decode_graph = false;
+    }
     if (mtp && !mtp->target_layers().empty())
         result.raw_row_bytes = std::size_t(metadata.hidden_size) * mtp->target_layers().size() * sizeof(float);
     for (const auto& layer : layers)
         if (layer.device.is_cpu()) result.decode_graph = false;
     return result;
+}
+
+Tensor Model::decision_logits(const Tensor& hidden, const Tensor& labels) const {
+    if (decision_head) return ops::project(ops::cast(hidden, kFloat32), decision_head);
+    if (labels && (ram_head_bytes || (ram_embedding_bytes && lm_head.same_view(embed)))) {
+        auto rows = ops::cast(ops::embedding(labels, lm_head), kFloat32);
+        auto projected = ops::project(ops::cast(hidden, kFloat32), rows);
+        return decision ? projected : softcap(projected);
+    }
+    auto projected = logits(hidden, !decision);
+    return labels ? ops::index_select(projected, -1, labels) : projected;
 }
 
 MfqModelCapabilities Model::capabilities() const {
@@ -32,7 +48,7 @@ tyloi::engine::Metrics Model::metrics() const {
         }
     }
     const bool mtp_declared = graph.has_component("predictor") || (mtp && !mtp->target_layers().empty());
-    return {{"kv_memory_supported", 0.0},
+    tyloi::engine::Metrics result{{"kv_memory_supported", 0.0},
             {"kv_quantization_supported", double(full_attention)},
             {"kv_quantization_bits", bits},
             {"vision_declared", double(graph.has_component("vision"))},
@@ -40,6 +56,15 @@ tyloi::engine::Metrics Model::metrics() const {
             {"vision_available", double(vision.has_value())},
             {"mtp_declared", double(mtp_declared)},
             {"mtp_supported", double(mtp_declared)}, {"mtp_available", double(bool(mtp))}};
+#if TYLOINFER_HAS_CUDA
+    result.emplace_back("ram_embedding_bytes", double(ram_embedding_bytes));
+    if (decision || layer_stream) {
+        result.emplace_back("ram_weight_bytes", double(ram_head_bytes) + (layer_stream ? double(layer_stream->host_bytes()) : 0.0));
+        result.emplace_back("layer_weight_buffer_bytes", layer_stream ? double(layer_stream->device_bytes()) : 0.0);
+        result.emplace_back("jev_weights_streamed", double(bool(layer_stream)));
+    }
+#endif
+    return result;
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {

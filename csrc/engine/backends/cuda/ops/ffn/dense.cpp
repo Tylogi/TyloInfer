@@ -126,7 +126,12 @@ std::optional<DenseTensor> mlp_residual(DenseTensor input, DenseTensor residual,
     const auto project = executor.projector(Executor::current_ffn());
     const auto weights = make_mlp(project, gate_up, down, activation, swiglu_limit);
     const auto& options = executor.options();
-    if (options.dense.fp32_residual || !options.projection.nvq_fusion ||
+    if (options.dense.fp32_residual) return std::nullopt;
+    if (executor.mmq().mode == KlMmqMode::Default) {
+        if (auto fused = weights.prefill_residual(project, executor.profiler(), input, residual))
+            return fused;
+    }
+    if (!options.projection.nvq_fusion ||
         !weights.can_fuse(input, residual))
         return std::nullopt;
     return executor.profiler().measure(

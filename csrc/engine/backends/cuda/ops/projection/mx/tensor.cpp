@@ -2,12 +2,14 @@
 #include "tensor.h"
 #include "engine/backends/cuda/kernels/projection/mx/grouped_gemm.h"
 #include "engine/backends/cuda/ops/projection/cpu_rows.h"
+#include <stdexcept>
 #include <cmath>
 
 CpuProjectionRows make_cpu_projection_rows(const tyloi::Mxfp4Tensor& w) {
-    TYLOINFER_RUNTIME_CHECK(!w.values.is_cuda() && !w.scales.is_cuda() && w.neuron_len>0 &&
+    if (!(!w.values.is_cuda() && !w.scales.is_cuda() && w.neuron_len>0 &&
         w.neuron_len%32==0 && w.values.numel()==w.out*(w.neuron_len/2) &&
-        w.scales.numel()==w.out*(w.neuron_len/32),"invalid CPU MXFP4 projection fields");
+        w.scales.numel()==w.out*(w.neuron_len/32)))
+        throw std::runtime_error("invalid CPU MXFP4 projection fields");
     CpuProjectionRows plan;plan.width=int(w.neuron_len);plan.outputs=int(w.out);
     const auto* values=w.values.data_ptr<uint8_t>();const auto* scales=w.scales.data_ptr<uint8_t>();
     const int width=plan.width;
@@ -37,13 +39,11 @@ using ::tyloi::indexing::Slice;
         const tyloi::Mxfp8Tensor & weight,
         ::tyloi::DenseTensor x) {
     x = x.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        x.dim() == 2 && x.size(1) == weight.neuron_len,
-        "MXFP8 activation width mismatch");
+    if (!(x.dim() == 2 && x.size(1) == weight.neuron_len))
+        throw std::runtime_error("MXFP8 activation width mismatch");
     if (!x.is_cuda()) {
-        TYLOINFER_RUNTIME_CHECK(
-            !weight.values.is_cuda() && !weight.scales.is_cuda(),
-            "CPU MXFP8 matmul requires CPU-resident weights");
+        if (!(!weight.values.is_cuda() && !weight.scales.is_cuda()))
+            throw std::runtime_error("CPU MXFP8 matmul requires CPU-resident weights");
         const int64_t rows = x.size(0);
         const int64_t outputs = weight.out;
         const int64_t width = weight.neuron_len;
@@ -108,9 +108,8 @@ using ::tyloi::indexing::Slice;
         const tyloi::Mxfp8Tensor & weight,
         ::tyloi::DenseTensor x) {
     x = x.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        x.dim() == 2 && x.size(1) == weight.neuron_len,
-        "MXFP8 FP32-output activation width mismatch");
+    if (!(x.dim() == 2 && x.size(1) == weight.neuron_len))
+        throw std::runtime_error("MXFP8 FP32-output activation width mismatch");
     if (x.size(0) <= 8) {
         return profiler.measure("mxfp8.small_m_f32", [&]() {
             return mxfp8_small_m_f32_cuda(
@@ -177,15 +176,13 @@ using ::tyloi::indexing::Slice;
         ::tyloi::DenseTensor grouped,
         int64_t groups) {
     grouped = grouped.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        grouped.dim() == 3 && grouped.size(1) == groups &&
+    if (!(grouped.dim() == 3 && grouped.size(1) == groups &&
             grouped.size(2) == weight.neuron_len &&
-            weight.out % groups == 0,
-        "MXFP8 groupwise projection geometry mismatch");
+            weight.out % groups == 0))
+        throw std::runtime_error("MXFP8 groupwise projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
-    TYLOINFER_RUNTIME_CHECK(
-        outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0,
-        "MXFP8 groupwise output width must preserve scale blocks");
+    if (!(outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0))
+        throw std::runtime_error("MXFP8 groupwise output width must preserve scale blocks");
     if(!grouped.is_cuda()) {
         std::vector<::tyloi::DenseTensor> outputs;
         outputs.reserve(static_cast<size_t>(groups));
@@ -217,15 +214,13 @@ using ::tyloi::indexing::Slice;
         ::tyloi::DenseTensor grouped,
         int64_t groups) {
     grouped = grouped.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        grouped.dim() == 3 && grouped.size(1) == groups &&
+    if (!(grouped.dim() == 3 && grouped.size(1) == groups &&
             grouped.size(2) == weight.neuron_len &&
-            weight.out % groups == 0,
-        "MXFP8 groupwise FP32-output projection geometry mismatch");
+            weight.out % groups == 0))
+        throw std::runtime_error("MXFP8 groupwise FP32-output projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
-    TYLOINFER_RUNTIME_CHECK(
-        outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0,
-        "MXFP8 groupwise output width must preserve scale blocks");
+    if (!(outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0))
+        throw std::runtime_error("MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
         return profiler.measure(
             "mxfp8.groupwise_small_m_f32", [&]() {
@@ -242,19 +237,16 @@ using ::tyloi::indexing::Slice;
         const tyloi::Mxfp4Tensor & weight,
         ::tyloi::DenseTensor x) {
     x = x.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        x.dim() == 2 && x.size(1) == weight.neuron_len,
-        "MXFP4 activation width mismatch");
+    if (!(x.dim() == 2 && x.size(1) == weight.neuron_len))
+        throw std::runtime_error("MXFP4 activation width mismatch");
     if (x.is_cuda()) {
-        TYLOINFER_RUNTIME_CHECK(
-            weight.values.is_cuda() && weight.scales.is_cuda(),
-            "CUDA MXFP4 matmul requires CUDA-resident weights");
+        if (!(weight.values.is_cuda() && weight.scales.is_cuda()))
+            throw std::runtime_error("CUDA MXFP4 matmul requires CUDA-resident weights");
         return mxfp4_matmul_f16_cuda(
             weight.values, weight.scales, x);
     }
-    TYLOINFER_RUNTIME_CHECK(
-        !weight.values.is_cuda() && !weight.scales.is_cuda(),
-        "CPU MXFP4 matmul requires CPU-resident weights");
+    if (!(!weight.values.is_cuda() && !weight.scales.is_cuda()))
+        throw std::runtime_error("CPU MXFP4 matmul requires CPU-resident weights");
     const int64_t rows = x.size(0);
     const int64_t outputs = weight.out;
     const int64_t width = weight.neuron_len;

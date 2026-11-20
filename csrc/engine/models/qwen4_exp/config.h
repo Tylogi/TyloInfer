@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +21,7 @@ struct Config {
     int64_t index_heads, index_width, pool, budget, ple_kernel, ngram, ngram_heads, shards,
         predictor_layers, eos;
     double eps, rope_base;
+    double norm_weight_offset = 1.0;
     bool interleaved, normalize_routes, silu_gate, tied_embeddings, dedicated_predictor_embeddings;
     bool linear_tiled_heads = false;
     std::vector<int64_t> sections, ple_layers;
@@ -37,9 +39,10 @@ struct Config {
     static Config parse(const nlohmann::json &outer) {
         const auto &text = outer.contains("text_config") ? outer.at("text_config") : outer;
         const auto outer_type = outer.value("model_type", std::string{});
-        if ((outer_type != "qwen4_exp" && outer_type != "qwen4_exp_text") ||
-            text.value("model_type", outer_type) != "qwen4_exp_text")
-            throw std::runtime_error("expected Qwen4-Exp text config");
+        const bool dense = outer_type == "qwen4" || outer_type == "qwen4_text";
+        if ((!dense && outer_type != "qwen4_exp" && outer_type != "qwen4_exp_text") ||
+            text.value("model_type", outer_type) != (dense ? "qwen4_text" : "qwen4_exp_text"))
+            throw std::runtime_error("expected a Qwen4 text config");
         const auto positive = [&](const char *key) {
             const auto &v = text.at(key);
             if (!v.is_number_integer() || v.get<int64_t>() <= 0)
@@ -57,6 +60,8 @@ struct Config {
         c.interval = positive("full_attention_interval");
         c.streams = positive("hc_count");
         c.rank = positive("hc_lowrank");
+        if (c.streams > std::numeric_limits<std::int64_t>::max() / c.hidden)
+            throw std::runtime_error("Qwen4 residual stream width overflows");
         c.layer_types = text.at("layer_types").get<std::vector<std::string>>();
         if (c.layer_types.size() != static_cast<std::size_t>(c.layers))
             throw std::runtime_error("Qwen4 layer schedule must describe every layer");
@@ -91,10 +96,17 @@ struct Config {
         c.value_heads = positive("linear_num_value_heads");
         c.linear_width = positive("linear_key_head_dim");
         c.kernel = positive("linear_conv_kernel_dim");
-        c.experts = positive("num_experts");
-        c.topk = positive("num_experts_per_tok");
-        c.moe_width = positive("moe_intermediate_size");
-        c.shared_width = positive("shared_expert_intermediate_size");
+        if (dense) {
+            const auto experts = text.find("num_experts");
+            if (experts != text.end() && (!experts->is_number_integer() || *experts != 0))
+                throw std::runtime_error("dense Qwen4 cannot declare routed experts");
+            c.moe_width = positive("intermediate_size");
+        } else {
+            c.experts = positive("num_experts");
+            c.topk = positive("num_experts_per_tok");
+            c.moe_width = positive("moe_intermediate_size");
+            c.shared_width = positive("shared_expert_intermediate_size");
+        }
         c.index_heads = positive("indexer_n_heads");
         c.index_width = positive("indexer_head_dim");
         c.pool = positive("indexer_compress_ratio");
@@ -105,7 +117,7 @@ struct Config {
         c.shards = positive("split_ngram_parts");
         positive("ngram_vocab_size_base");
         if (c.heads % c.kv_heads || c.value_heads % c.key_heads ||
-            c.linear_width != positive("linear_value_head_dim") || c.kernel < 2 || c.streams < 2 ||
+            c.linear_width != positive("linear_value_head_dim") || c.kernel < 2 || (!dense && c.streams < 2) ||
             positive("ple_embed_dim") != c.hidden || c.ngram < 2 ||
             c.hidden % ((c.ngram - 1) * c.ngram_heads) || positive("indexer_kv_heads") != 1 ||
             c.budget % c.pool || c.topk > std::min<int64_t>(16, c.experts) || c.experts > 4096 ||

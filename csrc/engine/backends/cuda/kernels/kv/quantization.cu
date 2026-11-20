@@ -1,4 +1,6 @@
 #include "env.h"
+#include <stdexcept>
+#include <string>
 #include <math_constants.h>
 #include "../../ops/attention/kv/quantization.h"
 
@@ -14,7 +16,8 @@
 namespace tyloi::cuda {
 namespace {
 int rotation_width(int dimension) {
-    TYLOINFER_RUNTIME_CHECK(dimension > 0 && dimension <= 1024, "unsupported TurboQuant KV head dimension");
+    if (!(dimension > 0 && dimension <= 1024))
+        throw std::runtime_error("unsupported TurboQuant KV head dimension");
     int width = 1;
     while (width < dimension) width *= 2;
     return width;
@@ -223,7 +226,8 @@ CacheView view(const ::tyloi::DenseTensor& data,const ::tyloi::DenseTensor& chun
         result.table_width=int(pages.table.size(1));result.page_size=pages.page_size;
         result.chunk_pages=pages.pages_per_chunk;result.heads=pages.heads;
     } else {
-        TYLOINFER_RUNTIME_CHECK(data.is_cuda()&&data.dim()==4&&data.scalar_type()==::tyloi::kInt32&&data.size(3)==packed&&data.stride(3)==1,"invalid packed KV layout");
+        if (!(data.is_cuda()&&data.dim()==4&&data.scalar_type()==::tyloi::kInt32&&data.size(3)==packed&&data.stride(3)==1))
+            throw std::runtime_error("invalid packed KV layout");
         result.data=reinterpret_cast<const uint32_t*>(data.data_ptr());result.batch_stride=data.stride(0);result.head_stride=data.stride(1);result.token_stride=data.stride(2);
     }
     return result;
@@ -233,32 +237,39 @@ CacheView view(const ::tyloi::DenseTensor& data,const ::tyloi::DenseTensor& chun
 tyloi::state::KvQuantization cuda_kv_quantization() {
     const char* text=tyloi::cuda::env_lookup("TYLOINFER_KV_TURBOQUANT_BITS");if(!text||!*text)return {};
     size_t consumed=0;double bits=std::stod(text,&consumed);
-    TYLOINFER_RUNTIME_CHECK(consumed==std::string(text).size()&&valid_bits(bits),"invalid TurboQuant KV bit width");return {bits};
+    if (!(consumed==std::string(text).size()&&valid_bits(bits)))
+        throw std::runtime_error("invalid TurboQuant KV bit width");return {bits};
 }
-int cuda_kv_packed_width(int d,int bits){TYLOINFER_RUNTIME_CHECK(bits>=2&&bits<=8,"invalid TurboQuant component bits");return 1+(rotation_width(d)*bits+31)/32;}
+int cuda_kv_packed_width(int d,int bits){if (!(bits>=2&&bits<=8))
+    throw std::runtime_error("invalid TurboQuant component bits");return 1+(rotation_width(d)*bits+31)/32;}
 std::string cuda_kv_quantization_tag(){auto q=cuda_kv_quantization();return q.enabled()?"-tq-v1-k"+std::to_string(q.key_bits())+"v"+std::to_string(q.value_bits()):"";}
 ::tyloi::DenseTensor cuda_kv_encode(const ::tyloi::DenseTensor& source,int bits,bool value) {
-    TYLOINFER_RUNTIME_CHECK(source.is_cuda()&&source.dim()>0,"TurboQuant requires a CUDA tensor");
+    if (!(source.is_cuda()&&source.dim()>0))
+        throw std::runtime_error("TurboQuant requires a CUDA tensor");
     MfqCudaGuard guard(source.get_device());
     const int d=int(source.size(-1)),w=rotation_width(d),p=cuda_kv_packed_width(d,bits);
     auto input=source.to(::tyloi::kFloat32).contiguous();auto shape=source.sizes().vec();shape.back()=p;
     auto output=::tyloi::cuda::empty(shape,source.options().dtype(::tyloi::kInt32));const auto rows=input.numel()/d;
-    TYLOINFER_RUNTIME_CHECK(rows<=std::numeric_limits<int>::max(),"TurboQuant encode grid overflow");
+    if (!(rows<=std::numeric_limits<int>::max()))
+        throw std::runtime_error("TurboQuant encode grid overflow");
     auto table=tables(w,bits,value,source.device());
     if(rows)encode_kernel<<<unsigned(rows),w,0,mfq_get_current_cuda_stream()>>>(input.data_ptr<float>(),reinterpret_cast<uint32_t*>(output.data_ptr()),table.centers.data_ptr<float>(),table.signs.data_ptr<float>(),d,w,bits,p);
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }
 ::tyloi::DenseTensor cuda_kv_decode(const ::tyloi::DenseTensor& source,int d,int bits,bool value,::tyloi::ScalarType dtype) {
     const int w=rotation_width(d),p=cuda_kv_packed_width(d,bits);
-    TYLOINFER_RUNTIME_CHECK(source.is_cuda()&&source.dim()>0&&source.scalar_type()==::tyloi::kInt32&&source.size(-1)==p,"invalid packed TurboQuant tensor");
+    if (!(source.is_cuda()&&source.dim()>0&&source.scalar_type()==::tyloi::kInt32&&source.size(-1)==p))
+        throw std::runtime_error("invalid packed TurboQuant tensor");
     MfqCudaGuard guard(source.get_device());auto input=source.contiguous();auto shape=source.sizes().vec();shape.back()=d;
     auto output=::tyloi::cuda::empty(shape,source.options().dtype(::tyloi::kFloat32));const auto rows=source.numel()/p;
-    TYLOINFER_RUNTIME_CHECK(rows<=std::numeric_limits<int>::max(),"TurboQuant decode grid overflow");auto table=tables(w,bits,value,source.device());
+    if (!(rows<=std::numeric_limits<int>::max()))
+        throw std::runtime_error("TurboQuant decode grid overflow");auto table=tables(w,bits,value,source.device());
     if(rows)decode_kernel<<<unsigned(rows),w,0,mfq_get_current_cuda_stream()>>>(reinterpret_cast<const uint32_t*>(input.data_ptr()),output.data_ptr<float>(),table.centers.data_ptr<float>(),table.signs.data_ptr<float>(),d,w,bits,p);
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return output.to(dtype);
 }
 void cuda_kv_write_paged(const QuantizedKvPages& pages,const ::tyloi::DenseTensor& keys,const ::tyloi::DenseTensor& values,const ::tyloi::DenseTensor& positions) {
-    TYLOINFER_RUNTIME_CHECK(pages.enabled()&&keys.dim()==4&&values.dim()==4&&keys.scalar_type()==::tyloi::kInt32&&values.scalar_type()==::tyloi::kInt32,"invalid paged TurboQuant write");
+    if (!(pages.enabled()&&keys.dim()==4&&values.dim()==4&&keys.scalar_type()==::tyloi::kInt32&&values.scalar_type()==::tyloi::kInt32))
+        throw std::runtime_error("invalid paged TurboQuant write");
     auto pos=positions.to(::tyloi::kInt64).contiguous();MfqCudaGuard guard(keys.get_device());
     for(auto pair:{std::pair{keys,pages.keys},std::pair{values,pages.values}}) {
         auto source=pair.first.contiguous();auto cache=view({},pair.second,pages,int(source.size(-1)));
@@ -270,25 +281,43 @@ void cuda_kv_write_paged(const QuantizedKvPages& pages,const ::tyloi::DenseTenso
 ::tyloi::DenseTensor cuda_kv_attention(const ::tyloi::DenseTensor& query,const ::tyloi::DenseTensor& keys,const ::tyloi::DenseTensor& values,
         tyloi::state::KvQuantization quant,const ::tyloi::DenseTensor& selected,const ::tyloi::DenseTensor& positions,int64_t offset,
         const QuantizedKvPages& pages,int64_t capacity,const ::tyloi::DenseTensor& lengths,const ::tyloi::DenseTensor& mask,double scale,HotKvView hot) {
-    TYLOINFER_RUNTIME_CHECK(quant.enabled()&&valid_bits(quant.bits)&&query.is_cuda()&&query.dim()==4,"invalid TurboQuant attention");
+    if (!(quant.enabled()&&valid_bits(quant.bits)&&query.is_cuda()&&query.dim()==4))
+        throw std::runtime_error("invalid TurboQuant attention");
     MfqCudaGuard guard(query.get_device());
     const int b=int(query.size(0)),h=int(query.size(1)),t=int(query.size(2)),d=int(query.size(3)),w=rotation_width(d);
     if(pages.enabled()) {
-        TYLOINFER_RUNTIME_CHECK(pages.table.is_cuda()&&pages.table.scalar_type()==::tyloi::kInt32&&pages.table.dim()==2&&pages.table.size(0)>=b&&pages.table.is_contiguous()&&pages.pages_per_chunk>0,"invalid TurboQuant page table");
-        TYLOINFER_RUNTIME_CHECK(pages.keys.is_cuda()&&pages.values.is_cuda()&&pages.keys.scalar_type()==::tyloi::kInt64&&pages.values.scalar_type()==::tyloi::kInt64&&pages.keys.is_contiguous()&&pages.values.is_contiguous()&&pages.keys.numel()==pages.values.numel(),"invalid TurboQuant page pointers");
+        if (!(pages.table.is_cuda()&&pages.table.scalar_type()==::tyloi::kInt32&&pages.table.dim()==2&&pages.table.size(0)>=b&&pages.table.is_contiguous()&&pages.pages_per_chunk>0))
+            throw std::runtime_error("invalid TurboQuant page table");
+        if (!(pages.keys.is_cuda()&&pages.values.is_cuda()&&pages.keys.scalar_type()==::tyloi::kInt64&&pages.values.scalar_type()==::tyloi::kInt64&&pages.keys.is_contiguous()&&pages.values.is_contiguous()&&pages.keys.numel()==pages.values.numel()))
+            throw std::runtime_error("invalid TurboQuant page pointers");
     } else {
-        TYLOINFER_RUNTIME_CHECK(keys.dim()==4&&values.dim()==4&&keys.size(0)==b&&values.size(0)==b&&keys.size(1)==values.size(1)&&keys.size(2)==values.size(2),"invalid TurboQuant cache geometry");
+        if (!(keys.dim()==4&&values.dim()==4&&keys.size(0)==b&&values.size(0)==b&&keys.size(1)==values.size(1)&&keys.size(2)==values.size(2)))
+            throw std::runtime_error("invalid TurboQuant cache geometry");
     }
     const int kh=pages.enabled()?pages.heads:int(keys.size(1));
     const int64_t allocated=pages.enabled()?pages.table.size(1)*pages.page_size:keys.size(2);
     if(!capacity)capacity=allocated;
-    TYLOINFER_RUNTIME_CHECK(capacity<=allocated&&capacity<=std::numeric_limits<int>::max(),"TurboQuant attention capacity exceeds allocation");
+    if (!(capacity<=allocated&&capacity<=std::numeric_limits<int>::max()))
+        throw std::runtime_error("TurboQuant attention capacity exceeds allocation");
     const int slots=selected.defined()?int(selected.size(-1)):int(capacity);
-    TYLOINFER_RUNTIME_CHECK(b>0&&h>0&&kh>0&&h%kh==0&&t>0&&b*t<=65535&&capacity>0&&slots>0,"invalid TurboQuant attention dimensions");
-    if(selected.defined())TYLOINFER_RUNTIME_CHECK(selected.dim()==3&&selected.size(0)==b&&selected.size(1)==t,"invalid TurboQuant selection");
-    if(positions.defined())TYLOINFER_RUNTIME_CHECK((positions.dim()==1&&positions.numel()==t)||(positions.dim()==2&&positions.size(0)==b&&positions.size(1)==t),"invalid TurboQuant positions");
-    if(lengths.defined())TYLOINFER_RUNTIME_CHECK(lengths.numel()==b,"invalid TurboQuant sequence lengths");
-    if(mask.defined())TYLOINFER_RUNTIME_CHECK(mask.dim()==2&&mask.size(0)==b&&mask.size(1)>=capacity,"invalid TurboQuant attention mask");
+    if (!(b>0&&h>0&&kh>0&&h%kh==0&&t>0&&b*t<=65535&&capacity>0&&slots>0))
+        throw std::runtime_error("invalid TurboQuant attention dimensions");
+    if(selected.defined()){
+        if (!(selected.dim()==3&&selected.size(0)==b&&selected.size(1)==t))
+            throw std::runtime_error("invalid TurboQuant selection");
+    }
+    if(positions.defined()){
+        if (!((positions.dim()==1&&positions.numel()==t)||(positions.dim()==2&&positions.size(0)==b&&positions.size(1)==t)))
+            throw std::runtime_error("invalid TurboQuant positions");
+    }
+    if(lengths.defined()){
+        if (!(lengths.numel()==b))
+            throw std::runtime_error("invalid TurboQuant sequence lengths");
+    }
+    if(mask.defined()){
+        if (!(mask.dim()==2&&mask.size(0)==b&&mask.size(1)>=capacity))
+            throw std::runtime_error("invalid TurboQuant attention mask");
+    }
     auto q=query.to(::tyloi::kFloat32).contiguous();
     auto ids=selected.defined()?selected.to(::tyloi::kInt32).contiguous(): ::tyloi::DenseTensor{};
     auto pos=positions.defined()?positions.to(::tyloi::kInt64).contiguous(): ::tyloi::DenseTensor{};

@@ -1,7 +1,6 @@
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/state.h"
 #include "engine/models/qwen4_exp/taps.h"
-#include "engine/models/common/check.h"
 #include "engine/models/common/mtp.h"
 #include "engine/weights/cache/workspace.h"
 
@@ -31,8 +30,9 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
     if (!state || !state->belongs_to(*this))
         throw std::invalid_argument("Qwen4 state belongs to a different model");
     if (input.suffix)
-        require_model(state->speculative_start >= 0 && state->speculative_confirmed == 0 &&
-            !state->speculative_suffix_forward, "speculative suffix is not active");
+        if (!(state->speculative_start >= 0 && state->speculative_confirmed == 0 &&
+            !state->speculative_suffix_forward))
+            throw std::runtime_error("speculative suffix is not active");
     struct SuffixScope {
         State& state;
         bool active;
@@ -40,24 +40,26 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
     } suffix{*state, input.suffix};
     if (input.suffix) state->speculative_suffix_forward = true;
 
-    require_model(bool(input.ids), "Qwen4 forward requires token ids");
+    if (!bool(input.ids))
+        throw std::runtime_error("Qwen4 forward requires token ids");
     auto ids = device_ids(input.ids);
     auto embeddings = input.embeddings ? ops::contiguous(ops::copy(input.embeddings, device)) : embed_tokens(ids);
     const auto batch = ids.size(0), tokens = ids.size(1);
-    require_model(embeddings.dim() == 3 && embeddings.size(0) == batch &&
-        embeddings.size(1) == tokens && embeddings.size(2) == hidden_size(),
-        "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    require_model(tokens > 0 && state->cache_pos + tokens <= metadata.max_position_embeddings &&
-        !input.cache_positions, "Qwen4 requires unpadded causal cache positions");
-    require_model(state->speculative_start < 0 || state->speculative_suffix_forward,
-        "commit or roll back the pending speculative pass before forwarding");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == batch &&
+        embeddings.size(1) == tokens && embeddings.size(2) == hidden_size()))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(tokens > 0 && state->cache_pos + tokens <= metadata.max_position_embeddings &&
+        !input.cache_positions))
+        throw std::runtime_error("Qwen4 requires unpadded causal cache positions");
+    if (!(state->speculative_start < 0 || state->speculative_suffix_forward))
+        throw std::runtime_error("commit or roll back the pending speculative pass before forwarding");
     const auto confirmed = input.confirmed;
-    require_model(confirmed >= 0 && (confirmed == 0 ||
-        (confirmed < tokens && batch == 1 && state->cache_pos > 0 && supports_speculation())),
-        "unsupported speculative backbone geometry");
+    if (!(confirmed >= 0 && (confirmed == 0 ||
+        (confirmed < tokens && batch == 1 && state->cache_pos > 0 && supports_speculation()))))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (confirmed > 0) {
-        require_model(state->cache_pos + tokens <= max_position_embeddings(),
-            "speculative pass exceeds context capacity");
+        if (!(state->cache_pos + tokens <= max_position_embeddings()))
+            throw std::runtime_error("speculative pass exceeds context capacity");
         state->speculative_start = state->cache_pos;
         state->speculative_confirmed = confirmed;
     }
@@ -74,9 +76,10 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
         full_positions = state->positions.defined()
             ? ops::cat(std::array<Tensor, 2>{state->positions, current}, -1) : ops::clone(current);
     }
-    require_model((current.dim() == 1 || (current.dim() == 2 && current.size(0) == 3) ||
+    if (!((current.dim() == 1 || (current.dim() == 2 && current.size(0) == 3) ||
         (current.dim() == 3 && current.size(0) == 3 && current.size(1) == batch)) &&
-        current.size(-1) == tokens, "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
+        current.size(-1) == tokens))
+        throw std::runtime_error("Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
 
     Tensor host_ids, cpu_positions;
     if (host_tokens || std::any_of(layers.begin(), layers.end(),
@@ -135,7 +138,7 @@ void Model::load_config(std::string_view payload) {
     metadata.tie_word_embeddings = config.tied_embeddings;
     metadata.multi_axis_positions = true;
     metadata.flash_next = true;
-    metadata.model_type = "qwen4_exp";
+    metadata.model_type = config.experts ? "qwen4_exp" : "qwen4";
     metadata.layer_types = config.layer_types;
 }
 

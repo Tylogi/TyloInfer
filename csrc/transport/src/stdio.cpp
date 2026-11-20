@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include "decision.h"
 #include "transport.h"
 #include "components/error.h"
 
@@ -186,6 +187,7 @@ public:
                 {"model", config_.model_name},
                 {"model_type", config_.model_type},
                 {"probability_available", engine.info().probability},
+                {"decisions_available", engine.info().decisions},
                 {"model_capabilities", model_capabilities},
                 {"vision_supported", vision_supported},
                 {"vision_available", vision_available},
@@ -827,6 +829,35 @@ public:
                 if (op == "count_tokens") {
                     send_result(id, token_count_json(std::get<tyloi::engine::TokenCount>(
                         engine.control(parse_token_count_request(params)))));
+                    continue;
+                }
+                if (op == "decide") {
+                    if (!engine.info().decisions)
+                        throw ApiError(501, "decisions_unavailable", "decision reads are unavailable for this model");
+                    auto decision = parse_decision_request(params, true);
+                    if (!decision.model.empty() && decision.model != config_.model_name)
+                        throw ApiError(404, "model_not_found", "the requested decision model is not served", "model");
+                    auto done = std::make_shared<std::atomic<bool>>(false);
+                    auto submitted = std::make_shared<std::atomic<bool>>(false);
+                    tasks.push_back({std::thread([&, id, decision = std::move(decision), done, submitted]() mutable {
+                        try {
+                            tyloi::engine::EngineRequest work;
+                            work.id = id;
+                            work.decision = std::move(decision.input);
+                            auto output = engine.submit(std::move(work));
+                            submitted->store(true, std::memory_order_release);
+                            submitted->notify_all();
+                            auto reads = collect_decisions(*output);
+                            send_result(id, decision_result_json(decision, reads, config_.model_name));
+                        } catch (const ApiError& error) {
+                            send_error(id, error.status, error.type, error.what());
+                        } catch (const std::exception& error) {
+                            send_error(id, 500, "server_error", error.what());
+                        }
+                        submitted->store(true, std::memory_order_release);
+                        submitted->notify_all();
+                        done->store(true, std::memory_order_release);
+                    }), done, submitted, id});
                     continue;
                 }
                 if (op == "score") {

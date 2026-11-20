@@ -4,7 +4,9 @@
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
 #include "engine/backends/cuda/ops/gguf/residual.h"
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/backends/cuda/ops/norm/rms.h"
+#include "engine/tensor/encoding/ggml.h"
 #include "engine/weights/encoding/fp8/tensor.h"
 #include "engine/backends/cuda/kernels/attention/selected.h"
 #include "engine/backends/cuda/native/profile.h"
@@ -15,29 +17,13 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 
-#include "engine/backends/cuda/kernels/ffn/residual/trace.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <optional>
 #include <string>
 #include <utility>
 #include <stdexcept>
-
-namespace tyloi::cuda {
-/** Retain and publish the profiling points used by one fused residual launch. */
-class ResidualTrace {
-public:
-    // shortcut: DecodeWindow exposes no residual-trace clock, so the points stay
-    // untimestamped and the fused launch skips its markers; attach a clock to
-    // each point to re-enable the phase trace.
-    explicit ResidualTrace(tyloi::ops::ResidualRole) {}
-    /** Publish recorded points and enforce the profiling capacity. */
-    void finish() {}
-    ResidualTraceData& data() noexcept { return data_; }
-private:
-    ResidualTraceData data_;
-};
-} // namespace tyloi::cuda
 
 namespace tyloi::cuda {
 class ResidualCore {
@@ -56,9 +42,16 @@ public:
     };
     static Projection projection(::tyloi::Tensor, Part);
     ResidualCore(::tyloi::ops::ResidualWeights weights,::tyloi::ops::ResidualConfig config)
-        : norm(std::move(weights.norm)), hidden(config.hidden),streams(config.streams),eps(config.eps),initialized_(true) {
+        : norm(std::move(weights.norm)), hidden(config.hidden),streams(config.streams),eps(config.eps),
+          plain_norm_offset(config.norm_weight_offset),initialized_(true) {
         std::optional<MfqCudaGuard> guard;
         if (config.target.is_cuda()) guard.emplace(config.target);
+        if (streams == 1 && !weights.down && !weights.up && !weights.injection) {
+            if (!norm || norm.device() != config.target || norm.dim() != 1 || norm.size(0) != hidden ||
+                norm.scalar_type() != kFloat32 || !norm.is_contiguous() || !std::isfinite(plain_norm_offset))
+                throw std::invalid_argument("single-stream residual requires one F32 norm weight per hidden feature");
+            return;
+        }
         down=projection(std::move(weights.down),config.final?Part::final_down:Part::generic);
         up=projection(std::move(weights.up),config.final?Part::final_up:Part::generic);
         if(weights.injection.defined()) injection=projection(std::move(weights.injection),Part::generic);
@@ -72,10 +65,11 @@ private:
     Projection down,up,injection;
     int64_t hidden=0,streams=0;
     double eps=0;
+    double plain_norm_offset = 0;
     bool initialized_=false;
     int64_t prefill_work_chunk(const DenseTensor&) const;
     template<class Project> Result bounded_pre(const DenseTensor&,int64_t,bool,Project) const;
-    Result fused(const DenseTensor&,const DenseTensor&,const DenseTensor&,bool,::tyloi::ops::ResidualRole) const;
+    Result fused(const DenseTensor&,const DenseTensor&,const DenseTensor&,bool) const;
     Result prepare(const DenseTensor&,const DenseTensor&,::tyloi::ops::ResidualRole) const;
     static void mark(::tyloi::ops::ResidualRole role,const char* phase) {
         if(role==::tyloi::ops::ResidualRole::none || !::tyloi::cuda::options::mhc_timings())return;
@@ -92,13 +86,12 @@ private:
 ResidualCore::Projection ResidualCore::projection(::tyloi::Tensor weight, Part part) {
     const tyloi::cuda::AllocationScope weight_memory;
     const auto* payload = weight.implementation().get();
-    TYLOINFER_RUNTIME_CHECK(
-        dynamic_cast<const DenseTensor*>(payload) != nullptr ||
+    if (!(dynamic_cast<const DenseTensor*>(payload) != nullptr ||
             dynamic_cast<const tyloi::NintTensor*>(payload) != nullptr ||
             dynamic_cast<const tyloi::encoding::TqTensor*>(payload) != nullptr ||
-            dynamic_cast<const tyloi::GgufTensor*>(payload) != nullptr ||
-            dynamic_cast<const tyloi::ChannelFp8Tensor*>(payload) != nullptr,
-        "unsupported floating residual projection");
+            dynamic_cast<const tyloi::GgmlQuantizedTensor*>(payload) != nullptr ||
+            dynamic_cast<const tyloi::ChannelFp8Tensor*>(payload) != nullptr))
+        throw std::runtime_error("unsupported floating residual projection");
     Projection result;
     result.weight = std::move(weight);
     if (dynamic_cast<const tyloi::encoding::TqTensor*>(payload) != nullptr)
@@ -122,7 +115,7 @@ ResidualCore::Projection ResidualCore::projection(::tyloi::Tensor weight, Part p
         result.can_mix = direct && part == Part::final_up;
         return result;
     }
-    if (result.weight.representation<tyloi::GgufTensor>() ||
+    if (result.weight.representation<tyloi::GgmlQuantizedTensor>() ||
             result.weight.representation<tyloi::ChannelFp8Tensor>())
         return result;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -148,7 +141,7 @@ ResidualCore::DenseTensor ResidualCore::Projection::forward(const DenseTensor& i
                 input.scalar_type() == ::tyloi::kFloat16 ? input : input.to(::tyloi::kFloat32));
         });
     }
-    if (const auto* gguf = weight.representation<tyloi::GgufTensor>())
+    if (const auto* gguf = weight.representation<tyloi::GgmlQuantizedTensor>())
         return ::tyloi::cuda::gguf::project(*gguf, input);
     if (weight.representation<tyloi::ChannelFp8Tensor>())
         return executor.projector(Executor::current_ffn()).run(weight, input);
@@ -181,7 +174,7 @@ ResidualCore::DenseTensor ResidualCore::Projection::mix(
         });
     }
 #endif
-    if (weight.representation<tyloi::GgufTensor>() ||
+    if (weight.representation<tyloi::GgmlQuantizedTensor>() ||
             weight.representation<tyloi::ChannelFp8Tensor>())
         return mfq_qwen4_exp::gated_residual_mix(forward(input), normalized, streams);
     const auto option = ::tyloi::cuda::options::gr_dense_bf16_direct();
@@ -203,7 +196,7 @@ ResidualCore::DenseTensor ResidualCore::Projection::activate(
         });
     }
 #endif
-    if (weight.representation<tyloi::GgufTensor>() ||
+    if (weight.representation<tyloi::GgmlQuantizedTensor>() ||
             weight.representation<tyloi::ChannelFp8Tensor>()) {
         auto projected = forward(input);
         return injection ? mfq_qwen4_exp::gated_residual_injection(projected, streams)
@@ -304,19 +297,16 @@ bool ResidualCore::can_fuse(const DenseTensor& input)const {
     return false;
 #endif
 }
-ResidualCore::Result ResidualCore::fused(const DenseTensor& input,const DenseTensor& residual,const DenseTensor& gate,bool after,
-    ::tyloi::ops::ResidualRole role)const {
+ResidualCore::Result ResidualCore::fused(const DenseTensor& input,const DenseTensor& residual,const DenseTensor& gate,bool after)const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     const auto& injection_payload = injection.weight;
     const auto* injection_nint = injection_payload.representation<tyloi::NintTensor>();
     const auto* injection_dense = injection_payload.representation<DenseTensor>();
-    ResidualTrace trace(role);
     auto result=gated_residual_two_stage_cuda(input,residual,gate,payload_as<DenseTensor>(norm),
         payload_as<tyloi::NintTensor>(down.weight),
         payload_as<tyloi::NintTensor>(up.weight),
         injection_nint,streams,eps,after,
-        injection_dense ? *injection_dense : DenseTensor{},injection.prepared_right,&trace.data(),up.up_group_coefficients);
-    trace.finish();
+        injection_dense ? *injection_dense : DenseTensor{},injection.prepared_right,nullptr,up.up_group_coefficients);
     return {std::move(result[0]),std::move(result[1]),std::move(result[2])};
 #else
     throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
@@ -324,10 +314,19 @@ ResidualCore::Result ResidualCore::fused(const DenseTensor& input,const DenseTen
 }
 ResidualCore::Result ResidualCore::pre(const DenseTensor &input,
     ::tyloi::ops::ResidualRole role) const {
-    if (const auto* down_weight = down.weight.representation<tyloi::GgufTensor>();
+    if (streams == 1 && !down) {
+        if (!input.defined() || input.dim() == 0 || input.size(-1) != hidden || input.device() != norm.device())
+            throw std::invalid_argument("single-stream residual input disagrees with its norm weight");
+        const auto dtype = input.scalar_type();
+        auto mixed = input.is_cuda() && (dtype == kFloat16 || dtype == kFloat32)
+            ? grouped_rms_norm_cuda(input.contiguous(), norm.dense(), hidden, eps, plain_norm_offset)
+            : cuda::ops::rms_norm(input, norm.dense(), eps, plain_norm_offset, dtype);
+        return {std::move(mixed), input, {}};
+    }
+    if (const auto* down_weight = down.weight.representation<tyloi::GgmlQuantizedTensor>();
             down_weight && Executor::current().residual_options().fused_projections) {
-        const auto* up_weight = up.weight.representation<tyloi::GgufTensor>();
-        const auto* injection_weight = injection.weight.representation<tyloi::GgufTensor>();
+        const auto* up_weight = up.weight.representation<tyloi::GgmlQuantizedTensor>();
+        const auto* injection_weight = injection.weight.representation<tyloi::GgmlQuantizedTensor>();
         if (up_weight && injection_weight) {
             auto fused = ::tyloi::cuda::gguf::gated_residual_pre(
                 input, payload_as<DenseTensor>(norm), *down_weight, *up_weight,
@@ -341,19 +340,25 @@ ResidualCore::Result ResidualCore::pre(const DenseTensor &input,
         return bounded_pre(input,chunk,true,[&](int64_t begin,int64_t count) {
             return pre(input.narrow(1,begin,count),role);
         });
-    if(can_fuse(input))return fused({},input,{},false,role);
+    if(can_fuse(input))return fused({},input,{},false);
     return prepare(input,{},role);
 }
 DenseTensor ResidualCore::post(const DenseTensor& input,const DenseTensor& residual,const DenseTensor& gate) const {
+    if (streams == 1 && !down) {
+        if (!input.defined() || input.device() != residual.device() || input.sizes() != residual.sizes())
+            throw std::invalid_argument("single-stream residual operands must share shape and device");
+        return residual + input;
+    }
     return mfq_qwen4_exp::gated_residual_post(input,residual,gate,streams);
 }
 ResidualCore::Result ResidualCore::pre_after(const DenseTensor& input,
     const DenseTensor& residual,const DenseTensor& gate,::tyloi::ops::ResidualRole role) const {
-    if (const auto* down_weight = down.weight.representation<tyloi::GgufTensor>();
+    if (streams == 1 && !down) return pre(post(input, residual, gate), role);
+    if (const auto* down_weight = down.weight.representation<tyloi::GgmlQuantizedTensor>();
             down_weight && Executor::current().residual_options().fused_projections &&
             Executor::current().residual_options().fused_post_norm) {
-        const auto* up_weight = up.weight.representation<tyloi::GgufTensor>();
-        const auto* injection_weight = injection.weight.representation<tyloi::GgufTensor>();
+        const auto* up_weight = up.weight.representation<tyloi::GgmlQuantizedTensor>();
+        const auto* injection_weight = injection.weight.representation<tyloi::GgmlQuantizedTensor>();
         if (up_weight && injection_weight) {
             auto fused = ::tyloi::cuda::gguf::gated_residual_pre(
                 residual, payload_as<DenseTensor>(norm), *down_weight, *up_weight,
@@ -370,13 +375,15 @@ ResidualCore::Result ResidualCore::pre_after(const DenseTensor& input,
     if(can_fuse(residual) && input.is_contiguous() && gate.is_contiguous() &&
         (input.scalar_type()==::tyloi::kFloat16 || input.scalar_type()==::tyloi::kFloat32) &&
         (gate.scalar_type()==::tyloi::kFloat16 || gate.scalar_type()==::tyloi::kFloat32))
-        return fused(input,residual,gate,true,role);
-    TYLOINFER_RUNTIME_CHECK(initialized_,"gated-residual operator is not initialized");
+        return fused(input,residual,gate,true);
+    if (!initialized_)
+        throw std::runtime_error("gated-residual operator is not initialized");
     const auto& options=Executor::current().residual_options();
     if(!options.fused_projections || !options.fused_post_norm) {
         return prepare(post(input,residual,gate),{},role);
     }
-    TYLOINFER_RUNTIME_CHECK(input.size(-1)==hidden,"gated-residual chained hidden width disagrees");
+    if (!(input.size(-1)==hidden))
+        throw std::runtime_error("gated-residual chained hidden width disagrees");
     mark(role,"begin");
     auto prepared=mfq_qwen4_exp::gated_residual_post_norm(input,residual,gate,payload_as<DenseTensor>(norm),streams,eps);
     return prepare(prepared[0],prepared[1],role);
@@ -384,9 +391,9 @@ ResidualCore::Result ResidualCore::pre_after(const DenseTensor& input,
 
 ResidualCore::Result ResidualCore::prepare(
         const DenseTensor& input, const DenseTensor& prepared_norm, ::tyloi::ops::ResidualRole role) const {
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && hidden > 0 && streams > 0 &&
-        input.size(-1) / streams == hidden && input.size(-1) % streams == 0 && initialized_ && down && up,
-        "gated-residual projection input dimensions disagree");
+    if (!(input.dim() >= 1 && hidden > 0 && streams > 0 &&
+        input.size(-1) / streams == hidden && input.size(-1) % streams == 0 && initialized_ && down && up))
+        throw std::runtime_error("gated-residual projection input dimensions disagree");
     const auto& options=Executor::current().residual_options();
     if(!prepared_norm.defined())mark(role,"begin");
     auto normalized = prepared_norm.defined()?prepared_norm:
@@ -397,8 +404,8 @@ ResidualCore::Result ResidualCore::prepare(
     const bool down_activated=epilogue && down.can_activate;
     auto low = down_activated?down.activate(normalized,streams,false):down.forward(normalized);
     mark(role,"down");
-    TYLOINFER_RUNTIME_CHECK(low.dim() == input.dim() && low.size(-1) > 0,
-        "gated-residual bottleneck rank disagrees");
+    if (!(low.dim() == input.dim() && low.size(-1) > 0))
+        throw std::runtime_error("gated-residual bottleneck rank disagrees");
     if(!down_activated) {
         if(fused)low=mfq_qwen4_exp::gated_residual_bottleneck(low,streams);
         else {low=low/streams;low=low*::tyloi::cuda::sigmoid(low);}
@@ -407,7 +414,8 @@ ResidualCore::Result ResidualCore::prepare(
     auto mixed = [&] {
         if(fused && up.can_mix)return up.mix(low,normalized,streams);
         auto mixing=up.forward(low);
-        TYLOINFER_RUNTIME_CHECK(mixing.sizes()==input.sizes(),"gated-residual mixing shape disagrees");
+        if (!(mixing.sizes()==input.sizes()))
+            throw std::runtime_error("gated-residual mixing shape disagrees");
         return mfq_qwen4_exp::gated_residual_mix(mixing,normalized,streams);
     }();
     mark(role,"up_mix");
@@ -424,8 +432,8 @@ ResidualCore::Result ResidualCore::prepare(
         }
         auto expected = input.sizes().vec();
         expected.back() = streams;
-        TYLOINFER_RUNTIME_CHECK(gate.sizes().vec() == expected,
-            "gated-residual injection shape disagrees");
+        if (!(gate.sizes().vec() == expected))
+            throw std::runtime_error("gated-residual injection shape disagrees");
     }
     mark(role,"end");
     return {mixed, input, gate};

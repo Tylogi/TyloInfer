@@ -22,10 +22,12 @@ Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
 tyloi::models::Info Model::info() const {
-    auto result = tyloi::models::Info{metadata.vocab_size, config.maximum, "qwen4_exp",
-        std::size_t(metadata.hidden_size) * sizeof(float) * 8, device.is_cuda(), device.is_cuda()};
+    const bool decode_graph = device.is_cuda() && config.experts > 0;
+    auto result = tyloi::models::Info{metadata.vocab_size, config.maximum, metadata.model_type,
+        std::size_t(metadata.hidden_size) * sizeof(float) * 8, decode_graph, decode_graph};
     result.streamed_kv = device.is_cuda() && std::any_of(layers.begin(), layers.end(),
         [](const auto& layer) { return bool(layer->qsa); });
+    result.decision_readout = device.is_cuda();
     result.graph = device.is_cuda() ? tyloi::models::GraphOwner::model : tyloi::models::GraphOwner::executor;
     result.graph_weights = tyloi::models::GraphWeights::native;
     result.raw_row_bytes = std::size_t(metadata.hidden_size) * metadata.hc_mult * sizeof(std::uint16_t);
@@ -140,15 +142,13 @@ void load_components(
 #endif
     }
     if (!model.graph.has_component("predictor")) return;
-    TYLOINFER_RUNTIME_CHECK(
-        model.supports_speculation(),
-        "invalid Qwen4 predictor model");
+    if (!model.supports_speculation())
+        throw std::runtime_error("invalid Qwen4 predictor model");
     auto predictor = Predictor::load_if_present(
         weights, load_options, model.config, model.embed, model.lm_head,
         model.metadata.final_logit_softcapping);
-    TYLOINFER_RUNTIME_CHECK(
-        predictor,
-        "Qwen4 graph declares the predictor component but the source has no MTP weights");
+    if (!predictor.has_value())
+        throw std::runtime_error("Qwen4 graph declares the predictor component but the source has no MTP weights");
     result.mtp = std::make_unique<Predictor>(std::move(*predictor));
 }
 

@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include <math_constants.h>
 #include <cuda_fp16.h>
 #include "backend.h"
@@ -265,18 +267,18 @@ __global__ void glm_indexer_scores_kernel(
     ::tyloi::DenseTensor x, ::tyloi::DenseTensor positions,
     ::tyloi::DenseTensor cos, ::tyloi::DenseTensor sin, int64_t rotary_dim)
 {
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 4,
-                "glm_interleaved_rope: x must be contiguous CUDA [B,H,T,D]");
-    TYLOINFER_RUNTIME_CHECK((x.scalar_type() == ::tyloi::kFloat16 || x.scalar_type() == ::tyloi::kFloat32) &&
+    if (!(x.is_cuda() && x.is_contiguous() && x.dim() == 4))
+        throw std::runtime_error("glm_interleaved_rope: x must be contiguous CUDA [B,H,T,D]");
+    if (!((x.scalar_type() == ::tyloi::kFloat16 || x.scalar_type() == ::tyloi::kFloat32) &&
                 positions.is_cuda() && positions.is_contiguous() &&
                 positions.scalar_type() == ::tyloi::kInt64 &&
                 cos.is_cuda() && sin.is_cuda() && cos.is_contiguous() && sin.is_contiguous() &&
-                cos.scalar_type() == ::tyloi::kFloat32 && sin.scalar_type() == ::tyloi::kFloat32,
-                "glm_interleaved_rope: unsupported dtype or placement");
-    TYLOINFER_RUNTIME_CHECK(x.size(3) % 2 == 0 && rotary_dim > 0 && rotary_dim <= x.size(3) &&
+                cos.scalar_type() == ::tyloi::kFloat32 && sin.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("glm_interleaved_rope: unsupported dtype or placement");
+    if (!(x.size(3) % 2 == 0 && rotary_dim > 0 && rotary_dim <= x.size(3) &&
                 rotary_dim % 2 == 0 && positions.numel() == x.size(2) &&
-                cos.dim() == 2 && sin.sizes() == cos.sizes() && cos.size(1) >= rotary_dim / 2,
-                "glm_interleaved_rope: shape mismatch");
+                cos.dim() == 2 && sin.sizes() == cos.sizes() && cos.size(1) >= rotary_dim / 2))
+        throw std::runtime_error("glm_interleaved_rope: shape mismatch");
     auto out = ::tyloi::cuda::empty_like(x);
     const int pairs = static_cast<int>(x.numel() / 2);
     const int blocks = std::min(65535, (pairs + 255) / 256);
@@ -300,22 +302,23 @@ __global__ void glm_indexer_scores_kernel(
             static_cast<int>(cos.size(1)));
     }
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "glm_interleaved_rope launch failed: ",
-                cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("glm_interleaved_rope launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
 ::tyloi::DenseTensor dsv4_tail_rope_cuda(
     ::tyloi::DenseTensor x,::tyloi::DenseTensor positions,
     ::tyloi::DenseTensor cosine,::tyloi::DenseTensor sine,int64_t rotary_dim) {
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.dim()==4 && x.stride(3)==1 && x.numel()>0 &&
+    if (!(x.is_cuda() && x.dim()==4 && x.stride(3)==1 && x.numel()>0 &&
         (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32) &&
         positions.device()==x.device() && positions.scalar_type()==::tyloi::kInt64 && positions.is_contiguous() &&
         positions.numel()==x.size(2) && cosine.device()==x.device() && sine.device()==x.device() &&
         cosine.scalar_type()==::tyloi::kFloat32 && sine.scalar_type()==::tyloi::kFloat32 &&
         cosine.is_contiguous() && sine.is_contiguous() && cosine.dim()==2 && sine.sizes()==cosine.sizes() &&
         x.size(3)%2==0 && rotary_dim>0 && rotary_dim<=x.size(3) && rotary_dim%2==0 &&
-        cosine.size(1)>=rotary_dim/2,"DeepSeek tail RoPE geometry or dtype mismatch");
+        cosine.size(1)>=rotary_dim/2))
+        throw std::runtime_error("DeepSeek tail RoPE geometry or dtype mismatch");
     auto output=::tyloi::cuda::empty(x.sizes(),x.options());
     const auto pairs=x.numel()/2;
     const auto blocks=unsigned(std::min<int64_t>(65535,(pairs+255)/256));
@@ -335,16 +338,16 @@ __global__ void glm_indexer_scores_kernel(
 ::tyloi::DenseTensor glm_dsa_indexer_layer_norm_cuda(
     ::tyloi::DenseTensor x, ::tyloi::DenseTensor weight, ::tyloi::DenseTensor bias, double eps)
 {
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(x.is_cuda() && x.is_contiguous() && x.scalar_type() == ::tyloi::kFloat16 &&
                 weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == ::tyloi::kFloat32 &&
-                bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == ::tyloi::kFloat32,
-                "glm_indexer_layer_norm: tensors must be contiguous CUDA f16/f32/f32");
-    TYLOINFER_RUNTIME_CHECK(x.dim() >= 1 && x.size(-1) == kIndexerDim &&
-                weight.numel() == kIndexerDim && bias.numel() == kIndexerDim,
-                "glm_indexer_layer_norm: shape mismatch");
+                bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("glm_indexer_layer_norm: tensors must be contiguous CUDA f16/f32/f32");
+    if (!(x.dim() >= 1 && x.size(-1) == kIndexerDim &&
+                weight.numel() == kIndexerDim && bias.numel() == kIndexerDim))
+        throw std::runtime_error("glm_indexer_layer_norm: shape mismatch");
     const int64_t rows64 = x.numel() / kIndexerDim;
-    TYLOINFER_RUNTIME_CHECK(rows64 > 0 && rows64 <= INT_MAX,
-                "glm_indexer_layer_norm: invalid row count");
+    if (!(rows64 > 0 && rows64 <= INT_MAX))
+        throw std::runtime_error("glm_indexer_layer_norm: invalid row count");
     auto out = ::tyloi::cuda::empty_like(x);
     glm_indexer_layer_norm_kernel<<<static_cast<int>(rows64), kIndexerDim, 0,
         mfq_current_cuda_stream()>>>(
@@ -353,22 +356,22 @@ __global__ void glm_indexer_scores_kernel(
         reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
         static_cast<int>(rows64), static_cast<float>(eps));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_layer_norm launch failed: ",
-                cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("glm_indexer_layer_norm launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
 ::tyloi::DenseTensor glm_dsa_cache_write_cuda(
     ::tyloi::DenseTensor cache, ::tyloi::DenseTensor values, ::tyloi::DenseTensor positions)
 {
-    TYLOINFER_RUNTIME_CHECK(cache.is_cuda() && cache.is_contiguous() && cache.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(cache.is_cuda() && cache.is_contiguous() && cache.scalar_type() == ::tyloi::kFloat16 &&
                 values.is_cuda() && values.is_contiguous() && values.scalar_type() == ::tyloi::kFloat16 &&
-                positions.is_cuda() && positions.is_contiguous() && positions.scalar_type() == ::tyloi::kInt64,
-                "glm_cache_write: tensors must be contiguous CUDA f16/f16/i64");
-    TYLOINFER_RUNTIME_CHECK(cache.dim() == 3 && values.dim() == 3 &&
+                positions.is_cuda() && positions.is_contiguous() && positions.scalar_type() == ::tyloi::kInt64))
+        throw std::runtime_error("glm_cache_write: tensors must be contiguous CUDA f16/f16/i64");
+    if (!(cache.dim() == 3 && values.dim() == 3 &&
                 cache.size(0) == values.size(0) && cache.size(2) == values.size(2) &&
-                positions.numel() == values.size(1),
-                "glm_cache_write: shape mismatch");
+                positions.numel() == values.size(1)))
+        throw std::runtime_error("glm_cache_write: shape mismatch");
     const int64_t total = values.numel();
     const int blocks = std::min<int64_t>(65535, (total + 255) / 256);
     glm_cache_write_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
@@ -378,8 +381,8 @@ __global__ void glm_indexer_scores_kernel(
         static_cast<int>(values.size(1)), static_cast<int>(cache.size(1)),
         static_cast<int>(values.size(2)));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "glm_cache_write launch failed: ",
-                cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("glm_cache_write launch failed: ") + cudaGetErrorString(status));
     return cache;
 }
 
@@ -387,23 +390,24 @@ __global__ void glm_indexer_scores_kernel(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor weights,
     int64_t query_offset, int64_t logical_k)
 {
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat16 &&
                 k.is_cuda() && k.is_contiguous() && k.scalar_type() == ::tyloi::kFloat16 &&
-                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == ::tyloi::kFloat32,
-                "glm_indexer_scores: tensors must be contiguous CUDA f16/f16/f32");
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 3 && weights.dim() == 3 &&
+                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("glm_indexer_scores: tensors must be contiguous CUDA f16/f16/f32");
+    if (!(q.dim() == 4 && k.dim() == 3 && weights.dim() == 3 &&
                 q.size(2) == kIndexerHeads && q.size(3) == kIndexerDim &&
                 k.size(0) == q.size(0) && k.size(2) == kIndexerDim &&
                 weights.size(0) == q.size(0) && weights.size(1) == q.size(1) &&
-                weights.size(2) == kIndexerHeads,
-                "glm_indexer_scores: shape mismatch");
+                weights.size(2) == kIndexerHeads))
+        throw std::runtime_error("glm_indexer_scores: shape mismatch");
     const int B = static_cast<int>(q.size(0));
     const int M = static_cast<int>(q.size(1));
     const int k_stride = static_cast<int>(k.size(1));
     const int K = logical_k < 0 ? k_stride : static_cast<int>(logical_k);
-    TYLOINFER_RUNTIME_CHECK(K > 0 && K <= k_stride, "glm_indexer_scores: invalid logical K");
-    TYLOINFER_RUNTIME_CHECK(query_offset >= 0 && query_offset + M <= K,
-                "glm_indexer_scores: invalid causal query offset");
+    if (!(K > 0 && K <= k_stride))
+        throw std::runtime_error("glm_indexer_scores: invalid logical K");
+    if (!(query_offset >= 0 && query_offset + M <= K))
+        throw std::runtime_error("glm_indexer_scores: invalid causal query offset");
     auto out = ::tyloi::cuda::empty({B, M, K}, weights.options());
     const dim3 grid((K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
     glm_indexer_scores_kernel<<<grid, dim3(32, 8, 1), 0, mfq_current_cuda_stream()>>>(
@@ -413,8 +417,8 @@ __global__ void glm_indexer_scores_kernel(
         static_cast<int>(query_offset), nullptr, 1.0f / std::sqrt(128.0f),
         1.0f / std::sqrt(32.0f));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_scores launch failed: ",
-                cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("glm_indexer_scores launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
@@ -422,18 +426,18 @@ __global__ void glm_indexer_scores_kernel(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor weights,
     ::tyloi::DenseTensor seq_len, int64_t planned_k)
 {
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat16 &&
                 k.is_cuda() && k.is_contiguous() && k.scalar_type() == ::tyloi::kFloat16 &&
                 weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == ::tyloi::kFloat32 &&
-                seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == ::tyloi::kInt64,
-                "glm_indexer_scores_decode: unsupported dtype or placement");
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && q.size(1) == 1 &&
+                seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == ::tyloi::kInt64))
+        throw std::runtime_error("glm_indexer_scores_decode: unsupported dtype or placement");
+    if (!(q.dim() == 4 && q.size(1) == 1 &&
                 q.size(2) == kIndexerHeads && q.size(3) == kIndexerDim &&
                 k.dim() == 3 && k.size(0) == q.size(0) && k.size(2) == kIndexerDim &&
                 weights.dim() == 3 && weights.size(0) == q.size(0) &&
                 weights.size(1) == 1 && weights.size(2) == kIndexerHeads &&
-                seq_len.numel() == q.size(0) && planned_k > 0 && planned_k <= k.size(1),
-                "glm_indexer_scores_decode: shape mismatch");
+                seq_len.numel() == q.size(0) && planned_k > 0 && planned_k <= k.size(1)))
+        throw std::runtime_error("glm_indexer_scores_decode: shape mismatch");
     const int B = static_cast<int>(q.size(0));
     const int K = static_cast<int>(planned_k);
     const int k_stride = static_cast<int>(k.size(1));
@@ -447,8 +451,8 @@ __global__ void glm_indexer_scores_kernel(
         0, seq_len.data_ptr<int64_t>(), 1.0f / std::sqrt(128.0f),
         1.0f / std::sqrt(32.0f));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_scores_decode launch failed: ",
-                cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("glm_indexer_scores_decode launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
@@ -456,30 +460,31 @@ __global__ void glm_indexer_scores_kernel(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor kv, ::tyloi::DenseTensor indices,
     ::tyloi::DenseTensor meta, double scale)
 {
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat32 &&
+    if (!(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat32 &&
                 kv.is_cuda() && kv.is_contiguous() && kv.scalar_type() == ::tyloi::kFloat16 &&
                 indices.is_cuda() && indices.is_contiguous() && indices.scalar_type() == ::tyloi::kInt32 &&
-                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == ::tyloi::kFloat32,
-                "glm_sparse_mla: tensors must be contiguous CUDA f32/f16/i32/f32");
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && q.size(1) == kMlaHeads && q.size(3) == kMlaDq &&
+                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("glm_sparse_mla: tensors must be contiguous CUDA f32/f16/i32/f32");
+    if (!(q.dim() == 4 && q.size(1) == kMlaHeads && q.size(3) == kMlaDq &&
                 kv.dim() == 3 && kv.size(0) == q.size(0) && kv.size(2) == kMlaDq &&
                 indices.dim() == 3 && indices.size(0) == q.size(0) &&
                 indices.size(1) == q.size(2) && indices.size(2) > 0 &&
-                indices.size(2) % 32 == 0,
-                "glm_sparse_mla: shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(q.size(0) <= INT_MAX && q.size(2) <= INT_MAX &&
-                kv.size(1) <= INT_MAX && indices.size(2) <= INT_MAX,
-                "glm_sparse_mla: attention dimensions exceed 32-bit indexing");
-    TYLOINFER_RUNTIME_CHECK(kv.device() == q.device() && indices.device() == q.device() &&
-                meta.device() == q.device(), "glm_sparse_mla: tensors must share one CUDA device");
+                indices.size(2) % 32 == 0))
+        throw std::runtime_error("glm_sparse_mla: shape mismatch");
+    if (!(q.size(0) <= INT_MAX && q.size(2) <= INT_MAX &&
+                kv.size(1) <= INT_MAX && indices.size(2) <= INT_MAX))
+        throw std::runtime_error("glm_sparse_mla: attention dimensions exceed 32-bit indexing");
+    if (!(kv.device() == q.device() && indices.device() == q.device() &&
+                meta.device() == q.device()))
+        throw std::runtime_error("glm_sparse_mla: tensors must share one CUDA device");
     const MfqCudaGuard guard(q.device());
     namespace mma = tyloi::cuda::sparse_mma_raw;
     const int batch = static_cast<int>(q.size(0));
     const int tokens = static_cast<int>(q.size(2));
     const auto plan = mma::plan(batch, tokens, kMlaHeads, 1,
         static_cast<int>(kv.size(1)), static_cast<int>(indices.size(2)), kMlaDq, kMlaDv, false);
-    TYLOINFER_RUNTIME_CHECK(static_cast<size_t>(meta.numel()) >= plan.workspace_bytes / sizeof(float),
-                "glm_sparse_mla: meta workspace too small");
+    if (!(static_cast<size_t>(meta.numel()) >= plan.workspace_bytes / sizeof(float)))
+        throw std::runtime_error("glm_sparse_mla: meta workspace too small");
     auto output = ::tyloi::cuda::empty(
         {batch, tokens, kMlaHeads, kMlaDv}, q.options().dtype(::tyloi::kFloat32));
     const int64_t strides[] = {q.stride(0), q.stride(1), q.stride(2), q.stride(3)};

@@ -33,10 +33,8 @@ public:
     StepSequence<tyloi::models::MtpDraft> greedy_draft(const tyloi::models::CausalModel& target,
         tyloi::models::MtpRow row, int depth,
         const tyloi::models::ForwardOptions& options = {}) const override;
-#if TYLOINFER_HAS_CUDA
     StepSequence<tyloi::models::MtpStep> graph_step(const tyloi::models::CausalModel& target,
         tyloi::models::MtpRow row, MtpStepMode mode, const ForwardOptions& options) const override;
-#endif
 
     void trim_cache_to(tyloi::models::MtpState& state, int64_t position) const override;
     bool supports_session_state(const tyloi::models::MtpState&) const noexcept override { return true; }
@@ -52,11 +50,9 @@ public:
     }
 
 private:
-#if TYLOINFER_HAS_CUDA
     struct GraphResult { Tensor output, logits; bool initialized; };
     StepSequence<GraphResult> graph(const CausalModel& target, MtpRow row,
         MtpStepMode mode, int depth, const ForwardOptions& options) const;
-#endif
     tyloi::models::qwen35::Predictor model_;
     bool preallocate_;
 };

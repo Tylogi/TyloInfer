@@ -1,4 +1,5 @@
 #pragma once
+#include <stdexcept>
 #include <atomic>
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/backends/cuda/native/memory.h"
@@ -14,10 +15,11 @@ inline std::atomic<std::uint64_t> mapped_embedding_host_bytes{0};
 }
 inline ::tyloi::DenseTensor map_embedding_storage(const ::tyloi::DenseTensor& cpu,int device,
         bool device_read_control=false) {
-    TYLOINFER_RUNTIME_CHECK(cpu.is_cpu() && cpu.is_contiguous(),
-        "mapped embedding requires contiguous CPU storage");
+    if (!(cpu.is_cpu() && cpu.is_contiguous()))
+        throw std::runtime_error("mapped embedding requires contiguous CPU storage");
     const auto bytes=std::size_t(cpu.numel())*cpu.element_size();
-    TYLOINFER_RUNTIME_CHECK(bytes>0,"mapped embedding table is empty");
+    if (!(bytes>0))
+        throw std::runtime_error("mapped embedding table is empty");
     struct Owner {
         tyloi::cuda::HostBuffer host;
         ::tyloi::DenseTensor device_copy;
@@ -36,7 +38,8 @@ inline ::tyloi::DenseTensor map_embedding_storage(const ::tyloi::DenseTensor& cp
     std::memcpy(owner->host.data(),cpu.data_ptr(),bytes);
     void* alias=nullptr;
     TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&alias,owner->host.data(),0));
-    TYLOINFER_RUNTIME_CHECK(alias,"mapped embedding has no device alias");
+    if (!alias)
+        throw std::runtime_error("mapped embedding has no device alias");
     const auto gpu_device=::tyloi::Device(::tyloi::kCUDA,device);
     // Diagnostic control: retain the identical mapped allocation, but gather
     // from a GPU copy. This separates pinning/placement from remote GPU reads.
@@ -51,21 +54,20 @@ inline ::tyloi::DenseTensor map_embedding_storage(const ::tyloi::DenseTensor& cp
 
 inline ::tyloi::Tensor map_dense_embedding(const ::tyloi::DenseTensor& cpu,int device,
         bool device_read_control=false) {
-    TYLOINFER_RUNTIME_CHECK(cpu.dim()==2 &&
-        (cpu.scalar_type()==::tyloi::kFloat16 || cpu.scalar_type()==::tyloi::kBFloat16 || cpu.scalar_type()==::tyloi::kFloat32),
-        "mapped embedding requires a rank-2 floating table");
+    if (!(cpu.dim()==2 &&
+        (cpu.scalar_type()==::tyloi::kFloat16 || cpu.scalar_type()==::tyloi::kBFloat16 || cpu.scalar_type()==::tyloi::kFloat32)))
+        throw std::runtime_error("mapped embedding requires a rank-2 floating table");
     return std::make_shared<::tyloi::DenseTensor>(map_embedding_storage(cpu,device,device_read_control));
 }
 
 inline ::tyloi::Tensor map_nint_embedding(const ::tyloi::Tensor& result,int device,bool device_read_control=false) {
-    TYLOINFER_RUNTIME_CHECK(
-        result.representation<tyloi::NintTensor>() != nullptr,
-        "mapped NINT embedding requires an unsharded CPU table");
+    if (!(result.representation<tyloi::NintTensor>() != nullptr))
+        throw std::runtime_error("mapped NINT embedding requires an unsharded CPU table");
     auto mapped=std::make_shared<tyloi::NintTensor>(
         *result.representation<tyloi::NintTensor>());
     auto* w=mapped.get();
-    TYLOINFER_RUNTIME_CHECK(w->q_packed.is_cpu(),
-        "mapped NINT embedding requires an unsharded CPU table");
+    if (!w->q_packed.is_cpu())
+        throw std::runtime_error("mapped NINT embedding requires an unsharded CPU table");
     // Only selected vocabulary rows cross PCIe. Keep small row descriptors on
     // the GPU so their dependent loads do not add host round trips.
     for (auto* field : {&w->q_packed, &w->sub_scale, &w->sub_min, &w->q8_zero_scale})

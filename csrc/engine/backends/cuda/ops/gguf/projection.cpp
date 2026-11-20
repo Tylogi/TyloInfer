@@ -3,9 +3,12 @@
 #include "prefill_fusion.h"
 #include "rotation.h"
 #include "row_correction.h"
+#include "components/error.h"
 #include "engine/backends/cuda/ops/projection/prefill.h"
+#include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "../../kernels/projection/gguf/linear.h"
 #include "../../kernels/projection/gguf/residual/m1_residual.h"
 #include "../../kernels/projection/gguf/compact/compact.h"
@@ -16,7 +19,9 @@
 #include "../../kernels/projection/gguf/quad/decode.h"
 #include "dense_schedule.h"
 #include "engine/weights/encoding/gguf/decode.h"
+#include "engine/weights/moe/prepare/projection.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -31,23 +36,22 @@
 
 namespace tyloi::cuda::gguf {
 
-bool original_input(const GgufTensor& w) {
+bool original_input(const GgmlQuantizedTensor& w) {
     return bool(w.correction) || bool(w.rotation) ||
         (w.type >= GGML_TYPE_TQ2_T && w.type <= GGML_TYPE_TQK4);
 }
 
-static bool quad_ready(const GgufTensor& w) {
+static bool quad_ready(const GgmlQuantizedTensor& w) {
     return w.quad_storage_rows && w.quad_row_begin % 4 == 0 && w.out % 4 == 0 &&
         w.quad_row_begin + w.out <= w.quad_storage_rows / 4 * 4;
 }
 
-static DenseTensor dequantize_stored(const GgufTensor&);
-static DenseTensor embedding_base(const GgufTensor&, DenseTensor);
-static DenseTensor project_m1(const GgufTensor&, const DenseTensor&, ScalarType);
-static bool can_prefill_residual(const GgufTensor&, std::int64_t, const DenseTensor&);
-static DenseTensor project_base(const GgufTensor&, DenseTensor, bool);
-static DenseTensor project_base(const GgufTensor&, DenseTensor, bool, const DenseTensor&);
-static DenseTensor project_prepared(const ProjectionInput&, const GgufTensor&);
+static DenseTensor dequantize_stored(const GgmlQuantizedTensor&);
+static DenseTensor embedding_base(const GgmlQuantizedTensor&, DenseTensor);
+static DenseTensor project_m1(const GgmlQuantizedTensor&, const DenseTensor&, ScalarType);
+static DenseTensor project_base(const GgmlQuantizedTensor&, DenseTensor, bool);
+static DenseTensor project_base(const GgmlQuantizedTensor&, DenseTensor, bool, const DenseTensor&);
+static DenseTensor project_prepared(const ProjectionInput&, const GgmlQuantizedTensor&);
 
 namespace {
 // Only row exponents are retained. Weak ownership prevents either model
@@ -57,7 +61,7 @@ struct PrefillRowScale {
     std::int64_t rows,columns,quad_rows,quad_begin;
     ::tyloi::DenseTensor exponents;tyloi::cuda::Event ready;
 };
-::tyloi::DenseTensor prefill_cached_exponents(const GgufTensor& w) {
+::tyloi::DenseTensor prefill_cached_exponents(const GgmlQuantizedTensor& w) {
     static std::mutex mutex;static std::vector<std::unique_ptr<PrefillRowScale>> cache;
     const auto owner=w.packed.weak_storage_owner();const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
     std::lock_guard lock(mutex);
@@ -77,7 +81,10 @@ struct PrefillRowScale {
     auto entry=std::make_unique<PrefillRowScale>();entry->owner=owner;entry->data=w.packed.data_ptr();entry->type=w.type;
     entry->device=w.packed.get_device();entry->rows=w.out;entry->columns=w.neuron_len;
     entry->quad_rows=w.quad_storage_rows;entry->quad_begin=w.quad_row_begin;
-    entry->exponents=::tyloi::cuda::empty({w.out},w.packed.options().dtype(::tyloi::kInt32));
+    {
+        const ResidentAllocationScope resident;
+        entry->exponents=::tyloi::cuda::empty({w.out},w.packed.options().dtype(::tyloi::kInt32));
+    }
     mfq_cuda_record_stream(entry->exponents,stream);
     if(w.quad_storage_rows) {
         const auto rows=tyloi::cuda::prefill_weight_rows(w.out,w.row_bytes,128,w.packed.get_device(),false);
@@ -171,25 +178,37 @@ bool GgufPrefillInputScope::lookup(const ::tyloi::DenseTensor& input,::tyloi::De
     }
     mfq_cuda_record_stream(half,stream);mfq_cuda_record_stream(exponents,stream);return true;
 }
-GgufPrefillProduct gguf_prefill_product(const GgufTensor& w,const ::tyloi::DenseTensor& input) {
-    const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if((setting && setting[0]!='1' && setting[0]!='a') || original_input(w) ||
-            !w.packed.is_cuda() || !input.is_cuda() || input.device()!=w.packed.device() ||
-            input.scalar_type()!=::tyloi::kFloat32 || !input.is_contiguous() || input.dim()<1 ||
-            input.size(-1)!=w.neuron_len || w.neuron_len<1 || input.numel()/w.neuron_len<512)return {};
+GgufPrefillProduct gguf_prefill_product(const GgmlQuantizedTensor& w, const DenseTensor& input,
+        const DenseTensor& input_exponents) {
+    const auto* setting = env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+    const bool prepared = input_exponents.defined();
+    if ((setting && setting[0] != '1' && setting[0] != 'a') || original_input(w) ||
+        !w.packed.is_cuda() || !input.is_cuda() || input.device() != w.packed.device() ||
+        input.scalar_type() != (prepared ? kFloat16 : kFloat32) || !input.is_contiguous() ||
+        input.dim() < 1 || w.neuron_len <= 0 || input.size(-1) != w.neuron_len ||
+        input.numel() / w.neuron_len < 512)
+        return {};
+    const auto tokens = input.numel() / w.neuron_len;
+    if (prepared && (input_exponents.device() != input.device() || input_exponents.scalar_type() != kInt32 ||
+        !input_exponents.is_contiguous() || input_exponents.numel() != tokens))
+        return {};
     const MfqCudaGuard guard(w.packed.get_device());
-    if(!tyloi::cuda::gguf::grouped_f16_available(w.packed.get_device()))return {};
-    const auto tokens=input.numel()/w.neuron_len;
-    if(tyloi::cuda::prefill_weight_rows(w.out,uint64_t(w.neuron_len)*2+uint64_t(tokens)*2,32,w.packed.get_device())<w.out)return {};
-    auto columns=prefill_cached_exponents(w);if(!columns.defined())return {};
-    ::tyloi::DenseTensor packed,rows;
-    const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
-    if(!GgufPrefillInputScope::lookup(input,packed,rows)) {
-        packed=::tyloi::cuda::empty({tokens,w.neuron_len},input.options().dtype(::tyloi::kFloat16));
-        rows=::tyloi::cuda::empty({tokens},input.options().dtype(::tyloi::kInt32));
-        mfq_cuda_record_stream(input,stream);mfq_cuda_record_stream(packed,stream);mfq_cuda_record_stream(rows,stream);
-        tyloi::cuda::gguf::pack_scaled_f16_unit(input.data_ptr<float>(),packed.data_ptr(),rows.data_ptr<int32_t>(),
-            tokens,w.neuron_len,stream.stream());
+    if (!grouped_f16_available(w.packed.get_device()) ||
+        prefill_weight_rows(w.out, uint64_t(w.neuron_len) * 2 + uint64_t(tokens) * 2, 32, w.packed.get_device()) < w.out)
+        return {};
+    auto columns = prefill_cached_exponents(w);
+    if (!columns.defined()) return {};
+    DenseTensor packed, rows;
+    const auto stream = mfq_get_current_cuda_stream(w.packed.get_device());
+    if (prepared) {
+        packed = input;
+        rows = input_exponents;
+    } else if (!GgufPrefillInputScope::lookup(input, packed, rows)) {
+        packed = cuda::empty({tokens, w.neuron_len}, input.options().dtype(kFloat16));
+        rows = cuda::empty({tokens}, input.options().dtype(kInt32));
+        mfq_cuda_record_stream(input, stream);
+        pack_scaled_f16_unit(input.data_ptr<float>(), packed.data_ptr(), rows.data_ptr<int32_t>(),
+            tokens, w.neuron_len, stream.stream());
     }
     auto image=::tyloi::cuda::empty({w.out,w.neuron_len},input.options().dtype(::tyloi::kFloat16));
     auto product=::tyloi::cuda::empty({tokens,w.out},input.options().dtype(::tyloi::kFloat16));
@@ -210,85 +229,86 @@ GgufPrefillProduct gguf_prefill_product(const GgufTensor& w,const ::tyloi::Dense
     return {product,rows,columns};
 }
 
-static GgufPrefillProduct rms_gated_product_impl(const GgufTensor& w,const ::tyloi::DenseTensor& attended,
-        const ::tyloi::DenseTensor& gate,const ::tyloi::DenseTensor& norm,double eps,bool silu,const GgufPrefillProduct* scaled_gate) {
-    const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if((setting && setting[0]!='1' && setting[0]!='a') || original_input(w) || !w.packed.is_cuda() ||
-            !attended.is_cuda() || attended.device()!=w.packed.device() || !attended.is_contiguous() ||
-            attended.scalar_type()!=::tyloi::kFloat32 || attended.dim()!=4 ||
-            norm.device()!=attended.device() || norm.scalar_type()!=::tyloi::kFloat32 || !norm.is_contiguous() ||
-            gate.device()!=attended.device() || gate.scalar_type()!=(scaled_gate?::tyloi::kFloat16: ::tyloi::kFloat32) || gate.dim()!=3)return {};
-    if(!std::isfinite(eps) || eps<=0)return {};
-    const MfqCudaGuard guard(w.packed.get_device());
-    const auto batch=attended.size(0),heads=attended.size(1),tokens=attended.size(2),width=attended.size(3);
-    const auto m=batch*tokens;
-    if(m<512 || heads*width!=w.neuron_len || norm.numel()!=width || gate.size(0)!=batch || gate.size(1)!=tokens ||
-            gate.size(2)!=heads*width || gate.stride(2)!=1 || gate.stride(1)<heads*width ||
-            gate.stride(0)<tokens*gate.stride(1) || !tyloi::cuda::gguf::grouped_f16_available(w.packed.get_device()) ||
-            !tyloi::cuda::gguf::rms_gated_prefill_available(w.neuron_len,w.packed.get_device()))return {};
-    if(scaled_gate) {
-        for(const auto* e:{&scaled_gate->row_exponents,&scaled_gate->column_exponents})
-            if(!e->defined() || !e->is_contiguous() || e->device()!=attended.device() || e->scalar_type()!=::tyloi::kInt32)return {};
-        if(scaled_gate->row_exponents.numel()!=m || scaled_gate->column_exponents.numel()!=w.neuron_len)return {};
+std::array<DenseTensor, 2> pack_rms_gated_input(const DenseTensor& attended, const DenseTensor& gate,
+        const DenseTensor& norm, double eps, bool silu, const GgufPrefillProduct& scaled_gate) {
+    const auto* setting = env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+    if ((setting && setting[0] != '1' && setting[0] != 'a') || !attended.is_cuda() ||
+        !attended.is_contiguous() || attended.scalar_type() != kFloat32 || attended.dim() != 4 ||
+        !norm.defined() || norm.device() != attended.device() || norm.scalar_type() != kFloat32 ||
+        !norm.is_contiguous() || !std::isfinite(eps) || eps <= 0)
+        return {};
+    const auto batch = attended.size(0), heads = attended.size(1);
+    const auto tokens = attended.size(2), width = attended.size(3);
+    if (heads <= 0 || width <= 0) return {};
+    const auto rows = batch * tokens, columns = heads * width;
+    if (rows < 512 || norm.numel() != width) return {};
+    const auto device = attended.get_device();
+    const MfqCudaGuard guard(device);
+    if (!grouped_f16_available(device) || !rms_gated_prefill_available(columns, device)) return {};
+
+    auto values = gate;
+    if (scaled_gate.defined()) {
+        if (scaled_gate.values.dim() != 2 || !scaled_gate.values.is_contiguous() ||
+            scaled_gate.values.size(0) != rows || scaled_gate.values.size(1) != columns)
+            return {};
+        for (const auto* e : {&scaled_gate.row_exponents, &scaled_gate.column_exponents})
+            if (!e->defined() || !e->is_contiguous() ||
+                e->device() != attended.device() || e->scalar_type() != kInt32)
+                return {};
+        if (scaled_gate.row_exponents.numel() != rows || scaled_gate.column_exponents.numel() != columns)
+            return {};
+        values = scaled_gate.values.reshape({batch, tokens, columns});
     }
-    const auto row_bytes=uint64_t(w.neuron_len)*2+uint64_t(m)*2;
-    if(tyloi::cuda::prefill_weight_rows(w.out,row_bytes,32,w.packed.get_device(),false)<w.out)return {};
-    auto exponents=prefill_cached_exponents(w);if(!exponents.defined())return {};
-    auto image=::tyloi::cuda::empty({w.out,w.neuron_len},attended.options().dtype(::tyloi::kFloat16));
-    auto packed=::tyloi::cuda::empty({m,w.neuron_len},attended.options().dtype(::tyloi::kFloat16));
-    auto rows=::tyloi::cuda::empty({m},attended.options().dtype(::tyloi::kInt32));
-    auto product=::tyloi::cuda::empty({m,w.out},attended.options().dtype(::tyloi::kFloat16));
-    const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
-    for(const auto& tensor:{w.packed,attended,gate,norm,exponents,image,packed,rows,product})mfq_cuda_record_stream(tensor,stream);
-    if(scaled_gate) {
-        mfq_cuda_record_stream(scaled_gate->row_exponents,stream);mfq_cuda_record_stream(scaled_gate->column_exponents,stream);
-        tyloi::cuda::gguf::pack_rms_scaled_gate_prefill(attended.data_ptr<float>(),gate.data_ptr(),norm.data_ptr<float>(),
-            scaled_gate->row_exponents.data_ptr<int32_t>(),scaled_gate->column_exponents.data_ptr<int32_t>(),
-            batch,heads,tokens,width,gate.stride(0),gate.stride(1),float(eps),silu,packed.data_ptr(),rows.data_ptr<int32_t>(),stream.stream());
-    } else tyloi::cuda::gguf::pack_rms_gated_prefill(attended.data_ptr<float>(),gate.data_ptr<float>(),norm.data_ptr<float>(),
-            batch,heads,tokens,width,gate.stride(0),gate.stride(1),float(eps),silu,packed.data_ptr(),rows.data_ptr<int32_t>(),stream.stream());
-    if(w.quad_storage_rows)tyloi::cuda::gguf::decode_quad_rows_scaled(w.type,w.packed.data_ptr(),w.quad_storage_rows,
-        w.neuron_len,w.quad_row_begin,w.out,exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    else tyloi::cuda::gguf::dequantize_rows_scaled(w.type,w.packed.data_ptr(),w.row_bytes,w.out,w.neuron_len,
-        exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    const auto context=tyloi::cuda::default_context(w.packed.get_device());auto& blas=context->blas(stream.stream());
-    tyloi::cuda::gguf::prefill_gemm_f16_accum(packed.data_ptr(),image.data_ptr(),nullptr,product.data_ptr(),true,
-        nullptr,nullptr,m,w.out,w.neuron_len,w.out,blas.get(),stream.stream());
-    if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> printed{false};if(!printed.exchange(true))std::fprintf(stderr,
-            "native_gguf_prefill_rms_gate_pack actual_match=1 M=%lld N=%lld K=%lld fused_rms=1 fused_layout=1 fused_gate=%s fused_scale=1\n",
-            static_cast<long long>(m),static_cast<long long>(w.out),static_cast<long long>(w.neuron_len),silu?"silu":"sigmoid");
+    if (!values.defined() || values.device() != attended.device() ||
+        values.scalar_type() != (scaled_gate.defined() ? kFloat16 : kFloat32) || values.dim() != 3 ||
+        values.size(0) != batch || values.size(1) != tokens || values.size(2) != columns ||
+        values.stride(2) != 1 || values.stride(1) < columns || values.stride(0) < tokens * values.stride(1))
+        return {};
+
+    auto packed = cuda::empty({rows, columns}, attended.options().dtype(kFloat16));
+    auto exponents = cuda::empty({rows}, attended.options().dtype(kInt32));
+    const auto stream = mfq_get_current_cuda_stream(device);
+    for (const auto& tensor : {attended, values, norm, packed, exponents})
+        mfq_cuda_record_stream(tensor, stream);
+    if (scaled_gate.defined()) {
+        mfq_cuda_record_stream(scaled_gate.row_exponents, stream);
+        mfq_cuda_record_stream(scaled_gate.column_exponents, stream);
+        pack_rms_scaled_gate_prefill(attended.data_ptr<float>(), values.data_ptr(), norm.data_ptr<float>(),
+            scaled_gate.row_exponents.data_ptr<int32_t>(), scaled_gate.column_exponents.data_ptr<int32_t>(),
+            batch, heads, tokens, width, values.stride(0), values.stride(1), float(eps), silu,
+            packed.data_ptr(), exponents.data_ptr<int32_t>(), stream.stream());
+    } else {
+        pack_rms_gated_prefill(attended.data_ptr<float>(), values.data_ptr<float>(), norm.data_ptr<float>(),
+            batch, heads, tokens, width, values.stride(0), values.stride(1), float(eps), silu,
+            packed.data_ptr(), exponents.data_ptr<int32_t>(), stream.stream());
     }
-    return {product,rows,exponents};
+    return {std::move(packed), std::move(exponents)};
 }
 
-GgufPrefillProduct gguf_rms_gated_product(const GgufTensor& w,const ::tyloi::DenseTensor& attended,
-        const ::tyloi::DenseTensor& gate,const ::tyloi::DenseTensor& norm,double eps,bool silu) {
-    return rms_gated_product_impl(w,attended,gate,norm,eps,silu,nullptr);
+GgufPrefillProduct gguf_rms_gated_product(const GgmlQuantizedTensor& weight, const DenseTensor& attended,
+        const DenseTensor& gate, const DenseTensor& norm, double eps, bool silu) {
+    auto [packed, exponents] = pack_rms_gated_input(attended, gate, norm, eps, silu);
+    return packed.defined() ? gguf_prefill_product(weight, packed, exponents) : GgufPrefillProduct{};
 }
-GgufPrefillProduct gguf_rms_gated_product(const GgufTensor& w,const ::tyloi::DenseTensor& attended,
-        const GgufPrefillProduct& gate,const ::tyloi::DenseTensor& norm,double eps,bool silu) {
-    if(!gate.defined() || gate.values.dim()!=2 || !gate.values.is_contiguous() || attended.dim()!=4 ||
-        gate.values.size(0)!=attended.size(0)*attended.size(2) ||
-        gate.values.size(1)!=attended.size(1)*attended.size(3))return {};
-    auto result=rms_gated_product_impl(w,attended,
-        gate.values.reshape({attended.size(0),attended.size(2),gate.values.size(1)}),norm,eps,silu,&gate);
-    if(result.defined())if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true))std::fprintf(stderr,"native_gguf_prefill_scaled_gate actual_match=1 restore_at_consumer=1\n");
-    }
-    return result;
+
+GgufPrefillProduct gguf_rms_gated_product(const GgmlQuantizedTensor& weight, const DenseTensor& attended,
+        const GgufPrefillProduct& gate, const DenseTensor& norm, double eps, bool silu) {
+    auto [packed, exponents] = pack_rms_gated_input(attended, {}, norm, eps, silu, gate);
+    return packed.defined() ? gguf_prefill_product(weight, packed, exponents) : GgufPrefillProduct{};
 }
+
 ::tyloi::DenseTensor gguf_prefill_materialize(const GgufPrefillProduct& product) {
-    TYLOINFER_RUNTIME_CHECK(product.defined() && product.values.is_cuda() && product.values.is_contiguous() &&
-        product.values.dim()==2 && product.values.scalar_type()==::tyloi::kFloat16,
-        "scaled prefill materialization requires a contiguous FP16 product");
+    if (!(product.defined() && product.values.is_cuda() && product.values.is_contiguous() &&
+        product.values.dim()==2 && product.values.scalar_type()==::tyloi::kFloat16))
+        throw std::runtime_error("scaled prefill materialization requires a contiguous FP16 product");
     const auto rows=product.values.size(0),columns=product.values.size(1);
     for(const auto* e:{&product.row_exponents,&product.column_exponents})
-        TYLOINFER_RUNTIME_CHECK(e->defined() && e->is_contiguous() && e->device()==product.values.device() && e->scalar_type()==::tyloi::kInt32,
-            "scaled prefill materialization exponents disagree");
-    TYLOINFER_RUNTIME_CHECK(product.row_exponents.numel()==rows && product.column_exponents.numel()==columns,
-        "scaled prefill materialization exponent sizes disagree");
+        {
+            if (!(e->defined() && e->is_contiguous() && e->device()==product.values.device() && e->scalar_type()==::tyloi::kInt32))
+                throw std::runtime_error("scaled prefill materialization exponents disagree");
+        }
+    if (!(product.row_exponents.numel()==rows && product.column_exponents.numel()==columns))
+        throw std::runtime_error("scaled prefill materialization exponent sizes disagree");
     const MfqCudaGuard guard(product.values.get_device());
     auto output=::tyloi::cuda::empty({rows,columns},product.values.options().dtype(::tyloi::kFloat32));
     const auto stream=mfq_get_current_cuda_stream(output.get_device());
@@ -300,18 +320,21 @@ GgufPrefillProduct gguf_rms_gated_product(const GgufTensor& w,const ::tyloi::Den
 
 std::vector<::tyloi::DenseTensor> gguf_prefill_acc_rms(const GgufPrefillProduct& product,const ::tyloi::DenseTensor& residual,
         const ::tyloi::DenseTensor& norm,double eps,double offset) {
-    TYLOINFER_RUNTIME_CHECK(product.defined() && residual.is_cuda() && residual.is_contiguous() &&
+    if (!(product.defined() && residual.is_cuda() && residual.is_contiguous() &&
         residual.scalar_type()==::tyloi::kFloat16 && residual.dim()==2 && product.values.is_contiguous() &&
         product.values.device()==residual.device() && product.values.sizes()==residual.sizes() &&
         product.values.scalar_type()==::tyloi::kFloat16 && norm.is_contiguous() && norm.device()==residual.device() &&
-        norm.scalar_type()==::tyloi::kFloat32 && norm.numel()==residual.size(1),"scaled prefill residual/RMS operands disagree");
+        norm.scalar_type()==::tyloi::kFloat32 && norm.numel()==residual.size(1)))
+        throw std::runtime_error("scaled prefill residual/RMS operands disagree");
     for(const auto* exponents:{&product.row_exponents,&product.column_exponents})
-        TYLOINFER_RUNTIME_CHECK(exponents->defined() && exponents->is_cuda() && exponents->is_contiguous() &&
-            exponents->device()==residual.device() && exponents->scalar_type()==::tyloi::kInt32,
-            "scaled prefill residual/RMS exponents disagree");
-    TYLOINFER_RUNTIME_CHECK(product.row_exponents.numel()==residual.size(0) &&
-        product.column_exponents.numel()==residual.size(1) && std::isfinite(eps) && eps>0,
-        "scaled prefill residual/RMS exponent geometry or epsilon disagrees");
+        {
+            if (!(exponents->defined() && exponents->is_cuda() && exponents->is_contiguous() &&
+            exponents->device()==residual.device() && exponents->scalar_type()==::tyloi::kInt32))
+                throw std::runtime_error("scaled prefill residual/RMS exponents disagree");
+        }
+    if (!(product.row_exponents.numel()==residual.size(0) &&
+        product.column_exponents.numel()==residual.size(1) && std::isfinite(eps) && eps>0))
+        throw std::runtime_error("scaled prefill residual/RMS exponent geometry or epsilon disagrees");
     const MfqCudaGuard guard(residual.get_device());
     auto sum=::tyloi::cuda::empty_like(residual),normalized=::tyloi::cuda::empty_like(residual);
     const auto stream=mfq_get_current_cuda_stream(residual.get_device());
@@ -328,7 +351,7 @@ std::vector<::tyloi::DenseTensor> gguf_prefill_acc_rms(const GgufPrefillProduct&
 }
 
 
-::tyloi::DenseTensor canonical_packed(const GgufTensor& w) {
+::tyloi::DenseTensor canonical_packed(const GgmlQuantizedTensor& w) {
     if(!w.quad_storage_rows)return w.packed;
     const MfqCudaGuard guard(w.packed.get_device());
     const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
@@ -340,22 +363,22 @@ std::vector<::tyloi::DenseTensor> gguf_prefill_acc_rms(const GgufPrefillProduct&
 }
 
 namespace {
-tyloi::cuda::gguf::QuadProjection quad_projection(const GgufTensor& w,void* output) {
+tyloi::cuda::gguf::QuadProjection quad_projection(const GgmlQuantizedTensor& w,void* output) {
     return {{w.packed.data_ptr(),w.row_bytes,w.out,output,w.type},
         w.quad_storage_rows,w.quad_row_begin,bool(w.quad_storage_rows)};
 }
 }
 
-::tyloi::DenseTensor gated_residual(const GgufTensor& w,
+::tyloi::DenseTensor gated_residual(const GgmlQuantizedTensor& w,
         const ::tyloi::DenseTensor& gate,const ::tyloi::DenseTensor& up,const ::tyloi::DenseTensor& residual) {
-    TYLOINFER_RUNTIME_CHECK(!original_input(w) &&
+    if (!(!original_input(w) &&
         tyloi::cuda::gguf::supports_m1_residual(w.type) && gate.is_cuda() &&
         gate.device()==w.packed.device() && up.device()==gate.device() &&
         residual.device()==gate.device() && gate.scalar_type()==::tyloi::kFloat16 &&
         up.scalar_type()==::tyloi::kFloat16 && residual.scalar_type()==::tyloi::kFloat16 &&
         gate.is_contiguous() && up.is_contiguous() && residual.is_contiguous() &&
-        gate.sizes()==up.sizes() && up.numel()==w.neuron_len && residual.numel()==w.out,
-        "fused GGUF SwiGLU/residual requires one contiguous FP16 row");
+        gate.sizes()==up.sizes() && up.numel()==w.neuron_len && residual.numel()==w.out))
+        throw std::runtime_error("fused GGUF SwiGLU/residual requires one contiguous FP16 row");
     const MfqCudaGuard guard(gate.get_device());
     const auto stream=mfq_get_current_cuda_stream(gate.get_device());
     auto activation=::tyloi::cuda::empty({int64_t(tyloi::cuda::gguf::q8_row_bytes(w.neuron_len))},
@@ -376,12 +399,12 @@ tyloi::cuda::gguf::QuadProjection quad_projection(const GgufTensor& w,void* outp
     return output;
 }
 
-bool same_input_basis(const GgufTensor& a, const GgufTensor& b) {
+bool same_input_basis(const GgmlQuantizedTensor& a, const GgmlQuantizedTensor& b) {
     return (!a.rotation && !b.rotation) || (a.rotation && b.rotation && (a.rotation->block==b.rotation->block && a.rotation->signs_cpu==b.rotation->signs_cpu));
 }
 
 
-::tyloi::DenseTensor dequantize_stored(const GgufTensor& w) {
+::tyloi::DenseTensor dequantize_stored(const GgmlQuantizedTensor& w) {
     auto output = ::tyloi::cuda::empty({w.out, w.neuron_len}, w.packed.options().dtype(::tyloi::kFloat32));
     if (w.packed.is_cuda()) {
         MfqCudaGuard guard(w.packed.get_device());
@@ -399,7 +422,7 @@ bool same_input_basis(const GgufTensor& a, const GgufTensor& b) {
     return output;
 }
 
-::tyloi::DenseTensor dequantize(const GgufTensor& w) {
+::tyloi::DenseTensor dequantize(const GgmlQuantizedTensor& w) {
     auto output = dequantize_stored(w);
     if (w.rotation) apply_rotation_inplace(*w.rotation,output, true);
     if (w.correction) {
@@ -410,12 +433,12 @@ bool same_input_basis(const GgufTensor& a, const GgufTensor& b) {
     return output;
 }
 
-::tyloi::DenseTensor embedding(const GgufTensor& w, ::tyloi::DenseTensor ids) {
+::tyloi::DenseTensor embedding(const GgmlQuantizedTensor& w, ::tyloi::DenseTensor ids) {
     auto output=embedding_base(w,ids);
     return w.correction?add_correction_embedding(*w.correction,ids.to(output.device()),std::move(output)):output;
 }
 
-::tyloi::DenseTensor embedding_base(const GgufTensor& w, ::tyloi::DenseTensor ids) {
+::tyloi::DenseTensor embedding_base(const GgmlQuantizedTensor& w, ::tyloi::DenseTensor ids) {
     auto shape = ids.sizes().vec();
     shape.push_back(w.neuron_len);
     ids = ids.to(w.packed.device()).to(::tyloi::kInt64).contiguous().reshape({-1});
@@ -442,22 +465,26 @@ bool same_input_basis(const GgufTensor& a, const GgufTensor& b) {
     return output.reshape(shape);
 }
 
-bool m1_aligned(const std::vector<GgufTensor>& weights,int64_t tokens) {
+bool m1_aligned(const std::vector<GgmlQuantizedTensor>& weights,int64_t tokens) {
     return tokens==1 && !weights.empty() &&
         std::any_of(weights.begin(),weights.end(),[](const auto& w){return tyloi::cuda::gguf::prefers_m1_aligned(w.type);}) &&
         std::all_of(weights.begin(),weights.end(),[](const auto& w){return !original_input(w) && tyloi::cuda::gguf::supports_m1_aligned(w.type);});
 }
 
-ProjectionInput prepare_input(const std::vector<GgufTensor>& weights,::tyloi::DenseTensor input) {
+ProjectionInput prepare_input(const std::vector<GgmlQuantizedTensor>& weights,::tyloi::DenseTensor input) {
     if(weights.empty())return {};
     const auto columns=weights.front().neuron_len;
-    TYLOINFER_RUNTIME_CHECK(input.dim()>=1 && columns>0 && input.size(-1)==columns && input.is_cuda(),
-        "GGUF projection group input width/device mismatch");
+    if (!(input.dim()>=1 && columns>0 && input.size(-1)==columns && input.is_cuda()))
+        throw std::runtime_error("GGUF projection group input width/device mismatch");
     const auto tokens=input.numel()/columns;
-    TYLOINFER_RUNTIME_CHECK(tokens<=32,"GGUF shared quantization requires a small token window");
+    if (!(tokens<=32))
+        throw std::runtime_error("GGUF shared quantization requires a small token window");
     for(const auto& weight:weights)
-        TYLOINFER_RUNTIME_CHECK(weight.neuron_len==columns && weight.packed.is_cuda() &&
-            weight.packed.device()==input.device(),"GGUF projection group contains incompatible input dimensions/devices");
+        {
+            if (!(weight.neuron_len==columns && weight.packed.is_cuda() &&
+            weight.packed.device()==input.device()))
+                throw std::runtime_error("GGUF projection group contains incompatible input dimensions/devices");
+        }
     const auto dtype=input.scalar_type()==::tyloi::kBFloat16?::tyloi::kFloat16:input.scalar_type();
     const MfqCudaGuard guard(input.get_device());
     const auto stream_handle=mfq_get_current_cuda_stream(input.get_device());
@@ -487,7 +514,7 @@ ProjectionInput prepare_input(const std::vector<GgufTensor>& weights,::tyloi::De
     return {std::move(activation),std::move(position_major),keep_original?std::move(original): ::tyloi::DenseTensor{},input.sizes().vec(),tokens,dtype,aligned_m1};
 }
 
-ProjectionInput prepare_rms_input(const std::vector<GgufTensor>& weights, const DenseTensor& input,
+ProjectionInput prepare_rms_input(const std::vector<GgmlQuantizedTensor>& weights, const DenseTensor& input,
         const DenseTensor& norm, double eps, double offset, DenseTensor& normalized) {
     normalized={};
     if(weights.empty() || !input.defined() || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
@@ -523,14 +550,17 @@ ProjectionInput prepare_rms_input(const std::vector<GgufTensor>& weights, const 
     return {std::move(packet),std::move(position),{},input.sizes().vec(),rows,kFloat32,aligned};
 }
 
-::tyloi::DenseTensor project_prepared(const ProjectionInput& prepared, const GgufTensor& weight) {
-    TYLOINFER_RUNTIME_CHECK(!prepared.shape.empty(),"GGUF projection input was not prepared");
-    TYLOINFER_RUNTIME_CHECK(!prepared.aligned_m1 || prepared.tokens==1,"Aligned GGUF projection requires one token");
+::tyloi::DenseTensor project_prepared(const ProjectionInput& prepared, const GgmlQuantizedTensor& weight) {
+    if (prepared.shape.empty())
+        throw std::runtime_error("GGUF projection input was not prepared");
+    if (!(!prepared.aligned_m1 || prepared.tokens==1))
+        throw std::runtime_error("Aligned GGUF projection requires one token");
     const bool use_interleaved=position_major_q8(weight,prepared.tokens);
     auto output_shape=prepared.shape;output_shape.back()=weight.out;
     if(!prepared.tokens)return ::tyloi::cuda::empty(output_shape,weight.packed.options().dtype(prepared.dtype));
     if(original_input(weight)) {
-        TYLOINFER_RUNTIME_CHECK(prepared.original.defined(),"GGUF floating codebook projection requires the original activation");
+        if (!prepared.original.defined())
+            throw std::runtime_error("GGUF floating codebook projection requires the original activation");
         return project(weight,prepared.original).to(prepared.dtype).reshape(output_shape);
     }
     auto result=(prepared.aligned_m1?project_m1(weight,prepared.native,prepared.dtype==::tyloi::kFloat16?::tyloi::kFloat16: ::tyloi::kFloat32):project_q8(weight,use_interleaved?prepared.interleaved:prepared.native,prepared.tokens,
@@ -539,10 +569,11 @@ ProjectionInput prepare_rms_input(const std::vector<GgufTensor>& weights, const 
     return result;
 }
 
-std::vector<::tyloi::DenseTensor> project_group(const std::vector<GgufTensor>& weights,::tyloi::DenseTensor input) {
+std::vector<::tyloi::DenseTensor> project_group(const std::vector<GgmlQuantizedTensor>& weights,::tyloi::DenseTensor input) {
     if(weights.empty())return {};
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && weights.front().neuron_len > 0 &&
-        input.size(-1) == weights.front().neuron_len, "GGUF projection group input width mismatch");
+    if (!(input.dim() >= 1 && weights.front().neuron_len > 0 &&
+        input.size(-1) == weights.front().neuron_len))
+        throw std::runtime_error("GGUF projection group input width mismatch");
     if (!input.is_cuda() || input.numel() / input.size(-1) > 32) {
         GgufPrefillInputScope scope(input.reshape({-1, weights.front().neuron_len}));
         std::vector<DenseTensor> result;
@@ -554,7 +585,7 @@ std::vector<::tyloi::DenseTensor> project_group(const std::vector<GgufTensor>& w
     return project_input(prepared,weights);
 }
 
-std::vector<::tyloi::DenseTensor> project_input(const ProjectionInput& prepared, const std::vector<GgufTensor>& weights) {
+std::vector<::tyloi::DenseTensor> project_input(const ProjectionInput& prepared, const std::vector<GgmlQuantizedTensor>& weights) {
     std::vector<::tyloi::DenseTensor> output;output.reserve(weights.size());
 
     const bool grouped_small_m=weights.size()>1 && prepared.tokens>=2 && prepared.tokens<=8 &&
@@ -625,10 +656,10 @@ std::vector<::tyloi::DenseTensor> project_input(const ProjectionInput& prepared,
         for(const auto& weight:weights)output.push_back(project_prepared(prepared,weight));
         return output;
     }
-    TYLOINFER_RUNTIME_CHECK(!prepared.aligned_m1 || (prepared.tokens==1 && prepared.native.defined() && prepared.native.is_cuda() &&
+    if (!(!prepared.aligned_m1 || (prepared.tokens==1 && prepared.native.defined() && prepared.native.is_cuda() &&
         prepared.native.device()==weights.front().packed.device() && prepared.native.is_contiguous() &&
-        prepared.native.scalar_type()==::tyloi::kUInt8 && prepared.native.nbytes()==tyloi::cuda::gguf::q8_row_bytes(weights.front().neuron_len)),
-        "Aligned GGUF group activation geometry/device/type differs");
+        prepared.native.scalar_type()==::tyloi::kUInt8 && prepared.native.nbytes()==tyloi::cuda::gguf::q8_row_bytes(weights.front().neuron_len))))
+        throw std::runtime_error("Aligned GGUF group activation geometry/device/type differs");
     const MfqCudaGuard guard(weights.front().packed.get_device());
     const auto stream=mfq_get_current_cuda_stream(weights.front().packed.get_device());
     for(const auto& packet:{prepared.native,prepared.interleaved,prepared.original})if(packet.defined())mfq_cuda_record_stream(packet,stream);
@@ -710,12 +741,13 @@ std::vector<::tyloi::DenseTensor> project_input(const ProjectionInput& prepared,
     return output;
 }
 
-::tyloi::DenseTensor project_m1(const GgufTensor& w, const ::tyloi::DenseTensor& activation,::tyloi::ScalarType dtype) {
-    TYLOINFER_RUNTIME_CHECK(!original_input(w) && tyloi::cuda::gguf::supports_m1_aligned(w.type) &&
+::tyloi::DenseTensor project_m1(const GgmlQuantizedTensor& w, const ::tyloi::DenseTensor& activation,::tyloi::ScalarType dtype) {
+    if (!(!original_input(w) && tyloi::cuda::gguf::supports_m1_aligned(w.type) &&
         w.packed.is_cuda() && activation.is_cuda() && activation.device()==w.packed.device() &&
         activation.is_contiguous() && activation.scalar_type()==::tyloi::kUInt8 &&
         activation.nbytes()==tyloi::cuda::gguf::q8_row_bytes(w.neuron_len) &&
-        (dtype==::tyloi::kFloat16 || dtype==::tyloi::kFloat32),"Aligned GGUF M=1 activation geometry/device/type differs");
+        (dtype==::tyloi::kFloat16 || dtype==::tyloi::kFloat32)))
+        throw std::runtime_error("Aligned GGUF M=1 activation geometry/device/type differs");
     const MfqCudaGuard guard(w.packed.get_device());const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
     auto output=::tyloi::cuda::empty({1,w.out},w.packed.options().dtype(dtype));
     for(const auto& tensor:{activation,w.packed,output})mfq_cuda_record_stream(tensor,stream);
@@ -729,7 +761,7 @@ std::vector<::tyloi::DenseTensor> project_input(const ProjectionInput& prepared,
     return output;
 }
 
-bool position_major_q8(const GgufTensor& w, std::int64_t tokens) {
+bool position_major_q8(const GgmlQuantizedTensor& w, std::int64_t tokens) {
     // Three/four queries share coordinate words through aligned vector loads.
     // The two-query native packet retains its smaller register working set.
     if(tokens>=3 && tokens<=8 && quad_ready(w) &&
@@ -743,17 +775,19 @@ bool position_major_q8(const GgufTensor& w, std::int64_t tokens) {
 }
 
 
-::tyloi::DenseTensor project_q8(const GgufTensor& w, const ::tyloi::DenseTensor& activation,std::int64_t tokens,::tyloi::ScalarType dtype,bool position_major) {
-    TYLOINFER_RUNTIME_CHECK(!w.rotation && !w.correction,"GGUF rotated/residual projection requires its original activation before Q8 quantization");
+::tyloi::DenseTensor project_q8(const GgmlQuantizedTensor& w, const ::tyloi::DenseTensor& activation,std::int64_t tokens,::tyloi::ScalarType dtype,bool position_major) {
+    if (!(!w.rotation && !w.correction))
+        throw std::runtime_error("GGUF rotated/residual projection requires its original activation before Q8 quantization");
     const auto bytes_per_row=tyloi::cuda::gguf::q8_row_bytes(w.neuron_len);
     const auto bytes=position_major?tyloi::cuda::gguf::interleaved_activation_bytes(tokens,w.neuron_len)
         :std::uint64_t(tokens)*bytes_per_row;
-    TYLOINFER_RUNTIME_CHECK(w.packed.is_cuda() && activation.is_cuda() && activation.device()==w.packed.device() &&
+    if (!(w.packed.is_cuda() && activation.is_cuda() && activation.device()==w.packed.device() &&
         activation.is_contiguous() && activation.scalar_type()==::tyloi::kUInt8 && tokens>=1 &&
         std::uint64_t(tokens)<=std::numeric_limits<std::uint64_t>::max()/bytes_per_row &&
         (dtype==::tyloi::kFloat16 || dtype==::tyloi::kFloat32) &&
         (!position_major || tyloi::cuda::gguf::supports_interleaved_activation(w.type,tokens) || position_major_q8(w,tokens)) &&
-        activation.nbytes()==bytes,"GGUF prepared activation geometry/device/type differs");
+        activation.nbytes()==bytes))
+        throw std::runtime_error("GGUF prepared activation geometry/device/type differs");
     const MfqCudaGuard guard(w.packed.get_device());const auto stream_handle=mfq_get_current_cuda_stream(w.packed.get_device());
     const auto stream=stream_handle.stream();
     auto result=::tyloi::cuda::empty({tokens,w.out},w.packed.options().dtype(dtype));
@@ -778,31 +812,94 @@ bool position_major_q8(const GgufTensor& w, std::int64_t tokens) {
         activation.data_ptr(),tokens,result.data_ptr<float>(),stream);
     return result;
 }
-::tyloi::DenseTensor project(const GgufTensor& w, ::tyloi::DenseTensor input,bool allow_mmq) {
+void project_routed(std::span<const GgmlQuantizedTensor> images, const weights::ExpertRows& rows,
+        std::size_t first, const DenseTensor& input, DenseTensor& output) {
+    const auto& indexes = input.dim() == 3 ? rows.slots : rows.inputs;
+    const auto source = input.reshape({-1, input.size(-1)});
+    const auto project_one = [&](std::size_t i) {
+        const auto& group = rows.groups[first + i];
+        auto value = project(images[i], source.index_select(0, indexes.narrow(0, group.begin, group.count)));
+        output.index_copy_(0, rows.slots.narrow(0, group.begin, group.count), value);
+    };
+    if (input.scalar_type() == kFloat16 && rows.tokens > 32 && images.size() > 1 &&
+        images.size() <= 65535 && source.is_contiguous() && source.size(1) % 8 == 0 &&
+        reinterpret_cast<std::uintptr_t>(source.data_ptr()) % 16 == 0 && grouped_f16_available(input.get_device())) {
+        std::vector<GemmJob> jobs;
+        std::vector<std::size_t> fallback;
+        jobs.reserve(images.size());
+        std::int64_t maximum = 0;
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            const auto& image = images[i];
+            const auto& group = rows.groups[first + i];
+            if (group.count < 32 || group.count >= 512 || original_input(image) || image.quad_storage_rows) {
+                fallback.push_back(i);
+                continue;
+            }
+            jobs.push_back({image.packed.data_ptr(), rows.slots.data_ptr<std::int64_t>() + group.begin, group.count});
+            maximum = std::max(maximum, group.count);
+        }
+        if (jobs.size() > 1) {
+            const auto& weight = images.front();
+            const auto stream = cuda::current_stream(input.get_device());
+            auto plan = cuda::empty({static_cast<std::int64_t>(jobs.size() * sizeof(GemmJob))},
+                source.options().dtype(kUInt8));
+            auto* device_jobs = static_cast<GemmJob*>(plan.data_ptr());
+            stage_grouped_jobs(jobs.data(), device_jobs, jobs.size(), stream.stream());
+            grouped_matmul_f16(weight.type, device_jobs, static_cast<int>(jobs.size()), maximum,
+                weight.row_bytes, weight.out, weight.neuron_len, source.data_ptr(), rows.routes,
+                input.dim() == 3, output.data_ptr(), stream.stream());
+            for (const auto i : fallback) project_one(i);
+            return;
+        }
+    }
+    for (std::size_t i = 0; i < images.size(); ++i) project_one(i);
+}
+
+DenseTensor project_indexed(const GgmlQuantizedTensor& weight, const DenseTensor& addresses,
+        const weights::ExpertRows& rows, const DenseTensor& input) {
+    if (!addresses.defined() || addresses.numel() != rows.experts || original_input(weight) ||
+        input.scalar_type() != kFloat16 || rows.tokens < 1 || rows.tokens > 32 ||
+        (rows.tokens > 1 && !rows.device_groups.defined()))
+        throw std::invalid_argument("invalid indexed GGML routed projection");
+    const auto stream = cuda::current_stream(input.get_device());
+    const auto columns = weight.neuron_len;
+    const auto source = input.reshape({-1, columns}).contiguous();
+    auto activation = cuda::empty({static_cast<std::int64_t>(source.size(0) * q8_row_bytes(columns))},
+        source.options().dtype(kUInt8));
+    auto output = cuda::empty({rows.tokens, rows.routes, weight.out}, input.options().dtype(kFloat32));
+    weight.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()), stream.lifetime());
+    addresses.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()), stream.lifetime());
+    quantize_input_f16(source.data_ptr(), source.size(0), columns, activation.data_ptr(), stream.stream());
+    const auto* groups = rows.device_groups.defined() ? rows.device_groups.data_ptr<RouteGroup>() : nullptr;
+    grouped_routed_matvec_q8(weight.type, addresses.data_ptr<std::uint64_t>(), weight.row_bytes,
+        rows.experts, weight.out, columns, rows.device_ids.data_ptr<std::int64_t>(), groups,
+        rows.tokens, rows.routes, activation.data_ptr(), input.dim() == 3, output.data_ptr<float>(), stream.stream());
+    return output.to(kFloat16);
+}
+
+::tyloi::DenseTensor project(const GgmlQuantizedTensor& w, ::tyloi::DenseTensor input,bool allow_mmq) {
     auto output=project_base(w,input,allow_mmq);
     if(w.correction)output=add_correction(*w.correction,input,std::move(output));
     return output;
 }
 
-bool can_prefill_residual(const GgufTensor& w, int64_t tokens,const ::tyloi::DenseTensor& residual) {
-    const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if(tokens<=32 || (setting?setting[0]!='1' && setting[0]!='a':false) ||
-            ((!setting || setting[0]=='a') && tokens<512) ||
-            w.correction || !w.packed.is_cuda() || w.out<1 || w.neuron_len<1 ||
-            !residual.is_cuda() || residual.device()!=w.packed.device() || !residual.is_contiguous() ||
-            residual.scalar_type()!=::tyloi::kFloat16 || residual.dim()<1 || residual.size(-1)!=w.out ||
-            residual.numel()/w.out!=tokens)return false;
-    const MfqCudaGuard guard(w.packed.get_device());
-    return tyloi::cuda::gguf::grouped_f16_available(w.packed.get_device());
+bool can_prefill_residual(const GgmlQuantizedTensor& w, int64_t tokens,const ::tyloi::DenseTensor& residual) {
+    return !original_input(w) && w.packed.defined() &&
+        can_prefill_f16_residual(tokens, w.out, w.neuron_len, w.packed.device(), residual);
 }
 
-::tyloi::DenseTensor project_base(const GgufTensor& w, ::tyloi::DenseTensor input,bool allow_mmq) {
+DenseTensor project_prefill_residual(const GgmlQuantizedTensor& weight, DenseTensor input,
+        const DenseTensor& residual) {
+    return project_base(weight, std::move(input), true, residual);
+}
+
+::tyloi::DenseTensor project_base(const GgmlQuantizedTensor& w, ::tyloi::DenseTensor input,bool allow_mmq) {
     return project_base(w,std::move(input),allow_mmq,{});
 }
 
-::tyloi::DenseTensor project_base(const GgufTensor& w, ::tyloi::DenseTensor input,bool allow_mmq,const ::tyloi::DenseTensor& prefill_residual) {
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && input.size(-1) == w.neuron_len,
-        "GGUF projection input width mismatch");
+::tyloi::DenseTensor project_base(const GgmlQuantizedTensor& w, ::tyloi::DenseTensor input,bool allow_mmq,const ::tyloi::DenseTensor& prefill_residual) {
+    if (input.dim() < 1 || input.size(-1) != w.neuron_len)
+        throw std::runtime_error("GGML projection input width mismatch");
     auto shape = input.sizes().vec();
     shape.back() = w.out;
     // CUDA attention and sampling consume FP16/FP32 activations. BF16 norms
@@ -810,13 +907,14 @@ bool can_prefill_residual(const GgufTensor& w, int64_t tokens,const ::tyloi::Den
     const auto dtype = input.scalar_type() == ::tyloi::kBFloat16 ? ::tyloi::kFloat16 : input.scalar_type();
     auto x = input.reshape({-1, w.neuron_len}).contiguous();
     if(w.rotation)x=apply_rotation(*w.rotation,x);
-    TYLOINFER_RUNTIME_CHECK(!prefill_residual.defined() || (allow_mmq && dtype==::tyloi::kFloat16 &&
-        can_prefill_residual(w,x.size(0),prefill_residual)),"Invalid GGUF prefill residual projection");
+    if (prefill_residual.defined() && (!allow_mmq || dtype != ::tyloi::kFloat16 ||
+        !can_prefill_residual(w, x.size(0), prefill_residual)))
+        throw std::runtime_error("invalid GGML prefill residual projection");
     if (!w.packed.is_cuda())
         return ::tyloi::cuda::matmul(x.to(::tyloi::kFloat32), dequantize_stored(w).transpose(0, 1)).to(dtype).reshape(shape);
     MfqCudaGuard guard(w.packed.get_device());
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.get_device() == w.packed.get_device(),
-        "GGUF weight and input must share a device");
+    if (!x.is_cuda() || x.get_device() != w.packed.get_device())
+        throw std::runtime_error("GGML weight and input must share a device");
     const auto tokens = x.size(0);
     if(w.quad_storage_rows && tokens<=32) {
         if(tokens==1 || (quad_ready(w) && tyloi::cuda::gguf::supports_quad_small_m(w.type,tokens))) {
@@ -998,6 +1096,7 @@ bool can_prefill_residual(const GgufTensor& w, int64_t tokens,const ::tyloi::Den
             if(pipelined)ready[slot]->record(decoder.stream());
         };
         const auto tiles=(w.out+tile_rows-1)/tile_rows;
+        DenseTensor residual_scratch;
         for(int i=0;i<buffers && i<tiles;++i)prepare(i);
         for(std::int64_t index=0;index<tiles;++index) {
             const auto begin=index*tile_rows,count=std::min(tile_rows,w.out-begin);
@@ -1006,22 +1105,8 @@ bool can_prefill_residual(const GgufTensor& w, int64_t tokens,const ::tyloi::Den
             if(fast_prefill && half) {
                 auto* destination=static_cast<std::uint8_t*>(output.data_ptr())+begin*output.element_size();
                 if(prefill_residual.defined()) {
-                    const auto* residual=static_cast<const std::uint8_t*>(prefill_residual.data_ptr())+begin*sizeof(std::uint16_t);
-                    auto plan=tyloi::cuda::gguf::prepare_prefill_residual_gemm(x.data_ptr(),tile[slot].data_ptr(),residual,
-                        destination,tokens,count,w.neuron_len,w.out,mfq_current_cuda_stream());
-                    ::tyloi::DenseTensor workspace;
-                    if(plan && plan.workspace_bytes) {
-                        try {
-                            workspace=::tyloi::cuda::empty({int64_t(plan.workspace_bytes)},x.options().dtype(::tyloi::kUInt8));
-                            mfq_cuda_record_stream(workspace,stream);
-                        } catch(const MfqResourceExhausted&) {
-                            (void)cudaGetLastError();
-                            plan={}; // Keep the ordinary result when scratch does not fit.
-                        }
-                    }
-                    tyloi::cuda::gguf::prefill_gemm_f16_residual(x.data_ptr(),tile[slot].data_ptr(),residual,destination,
-                        tokens,count,w.neuron_len,w.out,plan,workspace.defined()?workspace.data_ptr():nullptr,
-                        workspace.defined()?workspace.nbytes():0,blas.get(),mfq_current_cuda_stream());
+                    prefill_f16_residual_tile(x, tile[slot], prefill_residual, output,
+                        begin, count, blas.get(), residual_scratch);
                 }
                 else tyloi::cuda::gguf::prefill_gemm_f16_accum(x.data_ptr(),tile[slot].data_ptr(),nullptr,
                     destination,true,nullptr,nullptr,tokens,count,w.neuron_len,w.out,blas.get(),mfq_current_cuda_stream());

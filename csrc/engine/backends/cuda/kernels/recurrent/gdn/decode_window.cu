@@ -8,6 +8,7 @@
 #include "engine/backends/cuda/kernels/projection/gguf/quantize.cuh"
 #include "../../projection/gguf/linear.h"
 #include "engine/backends/cuda/kernels/warp_sums.cuh"
+#include <stdexcept>
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
@@ -381,9 +382,10 @@ __global__ void gdn_apply_recorded_updates(const GdnReplayLayer* layers,int keep
  }
 }
 void gdn_replay_commit_layers_cuda(const ::tyloi::DenseTensor& descriptors,int layers,int maximum_heads,int maximum_channels,int keep,bool recorded_updates) {
- TYLOINFER_RUNTIME_CHECK(descriptors.is_cuda() && descriptors.is_contiguous() && descriptors.scalar_type()==::tyloi::kUInt8 &&
+ if (!(descriptors.is_cuda() && descriptors.is_contiguous() && descriptors.scalar_type()==::tyloi::kUInt8 &&
   layers>0 && maximum_heads>0 && maximum_channels>0 && keep>=1 && keep<=8 &&
-  descriptors.numel()>=int64_t(layers)*int64_t(sizeof(GdnReplayLayer)),"GDN replay layer descriptors are invalid");
+  descriptors.numel()>=int64_t(layers)*int64_t(sizeof(GdnReplayLayer))))
+     throw std::runtime_error("GDN replay layer descriptors are invalid");
  const MfqCudaGuard guard(descriptors.device());const auto stream=mfq_current_cuda_stream();
  auto resident=descriptors;resident.record_stream(reinterpret_cast<std::uintptr_t>(stream));
  const auto* data=reinterpret_cast<const GdnReplayLayer*>(resident.data_ptr());
@@ -411,37 +413,42 @@ static std::vector<::tyloi::DenseTensor> gdn_window_impl(const ::tyloi::DenseTen
  const ::tyloi::DenseTensor& weights,const ::tyloi::DenseTensor& bias,const ::tyloi::DenseTensor& a_log,const ::tyloi::DenseTensor& norm,
  int nk,int nv,int confirmed,double conv_eps,double norm_eps,bool silu,bool half,bool transposed,
  const std::vector<::tyloi::DenseTensor>& checkpoint_conv,const std::vector<::tyloi::DenseTensor>& checkpoint_state,bool tiled_heads,GdnWindowMode mode,bool quantize_output=false,bool position_major=false,bool out_of_place=false) {
- TYLOINFER_RUNTIME_CHECK(!out_of_place || mode==GdnWindowMode::ReadOnly || mode==GdnWindowMode::RecordUpdates,"GDN separate final state requires read-only verification");
- TYLOINFER_RUNTIME_CHECK(!quantize_output || mode!=GdnWindowMode::Commit,"GDN output preparation requires a readout");
- TYLOINFER_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(0)==1 && qkv.size(1)>=1 && qkv.size(1)<=8 &&
-  nk>0 && nv>0 && nv<=65535 && nv%nk==0 && int64_t(2)*nk+nv<=std::numeric_limits<int>::max()/128,
-  "GDN window heads/sequence invalid");
+ if (!(!out_of_place || mode==GdnWindowMode::ReadOnly || mode==GdnWindowMode::RecordUpdates))
+     throw std::runtime_error("GDN separate final state requires read-only verification");
+ if (!(!quantize_output || mode!=GdnWindowMode::Commit))
+     throw std::runtime_error("GDN output preparation requires a readout");
+ if (!(qkv.dim()==3 && qkv.size(0)==1 && qkv.size(1)>=1 && qkv.size(1)<=8 &&
+  nk>0 && nv>0 && nv<=65535 && nv%nk==0 && int64_t(2)*nk+nv<=std::numeric_limits<int>::max()/128))
+     throw std::runtime_error("GDN window heads/sequence invalid");
  const int tokens=int(qkv.size(1)),channels=(2*nk+nv)*128;
- TYLOINFER_RUNTIME_CHECK(!position_major || (quantize_output && tokens>=2 && tokens<=8),"GDN position-major output requires 2..8 Q8 rows");
- TYLOINFER_RUNTIME_CHECK(confirmed>=1 && confirmed<=tokens &&
-  checkpoint_conv.size()==size_t(tokens-confirmed) && checkpoint_state.size()==checkpoint_conv.size(),"GDN window geometry invalid");
+ if (!(!position_major || (quantize_output && tokens>=2 && tokens<=8)))
+     throw std::runtime_error("GDN position-major output requires 2..8 Q8 rows");
+ if (!(confirmed>=1 && confirmed<=tokens &&
+  checkpoint_conv.size()==size_t(tokens-confirmed) && checkpoint_state.size()==checkpoint_conv.size()))
+     throw std::runtime_error("GDN window geometry invalid");
  const auto device=qkv.device();
  const auto real=[&](const ::tyloi::DenseTensor& x){return x.is_cuda() && x.device()==device && x.is_contiguous() && x.scalar_type()==::tyloi::kFloat32;};
- TYLOINFER_RUNTIME_CHECK(qkv.is_cuda() && (qkv.scalar_type()==::tyloi::kFloat16 || qkv.scalar_type()==::tyloi::kFloat32) && qkv.size(2)==channels &&
-  qkv.stride(2)==1 && qkv.stride(1)>=channels && std::isfinite(conv_eps) && conv_eps>0 && std::isfinite(norm_eps) && norm_eps>0,
-  "GDN window QKV/epsilon invalid");
- TYLOINFER_RUNTIME_CHECK(real(conv) && real(state) && real(weights) && real(bias) && real(a_log) && real(norm) &&
+ if (!(qkv.is_cuda() && (qkv.scalar_type()==::tyloi::kFloat16 || qkv.scalar_type()==::tyloi::kFloat32) && qkv.size(2)==channels &&
+  qkv.stride(2)==1 && qkv.stride(1)>=channels && std::isfinite(conv_eps) && conv_eps>0 && std::isfinite(norm_eps) && norm_eps>0))
+     throw std::runtime_error("GDN window QKV/epsilon invalid");
+ if (!(real(conv) && real(state) && real(weights) && real(bias) && real(a_log) && real(norm) &&
   conv.sizes().vec()==std::vector<int64_t>({1,3,channels}) && state.sizes().vec()==std::vector<int64_t>({1,nv,128,128}) &&
   (weights.sizes().vec()==std::vector<int64_t>({channels,1,4}) || weights.sizes().vec()==std::vector<int64_t>({4,channels})) &&
-  bias.numel()==nv && a_log.numel()==nv && norm.numel()==128,"GDN window state/weights invalid");
+  bias.numel()==nv && a_log.numel()==nv && norm.numel()==128))
+     throw std::runtime_error("GDN window state/weights invalid");
  const auto gate_type=gate.scalar_type();
  const auto projection=[&](const ::tyloi::DenseTensor& x,const std::vector<int64_t>& shape) {
   return x.is_cuda() && x.device()==device && x.scalar_type()==gate_type && x.sizes().vec()==shape &&
    x.stride(1)>0 && x.stride(2)>0;
  };
- TYLOINFER_RUNTIME_CHECK((gate_type==::tyloi::kFloat16 || gate_type==::tyloi::kFloat32) && gate.stride(2)==1 &&
-  projection(gate,{1,tokens,nv*128}) && projection(alpha,{1,tokens,nv}) && projection(beta,{1,tokens,nv}),
-  "GDN window gate projections invalid");
+ if (!((gate_type==::tyloi::kFloat16 || gate_type==::tyloi::kFloat32) && gate.stride(2)==1 &&
+  projection(gate,{1,tokens,nv*128}) && projection(alpha,{1,tokens,nv}) && projection(beta,{1,tokens,nv})))
+     throw std::runtime_error("GDN window gate projections invalid");
  for(int i=0;i<tokens-confirmed;++i) {
-  TYLOINFER_RUNTIME_CHECK(real(checkpoint_conv[i]) && real(checkpoint_state[i]) &&
+  if (!(real(checkpoint_conv[i]) && real(checkpoint_state[i]) &&
    checkpoint_conv[i].sizes()==conv.sizes() && checkpoint_state[i].sizes()==state.sizes() &&
-   checkpoint_conv[i].data_ptr()!=conv.data_ptr() && checkpoint_state[i].data_ptr()!=state.data_ptr(),
-   "GDN window checkpoint storage invalid");
+   checkpoint_conv[i].data_ptr()!=conv.data_ptr() && checkpoint_state[i].data_ptr()!=state.data_ptr()))
+      throw std::runtime_error("GDN window checkpoint storage invalid");
  }
  const MfqCudaGuard guard(device);
  auto output=mode==GdnWindowMode::Commit?::tyloi::DenseTensor{}:quantize_output?
@@ -541,7 +548,8 @@ std::vector<::tyloi::DenseTensor> gdn_replay_window_cuda(const ::tyloi::DenseTen
  const ::tyloi::DenseTensor& alpha,const ::tyloi::DenseTensor& beta,const ::tyloi::DenseTensor& conv,const ::tyloi::DenseTensor& state,
  const ::tyloi::DenseTensor& weights,const ::tyloi::DenseTensor& bias,const ::tyloi::DenseTensor& a_log,const ::tyloi::DenseTensor& norm,
  int nk,int nv,double conv_eps,double norm_eps,bool silu,bool half,bool transposed,bool commit,bool tiled_heads,bool record_updates,bool quantize_output,bool position_major) {
- TYLOINFER_RUNTIME_CHECK(!commit || !record_updates,"GDN update records are produced by read-only verification");
+ if (!(!commit || !record_updates))
+     throw std::runtime_error("GDN update records are produced by read-only verification");
  return gdn_window_impl(qkv,gate,alpha,beta,conv,state,weights,bias,a_log,norm,nk,nv,int(qkv.size(1)),
   conv_eps,norm_eps,silu,half,transposed,{}, {},tiled_heads,
   commit?GdnWindowMode::Commit:record_updates?GdnWindowMode::RecordUpdates:GdnWindowMode::ReadOnly,quantize_output,position_major);

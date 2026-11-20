@@ -227,6 +227,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         info.multimodal = caps.image_input || caps.video_input || caps.audio_input || caps.audio_output || caps.full_duplex;
         info.reload = true;
         if (text_) info.chat = text_->chat_template_capabilities();
+        info.decisions = model_info_.decision_readout && text_ && text_->supports_decisions();
         auto scope = executor_->enter();
         tyloi::weights::LoadScope memory_load(*ledger_);
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
@@ -250,8 +251,8 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
             }
         }
         models::DecodeOptions decode;
-        decode.enabled = config_.decode_graph.enabled && weights_->decode() != weights::Cache::Decode::none;
-        decode.routed = weights_->decode() == weights::Cache::Decode::routed;
+        decode.routed = weights_->routing().fixed_views;
+        decode.enabled = config_.decode_graph.enabled && decode.routed;
         engine::warmup(*model_, *idle_state_, *executor_, *weights_, *budget_, config_.device, decode);
         weights_->prepare(::tyloi::weights::Cache::Stage::loaded, config_.device, source_.get());
         drain();
@@ -441,7 +442,7 @@ ControlResult Engine::control_command(ControlRequest request) {
 }
 
 bool Engine::can_batch(const EngineRequest& request) const {
-    return batch_ && batch_compatible(request, cache_->persistent_prefix_enabled(),
+    return !request.decision && batch_ && batch_compatible(request, cache_->persistent_prefix_enabled(),
         model_->predictor() != nullptr, batch_->supports_sessions(), batch_->supports_mtp());
 }
 

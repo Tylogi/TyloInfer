@@ -41,6 +41,7 @@ struct Loader {
         bool ranges = true;
         bool preload = false;
         bool mapped_embedding = false;
+        bool force_device_embedding = false;
         bool mirror_attention_kv = true;
         int min_slots = 8;
     };
@@ -80,7 +81,8 @@ struct Loader {
         const std::vector<tyloi::TensorParallelSlice>* slices = nullptr, bool preserve_boundaries = false) const;
     std::vector<::tyloi::Tensor> gate_up(const std::vector<std::string>& names,
         const ::tyloi::Tensor& down, size_t prefix = 2, bool preserve_boundaries = false) const;
-    ::tyloi::Tensor embedding(const std::string& name, bool independent_output) const;
+    ::tyloi::Tensor embedding(const std::string& name, bool independent_output,
+        std::size_t* host_bytes = nullptr) const;
     ::tyloi::Tensor rows(const std::string& name) const;
     ::tyloi::Tensor experts(const std::string& name, bool cacheable = false,
         int layer = -1, const std::string& role = {}, bool cpu_offloaded = false) const;

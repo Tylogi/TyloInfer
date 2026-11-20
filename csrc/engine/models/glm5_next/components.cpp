@@ -16,9 +16,8 @@ void load_components(
         bool load_optional_components) {
     if (!load_optional_components) return;
     if (!model.graph.has_component("predictor")) return;
-    TYLOINFER_RUNTIME_CHECK(
-        tyloi::cuda::glm5_next::supports_speculation(model),
-        "invalid Flash-Next predictor model");
+    if (!tyloi::cuda::glm5_next::supports_speculation(model))
+        throw std::runtime_error("invalid Flash-Next predictor model");
     auto predictor = std::make_unique<tyloi::cuda::glm5_next::Mtp>(
         model.embed, weights.placement.target.index);
     auto* candidate = predictor.get();

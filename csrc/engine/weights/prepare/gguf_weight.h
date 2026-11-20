@@ -1,14 +1,14 @@
 #pragma once
 
 #include "engine/weights/source/source.h"
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/tensor/encoding/ggml.h"
 
 #include <cstdint>
 #include <string>
 
 namespace tyloi::weights {
 
-GgufTensor load_gguf(
+GgmlQuantizedTensor load_gguf(
     const source::Source& source,
     const std::string& name,
     Device target,

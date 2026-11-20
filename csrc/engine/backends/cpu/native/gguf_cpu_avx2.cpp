@@ -1,4 +1,4 @@
-// Adapted from Strata (MIT), cpp_runtime/third_party/strata.LICENSE.
+// Adapted from Strata (MIT), LICENSES/Strata-MIT.txt.
 // src/kernels/cpu/iq_avx2.cpp - the i-quant expert rows in 256-bit lanes, several tokens at once.
 //
 // The AVX-512 kernels' (iq_avx512.cpp) multi-token scheme on the CPUs without AVX-512 (AMD Zen 2/3, Intel

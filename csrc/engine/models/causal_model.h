@@ -16,6 +16,8 @@ struct MfqMultimodalInput;
 
 namespace tyloi::models {
 
+struct DecisionSpec;
+
 enum class LogitPrecision { model, input };
 
 class CausalModel {
@@ -34,6 +36,8 @@ public:
     virtual Tensor softcap(const Tensor& logits) const = 0;
     virtual Tensor logits(const Tensor& hidden, bool capped = true,
         LogitPrecision precision = LogitPrecision::model) const = 0;
+    virtual const DecisionSpec* decisions() const noexcept { return nullptr; }
+    virtual Tensor decision_logits(const Tensor& hidden, const Tensor& labels) const;
     virtual bool supports_speculation() const { return false; }
     virtual bool supports_suffix_speculation() const noexcept { return false; }
     virtual Tensor forward(Input input, State& state, const ForwardOptions& options = {}) const = 0;

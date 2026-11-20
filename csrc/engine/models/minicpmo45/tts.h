@@ -5,6 +5,7 @@
 #include "engine/models/minicpmo45/config.h"
 
 #include "vision.h"
+#include <stdexcept>
 #include <random>
 #include "engine/requests/policy.h"
 #include "engine/generation/sampling.h"
@@ -256,12 +257,12 @@ struct Tts {
         }
         const int64_t batch = input_embeddings.size(0);
         const int64_t tokens = input_embeddings.size(1);
-        TYLOINFER_RUNTIME_CHECK(state.kv.size() == layers.size(), "MiniCPM-o TTS state layer count differs");
-        tyloi::models::require_model(
-            batch > 0 && tokens > 0 && state.position >= 0 &&
-                state.position <= config.max_position_embeddings &&
-                tokens <= config.max_position_embeddings - state.position,
-            "MiniCPM-o TTS context exceeds capacity or has invalid geometry");
+        if (!(state.kv.size() == layers.size()))
+            throw std::runtime_error("MiniCPM-o TTS state layer count differs");
+        if (!(batch > 0 && tokens > 0 && state.position >= 0 &&
+            state.position <= config.max_position_embeddings &&
+            tokens <= config.max_position_embeddings - state.position))
+            throw std::runtime_error("MiniCPM-o TTS context exceeds capacity or has invalid geometry");
         if (state.position == 0) state.reset(batch);
         auto positions = ::tyloi::cuda::arange(
             state.position, state.position + tokens,

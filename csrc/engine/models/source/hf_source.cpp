@@ -1,4 +1,5 @@
 #include "hf_source.h"
+#include "decision.h"
 
 #include "engine/weights/source/assets.h"
 #include "engine/weights/source/json.h"
@@ -102,12 +103,14 @@ HfSource::HfSource(std::filesystem::path root, std::string source_prefix)
         impl_->metadata.emplace("source.precision", "native");
         impl_->asset_data.add(std::string(kModelConfigAsset), parsed.dump());
     }
-    static constexpr std::array<std::pair<std::string_view, std::string_view>, 4>
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 6>
         sidecars{{
             {"tokenizer.json", "hf/tokenizer.json"},
             {"tokenizer_config.json", "hf/tokenizer_config.json"},
             {"chat_template.jinja", "hf/chat_template.jinja"},
             {"generation_config.json", "hf/generation_config.json"},
+            {"decision_config.json", "decision_config.json"},
+            {"readout.safetensors", "readout.safetensors"},
         }};
     for (const auto& [filename, asset_name] : sidecars) {
         const auto path = impl_->files.root() / filename;
@@ -412,7 +415,7 @@ bool HfSource::has_asset(std::string_view name) const noexcept {
     return impl_->asset_data.has(name);
 }
 std::vector<std::byte> HfSource::read_asset(std::string_view name) const {
-    return impl_->asset_data.read(name);
+    return impl_->asset_data.read(name, decision_asset_limit(name));
 }
 std::optional<ModelGraph> HfSource::model_graph() const {
     if (!has_asset(kModelGraphAsset)) return std::nullopt;

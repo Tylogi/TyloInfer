@@ -20,10 +20,10 @@ namespace tyloi::cuda {
     const ::tyloi::DenseTensor& scores, std::int64_t query_offset,
     std::int64_t logical_length, std::int64_t pool, std::int64_t budget,
     bool include_tail) {
-    TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.dim() == 3 && pool > 0 && budget > 0 &&
+    if (!(scores.is_cuda() && scores.dim() == 3 && pool > 0 && budget > 0 &&
         budget % pool == 0 && query_offset >= 0 && logical_length >= query_offset &&
-        scores.size(1) <= logical_length - query_offset && scores.size(2) == logical_length / pool,
-        "pooled attention selection geometry mismatch");
+        scores.size(1) <= logical_length - query_offset && scores.size(2) == logical_length / pool))
+        throw std::runtime_error("pooled attention selection geometry mismatch");
     const auto b = scores.size(0), t = scores.size(1), pools = scores.size(2);
     const auto options = scores.options().dtype(::tyloi::kInt64);
     auto absolute = ::tyloi::cuda::arange(t, options) + query_offset;
@@ -238,27 +238,46 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
     bool attention_token_major = false;
 
     auto attention = profiler.measure("full.attention", [&]() -> ::tyloi::DenseTensor {
+        if (const auto prefix = input.bidirectional_prefix; prefix != 0) {
+            if (prefix < 1 || !q.is_cuda() || config.sliding || kv.quantization.enabled() ||
+                request.contiguous_tail || request.attention_mask.has_value() ||
+                (request.cache_position == 0 ? prefix > tokens : prefix != request.cache_position))
+                throw std::invalid_argument("unsupported bidirectional attention geometry");
+            auto query = q.to(kFloat16).contiguous();
+            auto key = (request.cache_position ? kv.visible_key : k).to(kFloat16).contiguous();
+            auto value = (request.cache_position ? kv.visible_value : v).to(kFloat16).contiguous();
+            if (request.cache_position != 0 || prefix == tokens)
+                return mfq_scaled_dot_product_attention(query, key, value, mfq_nullopt,
+                    0.0, false, attn_scale, true);
+            auto state = mfq_scaled_dot_product_attention(query.narrow(2, 0, prefix),
+                key.narrow(2, 0, prefix), value.narrow(2, 0, prefix), mfq_nullopt,
+                0.0, false, attn_scale, true);
+            auto question = mfq_scaled_dot_product_attention(query.narrow(2, prefix, tokens - prefix),
+                key, value, mfq_nullopt, 0.0, false, attn_scale, true);
+            return cuda::cat({state, question}, 2);
+        }
         if (request.contiguous_tail && (tokens > 1 || config.official_bf16 || config.kernels.decode_aten)) {
-            TYLOINFER_RUNTIME_CHECK(request.sequence_lengths.has_value() &&
+            if (!(request.sequence_lengths.has_value() &&
                 !request.attention_mask.has_value() && !config.sliding && !kv.paged() &&
-                !public_kv.ring && !kv.quantization.enabled(),
-                "contiguous tail attention requires lengths and an unmasked contiguous cache");
+                !public_kv.ring && !kv.quantization.enabled()))
+                throw std::runtime_error("contiguous tail attention requires lengths and an unmasked contiguous cache");
             const auto& lengths = request.sequence_lengths.value();
-            TYLOINFER_RUNTIME_CHECK(lengths.device() == q.device() && lengths.dim() == 1 &&
+            if (!(lengths.device() == q.device() && lengths.dim() == 1 &&
                 lengths.size(0) == batch && lengths.scalar_type() == ::tyloi::kInt64 &&
-                lengths.is_contiguous(), "contiguous tail attention requires CUDA int64 lengths [batch]");
+                lengths.is_contiguous()))
+                throw std::runtime_error("contiguous tail attention requires CUDA int64 lengths [batch]");
             const auto& key_cache = kv.physical_key;
             const auto& value_cache = kv.physical_value;
-            TYLOINFER_RUNTIME_CHECK(key_cache.defined() && value_cache.defined() &&
+            if (!(key_cache.defined() && value_cache.defined() &&
                 key_cache.dim() == 4 && value_cache.dim() == 4 &&
                 key_cache.sizes() == value_cache.sizes() && key_cache.size(0) == batch &&
                 key_cache.size(1) == kv_heads && key_cache.size(2) >= tokens &&
-                key_cache.size(3) == head_dim && heads % kv_heads == 0,
-                "contiguous tail attention cache geometry is incompatible");
+                key_cache.size(3) == head_dim && heads % kv_heads == 0))
+                throw std::runtime_error("contiguous tail attention cache geometry is incompatible");
             const auto attention_dtype = config.official_bf16 ? ::tyloi::kBFloat16 : ::tyloi::kFloat16;
-            TYLOINFER_RUNTIME_CHECK(key_cache.scalar_type() == attention_dtype &&
-                value_cache.scalar_type() == attention_dtype,
-                "contiguous tail attention cache dtype is incompatible");
+            if (!(key_cache.scalar_type() == attention_dtype &&
+                value_cache.scalar_type() == attention_dtype))
+                throw std::runtime_error("contiguous tail attention cache dtype is incompatible");
             const auto capacity = key_cache.size(2);
             return attention_cache_swa_planned_cuda(
                 q.to(attention_dtype).contiguous(), key_cache, value_cache,
@@ -277,8 +296,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
         }
 
         if (!q.is_cuda()) {
-            TYLOINFER_RUNTIME_CHECK(
-                !config.sliding, "CPU dense offload does not support sliding attention");
+            if (!(!config.sliding))
+                throw std::runtime_error("CPU dense offload does not support sliding attention");
             const auto cpu_attention_dtype = config.official_bf16
                                                  ? ::tyloi::kBFloat16
                                                  : ::tyloi::kFloat32;
@@ -286,8 +305,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
             auto kh = kv.visible_key.to(cpu_attention_dtype).contiguous();
             auto vh = kv.visible_value.to(cpu_attention_dtype).contiguous();
             if (kv_heads != heads) {
-                TYLOINFER_RUNTIME_CHECK(kv_heads > 0 && heads % kv_heads == 0,
-                                        "CPU attention head ratio is invalid");
+                if (!(kv_heads > 0 && heads % kv_heads == 0))
+                    throw std::runtime_error("CPU attention head ratio is invalid");
                 const std::int64_t repeat = heads / kv_heads;
                 kh = kh.repeat_interleave(repeat, 1);
                 vh = vh.repeat_interleave(repeat, 1);
@@ -362,9 +381,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
                 auto repeated_k = kh;
                 auto repeated_v = vh;
                 if (kv_heads != heads) {
-                    TYLOINFER_RUNTIME_CHECK(
-                        kv_heads > 0 && heads % kv_heads == 0,
-                        "MiniCPM-o Qwen3 attention head ratio is invalid");
+                    if (!(kv_heads > 0 && heads % kv_heads == 0))
+                        throw std::runtime_error("MiniCPM-o Qwen3 attention head ratio is invalid");
                     const std::int64_t repeat = heads / kv_heads;
                     repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
                     repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
@@ -439,9 +457,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
                                                       visible_len,
                                                       request.cache_position > 0 && tokens > 1);
                 if (config.official_bf16 && kv_heads != heads) {
-                    TYLOINFER_RUNTIME_CHECK(
-                        kv_heads > 0 && heads % kv_heads == 0,
-                        "MiniCPM-o Qwen3 attention head ratio is invalid");
+                    if (!(kv_heads > 0 && heads % kv_heads == 0))
+                        throw std::runtime_error("MiniCPM-o Qwen3 attention head ratio is invalid");
                     const std::int64_t repeat = heads / kv_heads;
                     cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
                     cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
@@ -505,9 +522,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
             auto cached_k = kv.visible_key.contiguous();
             auto cached_v = kv.visible_value.contiguous();
             if (kv_heads != heads) {
-                TYLOINFER_RUNTIME_CHECK(
-                    kv_heads > 0 && heads % kv_heads == 0,
-                    "MiniCPM-o Qwen3 attention head ratio is invalid");
+                if (!(kv_heads > 0 && heads % kv_heads == 0))
+                    throw std::runtime_error("MiniCPM-o Qwen3 attention head ratio is invalid");
                 const std::int64_t repeat = heads / kv_heads;
                 cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
                 cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();

@@ -70,7 +70,6 @@ bool model_parallel_enabled(const CudaLoadConfig& config);
 const ParallelConfig& model_parallel_config(const CudaLoadConfig& config);
 const ParallelConfig& moe_parallel_config(const CudaLoadConfig& config);
 int model_parallel_primary_device(const CudaLoadConfig& config);
-bool model_parallel_cuda_graph_enabled(const CudaLoadConfig& config,
-    const Executor& executor, const tyloi::weights::Cache& weights);
+bool model_parallel_cuda_graph_enabled(const CudaLoadConfig& config, const Executor& executor);
 
 } // namespace tyloi::cuda

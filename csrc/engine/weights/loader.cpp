@@ -1,6 +1,8 @@
 #include "engine/weights/rows/mapped_embedding.h"
 #include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/native/allocation.h"
+#include <stdexcept>
+#include <string>
 #include <iostream>
 #include "engine/weights/moe/prepare/load.h"
 #include "engine/weights/cache/resources.h"
@@ -14,7 +16,7 @@
 #include "engine/weights/sharded.h"
 #include "engine/weights/encoding/dense/blob.h"
 #include "engine/weights/encoding/fp8/tensor.h"
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/tensor/encoding/ggml.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/weights/prepare/gguf_weight.h"
 #include "engine/weights/source/transform.h"
@@ -604,21 +606,21 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         }
     } else if (tyloi::gguf::is_quantized(dtype)) {
         const auto* record = mfq.find_tensor(name);
-        TYLOINFER_RUNTIME_CHECK(record != nullptr && record->shape.has_value() &&
-            record->shape->size() == 2,
-            "GGUF projection requires a rank-2 tensor: ", name);
+        if (!(record != nullptr && record->shape.has_value() &&
+            record->shape->size() == 2))
+            throw std::runtime_error(std::string("GGUF projection requires a rank-2 tensor: ") + name);
         const auto shape = *record->shape;
         const auto type = tyloi::gguf::quant_type(dtype);
         const auto block = ggml_blck_size(type);
-        TYLOINFER_RUNTIME_CHECK(shape[0] > 0 && shape[1] > 0 && block > 0 &&
-            shape[1] % block == 0,
-            "GGUF projection width is not block aligned: ", name);
+        if (!(shape[0] > 0 && shape[1] > 0 && block > 0 &&
+            shape[1] % block == 0))
+            throw std::runtime_error(std::string("GGUF projection width is not block aligned: ") + name);
         logical_out = shape[0];
         logical_neuron_len = shape[1];
         const bool may_shard = !cpu_layer && placement.tensor.enabled() &&
             axis != TensorParallelAxis::Mirrored;
         if (!may_shard) {
-            weight = std::make_shared<tyloi::GgufTensor>(
+            weight = std::make_shared<tyloi::GgmlQuantizedTensor>(
                 tyloi::weights::load_gguf(mfq, name, placement.target));
         } else {
             const bool output_axis = axis == TensorParallelAxis::Output;
@@ -643,14 +645,15 @@ static TensorParallelAxis infer_tensor_parallel_axis(
                 shard.output_end = output_axis ? row_end : shape[0];
                 shard.input_begin = output_axis ? 0 : column_begin;
                 shard.input_end = output_axis ? shape[1] : column_end;
-                shard.weight = std::make_shared<tyloi::GgufTensor>(std::move(part));
+                shard.weight = std::make_shared<tyloi::GgmlQuantizedTensor>(std::move(part));
                 shards.push_back(std::move(shard));
             }
         }
         if (placement.drop_cache) mfq.drop_file_cache();
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         auto cpu = host_value(name);
-        TYLOINFER_RUNTIME_CHECK(cpu.dim() == 2, "dense linear tensor must be rank 2: ", name);
+        if (!(cpu.dim() == 2))
+            throw std::runtime_error(std::string("dense linear tensor must be rank 2: ") + name);
         logical_out = cpu.size(0);
         logical_neuron_len = cpu.size(1);
         // Keep native floating-point linears whole on the primary TP rank.
@@ -872,6 +875,11 @@ bool Cache::needs_finalize() const {
 void Cache::finalize(std::size_t reserve, std::size_t kv_charge) {
     if (needs_finalize())
         finalize_moe_expert_cache(data_->moe, reserve, kv_charge);
+    if (data_->device_bytes && (data_->tq || data_->ggml)) {
+        const auto ceiling = moe_expert_cache_has_sources(data_->moe)
+            ? std::min(*data_->device_bytes, moe_expert_cache_budget_bytes(data_->moe)) : *data_->device_bytes;
+        resize(ceiling);
+    }
 }
 
 std::vector<::tyloi::Tensor> Loader::group(const std::vector<std::string>& names,
@@ -891,7 +899,7 @@ std::vector<::tyloi::Tensor> Loader::group(const std::vector<std::string>& names
     }
     if (!tq_weights.empty()) tyloi::cuda::tq::validate_group(tq_weights);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    const bool all_nint = std::all_of(layers.begin(), layers.end(), [](const auto& layer) {
+    const bool all_nint = std::all_of(layers.begin(), layers.end(), [](const Tensor& layer) {
         const auto* nint = layer.representation<tyloi::NintTensor>();
         return nint && nint->q_packed.is_cuda();
     });
@@ -910,6 +918,11 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
 }
 ::tyloi::Tensor Loader::experts(const std::string& name, bool cacheable,
     int layer, const std::string& role, bool cpu_offloaded) const {
+    if (const auto* record = source.find_tensor(name); record && tyloi::gguf::is_quantized(record->dtype)) {
+        if (cpu_offloaded || placement.experts.enabled())
+            throw std::invalid_argument("GGUF experts require unsharded CUDA execution: " + name);
+        return impl_->cache.routed_gguf(source, name, placement.target);
+    }
     if (cpu_offloaded) return load_mfe_cpu_offloaded(source, name);
     if (tyloi::is_tq_table(source, name)) {
         MfqCudaGuard guard(cuda_device(placement));
@@ -931,8 +944,8 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
     const bool dense_storage = dtype=="F32" || dtype=="F16" || dtype=="BF16";
     const bool quantized_storage = tyloi::mfq_compat_enabled &&
         (dtype=="NINT" || dtype=="NINT8-0" || dtype=="MFE");
-    TYLOINFER_RUNTIME_CHECK(dense_storage || quantized_storage,
-        "expected a dense parameter: ",name);
+    if (!(dense_storage || quantized_storage))
+        throw std::runtime_error(std::string("expected a dense parameter: ") + name);
     auto value=tensor(name);
     if (!dense_storage) return value;
     std::optional<MfqCudaGuard> guard;
@@ -949,12 +962,18 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
         MfqCudaGuard guard(cuda_device(placement));
         return impl_->cache.routed_tq(file, name, placement.experts, experts, output, input);
     }
+    if (tyloi::gguf::is_quantized(dtype)) {
+        auto bank = this->experts(name, true, layer, role);
+        if (bank.size(0) != experts || bank.size(1) != output || bank.size(2) != input)
+            throw std::invalid_argument("GGUF expert bank shape differs: " + name);
+        return bank;
+    }
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
-        TYLOINFER_RUNTIME_CHECK(!placement.experts.enabled(),
-            "expert parallelism requires packed routed tensors: ",name);
+        if (!(!placement.experts.enabled()))
+            throw std::runtime_error(std::string("expert parallelism requires packed routed tensors: ") + name);
         auto w=dense(name);
-        TYLOINFER_RUNTIME_CHECK(w.dim()==3 && w.size(0)==experts && w.size(1)==output && w.size(2)==input,
-            "dense expert tensor shape mismatch: ",name);
+        if (!(w.dim()==3 && w.size(0)==experts && w.size(1)==output && w.size(2)==input))
+            throw std::runtime_error(std::string("dense expert tensor shape mismatch: ") + name);
         return w;
     }
 
@@ -963,8 +982,8 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
     // backbone's layer-zero transfer range or prefill lookahead.
     if(name.starts_with("predictor."))layer=-1-layer;
     auto w=this->experts(name,true,layer,role.empty() ? this->role : role);
-    TYLOINFER_RUNTIME_CHECK(w.size(0)==experts && w.size(1)==output && w.size(2)==input,
-        "routed tensor shape mismatch: ",name);
+    if (!(w.size(0)==experts && w.size(1)==output && w.size(2)==input))
+        throw std::runtime_error(std::string("routed tensor shape mismatch: ") + name);
     return w;
 
 #else
@@ -978,7 +997,8 @@ std::vector<::tyloi::Tensor> Loader::routed_gate_up(const std::string& mlp_prefi
     const auto base=mlp_prefix+".experts";
     const auto gate_name=base+".gate.weight",up_name=base+".up.weight";
     const bool has_gate=tyloi::has_tensor(file, gate_name),has_up=tyloi::has_tensor(file, up_name);
-    TYLOINFER_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
+    if (!(has_gate==has_up))
+        throw std::runtime_error(std::string("incomplete routed Gate/Up pair under ") + base);
     if (!has_gate) return {routed(base+".gate_up.weight",layer,experts,2*width,input,role)};
     return {routed(gate_name,layer,experts,width,input,"gate"),
             routed(up_name,layer,experts,width,input,"up")};
@@ -1023,29 +1043,59 @@ std::vector<::tyloi::Tensor> Loader::routed_gate_up(const std::string& mlp_prefi
     return std::make_shared<::tyloi::DenseTensor>(value.to(placement.target).contiguous());
 }
 
-::tyloi::Tensor tyloi::weights::Loader::embedding(const std::string& name, bool independent_output) const {
-    if (!source.find_tensor(name) && tyloi::is_tq_table(source, name)) return weight(name);
+::tyloi::Tensor tyloi::weights::Loader::embedding(const std::string& name, bool independent_output,
+        std::size_t* host_bytes) const {
+    if (host_bytes) *host_bytes = 0;
+    if (options.force_device_embedding) return weight(name);
+    const bool table = !source.find_tensor(name) && tyloi::is_tq_table(source, name);
     const auto* mapped=tyloi::cuda::env_lookup("TYLOINFER_EMBEDDING_MAPPED");
     const bool mapped_control=mapped && mapped[0]=='2';
     const bool use_mapped=mapped ? mapped[0]=='1' || mapped_control :
         options.mapped_embedding;
-    const auto& dtype=tyloi::require_tensor(source,name).dtype;
+    const auto dtype = table ? std::string("TQ") : tyloi::require_tensor(source,name).dtype;
     const bool nint=tyloi::mfq_compat_enabled && dtype=="NINT";
+    const bool tq = options.mapped_embedding && dtype == "TQ";
+    const bool gguf = options.mapped_embedding && tyloi::gguf::is_quantized(dtype);
     if(use_mapped && independent_output &&
             !placement.tensor.enabled() && !placement.target.is_cpu() &&
-            (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint)) {
+            (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint || tq || gguf)) {
         MfqCudaGuard guard(cuda_device(placement));
         try {
             const tyloi::cuda::AllocationScope weight_memory;
-            if(nint) {
+            if(nint || tq || gguf) {
                 auto cpu = for_layer(::tyloi::Device(::tyloi::kCPU)).weight(name);
-                auto result=map_nint_embedding(cpu,cuda_device(placement),mapped_control);
+                ::tyloi::Tensor result;
+                std::size_t bytes = 0;
+                if (const auto* packed = cpu.representation<tyloi::GgmlQuantizedTensor>()) {
+                    if (packed->rotation || packed->correction) {
+                        if (mapped) throw std::invalid_argument("mapped GGUF weights require self-contained storage");
+                        return weight(name);
+                    }
+                    auto mapped_weight = std::make_shared<tyloi::GgmlQuantizedTensor>(*packed);
+                    bytes = packed->packed.nbytes();
+                    mapped_weight->packed = map_embedding_storage(packed->packed, cuda_device(placement), mapped_control);
+                    result = std::move(mapped_weight);
+                } else if (const auto* packed = cpu.representation<tyloi::encoding::TqTensor>()) {
+                    bytes = packed->image().nbytes();
+                    auto image = map_embedding_storage(packed->image(), cuda_device(placement), mapped_control);
+                    result = std::make_shared<tyloi::encoding::TqTensor>(
+                        image, packed->size(0), packed->size(1), packed->layout());
+                } else {
+                    const auto* packed_nint = cpu.representation<tyloi::NintTensor>();
+                    if (!packed_nint) throw std::logic_error("mapped weight changed encoding");
+                    for (const auto* field : {&packed_nint->q_packed, &packed_nint->sub_scale,
+                                             &packed_nint->sub_min, &packed_nint->q8_zero_scale})
+                        bytes += field->nbytes();
+                    result = map_nint_embedding(cpu, cuda_device(placement), mapped_control);
+                }
+                if (host_bytes) *host_bytes = bytes;
                 std::cerr<<"mapped_token_embedding rows="<<result.size(0)<<" width="<<result.size(1)
                          <<" dtype="<<dtype<<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
                 return result;
             }
             auto cpu=host_value(name);
             auto result=map_dense_embedding(cpu,cuda_device(placement),mapped_control);
+            if (host_bytes) *host_bytes = cpu.nbytes();
             std::cerr<<"mapped_token_embedding bytes="<<cpu.numel()*cpu.element_size()
                      <<" rows="<<cpu.size(0)<<" width="<<cpu.size(1)<<" dtype="<<dtype
                      <<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
@@ -1117,7 +1167,7 @@ BiasWeight Loader::affine(const std::string& weight_name,
     if (value.device().is_cuda()) guard.emplace(cuda_device(placement));
     auto weight = value.dense().to(::tyloi::kFloat32).contiguous();
     if (weight.dim() != 1 || weight.size(0) != width) {
-        throw std::runtime_error("vision RMSNorm width mismatch: " + name);
+        throw std::runtime_error("normalization width mismatch: " + name);
     }
     return std::make_shared<::tyloi::DenseTensor>(std::move(weight));
 }

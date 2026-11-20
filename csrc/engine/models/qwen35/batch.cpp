@@ -1,6 +1,5 @@
 #include "engine/models/qwen35/batch.h"
 #include "engine/models/qwen35/forward.h"
-#include "engine/models/common/check.h"
 #include "engine/weights/moe/experts.h"
 
 #include <algorithm>
@@ -80,16 +79,22 @@ private:
 };
 
 Batch::Batch(const Model& model, BatchConfig config) : model_(model),config_(std::move(config)) {
-    require_model(config_.slots>0 && config_.slots<=32,"Qwen continuous batching supports 1..32 requests");
-    require_model(!model_.layers.empty(),"continuous batching requires at least one model block");
-    require_model(!config_.cpu_offload,"continuous batching requires GPU-resident model blocks");
+    if (!(config_.slots>0 && config_.slots<=32))
+        throw std::runtime_error("Qwen continuous batching supports 1..32 requests");
+    if (model_.layers.empty())
+        throw std::runtime_error("continuous batching requires at least one model block");
+    if (config_.cpu_offload)
+        throw std::runtime_error("continuous batching requires GPU-resident model blocks");
     for (const auto& layer:model_.layers) {
-        require_model(!layer.device.is_cpu(),"continuous batching cannot use CPU-offloaded blocks");
+        if (layer.device.is_cpu())
+            throw std::runtime_error("continuous batching cannot use CPU-offloaded blocks");
         std::visit([&](const auto& value) {
             if constexpr (std::is_same_v<std::decay_t<decltype(value)>,Full>)
-                require_model(!value.attention.sliding,"continuous batching requires non-sliding Qwen attention");
+                if (value.attention.sliding)
+                    throw std::runtime_error("continuous batching requires non-sliding Qwen attention");
             if (const auto* moe=std::get_if<models::Moe>(&value.ffn); moe && cached(value.ffn))
-                require_model(moe->top_k<=config_.cached_slots,"continuous batching requires one cached slot per routed expert");
+                if (!(moe->top_k<=config_.cached_slots))
+                    throw std::runtime_error("continuous batching requires one cached slot per routed expert");
         },layer.weights);
     }
 }
@@ -103,12 +108,14 @@ void Batch::initialize() {
         std::int32_t(config_.slots),config_.preallocate);
 }
 std::unique_ptr<models::BatchState> Batch::make_state(std::int64_t prompt) {
-    require_model(prompt>0,"invalid Qwen batch prompt");
+    if (!(prompt>0))
+        throw std::runtime_error("invalid Qwen batch prompt");
     return std::make_unique<Request>(*this);
 }
 Batch::Request& Batch::request(models::BatchState& value) const {
     auto* result=dynamic_cast<Request*>(&value);
-    require_model(result && &result->owner_==this,"Qwen batch state belongs to another batch");
+    if (!(result && &result->owner_==this))
+        throw std::runtime_error("Qwen batch state belongs to another batch");
     return *result;
 }
 void Batch::activate(models::BatchState& value) { request(value).admitted=true; }
@@ -121,7 +128,8 @@ std::vector<State*> Batch::active(std::span<const BatchRow> rows) const {
     std::vector<State*> states;
     for (const auto& row:rows) if (row.eligible) {
         auto& value=request(*row.state);
-        require_model(value.state.position()==row.position,"Qwen batch position mismatch");
+        if (!(value.state.position()==row.position))
+            throw std::runtime_error("Qwen batch position mismatch");
         states.push_back(&value.state);
     }
     return states;
@@ -145,7 +153,8 @@ StepSequence<std::vector<Decoded>> Batch::verify(std::vector<models::BatchState*
 }
 StepSequence<std::vector<Decoded>> Batch::forward(std::vector<models::BatchState*> states,
         std::vector<Tensor> ids,bool verify) {
-    require_model(!states.empty() && states.size()==ids.size(),"invalid Qwen batch rows");
+    if (!(!states.empty() && states.size()==ids.size()))
+        throw std::runtime_error("invalid Qwen batch rows");
     std::vector<ForwardRow> rows;
     for (std::size_t i=0;i<states.size();++i) {
         models::Input input;
@@ -182,8 +191,8 @@ StepSequence<std::vector<Decoded>> Batch::forward(std::vector<models::BatchState
 }
 Tensor Batch::decode(std::span<const BatchRow> rows,Tensor ids,const Tensor&) {
     const auto states=active(rows);
-    require_model(!states.empty() && ids.dim()==2 && ids.size(0)==std::int64_t(states.size()) && ids.size(1)==1,
-        "invalid Qwen batch decode rows");
+    if (!(!states.empty() && ids.dim()==2 && ids.size(0)==std::int64_t(states.size()) && ids.size(1)==1))
+        throw std::runtime_error("invalid Qwen batch decode rows");
     std::vector<ForwardRow> inputs;
     for (std::size_t i=0;i<states.size();++i) {
         models::Input input;
@@ -198,7 +207,8 @@ Tensor Batch::decode(std::span<const BatchRow> rows,Tensor ids,const Tensor&) {
         if (step.value) for (const auto& row:*step.value) hidden.push_back(row.hidden);
         else if (!step.layer) throw std::logic_error("unexpected ordinary Qwen batch decode event");
     }
-    require_model(hidden.size()==states.size(),"Qwen batch decode returned no hidden rows");
+    if (!(hidden.size()==states.size()))
+        throw std::runtime_error("Qwen batch decode returned no hidden rows");
     return ops::reshape(model_.logits(ops::cat(hidden,0)),{std::int64_t(states.size()),-1});
 }
 bool Batch::has_cached_moe() const {

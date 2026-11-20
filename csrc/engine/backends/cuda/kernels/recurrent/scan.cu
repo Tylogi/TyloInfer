@@ -27,6 +27,8 @@
 // intra-chunk blocks then become parallel over T and only the inter-chunk
 // state carry stays serial.
 
+#include <stdexcept>
+#include <string>
 #include <cuda_runtime.h>
 #include "backend.h"
 #include <cuda_bf16.h>
@@ -217,10 +219,10 @@ void selective_scan_check_parameters(
     const char* name, const ::tyloi::DenseTensor& dt_bias, const ::tyloi::DenseTensor& a_log,
     const ::tyloi::DenseTensor& d, int64_t heads) {
     for (const ::tyloi::DenseTensor* parameter : {&dt_bias, &a_log, &d}) {
-        TYLOINFER_RUNTIME_CHECK(parameter->is_cuda() && parameter->is_contiguous() &&
+        if (!(parameter->is_cuda() && parameter->is_contiguous() &&
             parameter->scalar_type() == ::tyloi::kFloat32 && parameter->dim() == 1 &&
-            parameter->numel() == heads,
-            name, ": dt_bias/A_log/D must be contiguous CUDA f32 [H] on the state device");
+            parameter->numel() == heads))
+            throw std::runtime_error(std::string(name) + ": dt_bias/A_log/D must be contiguous CUDA f32 [H] on the state device");
     }
 }
 
@@ -239,42 +241,42 @@ void selective_scan_check_parameters(
     double dt_limit_hi)
 {
     const char* name = "selective_state_scan_decode";
-    TYLOINFER_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() &&
-        state.scalar_type() == ::tyloi::kFloat32 && state.dim() == 4,
-        name, ": state must be contiguous CUDA f32 [B,H,P,N]");
+    if (!(state.is_cuda() && state.is_contiguous() &&
+        state.scalar_type() == ::tyloi::kFloat32 && state.dim() == 4))
+        throw std::runtime_error(std::string(name) + ": state must be contiguous CUDA f32 [B,H,P,N]");
     const int64_t batches = state.size(0);
     const int64_t heads = state.size(1);
     const int64_t columns = state.size(2);
     const int64_t state_width = state.size(3);
-    TYLOINFER_RUNTIME_CHECK(batches > 0 && heads > 0 && columns > 0 && state_width > 0,
-        name, ": state dimensions must be positive");
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 3 &&
-        x.size(0) == batches && x.size(1) == heads && x.size(2) == columns,
-        name, ": x must be contiguous CUDA [B,H,P] matching the state");
-    TYLOINFER_RUNTIME_CHECK(dt.is_cuda() && dt.is_contiguous() && dt.dim() == 2 &&
-        dt.size(0) == batches && dt.size(1) == heads,
-        name, ": dt must be contiguous CUDA [B,H] matching the state");
-    TYLOINFER_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous() && b.dim() == 3 &&
-        b.size(0) == batches && b.size(2) == state_width && b.sizes() == c.sizes(),
-        name, ": B/C must be contiguous CUDA [B,G,N] matching the state width");
-    TYLOINFER_RUNTIME_CHECK(c.is_cuda() && c.is_contiguous(),
-        name, ": C must be contiguous CUDA");
+    if (!(batches > 0 && heads > 0 && columns > 0 && state_width > 0))
+        throw std::runtime_error(std::string(name) + ": state dimensions must be positive");
+    if (!(x.is_cuda() && x.is_contiguous() && x.dim() == 3 &&
+        x.size(0) == batches && x.size(1) == heads && x.size(2) == columns))
+        throw std::runtime_error(std::string(name) + ": x must be contiguous CUDA [B,H,P] matching the state");
+    if (!(dt.is_cuda() && dt.is_contiguous() && dt.dim() == 2 &&
+        dt.size(0) == batches && dt.size(1) == heads))
+        throw std::runtime_error(std::string(name) + ": dt must be contiguous CUDA [B,H] matching the state");
+    if (!(b.is_cuda() && b.is_contiguous() && b.dim() == 3 &&
+        b.size(0) == batches && b.size(2) == state_width && b.sizes() == c.sizes()))
+        throw std::runtime_error(std::string(name) + ": B/C must be contiguous CUDA [B,G,N] matching the state width");
+    if (!(c.is_cuda() && c.is_contiguous()))
+        throw std::runtime_error(std::string(name) + ": C must be contiguous CUDA");
     const int64_t groups = b.size(1);
-    TYLOINFER_RUNTIME_CHECK(groups > 0 && heads % groups == 0,
-        name, ": head count must be divisible by the B/C group count");
-    TYLOINFER_RUNTIME_CHECK(selective_scan_supported(x) &&
+    if (!(groups > 0 && heads % groups == 0))
+        throw std::runtime_error(std::string(name) + ": head count must be divisible by the B/C group count");
+    if (!(selective_scan_supported(x) &&
         dt.scalar_type() == x.scalar_type() && b.scalar_type() == x.scalar_type() &&
-        c.scalar_type() == x.scalar_type(),
-        name, ": x/dt/B/C must share one of f32, f16 or bf16");
+        c.scalar_type() == x.scalar_type()))
+        throw std::runtime_error(std::string(name) + ": x/dt/B/C must share one of f32, f16 or bf16");
     for (const ::tyloi::DenseTensor* tensor : {&x, &dt, &b, &c}) {
-        TYLOINFER_RUNTIME_CHECK(tensor->device() == state.device(),
-            name, ": every input must live on the state device");
+        if (!(tensor->device() == state.device()))
+            throw std::runtime_error(std::string(name) + ": every input must live on the state device");
     }
     selective_scan_check_parameters(name, dt_bias, a_log, d, heads);
-    TYLOINFER_RUNTIME_CHECK(dt_bias.device() == state.device(),
-        name, ": parameters must live on the state device");
-    TYLOINFER_RUNTIME_CHECK(dt_limit_lo <= dt_limit_hi,
-        name, ": dt_limit_lo must not exceed dt_limit_hi");
+    if (!(dt_bias.device() == state.device()))
+        throw std::runtime_error(std::string(name) + ": parameters must live on the state device");
+    if (!(dt_limit_lo <= dt_limit_hi))
+        throw std::runtime_error(std::string(name) + ": dt_limit_lo must not exceed dt_limit_hi");
 
     auto output = ::tyloi::cuda::empty({batches, heads, columns},
         state.options().dtype(::tyloi::kFloat32));
@@ -318,41 +320,41 @@ std::vector<::tyloi::DenseTensor> selective_state_scan_prefill_cuda(
     double dt_limit_hi)
 {
     const char* name = "selective_state_scan_prefill";
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 4,
-        name, ": x must be contiguous CUDA [B,T,H,P]");
+    if (!(x.is_cuda() && x.is_contiguous() && x.dim() == 4))
+        throw std::runtime_error(std::string(name) + ": x must be contiguous CUDA [B,T,H,P]");
     const int64_t batches = x.size(0);
     const int64_t tokens = x.size(1);
     const int64_t heads = x.size(2);
     const int64_t columns = x.size(3);
-    TYLOINFER_RUNTIME_CHECK(batches > 0 && tokens > 0 && heads > 0 && columns > 0,
-        name, ": x dimensions must be positive");
-    TYLOINFER_RUNTIME_CHECK(dt.is_cuda() && dt.is_contiguous() && dt.dim() == 3 &&
-        dt.size(0) == batches && dt.size(1) == tokens && dt.size(2) == heads,
-        name, ": dt must be contiguous CUDA [B,T,H] matching x");
-    TYLOINFER_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous() && c.is_cuda() &&
+    if (!(batches > 0 && tokens > 0 && heads > 0 && columns > 0))
+        throw std::runtime_error(std::string(name) + ": x dimensions must be positive");
+    if (!(dt.is_cuda() && dt.is_contiguous() && dt.dim() == 3 &&
+        dt.size(0) == batches && dt.size(1) == tokens && dt.size(2) == heads))
+        throw std::runtime_error(std::string(name) + ": dt must be contiguous CUDA [B,T,H] matching x");
+    if (!(b.is_cuda() && b.is_contiguous() && c.is_cuda() &&
         c.is_contiguous() && b.dim() == 4 && b.sizes() == c.sizes() &&
-        b.size(0) == batches && b.size(1) == tokens,
-        name, ": B/C must be contiguous CUDA [B,T,G,N] with matching tokens");
+        b.size(0) == batches && b.size(1) == tokens))
+        throw std::runtime_error(std::string(name) + ": B/C must be contiguous CUDA [B,T,G,N] with matching tokens");
     const int64_t groups = b.size(2);
     const int64_t state_width = b.size(3);
-    TYLOINFER_RUNTIME_CHECK(groups > 0 && state_width > 0 && heads % groups == 0,
-        name, ": head count must be divisible by the B/C group count");
-    TYLOINFER_RUNTIME_CHECK(state_width % SELECTIVE_SCAN_WARP == 0,
-        name, ": state width N must be a multiple of 32");
-    TYLOINFER_RUNTIME_CHECK(selective_scan_supported(x) &&
+    if (!(groups > 0 && state_width > 0 && heads % groups == 0))
+        throw std::runtime_error(std::string(name) + ": head count must be divisible by the B/C group count");
+    if (!(state_width % SELECTIVE_SCAN_WARP == 0))
+        throw std::runtime_error(std::string(name) + ": state width N must be a multiple of 32");
+    if (!(selective_scan_supported(x) &&
         dt.scalar_type() == x.scalar_type() && b.scalar_type() == x.scalar_type() &&
-        c.scalar_type() == x.scalar_type(),
-        name, ": x/dt/B/C must share one of f32, f16 or bf16");
+        c.scalar_type() == x.scalar_type()))
+        throw std::runtime_error(std::string(name) + ": x/dt/B/C must share one of f32, f16 or bf16");
     selective_scan_check_parameters(name, dt_bias, a_log, d, heads);
-    TYLOINFER_RUNTIME_CHECK(dt_limit_lo <= dt_limit_hi,
-        name, ": dt_limit_lo must not exceed dt_limit_hi");
+    if (!(dt_limit_lo <= dt_limit_hi))
+        throw std::runtime_error(std::string(name) + ": dt_limit_lo must not exceed dt_limit_hi");
     const bool has_initial_state = initial_state.defined();
-    TYLOINFER_RUNTIME_CHECK(!has_initial_state ||
+    if (!(!has_initial_state ||
         (initial_state.is_cuda() && initial_state.is_contiguous() &&
             initial_state.scalar_type() == ::tyloi::kFloat32 &&
             initial_state.sizes().vec() ==
-                std::vector<int64_t>({batches, heads, columns, state_width})),
-        name, ": initial_state must be contiguous CUDA f32 [B,H,P,N]");
+                std::vector<int64_t>({batches, heads, columns, state_width}))))
+        throw std::runtime_error(std::string(name) + ": initial_state must be contiguous CUDA f32 [B,H,P,N]");
 
     auto options = ::tyloi::TensorOptions().dtype(::tyloi::kFloat32).device(x.device());
     auto output = ::tyloi::cuda::empty({batches, tokens, heads, columns}, options);
@@ -387,8 +389,9 @@ std::vector<::tyloi::DenseTensor> selective_state_scan_prefill_cuda(
         case 16: launch_width.template operator()<Value, 16>(); break;
         case 32: launch_width.template operator()<Value, 32>(); break;
         default:
-            TYLOINFER_RUNTIME_CHECK(false,
-                name, ": state width N must be 32 * {1,2,4,8,16,32}");
+            {
+                throw std::runtime_error(std::string(name) + ": state width N must be 32 * {1,2,4,8,16,32}");
+            }
         }
     };
     if (x.scalar_type() == ::tyloi::kFloat32) {

@@ -91,6 +91,7 @@ public:
     virtual std::unique_ptr<Timer> timer() = 0;
     virtual std::unique_ptr<Profile> profile(const char* name) = 0;
     virtual std::unique_ptr<Graph> graph() = 0;
+    virtual bool prepare_routed_graph(Device) { return false; }
     // Call within this executor's scope. Submit without waiting; results remain alive until completion.
     virtual void submit(std::span<const Tensor> outputs);
     // Query within this executor's scope; one snapshot per requested device, in the same order.

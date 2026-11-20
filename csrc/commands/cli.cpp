@@ -202,6 +202,11 @@ bool parse_load_option(
     else if (option == "--dflash2-draft") {
         result.dflash2_draft_path = args.value(option);
     }
+    else if (option == "--jev-weights") {
+        const auto value = args.value(option);
+        if (value != "stream" && value != "vram") usage_error("--jev-weights must be stream or vram");
+        result.jev_full_vram = value == "vram";
+    }
     else if (option == "--tensor-parallel") {
         result.tensor_parallel.devices = parse_parallel_devices(
             args.value(option), "--tensor-parallel");

@@ -51,5 +51,5 @@ public:
 void register_host_cache(const std::shared_ptr<HostCache>& cache);
 std::size_t reclaim_host_caches(std::size_t bytes) noexcept;
 // Reclaim under pressure; the caller's existing admission checks still apply.
-void reclaim_host(std::size_t bytes, std::uint64_t process_limit = 0) noexcept;
+std::size_t reclaim_host(std::size_t bytes, std::uint64_t process_limit = 0) noexcept;
 } // namespace tyloi

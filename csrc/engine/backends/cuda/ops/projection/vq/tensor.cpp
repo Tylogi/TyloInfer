@@ -273,8 +273,8 @@ static CpuNvqDecoder cpu_nvq_decoder(int format) {
 }
 
 CpuProjectionRows make_cpu_projection_rows(const tyloi::NvqTensor& w) {
-    TYLOINFER_RUNTIME_CHECK(w.indices_packed.is_cpu() && w.gs==24 && w.sub_bits>0 && w.sub_bits<=4,
-        "original-FP32 NVQ rows require canonical CPU storage");
+    if (!(w.indices_packed.is_cpu() && w.gs==24 && w.sub_bits>0 && w.sub_bits<=4))
+        throw std::runtime_error("original-FP32 NVQ rows require canonical CPU storage");
     CpuProjectionRows p; p.width=static_cast<int>(w.neuron_len); p.outputs=static_cast<int>(w.out);
     const int format=static_cast<int>(w.kernel_format);
     const int vector=cpu_nvq_d4(format) ? 4 : 8;
@@ -292,7 +292,8 @@ CpuProjectionRows make_cpu_projection_rows(const tyloi::NvqTensor& w) {
     }
     p.nvq_rows=w.dense_groups ? tyloi::cpu::nvq_dense_rows_dot_kernel(format) :
         (format==1 || format==8) && v.aux_bytes==0?nullptr:tyloi::cpu::nvq_rows_dot_kernel(format);
-    TYLOINFER_RUNTIME_CHECK(!w.dense_groups || p.nvq_rows,"compact NVQ CPU decoder unavailable");
+    if (!(!w.dense_groups || p.nvq_rows))
+        throw std::runtime_error("compact NVQ CPU decoder unavailable");
     if(!p.nvq_rows) {
         const auto decoder=cpu_nvq_decoder(format);
         const auto dot=tyloi::cpu::scaled_i8_dot_kernel();
@@ -315,13 +316,13 @@ CpuProjectionRows make_cpu_projection_rows(const tyloi::NvqTensor& w) {
 static ::tyloi::DenseTensor nvq_matmul_cpu(
         const tyloi::NvqTensor & w,
         ::tyloi::DenseTensor x) {
-    TYLOINFER_RUNTIME_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
-    TYLOINFER_RUNTIME_CHECK(
-        !w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
-        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda() && !w.aux_packed.is_cuda(),
-        "CPU NVQ GEMV requires CPU-resident weights");
-    TYLOINFER_RUNTIME_CHECK(w.gs == 24,
-        "CPU NVQ GEMV currently requires 24-value groups");
+    if (x.is_cuda())
+        throw std::runtime_error("CPU NVQ GEMV requires CPU activations");
+    if (!(!w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
+        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda() && !w.aux_packed.is_cuda()))
+        throw std::runtime_error("CPU NVQ GEMV requires CPU-resident weights");
+    if (!(w.gs == 24))
+        throw std::runtime_error("CPU NVQ GEMV currently requires 24-value groups");
     x = pad_last(x.contiguous().to(::tyloi::kFloat32), w.neuron_len).contiguous();
     const int64_t rows = x.size(0);
     const float* input = x.data_ptr<float>();
@@ -335,9 +336,11 @@ static ::tyloi::DenseTensor nvq_matmul_cpu(
     const auto decoder=cpu_nvq_decoder(format);
     const auto fused_rows=w.dense_groups ? tyloi::cpu::nvq_dense_rows_dot_kernel(format) :
         (format==1 || format==8) && w.aux_packed.numel()==0?nullptr:tyloi::cpu::nvq_rows_dot_kernel(format);
-    TYLOINFER_RUNTIME_CHECK(!w.dense_groups || fused_rows,"compact NVQ CPU decoder unavailable");
+    if (!(!w.dense_groups || fused_rows))
+        throw std::runtime_error("compact NVQ CPU decoder unavailable");
     const int vector_size=cpu_nvq_d4(format) ? 4 : 8;
-    TYLOINFER_RUNTIME_CHECK(w.sub_bits>0 && w.sub_bits<=4,"CPU NVQ state width must be 1..4");
+    if (!(w.sub_bits>0 && w.sub_bits<=4))
+        throw std::runtime_error("CPU NVQ state width must be 1..4");
     CpuNvqDecodeView view{w.indices_packed.data_ptr<uint8_t>(),
         w.aux_packed.data_ptr<uint8_t>(), w.indices_packed.numel(),w.aux_packed.numel(),
         static_cast<int>((w.neuron_len+vector_size-1)/vector_size),
@@ -436,11 +439,13 @@ static ::tyloi::DenseTensor nvq_matmul_cpu(
     ::tyloi::DenseTensor x,
     ::tyloi::DenseTensor gate,
     int mode) {
-    TYLOINFER_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
+    if (!(mode == 1 || mode == 2))
+        throw std::runtime_error("NVQ input gate mode must be 1(sigmoid) or 2(silu)");
     if (!x.is_cuda()) {
         x = x.contiguous().to(::tyloi::kFloat16);
         gate = gate.contiguous().to(::tyloi::kFloat16);
-        TYLOINFER_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+        if (!(x.sizes() == gate.sizes()))
+            throw std::runtime_error("NVQ x and gate shapes must match");
         auto value = mode == 1
             ? x * ::tyloi::cuda::sigmoid(gate)
             : x * ::tyloi::cuda::silu(gate);
@@ -448,7 +453,8 @@ static ::tyloi::DenseTensor nvq_matmul_cpu(
     }
     x = x.contiguous().to(::tyloi::kFloat16);
     gate = gate.contiguous().to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+    if (!(x.sizes() == gate.sizes()))
+        throw std::runtime_error("NVQ x and gate shapes must match");
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     int M = (int)x.size(0);

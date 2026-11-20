@@ -5,6 +5,8 @@
 #include "models/common/recurrent_attention.h"
 #include "models/common/transformer_layer.h"
 
+#include <stdexcept>
+
 namespace mfq::models::qwen4_exp {
 
 template <class Loader>
@@ -45,8 +47,8 @@ auto load_ple(Loader &ops, const Config &c, const std::string &p) {
     int64_t rows = 0, width = c.hidden / ((c.ngram - 1) * c.ngram_heads);
     for (int64_t i = 0; i < c.shards; ++i) {
         auto [embedding, shape] = ops.embedding(p + ".ngram.shard." + std::to_string(i) + ".weight");
-        require_model(shape[1] == width && shape[0] > 0 && (!rows || shape[0] == rows),
-                      "Qwen4 PLE embedding shard dimensions disagree");
+        if (!(shape[1] == width && shape[0] > 0 && (!rows || shape[0] == rows)))
+            throw std::runtime_error("Qwen4 PLE embedding shard dimensions disagree");
         rows = shape[0];
         shards.push_back(std::move(embedding));
     }
@@ -86,8 +88,8 @@ template <class Predictor, class Loader>
 bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
     const auto count = c.predictor_layers;
     if (!ops.has("predictor.embedding_norm.weight") || count <= 0) {
-        require_model(!ops.has_prefix("predictor"),
-                      "Qwen4-Exp model source contains an incomplete or undeclared MTP head");
+        if (ops.has_prefix("predictor"))
+            throw std::runtime_error("Qwen4-Exp model source contains an incomplete or undeclared MTP head");
         return false;
     }
     result.config = c;
@@ -98,9 +100,9 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
     result.final_mixer = ops.final_mixer(load_residual(ops, c, "predictor.mhc.pre", false));
     for (int64_t i = 0; i < count; ++i)
         result.layers.push_back(ops.block(c, int(i), true));
-    require_model(ops.shape(result.embedding_norm) == std::vector<int64_t>{c.hidden} &&
-                      ops.shape(result.hidden_norm) == std::vector<int64_t>{c.hidden * c.streams},
-                  "Qwen4-Exp MTP normalization width disagrees with backbone");
+    if (!(ops.shape(result.embedding_norm) == std::vector<int64_t>{c.hidden} &&
+        ops.shape(result.hidden_norm) == std::vector<int64_t>{c.hidden * c.streams}))
+        throw std::runtime_error("Qwen4-Exp MTP normalization width disagrees with backbone");
     result.positions.resize(count);
     result.lengths.resize(count, 0);
     return true;
@@ -243,19 +245,19 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
                                     bool has_mrope) const {
         const auto rank = Backend::rank(positions);
-        require_model((rank == 1 || (rank == 2 && Backend::size(positions, 0) == 3) ||
-                       (rank == 3 && Backend::size(positions, 0) == 3 &&
-                        Backend::size(positions, 1) == batch)) &&
-                          Backend::size(positions, -1) == tokens,
-                      "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
+        if (!((rank == 1 || (rank == 2 && Backend::size(positions, 0) == 3) ||
+            (rank == 3 && Backend::size(positions, 0) == 3 &&
+            Backend::size(positions, 1) == batch)) &&
+            Backend::size(positions, -1) == tokens))
+            throw std::runtime_error("Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     }
     void adapter_set_max_position_embeddings(int64_t value) { this->config.maximum = value; }
     void adapter_validate_forward(int64_t new_batch, int64_t tokens, int64_t cache_position, bool,
                                   bool has_cache_position_override, bool has_attention_mask) const {
-        require_model(tokens > 0 &&
-                          cache_position + tokens <= this->metadata.max_position_embeddings &&
-                          !has_cache_position_override && !has_attention_mask,
-                      "Qwen4 requires unpadded causal cache positions");
+        if (!(tokens > 0 &&
+            cache_position + tokens <= this->metadata.max_position_embeddings &&
+            !has_cache_position_override && !has_attention_mask))
+            throw std::runtime_error("Qwen4 requires unpadded causal cache positions");
         (void)new_batch;
     }
     bool adapter_requires_batch_reset(int64_t new_batch) const noexcept {

@@ -199,7 +199,7 @@ void pp_fused_projection(const TrellisPrefillMoeJob* jobs,const half* x,half* y,
 
 extern "C" int mfq_tq_prefill_moe(const TrellisPrefillMoeJob* jobs,const int64_t* slots,
         const void* input,void* pairs,int batch,int capacity,int input_width,int hidden_width,
-        int routes,float limit,void* activations,uint64_t activation_bytes,cudaStream_t stream) {
+        int routes,float limit,void* activations,uint64_t activation_bytes,cudaEvent_t down_ready,cudaStream_t stream) {
     if(!jobs || !slots || !input || !pairs || !activations || batch<1 || batch>65535 ||
        capacity<1 || capacity>65535*128 || input_width<1 || hidden_width<1 ||
        hidden_width>INT_MAX/2 || input_width>INT_MAX-255 || routes<1 ||
@@ -234,6 +234,7 @@ extern "C" int mfq_tq_prefill_moe(const TrellisPrefillMoeJob* jobs,const int64_t
     tq_prefill::pp_batch_activate<<<(rows*hidden_width+255)/256,256,0,stream>>>(
         jobs,g,x,batch,capacity,hidden_width,limit);
     error=cudaGetLastError();if(error)return int(error);
+    if(down_ready){error=cudaStreamWaitEvent(stream,down_ready,0);if(error)return int(error);}
     tq_prefill::pp_fused_projection<2,64,128><<<dim3((uint64_t(input_width)+63)/64,
         (uint64_t(capacity)+127)/128,batch),128,0,stream>>>(jobs,x,u,capacity,hidden_width,input_width);
     error=cudaGetLastError();if(error)return int(error);

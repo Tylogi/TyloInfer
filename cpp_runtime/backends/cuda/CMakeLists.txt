@@ -1,10 +1,5 @@
 # Native CUDA backend.
 
-if(NOT TARGET mfq-runtime-communication)
-    message(FATAL_ERROR
-        "The CUDA runtime requires TYLOINFER_BUILD_RUNTIME_COMMUNICATION=ON")
-endif()
-
 set(TYLOINFER_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(TYLOINFER_CUDA_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/tyloinfer/kernels/cuda")
 
@@ -570,7 +565,6 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${TYLOINFER_CUDA_ROOT}/runtime/graph_registry.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/mfq_cache_api.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/routed_cache_resources.cpp
-    ${TYLOINFER_CUDA_ROOT}/runtime/layer_weight_stream.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/decode_window.cpp
     ${TYLOINFER_CUDA_ROOT}/storage/weight_loader.cpp
     ${TYLOINFER_CUDA_ROOT}/storage/transformer_loader.cpp
@@ -600,8 +594,6 @@ set(TYLOINFER_CUDA_INSTANTIATION_SOURCES
     ${TYLOINFER_CUDA_ROOT}/engine/mtp.cpp
     ${TYLOINFER_CUDA_ROOT}/engine/cuda_batching.cpp
     ${TYLOINFER_CUDA_ROOT}/models/minicpmo45/components.cpp
-    ${TYLOINFER_CUDA_ROOT}/commands/cli.cpp
-    ${TYLOINFER_CUDA_ROOT}/commands/minicpmo45.cpp
     ${TYLOINFER_CUDA_MODEL_SOURCES}
     ${TYLOINFER_CUDA_TRANSFORMER_SOURCES}
 )
@@ -1357,22 +1349,6 @@ endif()
 
 
 
-add_executable(mfq-runtime
-    ${TYLOINFER_CUDA_ROOT}/apps/runtime_main.cpp
-    ${TYLOINFER_CUDA_ROOT}/commands/runtime.cpp
-)
-target_link_libraries(mfq-runtime PRIVATE
-    mfq-cuda-runtime mfq-runtime-communication)
-target_include_directories(mfq-runtime PRIVATE
-    ${TYLOINFER_CUDA_ROOT}
-    ${TYLOINFER_CUDA_ROOT}/include
-    ${TYLOINFER_CUDA_ROOT}/engine
-)
-target_compile_features(mfq-runtime PRIVATE cxx_std_20)
-set_target_properties(mfq-runtime PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-)
-
 if(BUILD_TESTING)
     add_test(
         NAME mfq-deepseek-v41-runtime-check
@@ -1404,13 +1380,6 @@ if(BUILD_TESTING)
         PROPERTIES WILL_FAIL TRUE)
 endif()
 
-if(NOT WIN32)
-    set(TYLOINFER_SYSTEM_RUNTIME_DIR
-        "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" CACHE PATH
-        "directory containing the host libstdc++ runtime")
-    set_property(TARGET mfq-runtime PROPERTY
-        BUILD_RPATH "${TYLOINFER_SYSTEM_RUNTIME_DIR}")
-endif()
 
 set_source_files_properties(
     ${TYLOINFER_CUDA_KERNEL_ROOT}/attention_mma.cu

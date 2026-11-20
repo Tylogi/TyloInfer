@@ -3,6 +3,7 @@
 #include "engine/backends/cuda/kernels/projection/nint/short_decode.h"
 #include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "env.h"
+#include <stdexcept>
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
@@ -49,8 +50,8 @@ void launch_nint_matmul_routed_cuda(
     const bool tiled = compact && (route_tile_m == 16 || route_tile_m == 32 ||
         route_tile_m == 64 || route_tile_m == 128);
     if (!tiled) {
-        TYLOINFER_RUNTIME_CHECK(route_tile_m == 8,
-            "NINT routed tile must be 8, 16, 32, 64, or 128");
+        if (!(route_tile_m == 8))
+            throw std::runtime_error("NINT routed tile must be 8, 16, 32, 64, or 128");
     }
     tyloi::cuda::nint_raw::Routed a{};
     a.bitstream=bitstream.data_ptr<uint8_t>(); a.row_q_bits=row_q_bits.data_ptr<uint8_t>();
@@ -91,12 +92,12 @@ static void nint_moe_grouped_matmul_dispatch_cuda(
         ::tyloi::DenseTensor expert_pool,::tyloi::DenseTensor expert_local,
         ::tyloi::DenseTensor ids,::tyloi::DenseTensor output,
         int64_t input_width,bool routed_input,int group_hint,int bits_hint) {
-    TYLOINFER_RUNTIME_CHECK(pointers.is_cuda() && pointers.is_contiguous() && pointers.scalar_type()==::tyloi::kInt64 &&
+    if (!(pointers.is_cuda() && pointers.is_contiguous() && pointers.scalar_type()==::tyloi::kInt64 &&
         pointers.dim()==2 && pointers.size(1)==9 && pointers.size(0)>0 &&
         params.is_cuda() && params.is_contiguous() && params.scalar_type()==::tyloi::kInt32 &&
-        params.dim()==2 && params.size(0)==pointers.size(0) && params.size(1)==3,
-        "mixed NINT pointer/geometry table disagrees");
-    TYLOINFER_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type()==::tyloi::kInt32 && ids.dim()==2 &&
+        params.dim()==2 && params.size(0)==pointers.size(0) && params.size(1)==3))
+        throw std::runtime_error("mixed NINT pointer/geometry table disagrees");
+    if (!(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type()==::tyloi::kInt32 && ids.dim()==2 &&
         ids.size(0)>0 && ids.size(0)<=8 && ids.size(1)>0 && ids.numel()<=65535 && input_width>0 &&
         expert_pool.is_cuda() && expert_pool.is_contiguous() && expert_pool.scalar_type()==::tyloi::kInt32 &&
         expert_pool.dim()==1 && expert_pool.numel()>0 && expert_pool.numel()<=4096 &&
@@ -105,8 +106,8 @@ static void nint_moe_grouped_matmul_dispatch_cuda(
         output.scalar_type()==::tyloi::kFloat16 && output.dim()==3 && output.size(0)==ids.size(0) &&
         output.size(1)==ids.size(1) && output.size(2)>0 && output.size(2)<=INT_MAX &&
         pointers.device()==output.device() && params.device()==output.device() && ids.device()==output.device() &&
-        expert_pool.device()==output.device() && expert_local.device()==output.device(),
-        "mixed NINT route/output geometry or device disagrees");
+        expert_pool.device()==output.device() && expert_local.device()==output.device()))
+        throw std::runtime_error("mixed NINT route/output geometry or device disagrees");
     MfqCudaGuard guard(output.device());
     tyloi::cuda::nint_raw::Mixed a{};
     a.pointers=pointers.data_ptr<int64_t>(); a.params=params.data_ptr<int32_t>();
@@ -160,15 +161,15 @@ bool tyloi::cuda::try_nint_decode(
     if((setting && setting[0]=='0') || (grouped && grouped[0]=='0') || (hint && hint[0]=='0') ||
             (warps && std::atoi(warps)==4) || bits_hint<4 || bits_hint>6 ||
             (weight.geometry[1]!=24 && weight.geometry[1]!=28))return false;
-    TYLOINFER_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() && expert_local.scalar_type()==::tyloi::kInt32 &&
+    if (!(expert_local.is_cuda() && expert_local.is_contiguous() && expert_local.scalar_type()==::tyloi::kInt32 &&
         expert_local.dim()==1 && expert_local.numel()>0 && expert_local.numel()<=4096 &&
         ids.is_cuda() && ids.is_contiguous() && ids.scalar_type()==::tyloi::kInt32 && ids.dim()==2 &&
         ids.size(0)>0 && ids.size(0)<=8 && ids.size(1)>0 && ids.numel()<=65535 &&
         output.is_cuda() && output.is_contiguous() && output.scalar_type()==::tyloi::kFloat16 && output.dim()==3 &&
         output.size(0)==ids.size(0) && output.size(1)==ids.size(1) && output.size(2)>0 && output.size(2)<=INT_MAX &&
         output.device()==ids.device() && output.device()==expert_local.device() &&
-        weight.local_experts>0 && weight.geometry[0]>0 && weight.geometry[2]>0,
-        "single-pool NINT routed tensors disagree");
+        weight.local_experts>0 && weight.geometry[0]>0 && weight.geometry[2]>0))
+        throw std::runtime_error("single-pool NINT routed tensors disagree");
     MfqCudaGuard guard(output.device());
     const bool late_scale=nint_late_scale_enabled(
         int64_t(weight.geometry[0])*weight.geometry[1],bits_hint,output.get_device());
@@ -177,8 +178,8 @@ bool tyloi::cuda::try_nint_decode(
     weight.row_metadata=0;
     const bool packed=metadata_ptr && (metadata_ready || (metadata && metadata[0]!='0'));
     if(packed) {
-        TYLOINFER_RUNTIME_CHECK(row_metadata.is_cuda() && row_metadata.device()==output.device(),
-            "NINT route metadata device disagrees with output");
+        if (!(row_metadata.is_cuda() && row_metadata.device()==output.device()))
+            throw std::runtime_error("NINT route metadata device disagrees with output");
         weight.row_metadata=metadata_ptr;
     }
     const auto *multi_sum=tyloi::cuda::env_lookup("TYLOINFER_CUDA_WARP_MULTI_SUM");
@@ -203,53 +204,45 @@ static ::tyloi::DenseTensor nint_decode_impl(
         ::tyloi::DenseTensor neuron_minimum,
         int64_t width,
         int64_t group_size) {
-    TYLOINFER_RUNTIME_CHECK(
-        bitstream.is_cuda() && bitstream.is_contiguous() &&
+    if (!(bitstream.is_cuda() && bitstream.is_contiguous() &&
         bitstream.scalar_type() == ::tyloi::kUInt8 &&
-        bitstream.dim() == 1,
-        "NINT bitstream must be contiguous CUDA uint8 rank-1");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q_bits.is_cuda() && row_q_bits.is_contiguous() &&
+        bitstream.dim() == 1))
+        throw std::runtime_error("NINT bitstream must be contiguous CUDA uint8 rank-1");
+    if (!(row_q_bits.is_cuda() && row_q_bits.is_contiguous() &&
         row_q_bits.scalar_type() == ::tyloi::kUInt8 &&
-        row_q_bits.dim() == 1,
-        "NINT q metadata must be contiguous CUDA uint8 rank-1");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q_bit_offsets.is_cuda() && row_q_bit_offsets.is_contiguous() &&
+        row_q_bits.dim() == 1))
+        throw std::runtime_error("NINT q metadata must be contiguous CUDA uint8 rank-1");
+    if (!(row_q_bit_offsets.is_cuda() && row_q_bit_offsets.is_contiguous() &&
         row_q_bit_offsets.scalar_type() == ::tyloi::kInt64 &&
-        row_q_bit_offsets.dim() == 1,
-        "NINT row offsets must be contiguous CUDA int64 rank-1");
-    TYLOINFER_RUNTIME_CHECK(
-        subgroup_scale.is_cuda() && subgroup_scale.is_contiguous() &&
+        row_q_bit_offsets.dim() == 1))
+        throw std::runtime_error("NINT row offsets must be contiguous CUDA int64 rank-1");
+    if (!(subgroup_scale.is_cuda() && subgroup_scale.is_contiguous() &&
         subgroup_scale.scalar_type() == ::tyloi::kUInt8 &&
         subgroup_scale.dim() == 2 && subgroup_minimum.is_cuda() &&
         subgroup_minimum.is_contiguous() &&
         subgroup_minimum.scalar_type() == ::tyloi::kUInt8 &&
-        subgroup_minimum.sizes() == subgroup_scale.sizes(),
-        "NINT subgroup metadata is invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
+        subgroup_minimum.sizes() == subgroup_scale.sizes()))
+        throw std::runtime_error("NINT subgroup metadata is invalid");
+    if (!(neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
         neuron_scale.scalar_type() == ::tyloi::kFloat32 &&
         neuron_minimum.is_cuda() && neuron_minimum.is_contiguous() &&
-        neuron_minimum.scalar_type() == ::tyloi::kFloat32,
-        "NINT neuron metadata is invalid");
+        neuron_minimum.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("NINT neuron metadata is invalid");
     const int rows = static_cast<int>(subgroup_scale.size(0));
     const int groups = static_cast<int>(subgroup_scale.size(1));
-    TYLOINFER_RUNTIME_CHECK(
-        rows > 0 && groups > 0 && group_size >= 4 && group_size <= 64 &&
-        width > 0 && width <= static_cast<int64_t>(groups) * group_size,
-        "NINT decode dimensions are invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q_bits.numel() == rows && row_q_bit_offsets.numel() == rows &&
-        neuron_scale.numel() == rows && neuron_minimum.numel() == rows,
-        "NINT row metadata shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(
-        bitstream.device() == row_q_bits.device() &&
+    if (!(rows > 0 && groups > 0 && group_size >= 4 && group_size <= 64 &&
+        width > 0 && width <= static_cast<int64_t>(groups) * group_size))
+        throw std::runtime_error("NINT decode dimensions are invalid");
+    if (!(row_q_bits.numel() == rows && row_q_bit_offsets.numel() == rows &&
+        neuron_scale.numel() == rows && neuron_minimum.numel() == rows))
+        throw std::runtime_error("NINT row metadata shape mismatch");
+    if (!(bitstream.device() == row_q_bits.device() &&
         bitstream.device() == row_q_bit_offsets.device() &&
         bitstream.device() == subgroup_scale.device() &&
         bitstream.device() == subgroup_minimum.device() &&
         bitstream.device() == neuron_scale.device() &&
-        bitstream.device() == neuron_minimum.device(),
-        "NINT tensors must share one CUDA device");
+        bitstream.device() == neuron_minimum.device()))
+        throw std::runtime_error("NINT tensors must share one CUDA device");
     auto output = ::tyloi::cuda::empty(
         {rows, width},
         neuron_scale.options().dtype(
@@ -312,20 +305,17 @@ namespace {
 void validate_nint8_zero(
         const ::tyloi::DenseTensor & quantized,
         const ::tyloi::DenseTensor & scale) {
-    TYLOINFER_RUNTIME_CHECK(
-        quantized.is_cuda() && quantized.is_contiguous() &&
+    if (!(quantized.is_cuda() && quantized.is_contiguous() &&
         quantized.scalar_type() == ::tyloi::kUInt8 &&
-        quantized.dim() == 3 && quantized.size(2) == 32,
-        "NINT8-0 q must be contiguous CUDA uint8 [N,G,32]");
-    TYLOINFER_RUNTIME_CHECK(
-        scale.is_cuda() && scale.is_contiguous() &&
+        quantized.dim() == 3 && quantized.size(2) == 32))
+        throw std::runtime_error("NINT8-0 q must be contiguous CUDA uint8 [N,G,32]");
+    if (!(scale.is_cuda() && scale.is_contiguous() &&
         scale.scalar_type() == ::tyloi::kFloat16 &&
         scale.dim() == 2 && scale.size(0) == quantized.size(0) &&
-        scale.size(1) == quantized.size(1),
-        "NINT8-0 scale must be contiguous CUDA fp16 [N,G]");
-    TYLOINFER_RUNTIME_CHECK(
-        quantized.device() == scale.device(),
-        "NINT8-0 tensors must share one CUDA device");
+        scale.size(1) == quantized.size(1)))
+        throw std::runtime_error("NINT8-0 scale must be contiguous CUDA fp16 [N,G]");
+    if (!(quantized.device() == scale.device()))
+        throw std::runtime_error("NINT8-0 tensors must share one CUDA device");
 }
 ::tyloi::DenseTensor cublas_gemm_nt_f32_output(
         const ::tyloi::DenseTensor & input,
@@ -339,10 +329,10 @@ void validate_nint8_zero(
     const auto status = tyloi::cuda::nint_raw::gemm_nt(
         mfq_current_cublas_handle(), mfq_current_cuda_stream(), input.data_ptr(),
         weight.data_ptr(), result.data_ptr(), rows, outputs, width, true, true);
-    TYLOINFER_RUNTIME_CHECK(status.stream == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
-    TYLOINFER_RUNTIME_CHECK(status.gemm == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasGemmEx(...)");
+    if (!(status.stream == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
+    if (!(status.gemm == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasGemmEx(...)");
     return result;
 }
 
@@ -351,19 +341,16 @@ void validate_nint8_zero(
 ::tyloi::DenseTensor nint_cublas_gemm_nt_f16acc_cuda(
         ::tyloi::DenseTensor input,
         ::tyloi::DenseTensor weight) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == ::tyloi::kFloat16 &&
-        input.dim() == 2,
-        "GEMM input must be contiguous CUDA fp16 rank-2");
-    TYLOINFER_RUNTIME_CHECK(
-        weight.is_cuda() && weight.is_contiguous() &&
+        input.dim() == 2))
+        throw std::runtime_error("GEMM input must be contiguous CUDA fp16 rank-2");
+    if (!(weight.is_cuda() && weight.is_contiguous() &&
         weight.scalar_type() == ::tyloi::kFloat16 &&
-        weight.dim() == 2 && weight.size(1) == input.size(1),
-        "GEMM weight must be contiguous CUDA fp16 [N,K]");
-    TYLOINFER_RUNTIME_CHECK(
-        input.device() == weight.device(),
-        "GEMM tensors must share one CUDA device");
+        weight.dim() == 2 && weight.size(1) == input.size(1)))
+        throw std::runtime_error("GEMM weight must be contiguous CUDA fp16 [N,K]");
+    if (!(input.device() == weight.device()))
+        throw std::runtime_error("GEMM tensors must share one CUDA device");
     const int rows = static_cast<int>(input.size(0));
     const int width = static_cast<int>(input.size(1));
     const int outputs = static_cast<int>(weight.size(0));
@@ -371,10 +358,10 @@ void validate_nint8_zero(
     const auto status = tyloi::cuda::nint_raw::gemm_nt(
         mfq_current_cublas_handle(), mfq_current_cuda_stream(), input.data_ptr(),
         weight.data_ptr(), result.data_ptr(), rows, outputs, width, false, false);
-    TYLOINFER_RUNTIME_CHECK(status.stream == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
-    TYLOINFER_RUNTIME_CHECK(status.gemm == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasGemmEx(...)");
+    if (!(status.stream == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
+    if (!(status.gemm == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasGemmEx(...)");
     return result;
 }
 
@@ -382,19 +369,16 @@ void validate_nint8_zero(
 ::tyloi::DenseTensor nint_cublas_gemm_nt_f32acc_cuda(
         ::tyloi::DenseTensor input,
         ::tyloi::DenseTensor weight) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == ::tyloi::kFloat16 &&
-        input.dim() == 2,
-        "GEMM input must be contiguous CUDA fp16 rank-2");
-    TYLOINFER_RUNTIME_CHECK(
-        weight.is_cuda() && weight.is_contiguous() &&
+        input.dim() == 2))
+        throw std::runtime_error("GEMM input must be contiguous CUDA fp16 rank-2");
+    if (!(weight.is_cuda() && weight.is_contiguous() &&
         weight.scalar_type() == ::tyloi::kFloat16 &&
-        weight.dim() == 2 && weight.size(1) == input.size(1),
-        "GEMM weight must be contiguous CUDA fp16 [N,K]");
-    TYLOINFER_RUNTIME_CHECK(
-        input.device() == weight.device(),
-        "GEMM tensors must share one CUDA device");
+        weight.dim() == 2 && weight.size(1) == input.size(1)))
+        throw std::runtime_error("GEMM weight must be contiguous CUDA fp16 [N,K]");
+    if (!(input.device() == weight.device()))
+        throw std::runtime_error("GEMM tensors must share one CUDA device");
     const int rows = static_cast<int>(input.size(0));
     const int width = static_cast<int>(input.size(1));
     const int outputs = static_cast<int>(weight.size(0));
@@ -402,10 +386,10 @@ void validate_nint8_zero(
     const auto status = tyloi::cuda::nint_raw::gemm_nt(
         mfq_current_cublas_handle(), mfq_current_cuda_stream(), input.data_ptr(),
         weight.data_ptr(), result.data_ptr(), rows, outputs, width, true, false);
-    TYLOINFER_RUNTIME_CHECK(status.stream == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
-    TYLOINFER_RUNTIME_CHECK(status.gemm == CUBLAS_STATUS_SUCCESS,
-        "cuBLAS call failed: cublasGemmEx(...)");
+    if (!(status.stream == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasSetStream(handle, mfq_current_cuda_stream())");
+    if (!(status.gemm == CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("cuBLAS call failed: cublasGemmEx(...)");
     return result;
 }
 template <typename Output>
@@ -414,9 +398,8 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         ::tyloi::DenseTensor scale,
         int64_t width) {
     validate_nint8_zero(quantized, scale);
-    TYLOINFER_RUNTIME_CHECK(
-        width > 0 && width <= quantized.size(1) * 32,
-        "NINT8-0 width is invalid");
+    if (!(width > 0 && width <= quantized.size(1) * 32))
+        throw std::runtime_error("NINT8-0 width is invalid");
     const int rows = static_cast<int>(quantized.size(0));
     const int groups = static_cast<int>(quantized.size(1));
     auto output = ::tyloi::cuda::empty(
@@ -466,23 +449,20 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         ::tyloi::DenseTensor quantized_input,
         ::tyloi::DenseTensor input_scale) {
     validate_nint8_zero(quantized, scale);
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         (input.scalar_type() == ::tyloi::kFloat16 ||
          input.scalar_type() == ::tyloi::kFloat32) &&
-        input.dim() == 2,
-        "NINT8-0 input must be contiguous CUDA fp16/fp32 rank-2");
+        input.dim() == 2))
+        throw std::runtime_error("NINT8-0 input must be contiguous CUDA fp16/fp32 rank-2");
     const int activation_rows = static_cast<int>(input.size(0));
     const int output_rows = static_cast<int>(quantized.size(0));
     const int groups = static_cast<int>(quantized.size(1));
     const int real_width = static_cast<int>(input.size(1));
     const int padded_width = groups * 32;
-    TYLOINFER_RUNTIME_CHECK(
-        activation_rows >= 1 && activation_rows <= 8 &&
-        real_width <= padded_width,
-        "NINT8-0 packed matmul expects M in [1,8] and K <= packed K");
-    TYLOINFER_RUNTIME_CHECK(
-        quantized_input.is_cuda() && quantized_input.is_contiguous() &&
+    if (!(activation_rows >= 1 && activation_rows <= 8 &&
+        real_width <= padded_width))
+        throw std::runtime_error("NINT8-0 packed matmul expects M in [1,8] and K <= packed K");
+    if (!(quantized_input.is_cuda() && quantized_input.is_contiguous() &&
         quantized_input.scalar_type() == ::tyloi::kInt8 &&
         quantized_input.dim() == 2 &&
         quantized_input.size(0) >= activation_rows &&
@@ -490,13 +470,12 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         input_scale.is_contiguous() &&
         input_scale.scalar_type() == ::tyloi::kFloat32 &&
         input_scale.dim() == 2 && input_scale.size(0) >= activation_rows &&
-        input_scale.size(1) >= groups,
-        "NINT8-0 activation workspace is invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        quantized.device() == input.device() && scale.device() == input.device() &&
+        input_scale.size(1) >= groups))
+        throw std::runtime_error("NINT8-0 activation workspace is invalid");
+    if (!(quantized.device() == input.device() && scale.device() == input.device() &&
         quantized_input.device() == input.device() &&
-        input_scale.device() == input.device(),
-        "NINT8-0 tensors and workspace must share one CUDA device");
+        input_scale.device() == input.device()))
+        throw std::runtime_error("NINT8-0 tensors and workspace must share one CUDA device");
     auto output = ::tyloi::cuda::empty(
         {activation_rows, output_rows}, input.options().dtype(::tyloi::kFloat16));
     const cudaStream_t stream = mfq_current_cuda_stream();
@@ -515,11 +494,10 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         ::tyloi::DenseTensor input,
         int64_t width) {
     validate_nint8_zero(quantized, scale);
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == ::tyloi::kFloat16 &&
-        input.dim() == 2 && input.size(1) == width,
-        "NINT8-0 GEMM input geometry is invalid");
+        input.dim() == 2 && input.size(1) == width))
+        throw std::runtime_error("NINT8-0 GEMM input geometry is invalid");
     auto weight = nint8_zero_dequant_cuda(quantized, scale, width);
     return nint_cublas_gemm_nt_f16acc_cuda(input, weight);
 }
@@ -531,11 +509,10 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         ::tyloi::DenseTensor input,
         int64_t width) {
     validate_nint8_zero(quantized, scale);
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == ::tyloi::kFloat16 &&
-        input.dim() == 2 && input.size(1) == width,
-        "NINT8-0 FP32 GEMM input geometry is invalid");
+        input.dim() == 2 && input.size(1) == width))
+        throw std::runtime_error("NINT8-0 FP32 GEMM input geometry is invalid");
     auto weight = nint8_zero_dequant_cuda(quantized, scale, width);
     return cublas_gemm_nt_f32_output(input, weight);
 }
@@ -545,26 +522,26 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
         ::tyloi::DenseTensor row_q_bit_offsets,::tyloi::DenseTensor subgroup_scale,
         ::tyloi::DenseTensor subgroup_minimum,::tyloi::DenseTensor neuron_scale,
         ::tyloi::DenseTensor neuron_minimum,::tyloi::DenseTensor input,int64_t group_size) {
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
-        input.scalar_type()==::tyloi::kFloat16 && input.size(0)>8 && input.size(0)<=32,
-        "NINT online projection requires contiguous CUDA FP16 input with 9..32 rows");
+    if (!(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
+        input.scalar_type()==::tyloi::kFloat16 && input.size(0)>8 && input.size(0)<=32))
+        throw std::runtime_error("NINT online projection requires contiguous CUDA FP16 input with 9..32 rows");
     for(const auto* tensor:{&bitstream,&row_q_bits,&row_q_bit_offsets,&subgroup_scale,
             &subgroup_minimum,&neuron_scale,&neuron_minimum}) {
-        TYLOINFER_RUNTIME_CHECK(tensor->is_cuda() && tensor->is_contiguous() && tensor->device()==input.device(),
-            "NINT online projection tensors must share the input CUDA device");
+        if (!(tensor->is_cuda() && tensor->is_contiguous() && tensor->device()==input.device()))
+            throw std::runtime_error("NINT online projection tensors must share the input CUDA device");
     }
-    TYLOINFER_RUNTIME_CHECK(bitstream.scalar_type()==::tyloi::kUInt8 && bitstream.dim()==1 &&
+    if (!(bitstream.scalar_type()==::tyloi::kUInt8 && bitstream.dim()==1 &&
         row_q_bits.scalar_type()==::tyloi::kUInt8 && row_q_bits.dim()==1 &&
         row_q_bit_offsets.scalar_type()==::tyloi::kInt64 && row_q_bit_offsets.dim()==1 &&
         subgroup_scale.scalar_type()==::tyloi::kUInt8 && subgroup_scale.dim()==2 &&
         subgroup_minimum.scalar_type()==::tyloi::kUInt8 && subgroup_minimum.sizes()==subgroup_scale.sizes() &&
-        neuron_scale.scalar_type()==::tyloi::kFloat32 && neuron_minimum.scalar_type()==::tyloi::kFloat32,
-        "NINT online projection metadata types are invalid");
+        neuron_scale.scalar_type()==::tyloi::kFloat32 && neuron_minimum.scalar_type()==::tyloi::kFloat32))
+        throw std::runtime_error("NINT online projection metadata types are invalid");
     const int rows=int(input.size(0)),outputs=int(subgroup_scale.size(0)),groups=int(subgroup_scale.size(1));
-    TYLOINFER_RUNTIME_CHECK(outputs>0 && groups>0 && group_size>=4 && group_size<=64 &&
+    if (!(outputs>0 && groups>0 && group_size>=4 && group_size<=64 &&
         input.size(1)>0 && input.size(1)<=int64_t(groups)*group_size && row_q_bits.numel()==outputs &&
-        row_q_bit_offsets.numel()==outputs && neuron_scale.numel()==outputs && neuron_minimum.numel()==outputs,
-        "NINT online projection metadata dimensions are invalid");
+        row_q_bit_offsets.numel()==outputs && neuron_scale.numel()==outputs && neuron_minimum.numel()==outputs))
+        throw std::runtime_error("NINT online projection metadata dimensions are invalid");
     auto output=::tyloi::cuda::empty({rows,outputs},input.options());
     const int output_tiles=(outputs+tyloi::cuda::nint_raw::prefill_tile_n-1)/tyloi::cuda::nint_raw::prefill_tile_n;
     int split=1;
@@ -590,14 +567,14 @@ static ::tyloi::DenseTensor nint8_zero_dequant_impl(
 
 std::vector<::tyloi::DenseTensor> nint8_one_quantize_reconstruct_cuda(
         ::tyloi::DenseTensor input) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == ::tyloi::kFloat16 &&
-        input.dim() == 2,
-        "NINT8-1 input must be contiguous CUDA fp16 rank-2");
+        input.dim() == 2))
+        throw std::runtime_error("NINT8-1 input must be contiguous CUDA fp16 rank-2");
     const int rows = static_cast<int>(input.size(0));
     const int width = static_cast<int>(input.size(1));
-    TYLOINFER_RUNTIME_CHECK(rows > 0 && width > 0, "NINT8-1 input must be non-empty");
+    if (!(rows > 0 && width > 0))
+        throw std::runtime_error("NINT8-1 input must be non-empty");
     const int groups = (width + 31) / 32;
     auto quantized = ::tyloi::cuda::empty(
         {rows, groups, 32},
@@ -617,10 +594,11 @@ namespace { thread_local NintInputQuantizationScope* prepared_input_scope=nullpt
 NintInputQuantizationScope::NintInputQuantizationScope(
         ::tyloi::DenseTensor source,const std::vector<int>& sizes):input(std::move(source)) {
     if(sizes.empty())return;
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
+    if (!(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
         input.size(0)>=1 && input.size(0)<=6 && input.size(1)>0 && input.size(1)<=INT_MAX-64 &&
         (input.scalar_type()==::tyloi::kFloat16 || input.scalar_type()==::tyloi::kFloat32) &&
-        sizes.size()<=4,"invalid shared NINT quantization input");
+        sizes.size()<=4))
+        throw std::runtime_error("invalid shared NINT quantization input");
     const MfqCudaGuard guard(input.device());
     tyloi::cuda::nint_raw::GroupQuantize args;
     args.input=input.data_ptr();args.rows=int(input.size(0));args.width=int(input.size(1));
@@ -629,7 +607,8 @@ NintInputQuantizationScope::NintInputQuantizationScope(
     const int columns=args.rows<=2?2:args.rows<=4?4:(exact && exact[0]=='0')?8:args.rows;
     int total=0;
     for(int gs:sizes) {
-        TYLOINFER_RUNTIME_CHECK(gs==24 || gs==28 || gs==48,"unsupported shared NINT group size");
+        if (!(gs==24 || gs==28 || gs==48))
+            throw std::runtime_error("unsupported shared NINT group size");
         const int ng=(args.width+gs-1)/gs;
         NintPreparedGroupInput prepared;prepared.gs=gs;
         prepared.codes=::tyloi::cuda::empty({args.rows,ng*gs},input.options().dtype(::tyloi::kInt8));
@@ -666,37 +645,31 @@ static ::tyloi::DenseTensor nint_matmul_ws_impl(
         ::tyloi::DenseTensor quantized_input,
         ::tyloi::DenseTensor input_scale,
         bool aligned_q8 = false,int uniform_bits = 0) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
         (input.scalar_type() == ::tyloi::kFloat16 ||
          input.scalar_type() == ::tyloi::kFloat32) &&
-        input.dim() == 2,
-        "NINT input must be contiguous CUDA fp16/fp32 rank-2");
+        input.dim() == 2))
+        throw std::runtime_error("NINT input must be contiguous CUDA fp16/fp32 rank-2");
     if (gate != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(
-            activation_mode == 1 || activation_mode == 2,
-            "NINT input gate mode must be sigmoid or SiLU");
-        TYLOINFER_RUNTIME_CHECK(
-            gate->is_cuda() && gate->is_contiguous() &&
+        if (!(activation_mode == 1 || activation_mode == 2))
+            throw std::runtime_error("NINT input gate mode must be sigmoid or SiLU");
+        if (!(gate->is_cuda() && gate->is_contiguous() &&
             (gate->scalar_type() == ::tyloi::kFloat16 ||
              gate->scalar_type() == ::tyloi::kFloat32) &&
-            gate->dim() == 2 && gate->sizes() == input.sizes(),
-            "NINT gate must be contiguous CUDA fp16/fp32 and match input shape");
+            gate->dim() == 2 && gate->sizes() == input.sizes()))
+            throw std::runtime_error("NINT gate must be contiguous CUDA fp16/fp32 and match input shape");
     } else {
-        TYLOINFER_RUNTIME_CHECK(
-            activation_mode == 0,
-            "NINT activation mode requires a gate tensor");
+        if (!(activation_mode == 0))
+            throw std::runtime_error("NINT activation mode requires a gate tensor");
     }
-    TYLOINFER_RUNTIME_CHECK(
-        subgroup_scale.is_cuda() && subgroup_scale.is_contiguous() &&
+    if (!(subgroup_scale.is_cuda() && subgroup_scale.is_contiguous() &&
         subgroup_scale.scalar_type() == ::tyloi::kUInt8 &&
         subgroup_scale.dim() == 2 && subgroup_minimum.is_cuda() &&
         subgroup_minimum.is_contiguous() &&
         subgroup_minimum.scalar_type() == ::tyloi::kUInt8 &&
-        subgroup_minimum.sizes() == subgroup_scale.sizes(),
-        "NINT subgroup metadata is invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        bitstream.is_cuda() && bitstream.is_contiguous() &&
+        subgroup_minimum.sizes() == subgroup_scale.sizes()))
+        throw std::runtime_error("NINT subgroup metadata is invalid");
+    if (!(bitstream.is_cuda() && bitstream.is_contiguous() &&
         bitstream.scalar_type() == ::tyloi::kUInt8 &&
         bitstream.dim() == 1 && row_q_bits.is_cuda() &&
         row_q_bits.is_contiguous() &&
@@ -704,33 +677,28 @@ static ::tyloi::DenseTensor nint_matmul_ws_impl(
         row_q_bits.dim() == 1 && row_q_bit_offsets.is_cuda() &&
         row_q_bit_offsets.is_contiguous() &&
         row_q_bit_offsets.scalar_type() == ::tyloi::kInt64 &&
-        row_q_bit_offsets.dim() == 1,
-        "NINT bitstream or q metadata is invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
+        row_q_bit_offsets.dim() == 1))
+        throw std::runtime_error("NINT bitstream or q metadata is invalid");
+    if (!(neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
         neuron_scale.scalar_type() == ::tyloi::kFloat32 &&
         neuron_minimum.is_cuda() && neuron_minimum.is_contiguous() &&
-        neuron_minimum.scalar_type() == ::tyloi::kFloat32,
-        "NINT neuron metadata is invalid");
+        neuron_minimum.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("NINT neuron metadata is invalid");
     const int output_rows = static_cast<int>(subgroup_scale.size(0));
     const int groups = static_cast<int>(subgroup_scale.size(1));
     const int activation_rows = static_cast<int>(input.size(0));
     const int real_width = static_cast<int>(input.size(1));
     const int padded_width = groups * static_cast<int>(group_size);
-    TYLOINFER_RUNTIME_CHECK(
-        activation_rows >= 1 && activation_rows <= 8,
-        "NINT packed matmul supports M in [1,8]");
-    TYLOINFER_RUNTIME_CHECK(
-        group_size >= 4 && group_size <= 64 && real_width <= padded_width,
-        "NINT packed matmul dimensions are invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q_bits.numel() == output_rows &&
+    if (!(activation_rows >= 1 && activation_rows <= 8))
+        throw std::runtime_error("NINT packed matmul supports M in [1,8]");
+    if (!(group_size >= 4 && group_size <= 64 && real_width <= padded_width))
+        throw std::runtime_error("NINT packed matmul dimensions are invalid");
+    if (!(row_q_bits.numel() == output_rows &&
         row_q_bit_offsets.numel() == output_rows &&
         neuron_scale.numel() == output_rows &&
-        neuron_minimum.numel() == output_rows,
-        "NINT row metadata shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(
-        quantized_input.is_cuda() && quantized_input.is_contiguous() &&
+        neuron_minimum.numel() == output_rows))
+        throw std::runtime_error("NINT row metadata shape mismatch");
+    if (!(quantized_input.is_cuda() && quantized_input.is_contiguous() &&
         quantized_input.scalar_type() == ::tyloi::kInt8 &&
         quantized_input.dim() == 2 &&
         quantized_input.size(0) >= activation_rows &&
@@ -738,10 +706,9 @@ static ::tyloi::DenseTensor nint_matmul_ws_impl(
         input_scale.is_contiguous() &&
         input_scale.scalar_type() == ::tyloi::kFloat32 &&
         input_scale.dim() == 2 && input_scale.size(0) >= activation_rows &&
-        input_scale.size(1) >= groups,
-        "NINT activation workspace is invalid");
-    TYLOINFER_RUNTIME_CHECK(
-        bitstream.device() == input.device() &&
+        input_scale.size(1) >= groups))
+        throw std::runtime_error("NINT activation workspace is invalid");
+    if (!(bitstream.device() == input.device() &&
         row_q_bits.device() == input.device() &&
         row_q_bit_offsets.device() == input.device() &&
         subgroup_scale.device() == input.device() &&
@@ -750,8 +717,8 @@ static ::tyloi::DenseTensor nint_matmul_ws_impl(
         neuron_minimum.device() == input.device() &&
         quantized_input.device() == input.device() &&
         input_scale.device() == input.device() &&
-        (gate == nullptr || gate->device() == input.device()),
-        "NINT tensors and workspace must share one CUDA device");
+        (gate == nullptr || gate->device() == input.device())))
+        throw std::runtime_error("NINT tensors and workspace must share one CUDA device");
     auto output = ::tyloi::cuda::empty(
         {activation_rows, output_rows}, input.options().dtype(::tyloi::kFloat16));
     const cudaStream_t stream = mfq_current_cuda_stream();
@@ -846,8 +813,10 @@ static ::tyloi::DenseTensor nint_matmul_ws_impl(
     a.real_width=real_width; a.uniform_bits=uniform_bits; a.device=input.get_device();
     a.aligned_q8=aligned_q8; a.whole_input=whole_input; a.cached_sums=cached_sums;
     const int error=tyloi::cuda::nint_raw::project(a,stream);
-    TYLOINFER_RUNTIME_CHECK(error != 1,"NINT shared activation device query failed");
-    TYLOINFER_RUNTIME_CHECK(error != 2,"NINT processor count query failed");
+    if (!(error != 1))
+        throw std::runtime_error("NINT shared activation device query failed");
+    if (!(error != 2))
+        throw std::runtime_error("NINT processor count query failed");
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

@@ -1,4 +1,4 @@
-// Adapted from Strata (MIT), cpp_runtime/third_party/strata.LICENSE.
+// Adapted from Strata (MIT), LICENSES/Strata-MIT.txt.
 // src/kernels/cpu/iq_avx2_rows.inl - the row kernels of iq_avx2.cpp.  Not a header: iq_avx2.cpp includes it twice,
 //
 //   STRATA_ROWS_VNNI 0   the AVX2 forms (namespace plain);

@@ -31,6 +31,7 @@ struct LayerEvent {
     enum class Mode { tiled, packed, single };
     Phase phase;
     Mode mode = Mode::tiled;
+    std::int64_t index = -1;
 };
 
 /** Request a workspace loan or detach its final output before the next visible quantum. */

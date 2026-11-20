@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/common/check.h"
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -25,15 +25,15 @@ inline NgramHashes ngram_hashes(const int64_t *source, int64_t b, int64_t t, int
                                 const std::vector<int64_t> &offsets_,
                                 const std::vector<int64_t> &vocab_, const NgramContext &context_,
                                 bool cache) {
-    require_model(
-        b > 0 && t > 0 && ngram_ > 1 && heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
-            offsets_.size() == size_t((ngram_ - 1) * heads_) && vocab_.size() == offsets_.size(),
-        "invalid ngram hash geometry");
+    if (!(b > 0 && t > 0 && ngram_ > 1 && heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
+        offsets_.size() == size_t((ngram_ - 1) * heads_) && vocab_.size() == offsets_.size()))
+        throw std::runtime_error("invalid ngram hash geometry");
     for (auto size : vocab_)
-        require_model(size > 0, "invalid ngram hash vocabulary");
+        if (!(size > 0))
+            throw std::runtime_error("invalid ngram hash vocabulary");
     const auto prefix = ngram_ - 1, length = prefix + t, nh = prefix * heads_;
-    require_model(!cache || context_.batch != b || context_.tokens.size() == size_t(b * prefix),
-                  "invalid ngram history");
+    if (!(!cache || context_.batch != b || context_.tokens.size() == size_t(b * prefix)))
+        throw std::runtime_error("invalid ngram history");
     std::vector<int64_t> global(b * t * nh), history(b * length, eos_);
     for (int64_t bi = 0; bi < b; ++bi) {
         if (cache && context_.batch == b)

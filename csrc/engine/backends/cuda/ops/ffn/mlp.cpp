@@ -3,6 +3,11 @@
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/ops/activation.h"
 #include "engine/backends/cuda/ops/ffn/experts/launch.h"
+#include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/backends/cuda/ops/projection/channel_fp8.h"
+#include "engine/backends/cuda/ops/projection/prefill.h"
+#include "components/error.h"
 
 #include <algorithm>
 #include <array>
@@ -16,15 +21,16 @@ using ActivationKind = tyloi::ops::MlpActivation;
 
 DenseTensor dense_routed_projection(const DenseTensor &bank, const DenseTensor &input, const DenseTensor &ids,
                                std::size_t gather_budget_bytes) {
-    TYLOINFER_RUNTIME_CHECK(bank.is_cuda() && bank.is_contiguous() && bank.dim() == 3,
-                      "dense routed expert bank must be contiguous CUDA [experts,out,in]");
-    TYLOINFER_RUNTIME_CHECK(ids.is_cuda() && ids.dim() == 2, "dense routed ids must be [tokens,routes]");
+    if (!(bank.is_cuda() && bank.is_contiguous() && bank.dim() == 3))
+        throw std::runtime_error("dense routed expert bank must be contiguous CUDA [experts,out,in]");
+    if (!(ids.is_cuda() && ids.dim() == 2))
+        throw std::runtime_error("dense routed ids must be [tokens,routes]");
     const int64_t rows = ids.size(0), routes = ids.size(1);
     const int64_t output = bank.size(1), width = bank.size(2);
-    TYLOINFER_RUNTIME_CHECK(input.size(0) == rows && input.size(-1) == width,
-                      "dense routed input shape does not match the expert bank");
-    TYLOINFER_RUNTIME_CHECK(input.dim() == 2 || (input.dim() == 3 && input.size(1) == routes),
-                      "dense routed activation shape does not match the route plan");
+    if (!(input.size(0) == rows && input.size(-1) == width))
+        throw std::runtime_error("dense routed input shape does not match the expert bank");
+    if (!(input.dim() == 2 || (input.dim() == 3 && input.size(1) == routes)))
+        throw std::runtime_error("dense routed activation shape does not match the route plan");
     auto project = [&](const DenseTensor &chunk_ids, const DenseTensor &chunk_input) {
         const int64_t count = chunk_ids.size(0);
         auto selected =
@@ -57,10 +63,10 @@ namespace tyloi::cuda {
 
 DenseTensor expert_activation(ActivationKind activation, DenseTensor gate, DenseTensor up, double limit) {
     if (activation == ActivationKind::relu_squared) {
-        TYLOINFER_RUNTIME_CHECK(!gate.defined(), "relu-squared experts have no gate projection");
+        if (gate.defined()) throw std::runtime_error("relu-squared experts have no gate projection");
         return relu_squared_cuda(up.contiguous());
     }
-    TYLOINFER_RUNTIME_CHECK(gate.defined(), "gated experts require a gate projection");
+    if (!gate.defined()) throw std::runtime_error("gated experts require a gate projection");
     if (activation == ActivationKind::gelu_gated)
         return gelu_mul_cuda(gate.contiguous(), up.contiguous());
     if (limit > 0.0) {
@@ -175,11 +181,11 @@ bool Mlp::parallel() const {
         ::tyloi::DenseTensor xh) const {
     using DenseTensor = ::tyloi::DenseTensor;
     if (activation == ActivationKind::relu_squared) {
-        TYLOINFER_RUNTIME_CHECK(!parallel(),
-                          "relu-squared MLP does not support tensor parallelism");
+        if (!(!parallel()))
+            throw std::runtime_error("relu-squared MLP does not support tensor parallelism");
         auto parts = profiler.measure("ffn.up", [&]() { return project.run(gate_up, xh); });
-        TYLOINFER_RUNTIME_CHECK(parts.size() == 1,
-                          "relu-squared FFN requires exactly one Up projection");
+        if (!(parts.size() == 1))
+            throw std::runtime_error("relu-squared FFN requires exactly one Up projection");
         auto hidden = profiler.measure("ffn.relu_squared", [&]() {
             return relu_squared_cuda(parts[0].contiguous());
         });
@@ -273,10 +279,12 @@ bool Mlp::parallel() const {
         const Projector& project, CudaProfiler& profiler, KlMmqState& mmq,
         ::tyloi::DenseTensor xh) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    TYLOINFER_RUNTIME_CHECK(!parallel() &&
+    {
+        if (!(!parallel() &&
                           activation == ActivationKind::silu_gated && !geglu &&
-                          swiglu_limit <= 0.0,
-                      "FP32-output IN diagnostic requires a local dense SiLU FFN");
+                          swiglu_limit <= 0.0))
+            throw std::runtime_error("FP32-output IN diagnostic requires a local dense SiLU FFN");
+    }
     auto parts = profiler.measure("ffn.gate_up", [&]() { return project.run(gate_up, xh); });
     return profiler.measure("ffn.down.fp32_output", [&]() {
         return nint_kld(profiler, mmq, down, parts[1], parts[0], InputGateMode::Silu);
@@ -294,6 +302,61 @@ const tyloi::NvqTensor* nvq_of(const ::tyloi::Tensor& linear) {
 }
 }  // namespace
 #endif
+
+std::optional<DenseTensor> Mlp::prefill_residual(const Projector& project,
+        CudaProfiler& profiler, const DenseTensor& input, const DenseTensor& residual) const {
+    if (activation != ActivationKind::silu_gated || swiglu_limit > 0 ||
+        !input.is_cuda() || input.scalar_type() != kFloat16 || !input.is_contiguous() ||
+        input.dim() != 2 || input.size(0) <= 32 || input.size(1) <= 0 ||
+        residual.device() != input.device() || residual.scalar_type() != kFloat16 ||
+        !residual.is_contiguous() || residual.sizes() != input.sizes() ||
+        !down || down.dim() != 2 || gate_up.layers.size() != 2 || gate_up.outs.size() != 2 ||
+        gate_up.outs[0] != gate_up.outs[1] || gate_up.outs[0] != down.size(1) ||
+        down.device() != input.device() || down.size(0) != residual.size(1)) return std::nullopt;
+    const auto* ggml = down.representation<GgmlQuantizedTensor>();
+    const auto* fp8 = down.representation<ChannelFp8Tensor>();
+    const auto* trellis = down.representation<encoding::TqTensor>();
+    const bool decode_weight = down.representation<DenseTensor>() ||
+        down.representation<Mxfp4Tensor>() || down.representation<Mxfp8Tensor>() ||
+        (mfq_compat_enabled && (down.representation<NintTensor>() || down.representation<NvqTensor>() ||
+            down.representation<Mxfp4SqTensor>() || down.representation<Fp8SqTensor>()));
+    if (!fp8 && (!ggml || !gguf::can_prefill_residual(*ggml, input.size(0), residual)) &&
+        (!(trellis || decode_weight) ||
+            !can_prefill_f16_residual(input.size(0), down.size(0), down.size(1), down.device(), residual)))
+        return std::nullopt;
+    auto hidden = profiler.measure("ffn.gate_up", [&] {
+        if (gate_up.tq.defined()) return project.swiglu(gate_up, input);
+        auto parts = project.run(gate_up, input);
+        auto gate = parts[0].to(parts[1].scalar_type());
+        return expert_activation(activation, std::move(gate), std::move(parts[1]), 0);
+    });
+    return profiler.measure("ffn.down_residual", [&] {
+        if (hidden.scalar_type() == kFloat16) {
+            if (fp8) return channel_fp8_projection(*fp8, std::move(hidden), &profiler, nullptr, residual);
+            if (ggml) return gguf::project_prefill_residual(*ggml, std::move(hidden), residual);
+            if (trellis) {
+                auto fused = tq::project_prefill_residual(*trellis, hidden, residual);
+                if (fused.defined()) return fused;
+            }
+            const auto rows = down.size(0);
+            const auto row_bytes = std::uint64_t(down.size(1))*6 + std::uint64_t(input.size(0))*2;
+            if (decode_weight && prefill_weight_rows(rows, row_bytes, 32, input.get_device()) == rows) {
+                DenseTensor decoded, output, scratch;
+                try {
+                    decoded = prefill_linear_weight(down);
+                    output = empty_like(residual);
+                } catch (const MfqResourceExhausted&) {}
+                if (output.defined()) {
+                    const auto stream = current_stream(input.get_device());
+                    auto& blas = default_context(input.get_device())->blas(stream.stream());
+                    prefill_f16_residual_tile(hidden, decoded, residual, output, 0, rows, blas.get(), scratch);
+                    return output;
+                }
+            }
+        }
+        return acc_cuda(residual, project.run(down, std::move(hidden)).to(kFloat16).contiguous());
+    });
+}
 
 bool Mlp::can_fuse(const DenseTensor& x, const DenseTensor& residual) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -323,8 +386,10 @@ bool Mlp::can_fuse(const DenseTensor& x, const DenseTensor& residual) const {
 
 DenseTensor Mlp::fused(CudaProfiler& profiler, DenseTensor x, DenseTensor residual) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    TYLOINFER_RUNTIME_CHECK(can_fuse(x, residual),
-                      "FFN fused residual requires a compatible single-token NVQ FFN");
+    {
+        if (!can_fuse(x, residual))
+            throw std::runtime_error("FFN fused residual requires a compatible single-token NVQ FFN");
+    }
     auto shape = x.sizes().vec();
     const auto& gate0 = payload_as<tyloi::NvqTensor>(gate_up.layers[0]);
     const auto& gate1 = payload_as<tyloi::NvqTensor>(gate_up.layers[1]);

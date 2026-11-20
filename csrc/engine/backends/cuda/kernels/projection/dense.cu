@@ -1,5 +1,6 @@
 #include "dense.h"
 #include "engine/backends/cuda/native/context.h"
+#include <stdexcept>
 #include <cublas_v2.h>
 #include "engine/weights/prepare/nint.h"
 #include "../../ops/qwen4_exp.h"
@@ -489,19 +490,19 @@ namespace {
 ::tyloi::DenseTensor float_projection_impl(
         const tyloi::NintTensor& weight, const ::tyloi::DenseTensor& input,bool parallel_groups,bool native_input,
         bool fixed_groups,int activation,int64_t streams) {
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && weight.q_packed.is_cuda() &&
+    if (!(input.is_cuda() && weight.q_packed.is_cuda() &&
         input.device() == weight.q_packed.device() && input.dim() >= 1 &&
         input.size(-1) == weight.neuron_len && weight.neuron_len > 0 && weight.out > 0 &&
         weight.gs > 0 && weight.gs <= 64 &&
-        weight.ng == (weight.neuron_len + weight.gs - 1) / weight.gs,
-        "packed float projection dimensions/device disagree");
+        weight.ng == (weight.neuron_len + weight.gs - 1) / weight.gs))
+        throw std::runtime_error("packed float projection dimensions/device disagree");
     MfqCudaGuard guard(input.device());
     auto x = native_input && input.scalar_type()==::tyloi::kFloat16
         ? input.contiguous() : input.to(::tyloi::kFloat32).contiguous();
     auto shape = x.sizes().vec();
     const auto rows = x.numel() / weight.neuron_len;
-    TYLOINFER_RUNTIME_CHECK(rows <= 65535 && (weight.out + 3) / 4 <= std::numeric_limits<int>::max(),
-        "packed float projection exceeds CUDA launch geometry");
+    if (!(rows <= 65535 && (weight.out + 3) / 4 <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("packed float projection exceeds CUDA launch geometry");
     shape.back() = weight.out;
     const auto output_dtype=activation && input.scalar_type()==::tyloi::kFloat16?::tyloi::kFloat16: ::tyloi::kFloat32;
     auto result = ::tyloi::cuda::empty(shape, x.options().dtype(output_dtype));
@@ -824,7 +825,8 @@ int nint_float_projection_resident_blocks(int device) {
 ::tyloi::DenseTensor nint_float_projection_activation_cuda(const tyloi::NintTensor& weight,
         const ::tyloi::DenseTensor& input,int64_t streams,bool injection,
         bool parallel_groups,bool native_input,bool fixed_groups) {
-    TYLOINFER_RUNTIME_CHECK(streams>0,"packed residual activation requires positive stream count");
+    if (!(streams>0))
+        throw std::runtime_error("packed residual activation requires positive stream count");
     if(gr_prefill_selected(input)) {
         auto projected=gr_prefill_matmul(weight,input);
         if(input.scalar_type()==::tyloi::kFloat16)projected=projected.to(::tyloi::kFloat16);
@@ -837,13 +839,15 @@ int nint_float_projection_resident_blocks(int device) {
 ::tyloi::DenseTensor nint_float_projection_mix_cuda(const tyloi::NintTensor& weight,
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized,
         int64_t streams,bool native_input,bool fixed_groups,bool compact) {
-    TYLOINFER_RUNTIME_CHECK(input.dim()>0 && streams>0 && weight.out>0 && weight.out%streams==0 &&
-        normalized.dim()==input.dim(),"packed residual mixing dimensions disagree");
+    if (!(input.dim()>0 && streams>0 && weight.out>0 && weight.out%streams==0 &&
+        normalized.dim()==input.dim()))
+        throw std::runtime_error("packed residual mixing dimensions disagree");
     auto expected=input.sizes().vec();expected.back()=weight.out;
-    TYLOINFER_RUNTIME_CHECK(normalized.sizes().vec()==expected && input.is_cuda() && normalized.is_cuda() &&
+    if (!(normalized.sizes().vec()==expected && input.is_cuda() && normalized.is_cuda() &&
         input.device()==normalized.device() && input.device()==weight.q_packed.device() &&
         input.size(-1)==weight.neuron_len && weight.ng>0 && weight.gs>0 && weight.gs<=64 &&
-        weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,"packed residual mixing geometry/device disagree");
+        weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs))
+        throw std::runtime_error("packed residual mixing geometry/device disagree");
     const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/streams;
     if(gr_prefill_selected(input)) {
         if(gr_prefill_blas_selected(weight,input) && normalized.is_contiguous() &&
@@ -867,8 +871,8 @@ int nint_float_projection_resident_blocks(int device) {
         if(input.scalar_type()==::tyloi::kFloat16)projection=projection.to(::tyloi::kFloat16);
         return mfq_qwen4_exp::gated_residual_mix(projection,normalized,streams);
     }
-    TYLOINFER_RUNTIME_CHECK(rows<=65535 && hidden<=std::numeric_limits<int>::max(),
-        "packed residual mixing exceeds CUDA launch geometry");
+    if (!(rows<=65535 && hidden<=std::numeric_limits<int>::max()))
+        throw std::runtime_error("packed residual mixing exceeds CUDA launch geometry");
     auto x=native_input && input.scalar_type()==::tyloi::kFloat16?input:input.to(::tyloi::kFloat32);
     auto shape=input.sizes().vec();shape.back()=hidden;
     const auto dtype=input.scalar_type()==::tyloi::kFloat32 || normalized.scalar_type()==::tyloi::kFloat32
@@ -935,8 +939,8 @@ int nint_float_projection_resident_blocks(int device) {
 #endif
 
 ::tyloi::DenseTensor prepare_gr_dense_vector_right(const ::tyloi::DenseTensor& right) {
-    TYLOINFER_RUNTIME_CHECK(right.is_cuda() && right.dim()==2 && right.scalar_type()==::tyloi::kFloat32 &&
-        right.size(0)>0 && right.size(0)%4==0 && right.size(1)>0 && right.size(1)<=4,
-        "vector residual injection requires F32 [4*k, 1..4] weights");
+    if (!(right.is_cuda() && right.dim()==2 && right.scalar_type()==::tyloi::kFloat32 &&
+        right.size(0)>0 && right.size(0)%4==0 && right.size(1)>0 && right.size(1)<=4))
+        throw std::runtime_error("vector residual injection requires F32 [4*k, 1..4] weights");
     return right.reshape({right.size(0)/4,4,right.size(1)}).transpose(1,2).contiguous();
 }

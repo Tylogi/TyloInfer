@@ -18,6 +18,16 @@ std::size_t request_bytes(const EngineRequest& request) {
     std::size_t bytes = sizeof(request) + request.id.size() + input.prompt.size() +
         input.cache_plan.session_id.size() + request.token_ids.size() * sizeof(std::int64_t);
     for (const auto& stop : input.stops) bytes += sizeof(stop) + stop.size();
+    if (const auto& decision = request.decision) {
+        bytes += decision->cache_salt.size();
+        for (const auto& [key, value] : decision->chat_template_kwargs)
+            bytes += sizeof(key) + sizeof(value) + key.size() + value.size();
+        for (const auto& read : decision->reads) {
+            bytes += sizeof(read) + read.prompt.size() + read.state.size() + read.instructions.size() + read.type.size();
+            for (const auto& label : read.labels) bytes += sizeof(label) + label.size();
+            for (const auto& option : read.option_texts) bytes += sizeof(option) + option.size();
+        }
+    }
     if (input.chat_input) {
         const auto& chat = *input.chat_input;
         const auto& value = chat.template_inputs;
@@ -55,6 +65,8 @@ std::size_t event_bytes(const EventData& data) {
                 bytes += diff.content_delta.size() + diff.reasoning_content_delta.size();
                 bytes += diff.tool_call_delta.name.size() + diff.tool_call_delta.arguments.size() + diff.tool_call_delta.id.size();
             }
+        } else if constexpr (std::is_same_v<T, DecisionReadResult>) {
+            bytes += value.probabilities.size() * sizeof(double);
         } else if constexpr (std::is_same_v<T, Completed>) {
             bytes += value.finish_reason.size();
         } else if constexpr (std::is_same_v<T, Failed>) {

@@ -4,7 +4,6 @@
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/models/session/snapshot.h"
-#include "engine/models/common/check.h"
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
@@ -20,6 +19,7 @@
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/kernels/attention/deepseek_v4.h"
 #include "engine/backends/cuda/kernels/ffn/hyperconnection.h"
+#include <stdexcept>
 #include <array>
 #include <iomanip>
 #include <limits>
@@ -83,8 +83,11 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
                                           p + "attention.compressor.gate.weight"});
         const auto output_dim = layer.compressor.overlap ? 2 * c.head_dim : c.head_dim;
         for (const auto& weight : projection)
-            TYLOINFER_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == output_dim &&
-                weight.size(1) == c.hidden_size, "FP32 compressor projection shape mismatch");
+            {
+                if (!(weight.dim() == 2 && weight.size(0) == output_dim &&
+                weight.size(1) == c.hidden_size))
+                    throw std::runtime_error("FP32 compressor projection shape mismatch");
+            }
         layer.compressor.projection = tyloi::weights::fp32_group(collectives, primary, projection);
         layer.compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
@@ -97,8 +100,11 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
         auto projection = weights.group({p + "attention.indexer.compressor.key_value.weight",
                                           p + "attention.indexer.compressor.gate.weight"});
         for (const auto& weight : projection)
-            TYLOINFER_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == 2 * c.index_head_dim &&
-                weight.size(1) == c.hidden_size, "FP32 compressor projection shape mismatch");
+            {
+                if (!(weight.dim() == 2 && weight.size(0) == 2 * c.index_head_dim &&
+                weight.size(1) == c.hidden_size))
+                    throw std::runtime_error("FP32 compressor projection shape mismatch");
+            }
         layer.indexer_compressor.projection = tyloi::weights::fp32_group(collectives, primary, projection);
         layer.indexer_compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.indexer_compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
@@ -233,8 +239,8 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    tyloi::models::require_model(model.graph.backbone == "deepseek_v4",
-                               "model backbone does not match the requested causal model");
+    if (!(model.graph.backbone == "deepseek_v4"))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     auto& c = model.config;
     auto& m = model.metadata;
     c = Config::from_json(definition);
@@ -255,11 +261,11 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     m.tie_word_embeddings = c.tie_word_embeddings;
     m.model_type = c.model_type;
     m.layer_types = c.layer_types;
-    tyloi::models::require_model(c.num_hidden_layers == model.graph.topology.text_layers,
-                               "model graph/config text-layer topology mismatch");
+    if (!(c.num_hidden_layers == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context > 0) {
-        tyloi::models::require_model(context <= m.max_position_embeddings,
-                                   "--ctx-size exceeds max_position_embeddings");
+        if (!(context <= m.max_position_embeddings))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         c.max_position_embeddings = m.max_position_embeddings = context;
     }
     return model;
@@ -329,11 +335,11 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
 
 namespace {
 DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids) {
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     if (ids.dim() == 1) ids = ids.unsqueeze(0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0,
-                               "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return collectives.copy(ids.to(::tyloi::kInt64), primary).contiguous();
 }
 } // namespace
@@ -357,11 +363,12 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 }
 
 ::tyloi::Tensor Model::embedding(const ::tyloi::Tensor& input_ids, int primary) const {
-    tyloi::models::require_model(input_ids.dim() == 1 || input_ids.dim() == 2,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(input_ids.dim() == 1 || input_ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto ids = tyloi::ops::cast(input_ids, tyloi::kInt64);
     if (ids.dim() == 1) ids = tyloi::ops::unsqueeze(ids, 0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     ids = tyloi::ops::contiguous(tyloi::ops::copy(ids, tyloi::Device(tyloi::kCUDA, primary)));
     return tyloi::ops::measure("model.embed", ids.device(), [&] { return tyloi::ops::embedding(ids, embed); });
 }
@@ -403,10 +410,11 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     auto embeddings = input.embeddings.defined() ? std::move(input.embeddings).dense()
         : embedding(ids, mode.primary).dense();
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-                                   embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
-                               "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(input.confirmed == 0, "unsupported speculative backbone geometry");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(input.confirmed == 0))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (state.cache_pos == 0) state.reset(B);
     const auto options = ::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA, mode.primary)).dtype(::tyloi::kInt64);
     auto physical = input.cache_positions.defined()
@@ -415,12 +423,12 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     auto semantic = input.positions.defined()
         ? collectives.copy(input.positions.dense().to(::tyloi::kInt64), mode.primary).contiguous()
         : (state.decode_position_delta == 0 ? physical : physical + state.decode_position_delta);
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-                                   (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-                               "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((semantic.dim() == 1 && semantic.size(0) == T) ||
-                                   (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T),
-                               "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((semantic.dim() == 1 && semantic.size(0) == T) ||
+        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths.defined() && state.cache_pos > 0 && T == 1)
         input.lengths = ::tyloi::cuda::full({B}, state.cache_pos + 1, options);
     ::tyloi::models::AttentionStep step{semantic, input.lengths,
@@ -1118,8 +1126,8 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                     state.indexer_compressor, indexer_parts.at(0), indexer_parts.at(1),
                     attention_rope);
             });
-            tyloi::models::require_model(
-                indexed == visible, "DeepSeek V4 compressor/indexer prefill length mismatch");
+            if (!(indexed == visible))
+                throw std::runtime_error("DeepSeek V4 compressor/indexer prefill length mismatch");
         }
 
         DenseTensor attention;

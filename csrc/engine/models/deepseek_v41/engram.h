@@ -262,15 +262,16 @@ class EngramHashState : public tyloi::models::deepseek_v41::EngramHashState {
                            .reshape({1, 4});
         auto full_state = make_state();
         const auto full = full_state.forward(all_ids, 0);
-        TYLOINFER_RUNTIME_CHECK(full.values == expected,
-                          "DeepSeek-V4.1 Engram full hash contract failed");
+        if (!(full.values == expected))
+            throw std::runtime_error("DeepSeek-V4.1 Engram full hash contract failed");
 
         auto chunked_state = make_state();
         const auto first = chunked_state.forward(all_ids.narrow(1, 0, 2), 0);
         const auto second = chunked_state.forward(all_ids.narrow(1, 2, 2), 2);
         std::vector<std::int64_t> chunked = first.values;
         chunked.insert(chunked.end(), second.values.begin(), second.values.end());
-        TYLOINFER_RUNTIME_CHECK(chunked == expected, "DeepSeek-V4.1 Engram chunked hash contract failed");
+        if (!(chunked == expected))
+            throw std::runtime_error("DeepSeek-V4.1 Engram chunked hash contract failed");
 
         auto speculative_state = make_state();
         (void)speculative_state.forward(all_ids.narrow(1, 0, 2), 0);
@@ -278,14 +279,14 @@ class EngramHashState : public tyloi::models::deepseek_v41::EngramHashState {
         const auto speculative = speculative_state.forward(all_ids.narrow(1, 2, 2), 2);
         speculative_state.rollback_speculative();
         const auto replayed = speculative_state.forward(all_ids.narrow(1, 2, 2), 2);
-        TYLOINFER_RUNTIME_CHECK(speculative.values == replayed.values,
-                          "DeepSeek-V4.1 Engram speculative rollback failed");
-        TYLOINFER_RUNTIME_CHECK(engram_detail::decode_e4m3(0x00) == 0.0f &&
+        if (!(speculative.values == replayed.values))
+            throw std::runtime_error("DeepSeek-V4.1 Engram speculative rollback failed");
+        if (!(engram_detail::decode_e4m3(0x00) == 0.0f &&
                               engram_detail::decode_e4m3(0x38) == 1.0f &&
                               engram_detail::decode_e4m3(0x40) == 2.0f &&
                               engram_detail::decode_e4m3(0xb8) == -1.0f &&
-                              engram_detail::decode_e4m3(0x01) == std::ldexp(1.0f, -9),
-                          "DeepSeek-V4.1 Engram E4M3 decode contract failed");
+                              engram_detail::decode_e4m3(0x01) == std::ldexp(1.0f, -9)))
+            throw std::runtime_error("DeepSeek-V4.1 Engram E4M3 decode contract failed");
     }
 };
 
@@ -383,8 +384,8 @@ class Engram {
                          const std::vector<int64_t>* host_rows=nullptr) const {
         if(text_rows.defined()) {
             if(!text_rows.numel())return hidden;
-            TYLOINFER_RUNTIME_CHECK(host_rows && host_rows->size()==std::size_t(text_rows.numel()),
-                              "DeepSeek-V4.1 Engram image participation is incomplete");
+            if (!(host_rows && host_rows->size()==std::size_t(text_rows.numel())))
+                throw std::runtime_error("DeepSeek-V4.1 Engram image participation is incomplete");
             auto flat=hidden.reshape({1,-1,config_.hc_mult,config_.hidden});
             auto selected=forward(state, flat.index_select(1,text_rows).contiguous(),
                                   select_hash_rows(hashes,*host_rows));
@@ -421,8 +422,8 @@ class Engram {
         const auto* source=hashes.layer_data(hash_layer_);
         auto* target=selected.values.data()+std::size_t(hash_layer_)*rows.size()*hashes.columns;
         for(const auto row:rows) {
-            TYLOINFER_RUNTIME_CHECK(row>=0 && row<int64_t(hashes.batch)*hashes.tokens,
-                              "DeepSeek-V4.1 Engram text row is out of range");
+            if (!(row>=0 && row<int64_t(hashes.batch)*hashes.tokens))
+                throw std::runtime_error("DeepSeek-V4.1 Engram text row is out of range");
             std::copy_n(source+row*hashes.columns,hashes.columns,target);target+=hashes.columns;
         }
         return selected;

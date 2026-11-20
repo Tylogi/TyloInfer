@@ -41,20 +41,20 @@ NintScratch scratch(const tyloi::NintTensor& weight, int rows) {
 }
 ::tyloi::DenseTensor nint_row_embedding_lookup(
         const tyloi::NintRows& table, const ::tyloi::DenseTensor& ids) {
-    TYLOINFER_RUNTIME_CHECK(ids.is_cuda() && ids.scalar_type() == ::tyloi::kInt64,
-        "NINT row IDs must be CUDA int64");
+    if (!(ids.is_cuda() && ids.scalar_type() == ::tyloi::kInt64))
+        throw std::runtime_error("NINT row IDs must be CUDA int64");
     const MfqCudaGuard guard(ids.device());
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(), &capture));
-    TYLOINFER_RUNTIME_CHECK(capture == cudaStreamCaptureStatusNone,
-        "range-backed NINT row lookup cannot run inside CUDA graph capture");
+    if (!(capture == cudaStreamCaptureStatusNone))
+        throw std::runtime_error("range-backed NINT row lookup cannot run inside CUDA graph capture");
     auto shape = ids.sizes().vec();
     shape.push_back(table.width());
     if (ids.numel() == 0)
         return ::tyloi::cuda::empty(shape, ids.options().dtype(::tyloi::kFloat16));
-    TYLOINFER_RUNTIME_CHECK(ids.numel() <= std::numeric_limits<int>::max() / 6 &&
-        static_cast<uint64_t>(ids.numel()) * table.width() <= std::numeric_limits<uint32_t>::max(),
-        "NINT row lookup batch exceeds bounds");
+    if (!(ids.numel() <= std::numeric_limits<int>::max() / 6 &&
+        static_cast<uint64_t>(ids.numel()) * table.width() <= std::numeric_limits<uint32_t>::max()))
+        throw std::runtime_error("NINT row lookup batch exceeds bounds");
     auto host = ids.contiguous().cpu();
     tyloi::NintRowBatch selected;
     table.append_rows(host.data_ptr<int64_t>(), static_cast<std::size_t>(host.numel()),
@@ -204,12 +204,13 @@ CpuQuantizedActivation cpu_quantize_activation(
         int64_t width,
         int64_t group_size,
         bool with_sums) {
-    TYLOINFER_RUNTIME_CHECK(!x.is_cuda(), "CPU activation quantization requires a CPU tensor");
+    if (x.is_cuda())
+        throw std::runtime_error("CPU activation quantization requires a CPU tensor");
     x = pad_last(x.contiguous().to(::tyloi::kFloat16), width).contiguous();
     const int64_t rows = x.size(0);
     const int64_t groups = (width + group_size - 1) / group_size;
-    TYLOINFER_RUNTIME_CHECK(group_size > 0 && group_size <= 64,
-        "CPU compact GEMV group size must be in [1, 64]");
+    if (!(group_size > 0 && group_size <= 64))
+        throw std::runtime_error("CPU compact GEMV group size must be in [1, 64]");
     CpuQuantizedActivation result;
     result.rows = rows;
     result.groups = groups;
@@ -263,7 +264,8 @@ float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
     return static_cast<float>(value);
 }
 CpuProjectionRows make_cpu_projection_rows(const tyloi::NintTensor& w) {
-    TYLOINFER_RUNTIME_CHECK(!w.q8_zero && w.q_packed.is_cpu(),"original-FP32 rows require CPU NINTv2 storage");
+    if (!(!w.q8_zero && w.q_packed.is_cpu()))
+        throw std::runtime_error("original-FP32 rows require CPU NINTv2 storage");
     CpuProjectionRows p;
     p.width=static_cast<int>(w.neuron_len); p.outputs=static_cast<int>(w.out);
     p.nint={w.q_packed.data_ptr<uint8_t>(),static_cast<size_t>(w.q_packed.numel()),
@@ -308,13 +310,15 @@ CpuProjectionRows make_cpu_projection_rows(const tyloi::NintTensor& w) {
 static ::tyloi::DenseTensor nint_matmul_cpu(
         const tyloi::NintTensor & w,
         ::tyloi::DenseTensor x) {
-    TYLOINFER_RUNTIME_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
-    TYLOINFER_RUNTIME_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    if (x.is_cuda())
+        throw std::runtime_error("CPU NINT GEMV requires CPU activations");
+    if (w.q_packed.is_cuda())
+        throw std::runtime_error("CPU NINT GEMV requires CPU-resident weights");
     if (!w.q8_zero) {
-        TYLOINFER_RUNTIME_CHECK(!w.row_q_bits.is_cuda() && !w.row_q_bit_offsets.is_cuda() &&
+        if (!(!w.row_q_bits.is_cuda() && !w.row_q_bit_offsets.is_cuda() &&
             !w.sub_scale.is_cuda() && !w.sub_min.is_cuda() &&
-            !w.neuron_scale.is_cuda() && !w.neuron_min.is_cuda(),
-            "CPU NINT GEMV requires CPU-resident metadata");
+            !w.neuron_scale.is_cuda() && !w.neuron_min.is_cuda()))
+            throw std::runtime_error("CPU NINT GEMV requires CPU-resident metadata");
         x = pad_last(x.contiguous().to(::tyloi::kFloat32), w.neuron_len).contiguous();
         auto result = ::tyloi::cuda::empty({x.size(0), w.out},
             x.options().dtype(::tyloi::kFloat32));
@@ -527,9 +531,8 @@ static ::tyloi::DenseTensor nint_matmul_f32(
         return nint_matmul(
             profiler, w, x).to(::tyloi::kFloat32);
     }
-    TYLOINFER_RUNTIME_CHECK(
-        x.size(0) >= 16,
-        "FP32-output NINT MMQ requires at least 16 activation rows");
+    if (!(x.size(0) >= 16))
+        throw std::runtime_error("FP32-output NINT MMQ requires at least 16 activation rows");
     return profiler.measure(
         "kld_mmq.nint8_zero.fp32_output", [&]() {
             return nint8_zero_mmq_f32_packed_cuda(
@@ -544,18 +547,16 @@ static ::tyloi::DenseTensor nint_matmul_f32(
         ::tyloi::DenseTensor x,
         ::tyloi::DenseTensor gate,
         int mode) {
-    TYLOINFER_RUNTIME_CHECK(
-        mode == 1 || mode == 2,
-        "FP32-output NINT input gate mode must be sigmoid or SiLU");
+    if (!(mode == 1 || mode == 2))
+        throw std::runtime_error("FP32-output NINT input gate mode must be sigmoid or SiLU");
     x = pad_last(
         x.contiguous().to(::tyloi::kFloat16),
         w.neuron_len);
     gate = pad_last(
         gate.contiguous().to(::tyloi::kFloat16),
         w.neuron_len);
-    TYLOINFER_RUNTIME_CHECK(
-        x.sizes() == gate.sizes(),
-        "FP32-output NINT x and gate shapes must match");
+    if (!(x.sizes() == gate.sizes()))
+        throw std::runtime_error("FP32-output NINT x and gate shapes must match");
     auto activation = mode == 1
         ? x * ::tyloi::cuda::sigmoid(gate)
         : x * ::tyloi::cuda::silu(gate);
@@ -568,15 +569,12 @@ static ::tyloi::DenseTensor nint_matmul_f32(
         const tyloi::NintTensor & w,
         ::tyloi::DenseTensor x,
         int64_t groups) {
-    TYLOINFER_RUNTIME_CHECK(
-        w.bits == 8 && w.gs == 48,
-        "groupwise NINT projection requires NINT8 gs48");
-    TYLOINFER_RUNTIME_CHECK(
-        x.dim() == 3 && x.size(1) == groups && x.size(2) == w.neuron_len,
-        "groupwise NINT projection expects [B, groups, K]");
-    TYLOINFER_RUNTIME_CHECK(
-        w.out % groups == 0,
-        "groupwise NINT projection output rows must divide groups");
+    if (!(w.bits == 8 && w.gs == 48))
+        throw std::runtime_error("groupwise NINT projection requires NINT8 gs48");
+    if (!(x.dim() == 3 && x.size(1) == groups && x.size(2) == w.neuron_len))
+        throw std::runtime_error("groupwise NINT projection expects [B, groups, K]");
+    if (!(w.out % groups == 0))
+        throw std::runtime_error("groupwise NINT projection output rows must divide groups");
     x = x.contiguous().to(::tyloi::kFloat16);
     auto dense = profiler.measure("nint.groupwise_dequant", [&]() {
         return nint_decode_cuda(
@@ -602,13 +600,13 @@ static ::tyloi::DenseTensor nint_matmul_f32(
         ::tyloi::DenseTensor x,
         ::tyloi::DenseTensor gate,
         int mode) {
-    TYLOINFER_RUNTIME_CHECK(
-        mode == 1 || mode == 2,
-        "NINT input gate mode must be sigmoid or SiLU");
+    if (!(mode == 1 || mode == 2))
+        throw std::runtime_error("NINT input gate mode must be sigmoid or SiLU");
     if (!x.is_cuda()) {
         x = x.contiguous().to(::tyloi::kFloat16);
         gate = gate.contiguous().to(::tyloi::kFloat16);
-        TYLOINFER_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NINT x and gate shapes must match");
+        if (!(x.sizes() == gate.sizes()))
+            throw std::runtime_error("NINT x and gate shapes must match");
         auto value = mode == 1
             ? x * ::tyloi::cuda::sigmoid(gate)
             : x * ::tyloi::cuda::silu(gate);
@@ -623,9 +621,8 @@ static ::tyloi::DenseTensor nint_matmul_f32(
     if (!fused_input || (gate.scalar_type() != ::tyloi::kFloat16 &&
             gate.scalar_type() != ::tyloi::kFloat32))
         gate = gate.to(::tyloi::kFloat16);
-    TYLOINFER_RUNTIME_CHECK(
-        x.sizes() == gate.sizes(),
-        "NINT x and gate shapes must match");
+    if (!(x.sizes() == gate.sizes()))
+        throw std::runtime_error("NINT x and gate shapes must match");
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     if (!w.q8_zero && x.size(0) <= 8) {

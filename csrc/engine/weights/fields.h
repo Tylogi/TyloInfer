@@ -27,8 +27,8 @@ void tensors(const ::tyloi::weights::BiasWeight& weight, Visitor visit) {
 
 // Anything that enumerates its own tensors, such as a vision weight block.
 template <class Weights, class Visitor,
-    class = decltype(std::declval<const Weights&>().visit_tensors(std::declval<Visitor>()))>
-void tensors(const Weights& weights, Visitor visit) {
+    class = decltype(std::declval<Weights&>().visit_tensors(std::declval<Visitor>()))>
+void tensors(Weights& weights, Visitor visit) {
     weights.visit_tensors(visit);
 }
 

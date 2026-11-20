@@ -1,5 +1,4 @@
 #include "engine/models/gemma4/forward.h"
-#include "engine/models/common/check.h"
 #include "engine/ops/ops.h"
 
 #include <algorithm>
@@ -20,8 +19,8 @@ static void trace_stage(const Model::Options& mode, int layer, const char* name,
 
 static ::tyloi::Tensor gemma_rms_norm_f16(
     const tyloi::Tensor& x, const tyloi::Tensor& weight, double eps, double weight_offset) {
-    tyloi::models::require_model(x.scalar_type() == tyloi::ScalarType::float16,
-                                 "gemma_rms_norm_f16: activation must remain f16");
+    if (!(x.scalar_type() == tyloi::ScalarType::float16))
+        throw std::runtime_error("gemma_rms_norm_f16: activation must remain f16");
     return tyloi::ops::rms_norm(x, weight, eps, weight_offset, tyloi::ScalarType::float16);
 }
 
@@ -152,12 +151,12 @@ static ::tyloi::Tensor forward_ffn(
 namespace {
 
 ::tyloi::Tensor normalize_ids(int primary, const tyloi::Tensor& ids) {
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto shaped = ids.dim() == 1 ? tyloi::ops::reshape(ids, {1, ids.size(0)})
                                  : tyloi::ops::copy(ids, ids.device());
-    tyloi::models::require_model(shaped.size(0) > 0 && shaped.size(1) > 0,
-                               "token IDs must not be empty");
+    if (!(shaped.size(0) > 0 && shaped.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     auto converted = tyloi::ops::cast(shaped, tyloi::ScalarType::int64);
     auto copied = tyloi::ops::copy(converted, tyloi::Device{tyloi::DeviceType::cuda, primary});
     return tyloi::ops::contiguous(copied);
@@ -230,18 +229,18 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     if (input.suffix) throw std::invalid_argument("Gemma4 does not support speculative suffix forwarding");
     auto& state = dynamic_cast<State&>(state_value);
     const auto& model = *this;
-    tyloi::models::require_model(input.ids.defined(),
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!input.ids.defined())
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto ids = normalize_ids(mode.primary, input.ids);
     ::tyloi::Tensor embeddings = input.embeddings
         ? input.embeddings : embedding(ids, mode.primary);
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-                                   embeddings.size(1) == T &&
-                                   embeddings.size(2) == model.config.hidden_size,
-                               "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(input.confirmed >= 0 && input.confirmed == 0,
-                               "unsupported speculative backbone geometry");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T &&
+        embeddings.size(2) == model.config.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(input.confirmed >= 0 && input.confirmed == 0))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (state.cache_pos == 0) state.reset(B);
     // Missing layer caches go in as one group, before any layer computes.
     state.prepare_caches(B, T, mode);
@@ -257,12 +256,12 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     auto semantic = input.positions ? positions_on_primary(input.positions)
         : (state.decode_position_delta == 0 ? physical
             : tyloi::ops::add(physical, state.decode_position_delta));
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-                                   (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-                               "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((semantic.dim() == 1 && semantic.size(0) == T) ||
-                                   (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T),
-                               "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((semantic.dim() == 1 && semantic.size(0) == T) ||
+        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths && state.cache_pos > 0 && T == 1) {
         const std::array<std::int64_t, 1> shape{B};
         input.lengths = tyloi::ops::full(shape, state.cache_pos + 1, primary);

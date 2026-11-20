@@ -1,6 +1,5 @@
 #include "engine/models/qwen4_exp/batch.h"
 #include "engine/models/qwen4_exp/ops.h"
-#include "engine/models/common/check.h"
 
 #include <algorithm>
 #include <array>
@@ -50,15 +49,16 @@ struct Rows {
 };
 
 Rows prepare(const Model& model, const std::vector<State*>& states, const std::vector<Tensor>& ids) {
-    require_model(!states.empty() && states.size() == ids.size(), "invalid Qwen4 batch rows");
+    if (!(!states.empty() && states.size() == ids.size()))
+        throw std::runtime_error("invalid Qwen4 batch rows");
     Rows result;
     for (std::size_t row = 0; row < states.size(); ++row) {
         auto& state = *states[row];
         const auto& chunk = ids[row];
-        require_model(state.belongs_to(model) && chunk.dim() == 2 && chunk.size(0) == 1 &&
+        if (!(state.belongs_to(model) && chunk.dim() == 2 && chunk.size(0) == 1 &&
             chunk.size(1) > 0 && state.cache_pos >= 0 &&
-            chunk.size(1) <= model.max_position_embeddings() - state.cache_pos,
-            "invalid Qwen4 batch input");
+            chunk.size(1) <= model.max_position_embeddings() - state.cache_pos))
+            throw std::runtime_error("invalid Qwen4 batch input");
         state.begin_forward();
         auto current = ops::arange(state.cache_pos, state.cache_pos + chunk.size(1), model.device);
         if (state.decode_position_delta) current = ops::add(current, state.decode_position_delta);
@@ -136,9 +136,11 @@ Tensor layer(const Layer& weights, const std::vector<State*>& requests, std::siz
 
 Batch::Batch(Model& model, const BatchConfig& config, bool batch_attention_projections)
     : model_(model), batch_attention_projections_(batch_attention_projections) {
-    require_model(config.slots > 0 && config.slots <= 32, "Qwen4 continuous batching supports 1..32 requests");
+    if (!(config.slots > 0 && config.slots <= 32))
+        throw std::runtime_error("Qwen4 continuous batching supports 1..32 requests");
     for (const auto& layer : model.layers)
-        require_model(layer->device == model.device, "Qwen4 continuous batching requires one device");
+        if (!(layer->device == model.device))
+            throw std::runtime_error("Qwen4 continuous batching requires one device");
 }
 
 std::unique_ptr<BatchState> Batch::make_state(std::int64_t) { return std::make_unique<Request>(model_); }
@@ -150,8 +152,8 @@ std::vector<State*> Batch::active(std::span<const BatchRow> rows) const {
     std::vector<State*> result;
     for (const auto& row : rows) if (row.eligible) {
         auto* request = dynamic_cast<Request*>(row.state);
-        require_model(request && request->state.belongs_to(model_) && request->position() == row.position,
-            "Qwen4 batch decode position mismatch");
+        if (!(request && request->state.belongs_to(model_) && request->position() == row.position))
+            throw std::runtime_error("Qwen4 batch decode position mismatch");
         result.push_back(&request->state);
     }
     return result;
@@ -173,22 +175,22 @@ StepSequence<std::vector<Decoded>> Batch::forward(std::vector<BatchState*> batch
     requests.reserve(batch.size());
     for (auto* value : batch) {
         auto* request = dynamic_cast<Request*>(value);
-        require_model(request && request->state.belongs_to(model_), "Qwen4 batch state belongs to a different model");
+        if (!(request && request->state.belongs_to(model_)))
+            throw std::runtime_error("Qwen4 batch state belongs to a different model");
         requests.push_back(&request->state);
     }
-    require_model(!requests.empty() && requests.size() == ids.size(),
-        verify ? "invalid Qwen4 verification rows" : "invalid Qwen4 batch rows");
+    if (!(!requests.empty() && requests.size() == ids.size()))
+        throw std::runtime_error(verify ? "invalid Qwen4 verification rows" : "invalid Qwen4 batch rows");
     std::vector<std::int64_t> confirmed;
     if (verify) {
         confirmed.assign(ids.size(), 0);
         for (std::size_t row = 0; row < requests.size(); ++row) {
-            require_model(ids[row].dim() == 2 && ids[row].size(0) == 1 && ids[row].size(1) > 0,
-                "invalid Qwen4 verification row");
-            require_model(requests[row]->speculative_start < 0,
-                "Qwen4 verification has a pending speculative pass");
-            if (ids[row].size(1) > 1)
-                require_model(requests[row]->cache_pos > 0,
-                    "Qwen4 speculative verification requires a non-empty prefix");
+            if (!(ids[row].dim() == 2 && ids[row].size(0) == 1 && ids[row].size(1) > 0))
+                throw std::runtime_error("invalid Qwen4 verification row");
+            if (requests[row]->speculative_start >= 0)
+                throw std::runtime_error("Qwen4 verification has a pending speculative pass");
+            if (ids[row].size(1) > 1 && requests[row]->cache_pos <= 0)
+                throw std::runtime_error("Qwen4 speculative verification requires a non-empty prefix");
         }
         for (std::size_t row = 0; row < requests.size(); ++row) {
             if (ids[row].size(1) <= 1) continue;
@@ -239,8 +241,9 @@ StepSequence<std::vector<Decoded>> Batch::forward(std::vector<BatchState*> batch
 
 Tensor Batch::decode(std::span<const BatchRow> rows, Tensor ids, const Tensor& host_ids) {
     auto requests = active(rows);
-    require_model(!requests.empty() && ids.dim() == 2 && ids.size(0) == std::int64_t(requests.size()) &&
-        ids.size(1) == 1, "invalid Qwen4 batch input");
+    if (!(!requests.empty() && ids.dim() == 2 && ids.size(0) == std::int64_t(requests.size()) &&
+        ids.size(1) == 1))
+        throw std::runtime_error("invalid Qwen4 batch input");
     auto host_all = host_ids ? host_ids : ops::copy(ids, Device(kCPU));
     std::vector<Tensor> chunks, host;
     for (std::size_t row = 0; row < requests.size(); ++row) {

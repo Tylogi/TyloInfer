@@ -160,9 +160,8 @@ void RopeCache::configure_mrope(
         ::tyloi::DenseTensor pos,
         bool grid_mrope_positions) const {
         if (!x.is_cuda()) {
-            TYLOINFER_RUNTIME_CHECK(
-                !cos.is_cuda() && !sin.is_cuda(),
-                "CPU RoPE requires a CPU-resident table");
+            if (!(!cos.is_cuda() && !sin.is_cuda()))
+                throw std::runtime_error("CPU RoPE requires a CPU-resident table");
             auto positions = pos.contiguous().to(::tyloi::kCPU, ::tyloi::kInt64)
                 .clamp(0, cos.size(0) - 1);
             ::tyloi::DenseTensor selected_cos;
@@ -254,9 +253,8 @@ void RopeCache::configure_mrope(
         bool fused,
         ::tyloi::DenseTensor x,
         ::tyloi::DenseTensor pos) const {
-        TYLOINFER_RUNTIME_CHECK(
-            sections.numel() == 0,
-            "Qwen3 BF16 RoPE does not support multi-axis sections");
+        if (!(sections.numel() == 0))
+            throw std::runtime_error("Qwen3 BF16 RoPE does not support multi-axis sections");
         if (x.is_cuda() && pos.dim() == 1 &&
                 fused) {
             return rope_table_bf16_cuda(
@@ -358,15 +356,14 @@ RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base
     : dimension_(dimension), maximum_(maximum), base_(base), sections_(std::move(sections)),
       interleaved_(interleaved),yarn_(yarn) {
     fused_ = fused && !yarn_.enabled();
-    TYLOINFER_RUNTIME_CHECK(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
-                          std::isfinite(base) && base > 0,
-                      "invalid rotary configuration");
-    TYLOINFER_RUNTIME_CHECK(
-        (sections_.empty() && !interleaved_) ||
+    if (!(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
+                          std::isfinite(base) && base > 0))
+        throw std::runtime_error("invalid rotary configuration");
+    if (!((sections_.empty() && !interleaved_) ||
             (sections_.size() == 3 &&
              std::all_of(sections_.begin(), sections_.end(), [](auto n) { return n >= 0; }) &&
-             std::accumulate(sections_.begin(), sections_.end(), int64_t(0)) == dimension / 2),
-        "MRoPE sections disagree with rotary width");
+             std::accumulate(sections_.begin(), sections_.end(), int64_t(0)) == dimension / 2)))
+        throw std::runtime_error("MRoPE sections disagree with rotary width");
 }
 
 bool RotaryEmbedding::fused() const {
@@ -397,8 +394,8 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const DenseTensor&
             } else selected[j] = j < sections_[0] ? 0 : (j < sections_[0] + sections_[1] ? 1 : 2);
         }
         next.axes = ::tyloi::cuda::tensor(selected).to(value.device());
-        TYLOINFER_RUNTIME_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()) == cudaSuccess,
-            "warm cached rotary parameters before CUDA graph capture");
+        if (!(cudaStreamSynchronize(mfq_current_cuda_stream()) == cudaSuccess))
+            throw std::runtime_error("warm cached rotary parameters before CUDA graph capture");
         cached = std::move(next);
     }
     return cached;
@@ -418,8 +415,9 @@ bool RotaryEmbedding::pool_normalized_into(const DenseTensor& index,const DenseT
 DenseTensor RotaryEmbedding::forward_normalized(const DenseTensor& value, const DenseTensor& weight,
         const DenseTensor& positions, double eps, const DenseTensor& key_cache,
         const DenseTensor& cache_positions, const DenseTensor& projected_value, const DenseTensor& value_cache) const {
-    TYLOINFER_RUNTIME_CHECK(fused() && value.is_cuda() && value.dim() == 4 &&
-        value.size(-1) >= dimension_, "normalized rotary requires fused [B,T,H,D] input");
+    if (!(fused() && value.is_cuda() && value.dim() == 4 &&
+        value.size(-1) >= dimension_))
+        throw std::runtime_error("normalized rotary requires fused [B,T,H,D] input");
     const auto prepared = prepare_parameters(value);
     auto active_positions = positions.scalar_type() == ::tyloi::kInt32 || positions.scalar_type() == ::tyloi::kInt64
         ? positions.contiguous() : positions.to(::tyloi::kInt32).contiguous();
@@ -432,12 +430,12 @@ std::vector<DenseTensor> RotaryEmbedding::forward_normalized_grouped(
         const std::vector<DenseTensor>& values,const std::vector<DenseTensor>& weights,
         const DenseTensor& positions,double eps,int cache_entry,const DenseTensor& key_cache,
         const DenseTensor& cache_positions,const DenseTensor& projected_value,const DenseTensor& value_cache) const {
-    TYLOINFER_RUNTIME_CHECK(fused() && !values.empty() && values.size()<=3 && weights.size()==values.size(),
-        "normalized rotary requires a fused input/weight group");
+    if (!(fused() && !values.empty() && values.size()<=3 && weights.size()==values.size()))
+        throw std::runtime_error("normalized rotary requires a fused input/weight group");
     std::vector<DenseTensor> active_weights;active_weights.reserve(weights.size());
     for(size_t i=0;i<values.size();++i) {
-        TYLOINFER_RUNTIME_CHECK(values[i].is_cuda() && values[i].dim()==4 && values[i].size(-1)>=dimension_,
-            "normalized rotary group requires [B,T,H,D] inputs");
+        if (!(values[i].is_cuda() && values[i].dim()==4 && values[i].size(-1)>=dimension_))
+            throw std::runtime_error("normalized rotary group requires [B,T,H,D] inputs");
         active_weights.push_back(weights[i].to(::tyloi::kFloat32).contiguous());
     }
     const auto prepared=prepare_parameters(values[0]);
@@ -448,16 +446,16 @@ std::vector<DenseTensor> RotaryEmbedding::forward_normalized_grouped(
 }
 
 ::tyloi::DenseTensor RotaryEmbedding::forward(const DenseTensor &value, const DenseTensor &positions) const {
-    TYLOINFER_RUNTIME_CHECK(value.is_cuda() && value.dim() == 4 && value.size(-1) >= dimension_ &&
+    if (!(value.is_cuda() && value.dim() == 4 && value.size(-1) >= dimension_ &&
                           positions.is_cuda() && positions.device() == value.device() &&
                           positions.dim() >= 1 && positions.dim() <= 3 &&
-                          positions.size(-1) == value.size(2),
-                      "RoPE requires [B,H,T,D] with compatible positions");
+                          positions.size(-1) == value.size(2)))
+        throw std::runtime_error("RoPE requires [B,H,T,D] with compatible positions");
     const auto b = value.size(0), t = value.size(2), pairs = dimension_ / 2;
     const auto axes = positions.dim() == 1 ? 1 : positions.size(0);
     const auto batches = positions.dim() < 3 ? 1 : positions.size(1);
-    TYLOINFER_RUNTIME_CHECK(axes > 0 && (batches == 1 || batches == b),
-                      "RoPE position batch mismatch");
+    if (!(axes > 0 && (batches == 1 || batches == b)))
+        throw std::runtime_error("RoPE position batch mismatch");
     auto input = value.scalar_type() == ::tyloi::kFloat32 ? value : value.to(::tyloi::kFloat16);
     if(fused()) {
         const auto prepared = prepare_parameters(value);

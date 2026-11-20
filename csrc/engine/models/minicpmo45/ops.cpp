@@ -7,12 +7,12 @@
 #include "engine/models/common/mlp.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
-#include "engine/models/common/check.h"
 #include "engine/models/session/state.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/requests/media.h"
 #include "engine/backends/cuda/executor/options.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <iostream>
 #include <limits>
@@ -24,8 +24,8 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    tyloi::models::require_model(model.graph.backbone == "minicpmo45",
-        "model backbone does not match the requested causal model");
+    if (!(model.graph.backbone == "minicpmo45"))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     const auto* vision = model.graph.component("vision");
     const auto* audio = model.graph.component("audio_input");
     const auto* tts = model.graph.component("audio_output");
@@ -71,11 +71,11 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     metadata.layer_types = config.layer_types;
     metadata.rope_interleaved = true;
     metadata.decode_graph_double_warmup = true;
-    tyloi::models::require_model(config.num_hidden_layers == model.graph.topology.text_layers,
-        "model graph/config text-layer topology mismatch");
+    if (!(config.num_hidden_layers == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context > 0) {
-        tyloi::models::require_model(context <= model.metadata.max_position_embeddings,
-            "--ctx-size exceeds max_position_embeddings");
+        if (!(context <= model.metadata.max_position_embeddings))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         config.max_position_embeddings = model.metadata.max_position_embeddings = context;
     }
     return model;
@@ -366,10 +366,11 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
 
 namespace {
 Tensor token_ids(int primary, const Tensor& ids) {
-    tyloi::models::require_model(ids.defined() && (ids.dim() == 1 || ids.dim() == 2),
-        "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.defined() && (ids.dim() == 1 || ids.dim() == 2)))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto shaped = ids.dim() == 1 ? tyloi::ops::reshape(ids, {1, ids.size(0)}) : ids;
-    tyloi::models::require_model(shaped.size(0) > 0 && shaped.size(1) > 0, "token IDs must not be empty");
+    if (!(shaped.size(0) > 0 && shaped.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(shaped, tyloi::kInt64),
         tyloi::Device(tyloi::kCUDA, primary)));
 }
@@ -408,9 +409,9 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     std::optional<MiniCPMO45AudioEncoder::State> audio_state;
     tyloi::StepSequence<Tensor> vision_steps, audio_steps;
     const auto scatter = [&](const Tensor& encoded, const tyloi::models::minicpmo45::MediaBound& bound, int64_t length) {
-        tyloi::models::require_model(bound.batch == 0 && bound.source >= 0 && bound.source < encoded.size(0) &&
-            bound.begin >= 0 && bound.end <= ids.size(1) && bound.end - bound.begin == length,
-            "MiniCPM-o media bound does not match encoded length");
+        if (!(bound.batch == 0 && bound.source >= 0 && bound.source < encoded.size(0) &&
+            bound.begin >= 0 && bound.end <= ids.size(1) && bound.end - bound.begin == length))
+            throw std::runtime_error("MiniCPM-o media bound does not match encoded length");
         auto& target = embeddings.dense();
         target.index({0, Slice(bound.begin, bound.end), Slice()}).copy_(
             encoded.dense().index({bound.source, Slice(0, length), Slice()}).to(target.scalar_type()));
@@ -448,8 +449,8 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
         retained.push_back(encoded);
         const auto pooled = MiniCPMO45AudioEncoder::pooled_lengths(lengths);
         for (const auto& bound : audios) {
-            tyloi::models::require_model(bound.source >= 0 && static_cast<size_t>(bound.source) < pooled.size(),
-                "MiniCPM-o audio bound source is out of range");
+            if (!(bound.source >= 0 && static_cast<size_t>(bound.source) < pooled.size()))
+                throw std::runtime_error("MiniCPM-o audio bound source is out of range");
             scatter(encoded, bound, pooled[bound.source]);
         }
         co_yield tyloi::StepState::advanced;
@@ -467,9 +468,11 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
     auto ids = token_ids(mode.primary, input.ids);
     auto hidden = input.embeddings ? input.embeddings : embedding(ids, mode.primary);
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(hidden.dim() == 3 && hidden.size(0) == B && hidden.size(1) == T &&
-        hidden.size(2) == metadata.hidden_size, "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(input.confirmed == 0, "unsupported speculative backbone geometry");
+    if (!(hidden.dim() == 3 && hidden.size(0) == B && hidden.size(1) == T &&
+        hidden.size(2) == metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(input.confirmed == 0))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (state.cache_pos == 0) {
         auto mask = state.attention_mask;
         state.reset(B);
@@ -483,12 +486,12 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
         : tyloi::ops::arange(state.cache_pos, state.cache_pos + T, primary);
     auto positions = input.positions ? copy_position(input.positions)
         : (state.decode_position_delta ? tyloi::ops::add(physical, state.decode_position_delta) : physical);
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((positions.dim() == 1 && positions.size(0) == T) ||
-        (positions.dim() == 2 && positions.size(0) == B && positions.size(1) == T),
-        "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((positions.dim() == 1 && positions.size(0) == T) ||
+        (positions.dim() == 2 && positions.size(0) == B && positions.size(1) == T)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     hidden = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::copy(hidden, primary), tyloi::kBFloat16));
     const auto trace = [&] {
         if (input.trace) input.trace->push_back(tyloi::ops::clone(

@@ -1,6 +1,7 @@
 #include "env.h"
 #include "ops.h"
 
+#include <stdexcept>
 #include <array>
 #include <cstring>
 #include <exception>
@@ -68,7 +69,8 @@ DenseTensor forward_layer(const Model& model, State& state, const DenseTensor& i
 tyloi::models::PrefillPlan Model::prefill_plan(
         const tyloi::models::State& value, const tyloi::models::PrefillOptions& policy) const {
     const auto& state = dynamic_cast<const State&>(value);
-    TYLOINFER_RUNTIME_CHECK(state.belongs_to(*this), "DeepSeek-V4.1 state belongs to a different model");
+    if (!state.belongs_to(*this))
+        throw std::runtime_error("DeepSeek-V4.1 state belongs to a different model");
     if (policy.transformed || policy.tokens <= 0 || policy.compute <= 0 || state.decode_position_delta != 0 ||
         config.causal_encoder_layers <= 0 || config.causal_encoder_layers >= num_hidden_layers())
         return {};
@@ -82,19 +84,19 @@ tyloi::StepSequence<tyloi::models::Prefill> Model::prefill(
     auto& state = dynamic_cast<State&>(value);
     const auto split = config.causal_encoder_layers;
     if (!prefill_plan(state, policy).layered) co_return;
-    TYLOINFER_RUNTIME_CHECK(input.ids && input.ids.dim() == 2,
-        "DeepSeek-V4.1 encoder prefill requires [batch,tokens] IDs");
+    if (!(input.ids && input.ids.dim() == 2))
+        throw std::runtime_error("DeepSeek-V4.1 encoder prefill requires [batch,tokens] IDs");
     const auto batch = input.ids.size(0), tokens = input.ids.size(1);
     const auto compute = std::min<std::int64_t>(policy.compute, 8192);
-    TYLOINFER_RUNTIME_CHECK(state.shared && batch > 0 && tokens > 0 && compute > 0 &&
+    if (!(state.shared && batch > 0 && tokens > 0 && compute > 0 &&
         state.speculative_start < 0 && state.cache_pos >= 0 &&
-        state.cache_pos <= max_position_embeddings() && tokens <= max_position_embeddings() - state.cache_pos,
-        "invalid DeepSeek-V4.1 encoder prefill request");
+        state.cache_pos <= max_position_embeddings() && tokens <= max_position_embeddings() - state.cache_pos))
+        throw std::runtime_error("invalid DeepSeek-V4.1 encoder prefill request");
     const auto previous_batch = state.batch;
     if (state.batch != batch || state.cache_pos == 0) state.reset(batch);
     const auto begin = state.cache_pos;
-    TYLOINFER_RUNTIME_CHECK(begin <= max_position_embeddings() && tokens <= max_position_embeddings() - begin,
-        "invalid DeepSeek-V4.1 encoder prefill request");
+    if (!(begin <= max_position_embeddings() && tokens <= max_position_embeddings() - begin))
+        throw std::runtime_error("invalid DeepSeek-V4.1 encoder prefill request");
     const auto end = begin + tokens;
     struct Abort {
         State& state;

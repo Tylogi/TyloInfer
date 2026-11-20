@@ -4,6 +4,7 @@
 #include "engine/ops/ops.h"
 
 #include <cstddef>
+#include <optional>
 
 // Default bound on the expert matrices dense_routed_projection gathers at once.
 inline constexpr std::size_t kDenseRoutedGatherBudgetBytes = std::size_t(512) << 20;
@@ -54,6 +55,9 @@ struct Mlp {
         ::tyloi::DenseTensor input) const;
     bool can_fuse(const ::tyloi::DenseTensor& input,
                   const ::tyloi::DenseTensor& residual) const;
+    std::optional<::tyloi::DenseTensor> prefill_residual(const Projector& project,
+        CudaProfiler& profiler, const ::tyloi::DenseTensor& input,
+        const ::tyloi::DenseTensor& residual) const;
     ::tyloi::DenseTensor fused(
         CudaProfiler& profiler, ::tyloi::DenseTensor input,
         ::tyloi::DenseTensor residual) const;

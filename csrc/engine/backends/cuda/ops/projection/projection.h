@@ -21,6 +21,7 @@ tyloi::DenseTensor head_project(tyloi::DenseTensor input, const ::tyloi::Tensor&
 }
 
 struct TqMoeBanks;
+namespace tyloi::weights { struct ExpertRows; }
 
 namespace tyloi::cuda {
 
@@ -64,6 +65,8 @@ public:
         ::tyloi::DenseTensor ids) const;
     ::tyloi::DenseTensor run(const ::tyloi::Tensor& weight, ::tyloi::DenseTensor input,
         const MoeRoutePlan& route) const;
+    ::tyloi::DenseTensor run(const ::tyloi::Tensor& weight, ::tyloi::DenseTensor input,
+        const weights::ExpertRows& rows) const;
     std::vector<::tyloi::DenseTensor> run(
         std::span<const ::tyloi::Tensor> weights,
         ::tyloi::DenseTensor input, size_t prefix = 1) const;

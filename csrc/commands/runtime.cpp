@@ -4,6 +4,7 @@
 #include "engine/engine.h"
 #include "engine/generation/mtp/limits.h"
 #include "engine/load.h"
+#include "engine/models/source/decision.h"
 #include "engine/models/source/model.h"
 #include "engine/models/source/model_config.h"
 #include "transport/include/transport.h"
@@ -51,6 +52,7 @@ void print_help() {
         << "  --cpu-offload-layers RANGES     explicit CPU-offloaded layers\n"
         << "  --moe-cache-profile PATH        MoE cache profile\n"
         << "  --dflash2-draft PATH             CUDA DFlash2 draft checkpoint for Qwen3.5 or Qwen4\n"
+        << "  --jev-weights stream|vram       Jev weight placement (default stream)\n"
         << "  --tensor-parallel DEVICES       device count or comma-separated IDs\n"
         << "  --tensor-split WEIGHTS          tensor-parallel weights\n"
         << "  --expert-parallel DEVICES       expert-parallel devices\n"
@@ -227,6 +229,7 @@ int execute_runtime(RuntimeOptions options) {
             nlohmann::json result{{"architecture", source->architecture()},
                 {"config", nlohmann::json::parse(tyloi::models::config_json(*source, options.config_path))},
                 {"paths", nlohmann::json::array()}, {"tensors", nlohmann::json::object()}};
+            result["structured_decisions"] = tyloi::models::decision_spec(*source).has_value();
             for (const auto& path : source->source_paths()) {
                 const auto value = path.generic_u8string();
                 result["paths"].push_back(std::string(value.begin(), value.end()));

@@ -17,6 +17,7 @@
 #include "engine/backends/cuda/executor/kv/memory.h"
 #include "engine/state/kv/offload.h"
 #include "engine/weights/cache/cache.h"
+#include "engine/weights/layer_stream.h"
 #include "engine/backends/cuda/executor/route_stats.h"
 
 #include <algorithm>
@@ -495,6 +496,23 @@ std::unique_ptr<tyloi::Executor::Scope> Executor::enter(const AttentionKernels& 
 
 std::unique_ptr<tyloi::Executor::Work> Executor::work() {
     return make_working_set(*this);
+}
+
+void Executor::bind_layer_stream(const std::shared_ptr<weights::LayerStream>& stream) {
+    layer_stream_ = stream;
+}
+
+void Executor::stage_layer(std::size_t index) {
+    const auto stream = layer_stream_.lock();
+    if (!stream) throw std::logic_error("streamed layer weights are unavailable");
+    stream->stage(index);
+}
+
+bool Executor::prepare_routed_graph(Device device) {
+    if (!device.is_cuda() || device.index < 0)
+        throw std::invalid_argument("routed graph requires a CUDA device");
+    tq()->get(device.index)->prepare_graph();
+    return true;
 }
 
 std::unique_ptr<tyloi::Executor::Timer> Executor::timer() {

@@ -371,7 +371,6 @@ void setup_cuda_load(
         const mfq::cuda::CudaLoadOptions& options,
         CudaExecutionContext& execution) {
     execution.reset();
-    if (options.jev_weights_set) execution.jev_full_vram = options.jev_full_vram;
     if (options.n_gpu_layers_set) execution.n_gpu_layers = options.n_gpu_layers;
     if (options.cpu_threads_set && options.cpu_threads <= 0) {
         throw std::runtime_error("--threads must be positive");

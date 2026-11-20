@@ -5,6 +5,14 @@
 namespace tyloi::engine {
 
 void prepare_request(Request &current, const TextProcessor *text, const EngineInfo &info, bool batched, bool mtp_available) {
+    if (current.submitted.decision) {
+        if (!text || !info.decisions)
+            throw InferenceInputError(InferenceInputErrorCode::Unsupported, "decision reads are unavailable for this model");
+        current.decisions = text->prepare_decisions(*current.submitted.decision, info.max_context);
+        current.input.sampling.max_tokens = 1;
+        current.output.emplace(current.input, nullptr, current.submitted.id);
+        return;
+    }
     auto request = current.submitted;
     const bool raw = !request.token_ids.empty();
     InferenceRequest input;
@@ -39,7 +47,7 @@ void finish_request(const RequestId &id, Request &request, bool &healthy, std::v
         auto delta = request.output->finish();
         if (!delta.diffs.empty())
             events.push_back({id, std::move(delta)});
-        const UsageUpdate usage{request.input.prompt.size(),
+        const UsageUpdate usage{request.decisions ? request.output->metrics.prefill_tokens : request.input.prompt.size(),
             static_cast<std::size_t>(request.output->result.completion_tokens)};
         events.push_back({id, usage});
         if (request.output->result.cancelled)

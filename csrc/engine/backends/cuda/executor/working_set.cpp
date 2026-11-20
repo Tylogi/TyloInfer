@@ -50,6 +50,7 @@ public:
         switch (event.phase) {
         case Phase::begin: {
             if (layer_) throw std::logic_error("prefill layer already started");
+            if (event.index >= 0) executor_.stage_layer(static_cast<std::size_t>(event.index));
             layer_ = true;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
             enabled_ = event.mode == Mode::packed;

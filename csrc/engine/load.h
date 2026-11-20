@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -26,6 +27,7 @@ struct LoadOptions {
     bool cpu_threads_set = false;
     int n_gpu_layers = -1;
     std::string dflash2_draft_path;
+    std::optional<bool> jev_full_vram;
 };
 
 struct EngineOptions : LoadOptions {

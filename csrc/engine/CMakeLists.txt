@@ -28,6 +28,7 @@ add_library(mfq-engine STATIC
     generation/batch/ops.cpp
     generation/decode.cpp
     generation/generation.cpp
+    generation/decision.cpp
     generation/prefill/prefill.cpp
     generation/prefill/preparation.cpp
     generation/mtp/metrics.cpp

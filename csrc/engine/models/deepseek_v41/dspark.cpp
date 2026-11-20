@@ -10,6 +10,8 @@
 #include "engine/ops/mhc.h"
 #include "ops.h"
 
+#include <string>
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -26,8 +28,8 @@ namespace tyloi::cuda::deepseek_v41_runtime {
 static std::pair<DenseTensor, DenseTensor>
 dspark_full_attention_plan(std::int64_t batch, std::int64_t queries, std::int64_t keys,
                            const ::tyloi::Device &device) {
-    TYLOINFER_RUNTIME_CHECK(batch > 0 && queries > 0 && keys > 0,
-                      "invalid DeepSeek-V4.1 DSpark attention plan geometry");
+    if (!(batch > 0 && queries > 0 && keys > 0))
+        throw std::runtime_error("invalid DeepSeek-V4.1 DSpark attention plan geometry");
     const auto selected = ((keys + 31) / 32) * 32;
     auto integer =
         ::tyloi::TensorOptions().device(device).dtype(::tyloi::kInt64);
@@ -148,7 +150,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                    norm.numel() == config.hidden;
         };
         const auto routed_experts = result->mlp.gate_up.empty() ? 0 : result->mlp.gate_up.front().size(0);
-        TYLOINFER_RUNTIME_CHECK(valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
+        if (!(valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
                                     result->attention_mhc_base, result->attention_norm) &&
                               valid_mhc(result->mlp_mhc_function, result->mlp_mhc_scale,
                                         result->mlp_mhc_base, result->mlp_norm) &&
@@ -168,8 +170,11 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                               result->key_value_norm.numel() == config.head_dim &&
                               result->sinks.numel() == config.n_heads &&
                               routed_experts == config.dspark_n_experts &&
-                              result->mlp.down && result->mlp.down.size(0) == config.dspark_n_experts,
-                          "DeepSeek-V4.1 DSpark stage tensor geometry disagrees at stage ", stage);
+                              result->mlp.down && result->mlp.down.size(0) == config.dspark_n_experts)) {
+            std::ostringstream failure;
+            failure << "DeepSeek-V4.1 DSpark stage tensor geometry disagrees at stage " << stage;
+            throw std::runtime_error(failure.str());
+        }
         return result;
     }
 
@@ -181,12 +186,12 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                          weights.has("predictor.stage.0.mlp.router.weight") ||
                          weights.has("predictor.stage.0.output_norm.weight");
         if (!root) {
-            TYLOINFER_RUNTIME_CHECK(!any,
-                              "DeepSeek-V4.1 model source contains an incomplete DSpark head");
+            if (!(!any))
+                throw std::runtime_error("DeepSeek-V4.1 model source contains an incomplete DSpark head");
             return std::nullopt;
         }
-        TYLOINFER_RUNTIME_CHECK(config.has_dspark(),
-                          "DeepSeek-V4.1 model source has DSpark tensors without configuration");
+        if (!config.has_dspark())
+            throw std::runtime_error("DeepSeek-V4.1 model source has DSpark tensors without configuration");
         DeepseekV41Dspark result;
         result.embedding = std::move(embedding);
         result.output = std::move(output);
@@ -211,8 +216,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         const auto target_width =
             result.config.hidden *
             static_cast<std::int64_t>(result.config.dspark_target_layer_ids.size());
-        TYLOINFER_RUNTIME_CHECK(
-            result.config.hc_mult == 4 && result.config.n_heads == 64 &&
+        if (!(result.config.hc_mult == 4 && result.config.n_heads == 64 &&
                 result.config.head_dim == 512 && result.config.rope_head_dim == 64 &&
                 result.main_projection.size(1) == target_width &&
                 result.main_projection.size(0) == result.config.hidden &&
@@ -224,14 +228,15 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                 result.markov_output.size(0) == result.config.vocab &&
                 result.confidence_projection.size(1) ==
                     result.config.hidden + result.config.dspark_markov_rank &&
-                result.confidence_projection.size(0) == 1,
-            "DeepSeek-V4.1 DSpark top-level tensor geometry disagrees");
+                result.confidence_projection.size(0) == 1))
+            throw std::runtime_error("DeepSeek-V4.1 DSpark top-level tensor geometry disagrees");
         return result;
     }
 
     void reset(tyloi::models::MtpState& value, std::int64_t next_batch = 1) const override {
         auto& state = this->state<DsState>(value);
-        TYLOINFER_RUNTIME_CHECK(next_batch > 0, "DeepSeek-V4.1 DSpark batch must be positive");
+        if (!(next_batch > 0))
+            throw std::runtime_error("DeepSeek-V4.1 DSpark batch must be positive");
         state.rings.resize(stages.size());
         const auto options = ::tyloi::TensorOptions()
             .device(::tyloi::Device(::tyloi::kCUDA, primary)).dtype(::tyloi::kFloat16);
@@ -248,8 +253,8 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
     std::vector<std::pair<::tyloi::Device, std::size_t>> reset_growth(
             const tyloi::models::MtpState& value, std::int64_t next_batch) const override {
         const auto& state = this->state<DsState>(value);
-        TYLOINFER_RUNTIME_CHECK(next_batch > 0 && config.sliding_window > 0 && config.head_dim > 0,
-            "DeepSeek-V4.1 DSpark batch or ring geometry is invalid");
+        if (!(next_batch > 0 && config.sliding_window > 0 && config.head_dim > 0))
+            throw std::runtime_error("DeepSeek-V4.1 DSpark batch or ring geometry is invalid");
         auto bytes = sizeof(std::uint16_t);
         for (const auto dimension : {next_batch, config.sliding_window, config.head_dim}) {
             if (bytes > std::numeric_limits<std::size_t>::max() / std::size_t(dimension))
@@ -295,17 +300,18 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         const auto& hidden=input_hidden.dense();
         const auto width=config.hidden*int64_t(config.dspark_target_layer_ids.size());
         const bool boundary = session_boundary(cache_pos, state.position_);
-        TYLOINFER_RUNTIME_CHECK(state.batch==1 && boundary &&
+        if (!(state.batch==1 && boundary &&
             state.rings.size()==stages.size() &&
-            hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)>0 && hidden.size(2)==width,
-            "DeepSeek-V4.1 DSpark session position or hidden state disagrees");
+            hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)>0 && hidden.size(2)==width))
+            throw std::runtime_error("DeepSeek-V4.1 DSpark session position or hidden state disagrees");
         MtpSessionState snapshot;snapshot.cache_pos=state.position_;
         snapshot.last_target_hidden=tyloi::ops::clone(input_hidden);
         snapshot.bytes=session_tensor_bytes(snapshot.last_target_hidden);
         auto& saved=snapshot.payload.emplace<tyloi::models::deepseek_v41::MtpSnapshot>();
         for(const auto& ring:state.rings) {
-            TYLOINFER_RUNTIME_CHECK(ring.dim()==3 && ring.size(0)==1 && ring.size(1)==config.sliding_window &&
-                ring.size(2)==config.head_dim,"DeepSeek-V4.1 DSpark session ring disagrees");
+            if (!(ring.dim()==3 && ring.size(0)==1 && ring.size(1)==config.sliding_window &&
+                ring.size(2)==config.head_dim))
+                throw std::runtime_error("DeepSeek-V4.1 DSpark session ring disagrees");
             saved.rings.push_back(tyloi::ops::clone(ring));
             snapshot.bytes+=session_tensor_bytes(saved.rings.back());
         }
@@ -401,8 +407,8 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
     void trim_cache_to(tyloi::models::MtpState& value,
                        std::int64_t selected_position) const override {
         const auto& state = this->state<DsState>(value);
-        TYLOINFER_RUNTIME_CHECK(selected_position == state.position_,
-                          "DeepSeek-V4.1 DSpark only stores committed context");
+        if (!(selected_position == state.position_))
+            throw std::runtime_error("DeepSeek-V4.1 DSpark only stores committed context");
     }
 
     bool teacher_forced_prompt_prime() const noexcept override { return false; }
@@ -432,10 +438,10 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                              std::int64_t tokens) const override {
         auto& state = this->state<DsState>(value);
         const auto& hidden = input_hidden.dense();
-        TYLOINFER_RUNTIME_CHECK(state.position_ == 0 && hidden.dim() == 3 && hidden.size(1) > 0 &&
+        if (!(state.position_ == 0 && hidden.dim() == 3 && hidden.size(1) > 0 &&
             tokens >= hidden.size(1) && tokens <= config.max_position_embeddings &&
-            hidden.size(1) >= std::min(tokens, config.sliding_window),
-            "invalid DeepSeek-V4.1 DSpark prompt tail");
+            hidden.size(1) >= std::min(tokens, config.sliding_window)))
+            throw std::runtime_error("invalid DeepSeek-V4.1 DSpark prompt tail");
         state.position_ = tokens - hidden.size(1);
         append_target_context(value, hidden, state.position_);
     }
@@ -447,13 +453,13 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         auto target_hidden = input_hidden.dense();
         const auto target_width =
             config.hidden * static_cast<std::int64_t>(config.dspark_target_layer_ids.size());
-        TYLOINFER_RUNTIME_CHECK(target_hidden.dim() == 3 && target_hidden.size(0) == state.batch &&
+        if (!(target_hidden.dim() == 3 && target_hidden.size(0) == state.batch &&
                               target_hidden.size(1) > 0 && target_hidden.size(2) == target_width &&
                               start_position >= state.position_ && state.position_ >= 0 &&
                               (start_position==state.position_ || target_hidden.size(1)>=config.sliding_window) &&
                               start_position + target_hidden.size(1) <= config.max_position_embeddings &&
-                              state.rings.size() == stages.size(),
-                          "invalid DeepSeek-V4.1 DSpark context append");
+                              state.rings.size() == stages.size()))
+            throw std::runtime_error("invalid DeepSeek-V4.1 DSpark context append");
         const auto tokens = target_hidden.size(1);
         const auto retained = std::min(tokens, config.sliding_window);
         target_hidden = target_hidden.narrow(1, tokens - retained, retained).contiguous();
@@ -559,11 +565,10 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         const auto physical_width =
             std::min<std::int64_t>(config.dspark_block_size,
                                    config.max_position_embeddings - state.position_);
-        TYLOINFER_RUNTIME_CHECK(
-            state.batch == 1 && anchor_ids.dim() == 2 && anchor_ids.size(0) == state.batch &&
+        if (!(state.batch == 1 && anchor_ids.dim() == 2 && anchor_ids.size(0) == state.batch &&
                 anchor_ids.size(1) == 1 && requested > 0 && requested <= config.dspark_block_size &&
-                requested <= physical_width && state.position_ > 0 && state.rings.size() == stages.size(),
-            "invalid DeepSeek-V4.1 DSpark draft input");
+                requested <= physical_width && state.position_ > 0 && state.rings.size() == stages.size()))
+            throw std::runtime_error("invalid DeepSeek-V4.1 DSpark draft input");
         anchor_ids =
             anchor_ids.to(::tyloi::Device(::tyloi::kCUDA, primary), ::tyloi::kInt64).contiguous();
         auto draft_ids = anchor_ids;

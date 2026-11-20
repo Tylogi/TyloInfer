@@ -69,6 +69,7 @@ tyloi::Tensor tyloi::weights::Cache::routed_tq(
     result->out = output;
     result->input = input;
     result->slices = std::move(slices);
-    result->source_id = cache->add(std::move(table), output);
+    result->source_id = cache->add(std::move(table), output,
+        !parallel.enabled() && name.starts_with("predictor."));
     return result;
 }

@@ -287,6 +287,8 @@ def create_build_plan(
         "-B",
         str(output),
         f"-DCMAKE_BUILD_TYPE={build_type}",
+        "-DBUILD_TESTING=OFF",
+        "-DTYLOINFER_BUILD_SERVER=OFF",
         "-DTYLOINFER_ENABLE_MFQ_COMPAT=OFF",
         "-DTYLOINFER_BUILD_TRANSPORT=ON",
     ]

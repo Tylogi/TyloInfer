@@ -20,8 +20,6 @@ add_library(mfq-model-graph STATIC
     grid_vision.h
     mfq_model_graph.cpp
     mfq_model_graph.h
-    compat/mfq_legacy_model_graph.cpp
-    compat/mfq_legacy_model_graph.h
     compat/mfq_legacy_tensor_names.cpp
     compat/mfq_legacy_tensor_names.h
     compat/mfq_format_compat.h
@@ -61,18 +59,12 @@ add_library(mfq-model-source STATIC
     nvq_rows.cpp
     include/tyloinfer/nvq_rows.h
     include/tyloinfer/packed_row_range.h
-    hf_model_source.cpp
     mlx/mlx_affine.cpp
     mlx/mlx_affine_source.cpp
     gguf/gguf_model_source.cpp
     include/tyloinfer/gguf_model_source.h
-    hf_safetensors_source.cpp
-    include/tyloinfer/hf_model_source.h
-    include/tyloinfer/hf_safetensors_source.h
     include/tyloinfer/model_graph.h
     include/tyloinfer/model_source.h
-    include/tyloinfer/mfq_model_source.h
-    mfq_model_source.cpp
     model_source.cpp
     row_residual.cpp
     include/tyloinfer/row_residual.h
@@ -127,31 +119,3 @@ target_link_libraries(mfq-core INTERFACE
     mfq-json
     mfq-qsa-kv-store
 )
-
-if(TYLOINFER_BUILD_RUNTIME_COMMUNICATION)
-    find_package(Threads REQUIRED)
-
-    add_library(mfq-paged-prefix-cache STATIC
-        mfq_paged_prefix_cache.cpp
-        mfq_paged_prefix_cache.h
-    )
-    target_include_directories(mfq-paged-prefix-cache PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    target_link_libraries(mfq-paged-prefix-cache PUBLIC Threads::Threads mfq-file-range-reader)
-    if(WIN32)
-        target_link_libraries(mfq-paged-prefix-cache PRIVATE bcrypt)
-    elseif(NOT APPLE)
-        # EVP_MD_CTX_new/free require OpenSSL 1.1; older or absent libraries
-        # keep the portable implementation without adding a build dependency.
-        find_package(OpenSSL 1.1 QUIET COMPONENTS Crypto)
-        if(TARGET OpenSSL::Crypto)
-            target_link_libraries(mfq-paged-prefix-cache PRIVATE OpenSSL::Crypto)
-            target_compile_definitions(mfq-paged-prefix-cache PRIVATE TYLOINFER_PREFIX_OPENSSL=1)
-        endif()
-    endif()
-    target_compile_features(mfq-paged-prefix-cache PUBLIC cxx_std_17)
-    set_target_properties(mfq-paged-prefix-cache PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-    )
-endif()

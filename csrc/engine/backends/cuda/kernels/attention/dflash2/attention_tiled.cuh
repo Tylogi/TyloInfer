@@ -1,6 +1,6 @@
 #pragma once
 // Adapted from Strata src/kernels/cuda/dflash2.cu, Copyright (c) 2026
-// Niko1221 and contributors. MIT: cpp_runtime/third_party/strata.LICENSE.
+// Niko1221 and contributors. MIT: LICENSES/Strata-MIT.txt.
 // Retile arbitrary query/GQA counts and token-major KV rings without fixing
 // the number of heads, rows, context length or device architecture.
 template<int Dimension,class History=float>

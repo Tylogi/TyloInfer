@@ -10,6 +10,7 @@
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/glm5_next.h"
+#include <stdexcept>
 #include <cmath>
 
 namespace tyloi::cuda::glm5_next {
@@ -29,21 +30,21 @@ class Kda {
         double eps)
         : w_(std::move(weights)), heads_(heads), width_(width), kernel_(kernel),
           lower_bound_(lower_bound), eps_(eps) {
-        TYLOINFER_RUNTIME_CHECK(heads > 0 && width > 0 && kernel > 1 && std::isfinite(lower_bound) &&
-                              std::isfinite(eps) && eps > 0,
-                          "invalid GLM KDA configuration");
+        if (!(heads > 0 && width > 0 && kernel > 1 && std::isfinite(lower_bound) &&
+                              std::isfinite(eps) && eps > 0))
+            throw std::runtime_error("invalid GLM KDA configuration");
     }
     DenseTensor forward(KdaState& state, const DenseTensor &hidden, bool use_cache,
                    int64_t confirmed = 0) const {
-        TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0,
-                          "recurrent attention requires nonempty [B,T,H] input");
+        if (!(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0))
+            throw std::runtime_error("recurrent attention requires nonempty [B,T,H] input");
         const auto tokens = hidden.size(1);
-        tyloi::models::require_model(
-            tokens > 0 && confirmed >= 0 && confirmed <= tokens && (!confirmed || use_cache),
-            "invalid recurrent verification window");
+        if (!(tokens > 0 && confirmed >= 0 && confirmed <= tokens && (!confirmed || use_cache)))
+            throw std::runtime_error("invalid recurrent verification window");
         if (confirmed == 0 || confirmed == tokens)
             return forward_chunk(state, hidden, use_cache);
-        tyloi::models::require_model(!state.pending(), "resolve previous recurrent checkpoint");
+        if (state.pending())
+            throw std::runtime_error("resolve previous recurrent checkpoint");
         auto prefix = forward_chunk(state, hidden.narrow(1, 0, confirmed), use_cache);
         state.rollback_conv = state.conv;
         state.rollback_recurrent = state.recurrent;
@@ -58,9 +59,9 @@ class Kda {
     DenseTensor forward_chunk(KdaState& state, const DenseTensor &hidden, bool use_cache) const {
         const auto b = hidden.size(0), t = hidden.size(1), channels = heads_ * width_;
         const auto options = hidden.options().dtype(::tyloi::kFloat32);
-        TYLOINFER_RUNTIME_CHECK(!use_cache || !state.conv.defined() ||
-                              (state.conv.size(0) == b && state.conv.device() == hidden.device()),
-                          "reset GLM KDA before changing batch/device");
+        if (!(!use_cache || !state.conv.defined() ||
+                              (state.conv.size(0) == b && state.conv.device() == hidden.device())))
+            throw std::runtime_error("reset GLM KDA before changing batch/device");
         auto previous = use_cache && state.conv.defined()
                             ? state.conv
                             : ::tyloi::cuda::zeros({b, kernel_ - 1, 3 * channels}, options);
@@ -70,9 +71,9 @@ class Kda {
                                       ::tyloi::ops::project(hidden, w_.value).dense()},
                                      -1)
                                  .to(::tyloi::kFloat32);
-            TYLOINFER_RUNTIME_CHECK(projected.sizes().vec() ==
-                                  std::vector<int64_t>({b, t, 3 * channels}),
-                              "GLM KDA projection shape mismatch");
+            if (!(projected.sizes().vec() ==
+                                  std::vector<int64_t>({b, t, 3 * channels})))
+                throw std::runtime_error("GLM KDA projection shape mismatch");
             auto joined = ::tyloi::cuda::cat({previous, projected}, 1).contiguous();
             auto convolved = ssm_conv_silu_cuda(joined,
                                                 w_.conv.dense().to(::tyloi::kFloat32).contiguous(),
@@ -180,17 +181,17 @@ class SparseMla {
   public:
     SparseMla(MlaWeights weights, MlaConfig config)
         : w_(std::move(weights)), c_(config) {
-        TYLOINFER_RUNTIME_CHECK(c_.heads > 0 && c_.nope > 0 && c_.value_width > 0 && c_.index_heads > 0 &&
-                              c_.pool > 0 && c_.budget > 0 && c_.budget % c_.pool == 0,
-                          "invalid Flash-Next MLA configuration");
+        if (!(c_.heads > 0 && c_.nope > 0 && c_.value_width > 0 && c_.index_heads > 0 &&
+                              c_.pool > 0 && c_.budget > 0 && c_.budget % c_.pool == 0))
+            throw std::runtime_error("invalid Flash-Next MLA configuration");
     }
     DenseTensor forward(MlaState& state, const DenseTensor &hidden, bool use_cache) const {
-        TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
-                              hidden.size(1) > 0,
-                          "GLM MLA requires nonempty [B,T,H] input");
+        if (!(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
+                              hidden.size(1) > 0))
+            throw std::runtime_error("GLM MLA requires nonempty [B,T,H] input");
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? state.position() : 0;
-        TYLOINFER_RUNTIME_CHECK(offset == (use_cache ? state.index.position() : 0) && t <= c_.maximum - offset,
-                          "GLM MLA cache position/capacity mismatch");
+        if (!(offset == (use_cache ? state.index.position() : 0) && t <= c_.maximum - offset))
+            throw std::runtime_error("GLM MLA cache position/capacity mismatch");
         const double scale = 1.0 / std::sqrt(double(c_.nope));
         auto rank = rms_norm(::tyloi::ops::project(hidden, w_.query_a).dense(),
                              w_.query_norm.dense(), c_.eps);
@@ -221,8 +222,8 @@ class SparseMla {
             }
             DenseTensor absorbed_query;
             {
-                TYLOINFER_RUNTIME_CHECK(query.dim() == 4 && query.size(2) == c_.heads,
-                                        "GLM head-wise projection shape mismatch");
+                if (!(query.dim() == 4 && query.size(2) == c_.heads))
+                    throw std::runtime_error("GLM head-wise projection shape mismatch");
                 const auto query_batch = query.size(0), query_tokens = query.size(1);
                 const auto query_rows = query_batch * query_tokens * c_.heads;
                 auto ids = ::tyloi::cuda::arange(query_rows, query.options().dtype(::tyloi::kInt32))
@@ -262,8 +263,8 @@ class SparseMla {
             DenseTensor unembedded;
             {
                 auto value = attended.to(::tyloi::kFloat16);
-                TYLOINFER_RUNTIME_CHECK(value.dim() == 4 && value.size(2) == c_.heads,
-                                        "GLM head-wise projection shape mismatch");
+                if (!(value.dim() == 4 && value.size(2) == c_.heads))
+                    throw std::runtime_error("GLM head-wise projection shape mismatch");
                 const auto value_batch = value.size(0), value_tokens = value.size(1);
                 const auto value_rows = value_batch * value_tokens * c_.heads;
                 auto value_ids = ::tyloi::cuda::arange(value_rows, value.options().dtype(::tyloi::kInt32))

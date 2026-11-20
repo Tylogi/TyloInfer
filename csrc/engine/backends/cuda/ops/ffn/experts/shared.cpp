@@ -6,6 +6,7 @@
 #include "engine/weights/encoding/tq/tensor.h"
 #include "env.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <utility>
 
@@ -35,13 +36,13 @@ DenseTensor preserve_rows(const DenseTensor& source,int64_t rows,Project project
 MoeSharedExpert::MoeSharedExpert(::tyloi::Tensor gate,::tyloi::Tensor up,
         ::tyloi::Tensor down,::tyloi::Tensor scalar)
     : projections{std::move(gate),std::move(up),std::move(down)},scalar_gate(std::move(scalar)) {
-    TYLOINFER_RUNTIME_CHECK(projections[0] && projections[1] && projections[2] && scalar_gate,
-        "Qwen shared expert requires projection weights");
+    if (!(projections[0] && projections[1] && projections[2] && scalar_gate))
+        throw std::runtime_error("Qwen shared expert requires projection weights");
     const auto* g=projections[0].representation<tyloi::encoding::TqTensor>();
     const auto* u=projections[1].representation<tyloi::encoding::TqTensor>();
     tq=g && u && g->image().device().is_cuda() && u->image().device().is_cuda();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    row_parallel=std::all_of(projections.begin(),projections.end(),[](const auto& weight) {
+    row_parallel=std::all_of(projections.begin(),projections.end(),[](const tyloi::Tensor& weight) {
         const auto* nint=weight.representation<tyloi::NintTensor>();
         return nint && !nint->q8_zero;
     });

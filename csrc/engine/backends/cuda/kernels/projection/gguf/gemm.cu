@@ -4,6 +4,7 @@
 #include "ggml-cuda/common.cuh"
 #include "decode.cuh"
 #include <mma.h>
+#include <algorithm>
 #include <stdexcept>
 #include <atomic>
 #include <cstdio>
@@ -11,6 +12,16 @@
 
 namespace tyloi::cuda::gguf {
 namespace {
+struct GroupedJobPacket {
+    static constexpr std::size_t capacity = 128;
+    GemmJob jobs[capacity]{};
+};
+static_assert(sizeof(GroupedJobPacket) < 4096 - 32);
+
+__global__ void publish_jobs(GroupedJobPacket packet, GemmJob* device, int count) {
+    if (threadIdx.x < count) device[threadIdx.x] = packet.jobs[threadIdx.x];
+}
+
 template<int Format>
 __global__ void decode_group(const GemmJob* jobs,std::uint64_t stride,std::int64_t rows,std::int64_t columns,
         std::int64_t batch_stride,half* output) {
@@ -146,6 +157,17 @@ void checked() {
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 }
+void stage_grouped_jobs(const GemmJob* host, GemmJob* device, std::size_t count, cudaStream_t stream) {
+    constexpr auto capacity = GroupedJobPacket::capacity;
+    for (std::size_t first = 0; first < count; first += capacity) {
+        GroupedJobPacket packet;
+        const auto size = std::min(capacity, count - first);
+        std::copy_n(host + first, size, packet.jobs);
+        publish_jobs<<<1, capacity, 0, stream>>>(packet, device + first, static_cast<int>(size));
+        checked();
+    }
+}
+
 bool grouped_f16_available(int device) {
     int major = 0;
     const auto status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);

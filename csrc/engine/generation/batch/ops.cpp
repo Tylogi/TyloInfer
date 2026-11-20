@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -189,16 +190,21 @@ public:
     std::size_t prefill_batch_limit() const { return packed_ && batch_->supports_packed() ? config_.max_sequences : 1; }
     std::int64_t prefill_batch_token_budget() const { return packed_tokens_; }
 
-    Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
+    PrefillBatchResult<Sample> prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
         try {
             auto scope = executor_.enter();
             initialize(request, chunk);
             auto timer = executor_.timer();
-            if (chunk.count > 1024) weights_.workspace(workspace_);
             reserve(request->state->prefill_growth_bytes(chunk.count),std::size_t(256)<<20,true);
+            if (chunk.count > 1024) weights_.workspace(workspace_);
             std::vector<models::BatchState*> states{request->state.get()};
             std::vector<Tensor> ids{ops::contiguous(ops::slice(request->ids,1,chunk.offset,chunk.offset+chunk.count))};
+            weights::Cache::Routes routes;
+            const int rows = chunk.count > 8 && chunk.count <= INT_MAX ? static_cast<int>(chunk.count) : 0;
+            const bool publish = routes.begin_prefill(weights_,
+                rows ? std::span<const int>{&rows, 1} : std::span<const int>{}) && rows;
             auto result = run_prefill(std::move(states), std::move(ids)).at(0);
+            routes.detach_prefill();
             prime_prompt(request, chunk, result.raw);
             auto hidden = std::move(result.hidden);
             Tensor next;
@@ -209,7 +215,14 @@ public:
             timer->stop({hidden, next});
             request->timers.push_back(std::move(timer));
             if (request->state->position() == static_cast<std::int64_t>(request->prefix)) checkpoint(request);
-            return finish(request, std::move(next));
+            PrefillBatchResult<Sample> sample{finish(request, std::move(next)), {}};
+            if (publish) {
+                auto publication = std::make_shared<weights::Cache::Routes>(std::move(routes));
+                sample.publish_routes = [publication](bool accepted) {
+                    publication->finish_prefill(accepted);
+                };
+            }
+            return sample;
         } catch (...) { std::rethrow_exception(prefill_failure(std::current_exception())); }
     }
 
@@ -239,7 +252,7 @@ public:
             try {
                 if (rows.size()==1) {
                     const auto row=rows.front();
-                    result[row].sample=prefill(items[row].first,items[row].second);
+                    result[row]=prefill(items[row].first,items[row].second);
                     return;
                 }
                 std::vector<models::BatchState*> states;
@@ -253,7 +266,13 @@ public:
                 }
                 auto timer=executor_.timer();
                 if (tokens>1024) weights_.workspace(workspace_);
+                std::vector<int> prompt_rows;
+                if (tokens > 8 && tokens <= INT_MAX)
+                    for (const auto row : rows) prompt_rows.push_back(static_cast<int>(items[row].second.count));
+                weights::Cache::Routes routes;
+                const bool publish = routes.begin_prefill(weights_, prompt_rows) && !prompt_rows.empty();
                 auto outputs=run_prefill(std::move(states),std::move(ids));
+                routes.detach_prefill();
                 if (outputs.size()!=rows.size()) throw std::runtime_error("invalid packed prefill output count");
                 std::vector<Tensor> hidden;
                 for (std::size_t i=0;i<rows.size();++i) {
@@ -286,6 +305,21 @@ public:
                     const auto& request = items[row].first;
                     if (request->state->position() == static_cast<std::int64_t>(request->prefix)) checkpoint(request);
                     result[row].sample=finish(items[row].first,std::move(next[row]));
+                }
+                if (publish) {
+                    struct Publication {
+                        weights::Cache::Routes routes;
+                        std::vector<std::uint8_t> accepted;
+                        std::size_t pending;
+                    };
+                    auto publication = std::make_shared<Publication>(Publication{
+                        std::move(routes), std::vector<std::uint8_t>(rows.size()), rows.size()});
+                    for (std::size_t i = 0; i < rows.size(); ++i)
+                        result[rows[i]].publish_routes = [publication, i](bool accepted) {
+                            publication->accepted[i] = accepted;
+                            if (--publication->pending == 0)
+                                publication->routes.finish_prefill(publication->accepted);
+                        };
                 }
                 ++packed_batches_; packed_requests_+=rows.size(); packed_rows_+=tokens;
             } catch (...) {

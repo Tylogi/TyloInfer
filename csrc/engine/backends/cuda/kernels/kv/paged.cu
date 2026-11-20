@@ -3,6 +3,8 @@
 // Chunk pointer tables: [chunks] int64 device addresses. Each chunk stores
 // [pages_per_chunk, kv_heads, page_size, head_dim].
 
+#include <stdexcept>
+#include <string>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
@@ -855,10 +857,10 @@ __global__ void paged_attention_decode_reduce_kernel(
 
 void validate_pointer_table(
         const ::tyloi::DenseTensor & pointers, const char * name) {
-    TYLOINFER_RUNTIME_CHECK(pointers.is_cuda() && pointers.is_contiguous() &&
+    if (!(pointers.is_cuda() && pointers.is_contiguous() &&
         pointers.scalar_type() == ::tyloi::kInt64 &&
-        pointers.dim() == 1 && pointers.numel() > 0,
-        name, " must be a non-empty contiguous CUDA int64 vector");
+        pointers.dim() == 1 && pointers.numel() > 0))
+        throw std::runtime_error(std::string(name) + " must be a non-empty contiguous CUDA int64 vector");
 }
 
 } // namespace
@@ -874,40 +876,40 @@ void paged_kv_cache_write_cuda(
     int64_t pages_per_chunk) {
     validate_pointer_table(k_chunk_ptrs, "paged KV key chunk table");
     validate_pointer_table(v_chunk_ptrs, "paged KV value chunk table");
-    TYLOINFER_RUNTIME_CHECK(k_chunk_ptrs.numel() == v_chunk_ptrs.numel(),
-        "paged KV chunk table sizes differ");
-    TYLOINFER_RUNTIME_CHECK(page_table.is_cuda() && page_table.is_contiguous() &&
+    if (!(k_chunk_ptrs.numel() == v_chunk_ptrs.numel()))
+        throw std::runtime_error("paged KV chunk table sizes differ");
+    if (!(page_table.is_cuda() && page_table.is_contiguous() &&
         page_table.scalar_type() == ::tyloi::kInt32 &&
-        page_table.dim() == 2,
-        "paged KV page table must be contiguous CUDA int32[batch,pages]");
-    TYLOINFER_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() &&
+        page_table.dim() == 2))
+        throw std::runtime_error("paged KV page table must be contiguous CUDA int32[batch,pages]");
+    if (!(k.is_cuda() && k.is_contiguous() &&
         v.is_cuda() && v.is_contiguous() && k.dim() == 4 &&
-        k.sizes() == v.sizes(),
-        "paged KV inputs must be matching contiguous CUDA rank-4 tensors");
-    TYLOINFER_RUNTIME_CHECK(k.scalar_type() == v.scalar_type() &&
+        k.sizes() == v.sizes()))
+        throw std::runtime_error("paged KV inputs must be matching contiguous CUDA rank-4 tensors");
+    if (!(k.scalar_type() == v.scalar_type() &&
         (k.scalar_type() == ::tyloi::kFloat16 ||
          k.scalar_type() == ::tyloi::kBFloat16 ||
-         k.scalar_type() == ::tyloi::kFloat32),
-        "paged KV inputs require a supported matching floating dtype");
-    TYLOINFER_RUNTIME_CHECK(positions.is_cuda() && positions.is_contiguous() &&
+         k.scalar_type() == ::tyloi::kFloat32)))
+        throw std::runtime_error("paged KV inputs require a supported matching floating dtype");
+    if (!(positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type() == ::tyloi::kInt64 &&
-        (positions.dim() == 1 || positions.dim() == 2),
-        "paged KV positions must be contiguous CUDA int64 [T] or [B,T]");
-    TYLOINFER_RUNTIME_CHECK(page_size > 0 && page_size <= INT_MAX &&
-        pages_per_chunk > 0 && pages_per_chunk <= INT_MAX,
-        "paged KV page geometry is invalid");
+        (positions.dim() == 1 || positions.dim() == 2)))
+        throw std::runtime_error("paged KV positions must be contiguous CUDA int64 [T] or [B,T]");
+    if (!(page_size > 0 && page_size <= INT_MAX &&
+        pages_per_chunk > 0 && pages_per_chunk <= INT_MAX))
+        throw std::runtime_error("paged KV page geometry is invalid");
     const int B = static_cast<int>(k.size(0));
     const int H = static_cast<int>(k.size(1));
     const int T = static_cast<int>(k.size(2));
     const int D = static_cast<int>(k.size(3));
-    TYLOINFER_RUNTIME_CHECK(page_table.size(0) >= B && page_table.size(1) > 0,
-        "paged KV page table does not cover the input batch");
+    if (!(page_table.size(0) >= B && page_table.size(1) > 0))
+        throw std::runtime_error("paged KV page table does not cover the input batch");
     if (positions.dim() == 1) {
-        TYLOINFER_RUNTIME_CHECK(positions.numel() == T,
-            "paged KV position vector length mismatch");
+        if (!(positions.numel() == T))
+            throw std::runtime_error("paged KV position vector length mismatch");
     } else {
-        TYLOINFER_RUNTIME_CHECK(positions.size(0) == B && positions.size(1) == T,
-            "paged KV position matrix shape mismatch");
+        if (!(positions.size(0) == B && positions.size(1) == T))
+            throw std::runtime_error("paged KV position matrix shape mismatch");
     }
     if (T == 0) return;
     constexpr int Threads = 256;
@@ -940,14 +942,14 @@ void paged_kv_cache_gather_cuda(
     int64_t pages_per_chunk) {
     validate_pointer_table(k_chunk_ptrs, "paged gather key pointers");
     validate_pointer_table(v_chunk_ptrs, "paged gather value pointers");
-    TYLOINFER_RUNTIME_CHECK(k.is_cuda() && v.is_cuda() && k.is_contiguous() && v.is_contiguous() &&
-        k.dim() == 4 && k.sizes() == v.sizes() && k.scalar_type() == v.scalar_type(),
-        "paged gather requires matching contiguous CUDA rank-4 outputs");
-    TYLOINFER_RUNTIME_CHECK(page_table.is_cuda() && page_table.is_contiguous() &&
+    if (!(k.is_cuda() && v.is_cuda() && k.is_contiguous() && v.is_contiguous() &&
+        k.dim() == 4 && k.sizes() == v.sizes() && k.scalar_type() == v.scalar_type()))
+        throw std::runtime_error("paged gather requires matching contiguous CUDA rank-4 outputs");
+    if (!(page_table.is_cuda() && page_table.is_contiguous() &&
         page_table.scalar_type() == ::tyloi::kInt32 && page_table.dim() == 2 &&
         page_table.size(0) >= k.size(0) && page_size > 0 && pages_per_chunk > 0 &&
-        k.size(2) <= page_table.size(1) * page_size,
-        "paged gather has invalid page geometry");
+        k.size(2) <= page_table.size(1) * page_size))
+        throw std::runtime_error("paged gather has invalid page geometry");
     const int B = k.size(0), H = k.size(1), T = k.size(2), D = k.size(3);
     if (!k.numel()) return;
     constexpr int threads = 256;
@@ -999,48 +1001,48 @@ template<int W> bool paged_mma_available() {
     bool dynamic_parts) {
     validate_pointer_table(k_chunk_ptrs, "paged attention key chunk table");
     validate_pointer_table(v_chunk_ptrs, "paged attention value chunk table");
-    TYLOINFER_RUNTIME_CHECK(k_chunk_ptrs.numel() == v_chunk_ptrs.numel(),
-        "paged attention chunk table sizes differ");
-    TYLOINFER_RUNTIME_CHECK(page_table.is_cuda() && page_table.is_contiguous() &&
+    if (!(k_chunk_ptrs.numel() == v_chunk_ptrs.numel()))
+        throw std::runtime_error("paged attention chunk table sizes differ");
+    if (!(page_table.is_cuda() && page_table.is_contiguous() &&
         page_table.scalar_type() == ::tyloi::kInt32 &&
-        page_table.dim() == 2,
-        "paged attention page table must be contiguous CUDA int32[batch,pages]");
-    TYLOINFER_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
+        page_table.dim() == 2))
+        throw std::runtime_error("paged attention page table must be contiguous CUDA int32[batch,pages]");
+    if (!(seq_len.is_cuda() && seq_len.is_contiguous() &&
         seq_len.scalar_type() == ::tyloi::kInt64 &&
-        seq_len.dim() == 1,
-        "paged attention lengths must be contiguous CUDA int64[batch]");
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.dim() == 4 &&
+        seq_len.dim() == 1))
+        throw std::runtime_error("paged attention lengths must be contiguous CUDA int64[batch]");
+    if (!(q.is_cuda() && q.is_contiguous() && q.dim() == 4 &&
         q.size(2) == 1 &&
         (q.scalar_type() == ::tyloi::kFloat16 ||
          q.scalar_type() == ::tyloi::kBFloat16 ||
-         q.scalar_type() == ::tyloi::kFloat32),
-        "paged attention query must be CUDA [batch,heads,1,dim]");
-    TYLOINFER_RUNTIME_CHECK(page_size > 0 && page_size <= INT_MAX &&
+         q.scalar_type() == ::tyloi::kFloat32)))
+        throw std::runtime_error("paged attention query must be CUDA [batch,heads,1,dim]");
+    if (!(page_size > 0 && page_size <= INT_MAX &&
         pages_per_chunk > 0 && pages_per_chunk <= INT_MAX &&
-        parts >= 1 && parts <= 64,
-        "paged attention geometry is invalid");
+        parts >= 1 && parts <= 64))
+        throw std::runtime_error("paged attention geometry is invalid");
     const int B = static_cast<int>(q.size(0));
     const int Hq = static_cast<int>(q.size(1));
     const int D = static_cast<int>(q.size(3));
-    TYLOINFER_RUNTIME_CHECK(page_table.size(0) >= B && page_table.size(1) > 0 &&
-        seq_len.numel() == B,
-        "paged attention metadata does not cover the query batch");
-    TYLOINFER_RUNTIME_CHECK(partial_o.defined() && partial_o.dim() == 3 &&
-        partial_o.size(0) == B * Hq && partial_o.size(2) == D,
-        "paged attention partial output shape mismatch");
+    if (!(page_table.size(0) >= B && page_table.size(1) > 0 &&
+        seq_len.numel() == B))
+        throw std::runtime_error("paged attention metadata does not cover the query batch");
+    if (!(partial_o.defined() && partial_o.dim() == 3 &&
+        partial_o.size(0) == B * Hq && partial_o.size(2) == D))
+        throw std::runtime_error("paged attention partial output shape mismatch");
     const int workspace_parts = static_cast<int>(partial_o.size(1));
-    TYLOINFER_RUNTIME_CHECK(parts <= workspace_parts && partial_m.defined() &&
+    if (!(parts <= workspace_parts && partial_m.defined() &&
         partial_l.defined() && partial_m.is_cuda() && partial_l.is_cuda() &&
         partial_m.is_contiguous() && partial_l.is_contiguous() &&
         partial_m.scalar_type() == ::tyloi::kFloat32 &&
         partial_l.scalar_type() == ::tyloi::kFloat32 &&
         partial_m.sizes() == ::tyloi::IntArrayRef(
             {B * Hq, workspace_parts}) &&
-        partial_l.sizes() == partial_m.sizes(),
-        "paged attention partial statistics shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(kv_heads > 0 && kv_heads <= Hq &&
-        Hq % kv_heads == 0,
-        "paged attention received an invalid KV-head count");
+        partial_l.sizes() == partial_m.sizes()))
+        throw std::runtime_error("paged attention partial statistics shape mismatch");
+    if (!(kv_heads > 0 && kv_heads <= Hq &&
+        Hq % kv_heads == 0))
+        throw std::runtime_error("paged attention received an invalid KV-head count");
     const int Hk = static_cast<int>(kv_heads);
     const int gqa_ratio = Hq / Hk;
     auto output = ::tyloi::cuda::empty_like(q);
@@ -1094,7 +1096,7 @@ template<int W> bool paged_mma_available() {
                     output.data_ptr<scalar_t>(), B, Hq, Hk, D, logical_pages,
                     page, chunk_pages, chunks, gqa_ratio, static_cast<float>(scale));
             } else {
-                TYLOINFER_RUNTIME_CHECK(false, "paged attention head_dim exceeds 512");
+                throw std::runtime_error("paged attention head_dim exceeds 512");
             }
         } else {
             const auto mma=[&]<int W>() {
@@ -1175,7 +1177,7 @@ template<int W> bool paged_mma_available() {
                     chunk_pages, chunks, gqa_ratio, split_parts, workspace_parts,
                     static_cast<float>(scale), dynamic_parts ? 1 : 0);
             } else {
-                TYLOINFER_RUNTIME_CHECK(false, "paged attention head_dim exceeds 512");
+                throw std::runtime_error("paged attention head_dim exceeds 512");
             }
             if (D <= 64) {
                 paged_attention_decode_reduce_kernel<64, scalar_t><<<

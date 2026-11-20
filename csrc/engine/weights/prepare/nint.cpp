@@ -509,8 +509,8 @@ tyloi::nint8::Data select_nint8_zero_cpu_rows(
 }
 
 ::tyloi::DenseTensor dequant_nint8_zero_cpu(const tyloi::nint8::Data & source) {
-    TYLOINFER_RUNTIME_CHECK(source.shape.size() == 2,
-        "CPU NINT8-0 dense tensor must be rank 2");
+    if (!(source.shape.size() == 2))
+        throw std::runtime_error("CPU NINT8-0 dense tensor must be rank 2");
     const auto quantized_tensor = cpu_u8_tensor(
         source.q, {source.out, source.ng, 32});
     const auto scales_tensor = cpu_f16_tensor(

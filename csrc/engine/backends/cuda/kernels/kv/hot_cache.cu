@@ -1,6 +1,7 @@
 #include "env.h"
 #include "../../ops/attention/kv/hot_cache.h"
 #include "resident_allocations.h"
+#include <stdexcept>
 #include <algorithm>
 #include <limits>
 #include <cassert>
@@ -254,8 +255,8 @@ template<class Word> __global__ void publish_rows(const Word* keys,const Word* v
 }
 HotKvCache::Layout HotKvCache::layout(int64_t heads,int64_t maximum,int64_t cells,int64_t kw,int64_t vw,
         const ::tyloi::TensorOptions& options,bool exclusive) {
-    TYLOINFER_RUNTIME_CHECK(heads>0 && maximum>0 && maximum<=INT_MAX && cells>0 && cells<=maximum,
-        "invalid resident KV geometry");
+    if (!(heads>0 && maximum>0 && maximum<=INT_MAX && cells>0 && cells<=maximum))
+        throw std::runtime_error("invalid resident KV geometry");
     return {{1,heads,cells,kw},{1,heads,cells,vw},maximum,cells,maximum,cells,maximum,7,
         exclusive?maximum:0,exclusive?maximum-cells:0,exclusive?cells:0,exclusive?3:0,
         ::tyloi::scalar_size(options.scalar_type())};
@@ -283,7 +284,8 @@ HotKvView HotKvCache::view() const {
         exclusive()?cold_mapping.data_ptr<int32_t>():nullptr,exclusive()?cold_keys.size(2):0};
 }
 void HotKvCache::set_cold_storage(const ::tyloi::DenseTensor& k,const ::tyloi::DenseTensor& v) {
-    TYLOINFER_RUNTIME_CHECK(defined() && k.size(2)==mapping.numel()-keys.size(2) && k.size(2)>0,"invalid exclusive KV capacity");
+    if (!(defined() && k.size(2)==mapping.numel()-keys.size(2) && k.size(2)>0))
+        throw std::runtime_error("invalid exclusive KV capacity");
     const auto plan=layout(keys.size(1),mapping.numel(),keys.size(2),keys.size(3),values.size(3),keys.options(),true);
     cold_keys=k;cold_values=v;
     cold_mapping=::tyloi::cuda::full({plan.cold_mapping},-1,mapping.options());
@@ -291,7 +293,8 @@ void HotKvCache::set_cold_storage(const ::tyloi::DenseTensor& k,const ::tyloi::D
     cold_control=::tyloi::cuda::zeros({plan.cold_control},mapping.options());cold_control.narrow(0,2,1).fill_(keys.size(2));
 }
 void HotKvCache::append(const ::tyloi::DenseTensor& k,const ::tyloi::DenseTensor& v,const ::tyloi::DenseTensor& positions) {
-    TYLOINFER_RUNTIME_CHECK(exclusive() && k.size(2)==positions.numel() && v.size(2)==positions.numel(),"exclusive KV append geometry mismatch");
+    if (!(exclusive() && k.size(2)==positions.numel() && v.size(2)==positions.numel()))
+        throw std::runtime_error("exclusive KV append geometry mismatch");
     if(append_decode(k,v,positions))return;
     auto source_k=k.contiguous(),source_v=v.contiguous(),pos=positions.to(::tyloi::kInt64).contiguous();
     const int count=int(pos.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),kw=int(keys.size(3)),vw=int(values.size(3));
@@ -359,7 +362,8 @@ bool HotKvCache::append_decode(const ::tyloi::DenseTensor& k,const ::tyloi::Dens
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return true;
 }
 std::pair<::tyloi::DenseTensor,::tyloi::DenseTensor> HotKvCache::gather(int64_t count) const {
-    TYLOINFER_RUNTIME_CHECK(exclusive() && count>0 && count<=mapping.numel(),"invalid exclusive KV read");
+    if (!(exclusive() && count>0 && count<=mapping.numel()))
+        throw std::runtime_error("invalid exclusive KV read");
     auto read=[&](const ::tyloi::DenseTensor& gpu,const ::tyloi::DenseTensor& ram){
         auto out=::tyloi::cuda::empty({1,gpu.size(1),count,gpu.size(3)},gpu.options());
         const int blocks=int(std::min<int64_t>(65535,(out.numel()+255)/256));
@@ -393,8 +397,9 @@ void HotKvCache::reset() {
 }
 void HotKvCache::invalidate(const ::tyloi::DenseTensor& positions) {
     if(!defined() || !positions.numel())return;
-    TYLOINFER_RUNTIME_CHECK(positions.is_cuda() && positions.is_contiguous() &&
-        (positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64),"invalid KV update positions");
+    if (!(positions.is_cuda() && positions.is_contiguous() &&
+        (positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64)))
+        throw std::runtime_error("invalid KV update positions");
     const int blocks=int(std::min<int64_t>(65535,(positions.numel()+255)/256));
     if(positions.scalar_type()==::tyloi::kInt64)invalidate_rows<<<blocks,256,0,mfq_current_cuda_stream()>>>(
         positions.data_ptr<int64_t>(),positions.numel(),mapping.data_ptr<int32_t>(),slot_ids.data_ptr<int32_t>(),
@@ -405,7 +410,8 @@ void HotKvCache::invalidate(const ::tyloi::DenseTensor& positions) {
 }
 void HotKvCache::publish(const ::tyloi::DenseTensor& source_keys,const ::tyloi::DenseTensor& source_values,const ::tyloi::DenseTensor& positions) {
     if(!defined() || !positions.numel())return;
-    TYLOINFER_RUNTIME_CHECK(source_keys.is_contiguous() && source_values.is_contiguous(),"resident KV publication source must be contiguous");
+    if (!(source_keys.is_contiguous() && source_values.is_contiguous()))
+        throw std::runtime_error("resident KV publication source must be contiguous");
     auto indices=positions.to(::tyloi::kInt64).contiguous();
     invalidate(indices);
     const int grid=int((std::min<int64_t>(indices.numel(),keys.size(2))+3)/4);
@@ -423,14 +429,16 @@ void HotKvCache::publish(const ::tyloi::DenseTensor& source_keys,const ::tyloi::
 void HotKvCache::prepare(const ::tyloi::DenseTensor& source_keys,const ::tyloi::DenseTensor& source_values,
         const ::tyloi::DenseTensor& selected,const ::tyloi::DenseTensor& positions,int64_t columns,bool skip_small_prefix,bool epoch_ready) {
     if(!defined())return;
-    TYLOINFER_RUNTIME_CHECK(source_keys.is_contiguous() && source_values.is_contiguous() && source_keys.size(0)==1 &&
+    if (!(source_keys.is_contiguous() && source_values.is_contiguous() && source_keys.size(0)==1 &&
         source_keys.size(2)==mapping.numel() && source_keys.scalar_type()==keys.scalar_type() &&
-        source_values.scalar_type()==values.scalar_type(),"resident KV source geometry mismatch");
+        source_values.scalar_type()==values.scalar_type()))
+        throw std::runtime_error("resident KV source geometry mismatch");
     auto indices=selected.defined()?selected.to(::tyloi::kInt32).contiguous(): ::tyloi::DenseTensor{};
     auto boundaries=positions.defined()?positions.to(::tyloi::kInt64).contiguous(): ::tyloi::DenseTensor{};
     const auto count=indices.defined()?indices.numel():columns;
-    TYLOINFER_RUNTIME_CHECK(count>0 && columns<=mapping.numel() &&
-        (!indices.defined() || (indices.size(0)==1 && indices.dim()==3)),"invalid resident KV selection");
+    if (!(count>0 && columns<=mapping.numel() &&
+        (!indices.defined() || (indices.size(0)==1 && indices.dim()==3))))
+        throw std::runtime_error("invalid resident KV selection");
     auto* meta=reinterpret_cast<Stamp*>(control.data_ptr());
     const int blocks=int(std::min<int64_t>(65535,(count+255)/256));
     if(!epoch_ready)begin<<<1,1,0,mfq_current_cuda_stream()>>>(meta,boundaries.defined()?boundaries.data_ptr<int64_t>():nullptr,

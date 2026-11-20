@@ -3,15 +3,67 @@
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/ops/projection/channel_fp8.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/ops/gguf/prefill_fusion.h"
 #include "engine/backends/cuda/kernels/projection/dense.h"
+#include "engine/backends/cuda/kernels/projection/gguf/linear.h"
+#include "engine/backends/cuda/ops/projection/prefill.h"
+#include "components/error.h"
 #include "engine/weights/encoding/sq/mxfp4_decode.h"
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <initializer_list>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+namespace tyloi::cuda {
+
+bool can_prefill_f16_residual(std::int64_t tokens, std::int64_t rows,
+        std::int64_t columns, Device device, const DenseTensor& residual) {
+    const auto* setting = env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+    if (tokens <= 32 || tokens > INT_MAX || (setting && setting[0] != '1' && setting[0] != 'a') ||
+        ((!setting || setting[0] == 'a') && tokens < 512) || !device.is_cuda() ||
+        rows < 1 || rows > INT_MAX || columns < 1 || columns > INT_MAX ||
+        !residual.defined() || residual.device() != device || !residual.is_contiguous() ||
+        residual.scalar_type() != kFloat16 || residual.dim() < 1 || residual.size(-1) != rows ||
+        residual.numel() / rows != tokens) return false;
+    const DeviceGuard guard(device.index);
+    return gguf::grouped_f16_available(device.index);
+}
+
+void prefill_f16_residual_tile(const DenseTensor& input, const DenseTensor& weights,
+        const DenseTensor& residual, const DenseTensor& output, std::int64_t first,
+        std::int64_t count, void* blas, DenseTensor& scratch) {
+    if (input.dim() != 2 || weights.dim() != 2 || output.dim() != 2 ||
+        weights.size(1) != input.size(1) || output.size(0) != input.size(0) ||
+        count <= 0 || count > weights.size(0) || first < 0 || first > output.size(1) ||
+        count > output.size(1) - first || residual.numel() != output.numel() ||
+        weights.device() != input.device() || weights.scalar_type() != kFloat16 || !weights.is_contiguous())
+        throw std::runtime_error("invalid decoded tile for FP16 prefill residual projection");
+    const auto stream = current_stream(input.get_device());
+    const auto offset = first * output.element_size();
+    const auto* addend = static_cast<const std::byte*>(residual.data_ptr()) + offset;
+    auto* destination = static_cast<std::byte*>(output.data_ptr()) + offset;
+    auto plan = gguf::prepare_prefill_residual_gemm(input.data_ptr(), weights.data_ptr(),
+        addend, destination, input.size(0), count, input.size(1), output.size(1), stream.stream());
+    if (plan.workspace_bytes && (!scratch.defined() || scratch.nbytes() < plan.workspace_bytes)) {
+        try {
+            scratch = empty({static_cast<std::int64_t>(plan.workspace_bytes)}, input.options().dtype(kUInt8));
+        } catch (const MfqResourceExhausted&) {
+            (void)cudaGetLastError();
+            plan = {};
+        }
+    }
+    gguf::prefill_gemm_f16_residual(input.data_ptr(), weights.data_ptr(), addend, destination,
+        input.size(0), count, input.size(1), output.size(1), plan,
+        scratch.defined() ? scratch.data_ptr() : nullptr, scratch.defined() ? scratch.nbytes() : 0,
+        blas, stream.stream());
+}
+
+} // namespace tyloi::cuda
 
 namespace {
 void check_width(int64_t width, int64_t expected, bool padded) {
@@ -140,12 +192,27 @@ void check_device(const ::tyloi::TensorImpl& weight, const ::tyloi::DenseTensor&
 }
 #endif
 
+tyloi::cuda::gguf::GgufPrefillProduct tyloi::cuda::mfq_prefill_product(
+        const Tensor& weight, const DenseTensor& input, const DenseTensor& input_exponents) {
+    gguf::GgufPrefillProduct product;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (const auto* nint = weight.representation<NintTensor>())
+        scaled_prefill(*nint, input, &product, input_exponents);
+    else if (const auto* nvq = weight.representation<NvqTensor>())
+        scaled_prefill(*nvq, input, &product, input_exponents);
+#else
+    (void)weight;
+    (void)input;
+    (void)input_exponents;
+#endif
+    return product;
+}
+
 ::tyloi::DenseTensor quant_embedding_lookup(
         const ::tyloi::Tensor & weight,
         ::tyloi::DenseTensor token_ids) {
-    TYLOINFER_RUNTIME_CHECK(
-        weight.representation<tyloi::ShardedTensor>() == nullptr,
-        "quantized embedding does not support tensor-parallel shards");
+    if (!(weight.representation<tyloi::ShardedTensor>() == nullptr))
+        throw std::runtime_error("quantized embedding does not support tensor-parallel shards");
     if (const auto* dense = weight.representation<::tyloi::DenseTensor>()) {
         auto output_shape = token_ids.sizes().vec();
         output_shape.push_back(dense->size(1));
@@ -157,17 +224,19 @@ void check_device(const ::tyloi::TensorImpl& weight, const ::tyloi::DenseTensor&
         check_device(*fp8, token_ids);
         return tyloi::cuda::channel_fp8_rows(*fp8, std::move(token_ids));
     }
-    if (const auto* gguf = weight.representation<tyloi::GgufTensor>())
+    if (const auto* gguf = weight.representation<tyloi::GgmlQuantizedTensor>())
         return tyloi::cuda::gguf::embedding(*gguf, std::move(token_ids));
     if (const auto* nvq = weight.representation<tyloi::NvqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ embedding weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NVQ embedding weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         check_device(*nvq, token_ids);
         return nvq_embedding(*nvq, token_ids);
 #endif
     }
     if (const auto* nint = weight.representation<tyloi::NintTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT embedding weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NINT embedding weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         check_device(*nint, token_ids);
         if (nint->q8_zero)
@@ -187,10 +256,9 @@ void check_device(const ::tyloi::TensorImpl& weight, const ::tyloi::DenseTensor&
         check_device(*mx8, token_ids);
         return mxfp8_embedding_lookup_cuda(mx8->values, mx8->scales, token_ids);
     }
-    TYLOINFER_RUNTIME_CHECK(
-        weight.representation<tyloi::Mxfp4SqTensor>() == nullptr &&
-            weight.representation<tyloi::Fp8SqTensor>() == nullptr,
-        "SQ tensors do not support embedding lookup");
+    if (!(weight.representation<tyloi::Mxfp4SqTensor>() == nullptr &&
+            weight.representation<tyloi::Fp8SqTensor>() == nullptr))
+        throw std::runtime_error("SQ tensors do not support embedding lookup");
     throw std::runtime_error("unsupported quantized embedding weight");
 }
 
@@ -217,10 +285,11 @@ bool tensor_parallel_output_projections_compatible(
 
 ::tyloi::DenseTensor quant_linear_reference_weight(
         const ::tyloi::Tensor& weight) {
-    TYLOINFER_RUNTIME_CHECK(weight.representation<tyloi::ShardedTensor>() == nullptr, "linear reference requires local weights");
+    if (!(weight.representation<tyloi::ShardedTensor>() == nullptr))
+        throw std::runtime_error("linear reference requires local weights");
     if (const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>())
         return tyloi::cuda::dequant_channel_fp8(*fp8);
-    if (const auto* gguf = weight.representation<tyloi::GgufTensor>())
+    if (const auto* gguf = weight.representation<tyloi::GgmlQuantizedTensor>())
         return tyloi::cuda::gguf::dequantize(*gguf);
     if (const auto* tq = weight.representation<tyloi::encoding::TqTensor>()) {
         const auto ids = ::tyloi::cuda::arange(tq->size(0),
@@ -228,7 +297,8 @@ bool tensor_parallel_output_projections_compatible(
         return tyloi::cuda::tq::embedding(*tq, ids);
     }
     if (const auto* nint = weight.representation<tyloi::NintTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NINT linear weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         return nint->q8_zero
             ? nint8_zero_dequant_cuda(nint->q_packed, nint->q8_zero_scale, nint->neuron_len)
@@ -238,7 +308,8 @@ bool tensor_parallel_output_projections_compatible(
 #endif
     }
     if (const auto* nvq = weight.representation<tyloi::NvqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ linear weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NVQ linear weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         return nvq_dequant(*nvq);
 #endif
@@ -247,7 +318,8 @@ bool tensor_parallel_output_projections_compatible(
         return mxfp4_dequant_cuda(mx4->values, mx4->scales);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* sq4 = weight.representation<tyloi::Mxfp4SqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "MXFP4-SQ linear weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("MXFP4-SQ linear weight is not enabled");
         if (!sq4->blob.is_cuda()) return dequant_mxfp4_sq_cpu(*sq4).to(::tyloi::kFloat16);
         return mxfp4_sq_dequant_cuda(
             sq4->blob, sq4->row_q, sq4->row_symbol_byte_offsets, sq4->row_auxiliary,
@@ -256,7 +328,8 @@ bool tensor_parallel_output_projections_compatible(
     }
 #endif
     if (const auto* sq8 = weight.representation<tyloi::Fp8SqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "FP8-SQ linear weight is not enabled");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("FP8-SQ linear weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         return dequant_fp8_sq(*sq8, false);
 #endif
@@ -265,6 +338,22 @@ bool tensor_parallel_output_projections_compatible(
         return mxfp8_cpu_reference(*mx8);
     if (const auto* dense = weight.representation<::tyloi::DenseTensor>()) return *dense;
     throw std::runtime_error("unsupported linear reference format");
+}
+
+::tyloi::DenseTensor prefill_linear_weight(const ::tyloi::Tensor& weight) {
+    if (const auto* mx8 = weight.representation<tyloi::Mxfp8Tensor>())
+        return mxfp8_dequant_cuda(mx8->values, mx8->scales);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (const auto* nint = weight.representation<tyloi::NintTensor>())
+        return dequant_nint_dense_f32(*nint).to(tyloi::kFloat16).contiguous();
+    if (const auto* sq4 = weight.representation<tyloi::Mxfp4SqTensor>())
+        return mxfp4_sq_dequant_cuda(sq4->blob, sq4->row_q, sq4->row_symbol_byte_offsets,
+            sq4->row_auxiliary, sq4->bits, sq4->out, sq4->neuron_len, sq4->matrix_scale_base,
+            sq4->q_sum, sq4->sq4_rows, true).to(tyloi::kFloat16).contiguous();
+    if (const auto* sq8 = weight.representation<tyloi::Fp8SqTensor>())
+        return dequant_fp8_sq(*sq8, true).to(tyloi::kFloat16).contiguous();
+#endif
+    return quant_linear_reference_weight(weight).to(tyloi::kFloat16).contiguous();
 }
 
 ::tyloi::DenseTensor dense_projection(

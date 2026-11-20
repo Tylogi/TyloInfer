@@ -99,14 +99,16 @@ __global__ void decode_tile(
 template <class Input, class Output>
 __global__ void restore_scales(
         const Input* product, Output* output, const float* weights,
-        const float* tokens, int columns, int rows, float product_scale) {
+        const float* tokens, int columns, int rows, float product_scale,
+        const Output* residual) {
     for (int column = blockIdx.x * blockDim.x + threadIdx.x;
          column < columns; column += blockDim.x * gridDim.x) {
         const float weight = weights[column];
         for (int row = blockIdx.y; row < rows; row += gridDim.y) {
             const float token = tokens ? tokens[row] : 1.f;
             const auto i = std::int64_t(row) * columns + column;
-            output[i] = Output((float(product[i]) * product_scale) * (weight * token));
+            const auto restored = Output((float(product[i]) * product_scale) * (weight * token));
+            output[i] = residual ? Output(float(restored) + float(residual[i])) : restored;
         }
     }
 }
@@ -220,7 +222,7 @@ ChannelFp8Input prepare_channel_fp8_input(
 
 DenseTensor channel_fp8_projection(
         const ChannelFp8Tensor& weight, DenseTensor input,
-        CudaProfiler* profiler, const ChannelFp8Input* prepared) {
+        CudaProfiler* profiler, const ChannelFp8Input* prepared, const DenseTensor& residual) {
     const auto measure_operation = [profiler](const char* name, auto&& operation) {
         return measure(profiler, name, std::forward<decltype(operation)>(operation));
     };
@@ -234,6 +236,10 @@ DenseTensor channel_fp8_projection(
     const auto dtype = input.scalar_type();
     auto shape = input.sizes().vec();
     shape.back() = weight.out;
+    if (residual.defined() && (!input.is_cuda() || residual.device() != input.device() ||
+        dtype != kFloat16 || residual.scalar_type() != dtype || !residual.is_contiguous() ||
+        !std::ranges::equal(residual.sizes(), shape) || input.numel() / weight.neuron_len <= 8))
+        throw std::invalid_argument("channel FP8 residual must match the contiguous FP16 prefill output");
     if (prepared &&
         (!weight.dynamic_activations || !input.is_cuda() ||
          !prepared->source.defined() ||
@@ -421,21 +427,24 @@ DenseTensor channel_fp8_projection(
         auto restored = output.scalar_type() == dtype
             ? output : empty(output.sizes(), output.options().dtype(dtype));
         mfq_cuda_record_stream(restored, stream);
+        if (residual.defined()) mfq_cuda_record_stream(residual, stream);
         measure_operation("fp8.scale_restore", [&] {
-            const auto restore = [&](auto* target) {
+            const auto restore = [&](auto* target, const auto* addend) {
                 const auto grid = restore_grid(weight.out, tokens, weight.values.get_device());
                 if (half_accum)
                     restore_scales<<<grid, 256, 0, stream.stream()>>>(
                         output.data_ptr<__half>(), target, weight.scales.data_ptr<float>(),
-                        token_scale, int(weight.out), int(tokens), product_scale);
+                        token_scale, int(weight.out), int(tokens), product_scale, addend);
                 else
                     restore_scales<<<grid, 256, 0, stream.stream()>>>(
                         output.data_ptr<float>(), target, weight.scales.data_ptr<float>(),
-                        token_scale, int(weight.out), int(tokens), 1.f);
+                        token_scale, int(weight.out), int(tokens), 1.f, addend);
             };
-            if (dtype == kFloat16) restore(restored.data_ptr<__half>());
-            else if (dtype == kBFloat16) restore(restored.data_ptr<__nv_bfloat16>());
-            else restore(restored.data_ptr<float>());
+            if (dtype == kFloat16) restore(restored.data_ptr<__half>(),
+                residual.defined() ? residual.data_ptr<__half>() : nullptr);
+            else if (dtype == kBFloat16) restore(restored.data_ptr<__nv_bfloat16>(),
+                static_cast<const __nv_bfloat16*>(nullptr));
+            else restore(restored.data_ptr<float>(), static_cast<const float*>(nullptr));
             return 0;
         });
         output = std::move(restored);

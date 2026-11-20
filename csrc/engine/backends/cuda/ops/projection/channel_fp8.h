@@ -21,7 +21,8 @@ DenseTensor channel_fp8_projection(
     const ChannelFp8Tensor& weight,
     DenseTensor input,
     CudaProfiler* profiler = nullptr,
-    const ChannelFp8Input* prepared = nullptr);
+    const ChannelFp8Input* prepared = nullptr,
+    const DenseTensor& residual = {});
 
 DenseTensor channel_fp8_rows(
     const ChannelFp8Tensor& weight, DenseTensor ids);

@@ -58,8 +58,6 @@ void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) {}
 void discard_moe_prefill_routes(const std::shared_ptr<MoeExpertCache>& cache) {}
 
-bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) { return {}; }
-
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {}
 
 bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& cache, std::size_t workspace_bytes) { return {}; }
@@ -84,15 +82,6 @@ void print_moe_expert_cache_stats(const std::shared_ptr<MoeExpertCache>& cache, 
 
 void set_moe_expert_cache_profile(MoeExpertCache& cache, tyloi::MoeCacheProfile profile) {}
 
-struct tyloi::weights::Loan::Impl { Cache& cache; };
-tyloi::weights::Loan::Loan(Cache& cache) { cache.lend(*this); }
-void tyloi::weights::Cache::lend(Loan& loan) { loan.impl_ = std::make_unique<Loan::Impl>(Loan::Impl{*this}); }
-tyloi::weights::Loan::~Loan() = default;
-std::size_t tyloi::weights::Loan::begin(std::size_t bytes) { impl_->cache.workspace(bytes); return 0; }
-std::size_t tyloi::weights::Loan::predictor(std::size_t bytes) { return begin(bytes); }
-std::size_t tyloi::weights::Loan::transfer_bytes() const { return 0; }
-void tyloi::weights::Loan::suspend() {}
-void tyloi::weights::Loan::finish() {}
 struct tyloi::weights::Cache::Priority::Impl {
     std::shared_ptr<MoeExpertCache> cache;
     std::vector<int> previous;

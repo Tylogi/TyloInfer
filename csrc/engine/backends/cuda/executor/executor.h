@@ -17,7 +17,7 @@
 #include <unordered_set>
 
 class TqExec;
-namespace tyloi::weights { class Cache; }
+namespace tyloi::weights { class Cache; class LayerStream; }
 namespace tyloi::state { class KvOffloadStore; }
 
 namespace tyloi::cuda {
@@ -36,6 +36,7 @@ public:
     std::unique_ptr<tyloi::Executor::Timer> timer() override;
     std::unique_ptr<tyloi::Executor::Profile> profile(const char* name) override;
     std::unique_ptr<tyloi::Executor::Graph> graph() override;
+    bool prepare_routed_graph(Device device) override;
     std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const override;
     void reclaim(tyloi::Device device) override;
     void set_memory_limit(tyloi::Device device, std::size_t bytes) override;
@@ -57,6 +58,8 @@ public:
     void init_kv();
     /** Finalize KV mappings after model loading and publish them to the weight cache. */
     void finalize_kv(tyloi::weights::Cache& weights);
+    void bind_layer_stream(const std::shared_ptr<weights::LayerStream>& stream);
+    void stage_layer(std::size_t index);
     std::shared_ptr<KvMemoryManager> kv_memory() const noexcept { return kv_memory_.lock(); }
     std::shared_ptr<state::KvOffloadStore> kv_offload() const;
     void wait();
@@ -176,6 +179,7 @@ private:
     std::shared_ptr<KvMemoryManager> owned_kv_memory_;
     std::shared_ptr<state::KvOffloadStore> owned_kv_offload_;
     std::shared_ptr<BudgetLink> budget_;
+    std::weak_ptr<weights::LayerStream> layer_stream_;
     int primary_;
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;

@@ -45,6 +45,16 @@ public:
         return moved;
     }
 
+    std::shared_ptr<TensorImpl> with_buffers(std::span<const DenseTensor> replacements) const {
+        auto result = cloned();
+        const auto fields = result->buffers();
+        if (fields.size() != replacements.size())
+            throw std::invalid_argument("encoded weight buffer count changed");
+        for (std::size_t i = 0; i < fields.size(); ++i)
+            const_cast<DenseTensor&>(*fields[i]) = replacements[i];
+        return result;
+    }
+
 protected:
     // A copy of the concrete representation, before its buffers move.
     virtual std::shared_ptr<EncodedTensor> cloned() const = 0;

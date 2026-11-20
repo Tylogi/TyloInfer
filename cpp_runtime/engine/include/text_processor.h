@@ -2,7 +2,6 @@
 
 #include "inference.h"
 #include "chat.h"
-#include "decision.h"
 
 #include <cstdint>
 #include <memory>
@@ -82,8 +81,7 @@ public:
     ChatTemplateCapabilities chat_template_capabilities() const;
     InferenceRequest prepare(
         InferenceInput input,
-        std::int64_t max_context,std::string* rendered_prompt = nullptr) const;
-    DecisionTokens prepare_decisions(const DecisionText& input,std::int64_t max_context) const;
+        std::int64_t max_context) const;
     const MfqTokenizer& tokenizer() const;
     std::size_t count_tokens(const std::string& prompt) const;
 

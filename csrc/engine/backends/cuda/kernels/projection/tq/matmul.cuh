@@ -127,7 +127,7 @@ void tq_multi_swiglu_kernel(TrellisProjectionView gate,TrellisProjectionView up,
 
 template<int Bits,bool Columns>
 __device__ __forceinline__ void tq_decode_tile(TrellisProjectionView m,uint64_t d,int row,int col,half* out) {
-    half value[16];
+    alignas(16) half value[16];
     decode_vector<16,true,Columns,Bits>(m.words,d,m.scales,static_cast<const half*>(m.relative),
         nullptr,nullptr,row,col,m.stored_columns,m.gslog,value);
     if(col+16<=m.input_columns && (reinterpret_cast<uintptr_t>(out)&15)==0) {
@@ -151,6 +151,15 @@ __global__ void tq_decode_tile_kernel(TrellisProjectionView m,int first,half* ou
     auto* target=output+std::size_t(blockIdx.y)*m.input_columns+col;
     if(m.columns)tq_decode_tile_dispatch<true>(m,d,row,col,target);
     else tq_decode_tile_dispatch<false>(m,d,row,col,target);
+}
+
+extern "C" int mfq_tq_decode_rows(TrellisProjectionView m,int first,int count,void* output,cudaStream_t stream) {
+    if(!output || !m.words || !m.descriptors || !m.scales || !m.relative || m.input_columns<1 ||
+       m.input_columns>m.stored_columns || m.stored_columns%32 || first<0 || first>m.rows ||
+       count<1 || count>65535 || count>m.rows-first || (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
+    tq_decode_tile_kernel<<<dim3((std::uint64_t(m.input_columns)+2047)/2048,count),128,0,stream>>>(
+        m,first,static_cast<half*>(output));
+    return int(cudaGetLastError());
 }
 
 __global__ void tq_prefill_bias_epilogue(const float* values,const float* bias,

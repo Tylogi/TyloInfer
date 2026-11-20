@@ -41,6 +41,7 @@ struct AttentionInput {
     std::int64_t cache_position = 0, planned_kv_length = 0, decode_attention_parts = 0;
     // Positions are the contiguous tail ending at each length, which must be in [tokens, capacity].
     bool contiguous_tail = false;
+    std::int64_t bidirectional_prefix = 0;
 };
 struct AttentionConfig {
     bool bf16 = false, sliding = false;

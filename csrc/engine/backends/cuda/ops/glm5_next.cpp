@@ -2,6 +2,7 @@
 
 #include "engine/backends/cuda/kernels/attention/selected.h"
 
+#include <stdexcept>
 #include <cmath>
 
 namespace mfq_glm5_next {
@@ -10,14 +11,14 @@ using ::tyloi::DenseTensor;
 std::vector<DenseTensor> mhc_pre(const DenseTensor& input, const DenseTensor& function,
     const DenseTensor& base, const DenseTensor& scale, int64_t iterations, double hc_eps, double rms_eps) {
     mfq_selected_attention::values({&input, &function, &base, &scale});
-    TYLOINFER_RUNTIME_CHECK(input.dim() == 4 && input.size(2) > 0 && input.size(3) > 0,
-        "GLM mHC requires [B,T,C,H] input");
+    if (!(input.dim() == 4 && input.size(2) > 0 && input.size(3) > 0))
+        throw std::runtime_error("GLM mHC requires [B,T,C,H] input");
     const auto streams = input.size(2), hidden = input.size(3);
     const auto mix = (2 + streams) * streams;
-    TYLOINFER_RUNTIME_CHECK(function.dim() == 2 && function.size(0) == mix &&
+    if (!(function.dim() == 2 && function.size(0) == mix &&
         function.size(1) == streams * hidden && base.dim() == 1 && base.size(0) == mix &&
-        scale.dim() == 1 && scale.size(0) == 3 && iterations > 0,
-        "GLM mHC parameters disagree");
+        scale.dim() == 1 && scale.size(0) == 3 && iterations > 0))
+        throw std::runtime_error("GLM mHC parameters disagree");
     MfqCudaGuard guard(input.device());
     auto flat = input.to(::tyloi::kFloat32).reshape({input.size(0), input.size(1), streams * hidden});
     flat = flat * ::tyloi::cuda::rsqrt((flat * flat).mean(-1, true) + rms_eps);
@@ -42,13 +43,14 @@ std::vector<DenseTensor> mhc_pre(const DenseTensor& input, const DenseTensor& fu
 DenseTensor mhc_post(const DenseTensor& branch, const DenseTensor& residual,
                 const DenseTensor& post, const DenseTensor& combination) {
     mfq_selected_attention::values({&branch, &residual, &post, &combination});
-    TYLOINFER_RUNTIME_CHECK(residual.dim() == 4 && branch.dim() == 3 &&
+    if (!(residual.dim() == 4 && branch.dim() == 3 &&
         branch.size(0) == residual.size(0) && branch.size(1) == residual.size(1) &&
-        branch.size(2) == residual.size(3), "GLM mHC branch/residual dimensions disagree");
+        branch.size(2) == residual.size(3)))
+        throw std::runtime_error("GLM mHC branch/residual dimensions disagree");
     const auto b = branch.size(0), t = branch.size(1), c = residual.size(2);
-    TYLOINFER_RUNTIME_CHECK(post.sizes().vec() == std::vector<int64_t>({b,t,c}) &&
-        combination.sizes().vec() == std::vector<int64_t>({b,t,c,c}),
-        "GLM mHC post metadata dimensions disagree");
+    if (!(post.sizes().vec() == std::vector<int64_t>({b,t,c}) &&
+        combination.sizes().vec() == std::vector<int64_t>({b,t,c,c})))
+        throw std::runtime_error("GLM mHC post metadata dimensions disagree");
     MfqCudaGuard guard(branch.device());
     auto mixed = mfq_selected_attention::promoted_matmul(
         combination.transpose(-1, -2), residual);
@@ -58,11 +60,12 @@ DenseTensor mhc_post(const DenseTensor& branch, const DenseTensor& residual,
 DenseTensor kda_forget_gate(const DenseTensor& input, const DenseTensor& fa, const DenseTensor& fb,
     const DenseTensor& bias, const DenseTensor& a_log, int64_t heads, int64_t width, double lower_bound) {
     mfq_selected_attention::values({&input, &fa, &fb, &bias, &a_log});
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && heads > 0 && width > 0 && fa.dim() == 2 &&
+    if (!(input.dim() >= 1 && heads > 0 && width > 0 && fa.dim() == 2 &&
         fa.size(0) == width && fa.size(1) == input.size(-1) && fb.dim() == 2 &&
         fb.size(0) == heads * width && fb.size(1) == width && bias.dim() == 1 &&
         bias.size(0) == heads * width && a_log.dim() == 1 && a_log.size(0) == heads &&
-        std::isfinite(lower_bound), "GLM KDA forget-gate dimensions disagree");
+        std::isfinite(lower_bound)))
+        throw std::runtime_error("GLM KDA forget-gate dimensions disagree");
     MfqCudaGuard guard(input.device());
     auto reduced = mfq_selected_attention::promoted_matmul(input, fa.transpose(-1, -2));
     auto gate = mfq_selected_attention::promoted_matmul(
@@ -79,9 +82,10 @@ DenseTensor kda_forget_gate(const DenseTensor& input, const DenseTensor& fa, con
 
 DenseTensor kpool_scores(const DenseTensor& query, const DenseTensor& pooled, const DenseTensor& weights) {
     mfq_selected_attention::values({&query, &pooled, &weights});
-    TYLOINFER_RUNTIME_CHECK(query.dim() == 4 && weights.dim() == 3 &&
+    if (!(query.dim() == 4 && weights.dim() == 3 &&
         weights.size(0) == query.size(0) && weights.size(1) == query.size(1) &&
-        weights.size(2) == query.size(2), "GLM k-pool head weights disagree");
+        weights.size(2) == query.size(2)))
+        throw std::runtime_error("GLM k-pool head weights disagree");
     MfqCudaGuard guard(query.device());
     auto scores = mfq_selected_attention::dots(query, pooled) /
         std::sqrt(double(query.size(3)));
@@ -92,9 +96,9 @@ DenseTensor kpool_scores(const DenseTensor& query, const DenseTensor& pooled, co
 DenseTensor kpool_states(const DenseTensor& keys, const DenseTensor& gates,
                     const DenseTensor& ape, int64_t pool) {
     mfq_selected_attention::values({&keys, &gates, &ape});
-    TYLOINFER_RUNTIME_CHECK(keys.dim() == 3 && gates.sizes() == keys.sizes() && pool > 0 &&
-        ape.dim() == 2 && ape.size(0) == pool && ape.size(1) == keys.size(2),
-        "GLM k-pool parameter dimensions disagree");
+    if (!(keys.dim() == 3 && gates.sizes() == keys.sizes() && pool > 0 &&
+        ape.dim() == 2 && ape.size(0) == pool && ape.size(1) == keys.size(2)))
+        throw std::runtime_error("GLM k-pool parameter dimensions disagree");
     MfqCudaGuard guard(keys.device());
     const auto complete = keys.size(1) / pool;
     if (complete == 0) return ::tyloi::cuda::zeros({keys.size(0), 0, keys.size(2)}, keys.options());
@@ -109,8 +113,8 @@ DenseTensor kpool_states(const DenseTensor& keys, const DenseTensor& gates,
 DenseTensor dense_mla_attention(const DenseTensor& query, const DenseTensor& cache,
                            int64_t offset, std::optional<double> scale) {
     mfq_selected_attention::values({&query, &cache});
-    TYLOINFER_RUNTIME_CHECK(query.dim() == 4 && cache.dim() == 3,
-        "GLM MLA requires [B,H,T,D] query and [B,K,D] cache");
+    if (!(query.dim() == 4 && cache.dim() == 3))
+        throw std::runtime_error("GLM MLA requires [B,H,T,D] query and [B,K,D] cache");
     return mfq_selected_attention::dense(query, cache.unsqueeze(1),
         cache.unsqueeze(1), offset,
         scale.value_or(1.0 / std::sqrt(double(query.size(3)))));
@@ -119,8 +123,8 @@ DenseTensor dense_mla_attention(const DenseTensor& query, const DenseTensor& cac
 DenseTensor sparse_mla_attention(const DenseTensor& query, const DenseTensor& cache,
     const DenseTensor& indices, std::optional<double> scale) {
     mfq_selected_attention::values({&query, &cache});
-    TYLOINFER_RUNTIME_CHECK(query.dim() == 4 && cache.dim() == 3,
-        "GLM MLA requires [B,H,T,D] query and [B,K,D] cache");
+    if (!(query.dim() == 4 && cache.dim() == 3))
+        throw std::runtime_error("GLM MLA requires [B,H,T,D] query and [B,K,D] cache");
     return mfq_selected_attention::sparse(query, cache.unsqueeze(1),
         cache.unsqueeze(1), indices,
         scale.value_or(1.0 / std::sqrt(double(query.size(3)))), true);

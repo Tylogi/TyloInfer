@@ -8,8 +8,10 @@
 
 namespace tyloi::models::qwen4_exp {
 
-Tensor feed_forward(const Moe& weights, const Tensor& input, std::int64_t projection_rows,
+Tensor feed_forward(const Ffn& ffn, const Tensor& input, std::int64_t projection_rows,
                     std::int64_t prefill_offset, std::int64_t prefill_rows) {
+    if (const auto* dense = std::get_if<Mlp>(&ffn)) return mlp(*dense, input);
+    const auto& weights = std::get<Moe>(ffn);
     if (!input || input.dim() < 2 || weights.gate_up.empty() ||
         !weights.router || input.size(-1) != weights.router.size(1))
         throw std::invalid_argument("invalid Qwen4 FFN input");

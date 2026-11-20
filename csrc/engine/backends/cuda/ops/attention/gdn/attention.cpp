@@ -43,8 +43,8 @@ class GdnCore {
           transposed_state_(fused_decode && transposed_state && (width==32 || width==64 || width==128)),
           fused_output_(fused_output), grouped_projection_(grouped_projection), fused_preparation_(fused_preparation),
           fused_core_(fused_core) {
-        TYLOINFER_RUNTIME_CHECK(nk_ > 0 && nv_ > 0 && nv_ % nk_ == 0 && d_ > 0 && kernel_ > 1 && eps_ > 0,
-                          "invalid Qwen4 GDN head/convolution geometry");
+        if (!(nk_ > 0 && nv_ > 0 && nv_ % nk_ == 0 && d_ > 0 && kernel_ > 1 && eps_ > 0))
+            throw std::runtime_error("invalid Qwen4 GDN head/convolution geometry");
     }
     void reset(State& request, bool retain_storage=false) {
         request.impl_->failed_conv.clear();
@@ -67,11 +67,12 @@ class GdnCore {
         request.saved_prefix_conv.clear();request.saved_prefix_state.clear();request.saved_prefix_position=-1;
     }
     void rollback(State& request, int64_t keep=-1) {
-        TYLOINFER_RUNTIME_CHECK(request.saved_conv.defined(), "Qwen4 GDN has no speculative checkpoint");
+        if (!request.saved_conv.defined())
+            throw std::runtime_error("Qwen4 GDN has no speculative checkpoint");
         if(keep>=0 && request.saved_prefix_position>=0) {
             const auto index=keep-request.saved_prefix_position;
-            TYLOINFER_RUNTIME_CHECK(index>=0 && index<int64_t(request.saved_prefix_conv.size()),
-                "Qwen4 GDN prefix checkpoint is out of range");
+            if (!(index>=0 && index<int64_t(request.saved_prefix_conv.size())))
+                throw std::runtime_error("Qwen4 GDN prefix checkpoint is out of range");
             request.saved_conv=request.saved_prefix_conv[index];request.saved_state=request.saved_prefix_state[index];
         }
         if(request.conv.dense().defined())request.conv.dense().copy_(request.saved_conv.dense());else request.conv.dense()=request.saved_conv.dense();
@@ -94,11 +95,15 @@ class GdnCore {
             (request.recurrent.dense().defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
     }
     std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& request, int64_t batch, int64_t tokens) const {
-        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && nk_ > 0 && nv_ > 0 && d_ > 0 && kernel_ > 1 &&
+        if (!(batch > 0 && tokens > 0 && nk_ > 0 && nv_ > 0 && d_ > 0 && kernel_ > 1 &&
             nk_ <= (std::numeric_limits<int64_t>::max() - nv_) / 2 &&
-            tokens <= std::numeric_limits<int64_t>::max() - (kernel_ - 1), "invalid GDN growth geometry");
+            tokens <= std::numeric_limits<int64_t>::max() - (kernel_ - 1)))
+            throw std::runtime_error("invalid GDN growth geometry");
         if (request.conv.dense().defined())
-            TYLOINFER_RUNTIME_CHECK(request.conv.dense().size(0) == batch, "GDN batch changed");
+            {
+                if (!(request.conv.dense().size(0) == batch))
+                    throw std::runtime_error("GDN batch changed");
+            }
         const auto device = w_->norm.device();
         const auto bytes = [&](const auto& shape) {
             return ::tyloi::make_contiguous_view(nullptr, shape, ::tyloi::kFloat32, device).nbytes();
@@ -135,8 +140,10 @@ class GdnCore {
     }
     std::size_t checkpoint_growth_bytes(const State& request, int64_t batch, int64_t tokens, int64_t confirmed) const {
         if (tokens <= 8)
-            TYLOINFER_RUNTIME_CHECK(request.conv.dense().defined() && request.recurrent.dense().defined(),
-                                    "GDN verification requires committed recurrent state");
+            {
+                if (!(request.conv.dense().defined() && request.recurrent.dense().defined()))
+                    throw std::runtime_error("GDN verification requires committed recurrent state");
+            }
         const auto count = tokens <= 8 ? tokens - confirmed : 1;
         const std::array<int64_t,4> conv{batch, kernel_ - 1, 2 * nk_ + nv_, d_};
         const std::array<int64_t,4> recurrent{batch, nv_, d_, d_};
@@ -153,10 +160,12 @@ class GdnCore {
             ? std::size_t(nv_)*(d_+1)*sizeof(float) : 0);
     }
     void restore_session(State& request, const DenseTensor& convolution,const DenseTensor& recurrent,bool retain_storage=false) {
-        TYLOINFER_RUNTIME_CHECK(convolution.defined() && recurrent.defined(),"missing Qwen4 GDN session state");
+        if (!(convolution.defined() && recurrent.defined()))
+            throw std::runtime_error("missing Qwen4 GDN session state");
         if(retain_storage) {
-            TYLOINFER_RUNTIME_CHECK(request.conv.dense().defined() && request.recurrent.dense().defined() && request.conv.dense().sizes()==convolution.sizes() &&
-                request.recurrent.dense().sizes()==recurrent.sizes(),"Qwen4 GDN graph session geometry changed");
+            if (!(request.conv.dense().defined() && request.recurrent.dense().defined() && request.conv.dense().sizes()==convolution.sizes() &&
+                request.recurrent.dense().sizes()==recurrent.sizes()))
+                throw std::runtime_error("Qwen4 GDN graph session geometry changed");
             commit(request);request.conv.dense().copy_(convolution);request.recurrent.dense().copy_(recurrent);
         } else {reset(request);request.conv.dense()=convolution.clone();request.recurrent.dense()=recurrent.clone();}
     }
@@ -293,8 +302,10 @@ class GdnCore {
     }
     void bind_graph_checkpoint(State& request, const std::vector<DenseTensor>& conv,const std::vector<DenseTensor>& state,
                                int64_t position) {
-        TYLOINFER_RUNTIME_CHECK(!request.saved_conv.defined(),"resolve previous GDN checkpoint");
-        TYLOINFER_RUNTIME_CHECK(!conv.empty() && conv.size()==state.size(),"invalid GDN prefix checkpoints");
+        if (request.saved_conv.defined())
+            throw std::runtime_error("resolve previous GDN checkpoint");
+        if (!(!conv.empty() && conv.size()==state.size()))
+            throw std::runtime_error("invalid GDN prefix checkpoints");
         request.saved_conv=conv.front();request.saved_state=state.front();
         request.saved_prefix_conv.clear();request.saved_prefix_state.clear();
         for(const auto& value:conv)request.saved_prefix_conv.emplace_back(value);
@@ -303,11 +314,11 @@ class GdnCore {
     }
     DenseTensor forward(State& request, const DenseTensor &x, bool cache,
                    int64_t confirmed = 0, int64_t cache_position = -1) {
-        TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.dim() == 3 && x.size(0) > 0,
-                          "recurrent attention requires nonempty [B,T,H] input");
+        if (!(x.is_cuda() && x.dim() == 3 && x.size(0) > 0))
+            throw std::runtime_error("recurrent attention requires nonempty [B,T,H] input");
         if(cache && cache_position>=0 && confirmed>0 && confirmed<x.size(1) && x.size(1)<=8) {
-            TYLOINFER_RUNTIME_CHECK(!request.saved_conv.defined() && request.conv.dense().defined() && request.recurrent.dense().defined(),
-                              "GDN verification requires committed recurrent state");
+            if (!(!request.saved_conv.defined() && request.conv.dense().defined() && request.recurrent.dense().defined()))
+                throw std::runtime_error("GDN verification requires committed recurrent state");
             std::vector<DenseTensor> conv,state;
             for(int64_t i=confirmed;i<x.size(1);++i) {
                 conv.push_back(::tyloi::cuda::empty_like(request.conv.dense()));state.push_back(::tyloi::cuda::empty_like(request.recurrent.dense()));
@@ -339,12 +350,13 @@ class GdnCore {
                 request.saved_conv = request.conv.dense().clone();
                 request.saved_state = request.recurrent.dense().clone();
             };
-        TYLOINFER_RUNTIME_CHECK(x.size(1)>0 && confirmed>=0 && confirmed<=x.size(1) && (!confirmed || cache),
-            "invalid recurrent verification window");
+        if (!(x.size(1)>0 && confirmed>=0 && confirmed<=x.size(1) && (!confirmed || cache)))
+            throw std::runtime_error("invalid recurrent verification window");
         DenseTensor result;
         if(confirmed==0 || confirmed==x.size(1)) result=run_window(0,x.size(1));
         else {
-            TYLOINFER_RUNTIME_CHECK(!request.saved_conv.defined(), "resolve previous recurrent checkpoint");
+            if (request.saved_conv.defined())
+                throw std::runtime_error("resolve previous recurrent checkpoint");
             auto prefix=run_window(0,confirmed);
             checkpoint();
             try {
@@ -361,9 +373,9 @@ class GdnCore {
         const auto b = x.size(0), t = x.size(1), kw = nk_ * d_, vw = nv_ * d_,
                    channels = 2 * kw + vw;
         auto options = x.options().dtype(::tyloi::kFloat32);
-        TYLOINFER_RUNTIME_CHECK(!cache || !request.conv.dense().defined() ||
-                              (request.conv.dense().size(0) == b && request.conv.dense().device() == x.device()),
-                          "reset Qwen4 GDN before changing batch/device");
+        if (!(!cache || !request.conv.dense().defined() ||
+                              (request.conv.dense().size(0) == b && request.conv.dense().device() == x.device())))
+            throw std::runtime_error("reset Qwen4 GDN before changing batch/device");
         auto previous =
             cache && request.conv.dense().defined() ? request.conv.dense() : ::tyloi::cuda::zeros({b, kernel_ - 1, channels}, options);
         std::array<DenseTensor,2> prepared_gates;
@@ -377,7 +389,8 @@ class GdnCore {
             if(projections.empty()) {
                 projections=project_inputs(x);
             }
-            TYLOINFER_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
+            if (!(projections.size()==4))
+                throw std::runtime_error("GDN input projection count mismatch");
             if(projections[0].scalar_type()==::tyloi::kFloat16 &&
                 projections[1].scalar_type()==projections[2].scalar_type() &&
                 projections[2].scalar_type()==projections[3].scalar_type() &&
@@ -427,11 +440,12 @@ class GdnCore {
                 if(!projections.empty())projected=projections[0];
                 else if(tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection)) {
                     projections=project_inputs(x);
-                    TYLOINFER_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
+                    if (!(projections.size()==4))
+                        throw std::runtime_error("GDN input projection count mismatch");
                     projected=projections[0];
                 } else projected=project_qkv(x);
-                TYLOINFER_RUNTIME_CHECK(projected.sizes().vec() == std::vector<int64_t>({b, t, channels}),
-                                  "Qwen4 GDN projection width mismatch");
+                if (!(projected.sizes().vec() == std::vector<int64_t>({b, t, channels})))
+                    throw std::runtime_error("Qwen4 GDN projection width mismatch");
                 return projected;
             };
         const auto convolve = [&](DenseTensor projected) {
@@ -689,10 +703,12 @@ inline std::vector<DenseTensor> GdnCore::project_inputs(const DenseTensor& sourc
         std::vector<DenseTensor> result;
         for(const auto& handle:handles)result.push_back(handle.dense());
         if(w_->qkv_count==3 && prefix==1) {
-            TYLOINFER_RUNTIME_CHECK(result.size()==6,"GDN input projection count mismatch");
+            if (!(result.size()==6))
+                throw std::runtime_error("GDN input projection count mismatch");
             result={::tyloi::cuda::cat({result[0],result[1],result[2]},-1),result[3],result[4],result[5]};
         }
-        TYLOINFER_RUNTIME_CHECK(result.size()==4,"GDN input projection count mismatch");
+        if (!(result.size()==4))
+            throw std::runtime_error("GDN input projection count mismatch");
         return result;
     };
     std::vector<DenseTensor> output;
@@ -704,7 +720,8 @@ inline std::vector<DenseTensor> GdnCore::project_inputs(const DenseTensor& sourc
                 auto shape=value.sizes().vec();shape[1]=source.size(1);
                 output.push_back(::tyloi::cuda::empty(shape,value.options()));
             }
-            TYLOINFER_RUNTIME_CHECK(part.size()==output.size(),"GDN projection count changed across chunks");
+            if (!(part.size()==output.size()))
+                throw std::runtime_error("GDN projection count changed across chunks");
             for(size_t i=0;i<part.size();++i)output[i].narrow(1,begin,count).copy_(part[i]);
         }
     };

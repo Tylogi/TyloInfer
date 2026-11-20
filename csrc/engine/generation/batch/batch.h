@@ -53,6 +53,7 @@ template <class Request> struct BatchState {
 template <class Sample> struct PrefillBatchResult {
     Sample sample;
     std::exception_ptr failure;
+    std::function<void(bool)> publish_routes;
 };
 
 // Groups pending numerical operations and publishes each request's progress.
@@ -298,17 +299,18 @@ template <class Ops> class ContinuousBatch : public Batch {
                 PrefillActivity prefill_activity;
                 prefilling_operation = true;
                 std::vector<PrefillBatchResult<Sample>> samples;
+                const auto append = [&](auto result) {
+                    if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
+                    else samples.push_back({std::move(result), {}});
+                };
                 const bool use_batch = items.size() > 1 || !requires { operations.prefill_batch_limit(); };
                 if (use_batch) {
                     auto results = operations.prefill_batch(items);
-                    for (auto& result : results) {
-                        if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
-                        else samples.push_back({std::move(result), {}});
-                    }
+                    for (auto& result : results) append(std::move(result));
                 }
                 if (samples.empty()) {
                     const auto& [request,chunk]=items.front();
-                    samples.push_back({operations.prefill(request, chunk),{}});
+                    append(operations.prefill(request, chunk));
                 }
                 prefilling_operation = false;
                 if (samples.size() != items.size()) throw std::runtime_error("invalid packed prefill result count");
@@ -335,6 +337,11 @@ template <class Ops> class ContinuousBatch : public Batch {
                     work.prefill.reset();
                 }
                 operations.resume_decode(cache_position());
+                for (std::size_t row = 0; row < samples.size(); ++row)
+                    if (samples[row].publish_routes) {
+                        const auto* output = prefill_work[row]->output;
+                        samples[row].publish_routes(!samples[row].failure && output && !output->stopped());
+                    }
             }
             decode_next = !decode_next;
         } catch (...) {

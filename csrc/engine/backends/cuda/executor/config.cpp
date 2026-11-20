@@ -170,12 +170,14 @@ tyloi::models::LoadOptions model_options(const CudaLoadConfig& config, std::int6
 
 bool graph_allowed(const CudaLoadConfig& config, Executor& executor,
         const tyloi::weights::Cache& weights, const tyloi::models::Info& info) {
-    const auto graph_weights = info.graph_weights == models::GraphWeights::resident
-        ? tyloi::weights::Cache::Graph::legacy : tyloi::weights::Cache::Graph::native;
+    const auto routing = weights.routing();
+    const bool requires_resident = info.graph_weights == models::GraphWeights::resident;
+    const bool streamed_graph = info.graph == models::GraphOwner::model && !requires_resident;
     return info.decode_graph && config.dense_cpu_layer_count == 0 && config.dsv4_cpu_offload_layers.empty() &&
         !executor.attention_options().kernels.decode_aten &&
-        model_parallel_cuda_graph_enabled(config, executor, weights) &&
-        weights.graph_safe(graph_weights, moe_parallel_config(config).enabled());
+        (!routing.host_ids_required || streamed_graph) && !routing.shared_slots &&
+        !(routing.fixed_views && (requires_resident || moe_parallel_config(config).enabled())) &&
+        model_parallel_cuda_graph_enabled(config, executor);
 }
 
 void configure_generation(tyloi::engine::Config& runtime, const CudaLoadConfig& config,
@@ -193,7 +195,7 @@ void configure_generation(tyloi::engine::Config& runtime, const CudaLoadConfig& 
     runtime.continuous_batch.cached_slots = config.weights.min_slots;
     const bool allowed = graph_allowed(config, executor, weights, info);
     runtime.decode_graph.enabled &= allowed;
-    runtime.continuous_batch.cuda_graph &= allowed;
+    runtime.continuous_batch.cuda_graph &= allowed && !weights.routing().host_ids_required;
 }
 
 void configure_placement(CudaLoadConfig& config, Collectives& collectives, int primary) {
@@ -294,10 +296,7 @@ int model_parallel_primary_device(const CudaLoadConfig& config) {
     return config.layer_placement.primary_device();
 }
 
-bool model_parallel_cuda_graph_enabled(const CudaLoadConfig& config,
-        const Executor& executor, const tyloi::weights::Cache& weights) {
-    if (!weights.graph_safe(tyloi::weights::Cache::Graph::model_parallel,
-            moe_parallel_config(config).enabled())) return false;
+bool model_parallel_cuda_graph_enabled(const CudaLoadConfig& config, const Executor& executor) {
     if (!config.tensor_parallel.enabled() && !config.expert_parallel.enabled()) return true;
     const bool enabled = config.expert_parallel.enabled() && !config.tensor_parallel.enabled()
         ? config.expert_parallel_cuda_graph : config.tensor_parallel_cuda_graph;

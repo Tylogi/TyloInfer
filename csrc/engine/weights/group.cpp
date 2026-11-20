@@ -22,11 +22,10 @@ std::vector<::tyloi::Tensor> nint_aliases(
         const auto& matrix = group.split_w.empty()
             ? group.w : group.split_w.at(matrix_index);
         const auto* original_nint = original.representation<tyloi::NintTensor>();
-        TYLOINFER_RUNTIME_CHECK(
-            original_nint != nullptr && row + original.size(0) <= matrix.out &&
+        if (!(original_nint != nullptr && row + original.size(0) <= matrix.out &&
                 original_nint->ng == matrix.ng && original_nint->gs == matrix.gs &&
-                original_nint->q8_zero == matrix.q8_zero,
-            "grouped projection storage geometry mismatch");
+                original_nint->q8_zero == matrix.q8_zero))
+            throw std::runtime_error("grouped projection storage geometry mismatch");
         auto view = *original_nint;
         view.q_packed = matrix.q_packed;
         if (view.q8_zero) {
@@ -50,9 +49,8 @@ std::vector<::tyloi::Tensor> nint_aliases(
             packed_bytes = 0;
         }
     }
-    TYLOINFER_RUNTIME_CHECK(
-        row == 0 && matrix_index == (group.split_w.empty() ? 1 : group.split_w.size()),
-        "grouped projection storage is not fully covered");
+    if (!(row == 0 && matrix_index == (group.split_w.empty() ? 1 : group.split_w.size())))
+        throw std::runtime_error("grouped projection storage is not fully covered");
     return aliases;
 }
 #endif

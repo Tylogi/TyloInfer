@@ -68,11 +68,12 @@ Components load_components(Model& model, const tyloi::weights::Loader& weights,
             weights, vision, component->input_contract, component->position_policy));
     }
     if (!model.graph.has_component("predictor")) return result;
-    TYLOINFER_RUNTIME_CHECK(supports_speculation(model), "invalid Nemotron-H predictor model");
+    if (!supports_speculation(model))
+        throw std::runtime_error("invalid Nemotron-H predictor model");
     auto predictor = Mtp::load_if_present(
         weights, model.config, model.embed);
-    TYLOINFER_RUNTIME_CHECK(predictor,
-        "Nemotron-H graph declares the predictor component but the source has no MTP weights");
+    if (!predictor)
+        throw std::runtime_error("Nemotron-H graph declares the predictor component but the source has no MTP weights");
     result.mtp = std::make_unique<Mtp>(std::move(*predictor));
     return result;
 }

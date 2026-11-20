@@ -167,10 +167,11 @@ struct MtpOps {
         return hidden;
     }
     bool draft_target_graph(bool routed) const {
-        if (!device.is_cuda()) return false;
+        const auto routing = weights.routing();
+        if (!device.is_cuda() || routing.host_ids_required) return false;
         if (info.graph == models::GraphOwner::executor)
-            return weights.graph_safe(weights::Cache::Graph::legacy);
-        return routed || weights.graph_safe(weights::Cache::Graph::native);
+            return !routing.fixed_views && !routing.shared_slots;
+        return routed || !routing.shared_slots;
     }
     Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0, bool queued = false) {
         weights.admit_routes(device);
@@ -189,7 +190,7 @@ struct MtpOps {
             budget.reserve(state.growth(input, options));
             models::DecodeOptions policy;
             policy.projection = models::DecodeOptions::Projection::hidden;
-            policy.routed = weights.decode() == weights::Cache::Decode::routed;
+            policy.routed = weights.routing().fixed_views;
             const bool draft_graph = draft_target_graph(policy.routed);
             policy.enabled = policy.routed || draft_graph;
             if (draft_graph) {
@@ -367,7 +368,7 @@ struct MtpOps {
     }
     models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth, Tensor context = {}) {
         if (!graph_enabled || (prepared && prepared->transformed()) ||
-            !draft_target_graph(weights.decode() == weights::Cache::Decode::routed)) return {};
+            !draft_target_graph(weights.routing().fixed_views)) return {};
         auto predictor_options = options;
         predictor_options.serial_experts = false;
         bool initialized = false;

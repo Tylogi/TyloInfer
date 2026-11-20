@@ -239,9 +239,11 @@ Safetensors::Safetensors(
             shard_names.push_back(name);
         }
     } else {
+        const bool decision_sidecar = std::filesystem::is_regular_file(impl_->root / "decision_config.json");
         for (const auto& entry : std::filesystem::directory_iterator(impl_->root)) {
             if (entry.is_regular_file() &&
-                entry.path().extension() == ".safetensors") {
+                entry.path().extension() == ".safetensors" &&
+                !(decision_sidecar && entry.path().filename() == "readout.safetensors")) {
                 shard_names.push_back(entry.path().filename().string());
             }
         }

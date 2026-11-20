@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <exception>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -86,27 +85,9 @@ std::vector<models::Decoded> prefill_batch(models::Batch& batch, Executor& execu
                 if(request.bytes) {
                     if(loan || request.output || request.extra)throw std::logic_error("invalid batch workspace acquisition");
                     loan=std::make_unique<weights::Loan>(weights);
-                    if(request.tile) {
-                        const auto tile=*request.tile;
-                        if(!tile.compute || *tile.compute<=0 || tile.tokens<=0 || !tile.row_bytes)
-                            throw std::invalid_argument("invalid batch workspace geometry");
-                        const auto memory=[&] {
-                            const std::array<Device,1> devices{device};
-                            const auto snapshot=executor.memory(devices).at(0);
-                            return prefill_budget_add(snapshot.allocatable,snapshot.workspace);
-                        };
-                        const auto available=weights.prefill_budget(true);
-                        const auto fixed=prefill_budget_add(request.bytes,available.transfer_bytes);
-                        auto selected=select_prefill_chunk(tile.tokens,*tile.compute,
-                            prefill_budget_add(memory(),available.lendable_bytes),fixed,tile.row_bytes);
-                        if(selected<=0)throw std::runtime_error("insufficient batch prefill workspace before expert loan");
-                        const auto rows=std::size_t(selected)>std::numeric_limits<std::size_t>::max()/tile.row_bytes
-                            ? std::numeric_limits<std::size_t>::max() : std::size_t(selected)*tile.row_bytes;
-                        loan->begin(prefill_budget_add(fixed,rows));
-                        selected=select_prefill_chunk(tile.tokens,selected,memory(),
-                            prefill_budget_add(request.bytes,loan->transfer_bytes()),tile.row_bytes);
-                        if(selected<=0)throw std::runtime_error("insufficient batch prefill workspace after expert loan");
-                        *tile.compute=selected;
+                    if (request.tile) {
+                        const auto admitted = budget.tiled_workspace(device, *loan, request);
+                        *request.tile->compute = admitted;
                     } else loan->begin(request.bytes);
                 } else {
                     if(!loan || !request.output || request.tile)throw std::logic_error("invalid batch workspace completion");

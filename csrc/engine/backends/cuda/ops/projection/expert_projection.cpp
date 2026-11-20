@@ -10,6 +10,7 @@
 #include "engine/ops/ops.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/backends/cuda/ops/ffn/experts/launch.h"
 #include "engine/backends/cuda/ops/ffn/mfe/projection.h"
 #include "engine/backends/cuda/ops/projection/cpu_rows.h"
 #include "engine/backends/cpu/executor/expert_pool.h"

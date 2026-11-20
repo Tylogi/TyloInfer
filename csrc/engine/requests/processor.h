@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace tyloi { class ModelSource; }
+namespace tyloi::models { struct DecisionSpec; }
 
 namespace tyloi::engine {
 
@@ -19,7 +20,8 @@ namespace tyloi::engine {
 class TextProcessor {
 public:
     static std::unique_ptr<TextProcessor> load(const ModelSource& source,
-        const std::string& tokenizer_path, std::int32_t vocabulary, const std::string& model_type);
+        const std::string& tokenizer_path, std::int32_t vocabulary, const std::string& model_type,
+        const models::DecisionSpec* decision = nullptr);
     TextProcessor(
         const std::string& tokenizer_path,
         std::int32_t expected_vocabulary,
@@ -37,7 +39,9 @@ public:
     ChatTemplateCapabilities chat_template_capabilities() const;
     InferenceRequest prepare(
         InferenceInput input,
-        std::int64_t max_context) const;
+        std::int64_t max_context, std::string* rendered = nullptr) const;
+    DecisionTokens prepare_decisions(const DecisionText&, std::int64_t max_context) const;
+    bool supports_decisions() const noexcept;
     const MfqTokenizer& tokenizer() const;
     std::size_t count_tokens(const std::string& prompt) const;
 

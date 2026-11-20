@@ -250,15 +250,10 @@ Cache::Activity Cache::activity() const {
         });
     return {bytes, 0};
 }
-bool Cache::graph_safe(Graph, bool) const { return false; }
-Cache::Transfer Cache::transfer() const { return Transfer::automatic; }
-Cache::Decode Cache::decode() const { return data_->groups.empty() ? Decode::none : Decode::routed; }
+Cache::Routing Cache::routing() const { return {}; }
 bool Cache::legacy_experts_resident() const { return false; }
-bool Cache::split_prefill(std::int64_t) const { return true; }
-bool Cache::prepare_graph(Device device) { require_metal(device); return false; }
 bool Cache::needs_finalize() const { return false; }
 void Cache::finalize(std::size_t, std::size_t) {}
-Cache::Prefill Cache::prefill_mode(std::size_t, bool) const { return Prefill::regular; }
 Cache::PrefillBudget Cache::prefill_budget(bool) const { return {}; }
 
 void Cache::resize(std::size_t bytes) {
@@ -390,8 +385,8 @@ void Cache::retire_prefill() { drain(); }
 void Cache::discard_prefill() {}
 void Cache::settle() { drain(); }
 void Cache::request(bool) { drain(); }
-std::optional<std::size_t> Cache::prepare_prefill(Device device, std::size_t,
-        std::int64_t, Prefill, bool) { require_metal(device); return std::nullopt; }
+std::size_t Cache::storage_workspace_reserve() const { return 0; }
+bool Cache::lend_decode_storage(std::size_t) { return false; }
 void Cache::prepare(Stage, Device device, const source::Source*) { require_metal(device); }
 void Cache::trace(const char*, bool wait, const source::Source*) { if (wait) drain(); }
 void Cache::bind(engine::Budget& budget, Device device, bool) { require_metal(device); data_->budget = &budget; }
@@ -456,6 +451,11 @@ Cache::Routes::Routes() noexcept = default;
 Cache::Routes::Routes(Routes&&) noexcept = default;
 Cache::Routes::~Routes() = default;
 void Cache::Routes::begin(Cache&, int) {}
+void Cache::Routes::begin_prefill(Cache&, int) {}
+bool Cache::Routes::begin_prefill(Cache&, std::span<const int>) { return false; }
+void Cache::Routes::detach_prefill() noexcept {}
+void Cache::Routes::finish_prefill(bool) {}
+void Cache::Routes::finish_prefill(std::span<const std::uint8_t>) {}
 void Cache::Routes::resolve(int, bool) {}
 void Cache::Routes::resolve(std::span<const std::uint8_t>) {}
 
@@ -552,7 +552,7 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
             prefixes[*format].push_back(base);
         }
         using TqPlan = metal::MlxTqExpertCache::Plan;
-        using GgufPlan = metal::MlxGgufExpertCache::Plan;
+        using GgufPlan = metal::MlxGgmlExpertCache::Plan;
         using AffinePlan = metal::MlxAffineExpertCache::Plan;
         struct Pending {
             Format format;
@@ -569,7 +569,7 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
                 const auto low = plan.minimum(), high = plan.maximum();
                 pending.push_back({format, std::move(names), low, high, low, std::move(plan)});
             } else if (format == Format::gguf) {
-                auto plan = metal::MlxGgufExpertCache::plan(source, names);
+                auto plan = metal::MlxGgmlExpertCache::plan(source, names);
                 const auto low = plan.minimum(), high = plan.capacity();
                 pending.push_back({format, std::move(names), low, high, low, std::move(plan)});
             } else {
@@ -613,7 +613,7 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
                 item.maximum = tq->maximum();
                 cache = std::move(tq);
             } else if (item.format == Format::gguf)
-                cache = std::shared_ptr<metal::MlxPackedExpertCache>(std::make_shared<metal::MlxGgufExpertCache>(
+                cache = std::shared_ptr<metal::MlxPackedExpertCache>(std::make_shared<metal::MlxGgmlExpertCache>(
                     std::move(std::get<GgufPlan>(item.plan)), item.limit, data_->policy.io_workers));
             else
                 cache = std::shared_ptr<metal::MlxPackedExpertCache>(std::make_shared<metal::MlxAffineExpertCache>(

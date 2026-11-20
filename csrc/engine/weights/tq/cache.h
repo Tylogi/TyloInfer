@@ -27,15 +27,19 @@ public:
             bool retain_all, std::shared_ptr<TqExec> exec);
     ~TqCache() override;
 
-    std::uint64_t add(std::shared_ptr<const tyloi::TqTable>, std::int64_t rows);
-    std::size_t prefill_peak(const std::array<std::uint64_t,3>& banks,
-                             std::span<const std::int64_t> experts);
+    std::uint64_t add(std::shared_ptr<const tyloi::TqTable>, std::int64_t rows, bool resident = false);
+    ::tyloi::DenseTensor resident_views(std::uint64_t source, int device);
+    std::size_t peak_expert_bytes(const std::array<std::uint64_t,3>& banks,
+                                 std::span<const std::int64_t> experts);
+    struct UploadArena { ::tyloi::DenseTensor image; std::size_t used = 0; };
     std::vector<::tyloi::encoding::TqTensor> get(std::uint64_t source, const std::int64_t* ids,
-                              std::size_t count, int device);
+                              std::size_t count, int device, UploadArena* arena = nullptr);
     ::tyloi::DenseTensor views(std::uint64_t source, const std::int64_t* ids,
                                       const std::vector<::tyloi::encoding::TqTensor>& weights, int device);
     std::size_t budget();
-    std::size_t resident_bytes();
+    bool has_cached_sources();
+    std::size_t lendable_bytes(int device);
+    std::shared_ptr<::tyloi::TensorStorage> take_workspace(int device, std::size_t bytes);
     void resize(std::size_t bytes);
     void preload(int device, std::size_t workspace_reserve);
     void reclaim(int device, std::size_t available_bytes);
@@ -79,6 +83,13 @@ private:
         ::tyloi::encoding::TqTensor weight;
         std::shared_ptr<Upload> uploaded;
         std::size_t source_bytes = 0;
+
+        std::size_t lendable_bytes() const noexcept {
+            const auto& storage = weight.storage();
+            // The encoded tensor and its byte view each own the backing.
+            return storage.use_count() == 2 && weight.byte_offset() == 0
+                ? storage->bytes & ~std::size_t(255) : 0;
+        }
     };
     struct ViewTable;
     struct Routes;
@@ -89,6 +100,8 @@ private:
     struct Source {
         std::shared_ptr<const tyloi::TqTable> table;
         std::int64_t rows;
+        std::vector<::tyloi::encoding::TqTensor> resident;
+        ::tyloi::DenseTensor resident_views;
     };
 
     // Streams outlive every cached tensor and its final consumer fence.
@@ -102,6 +115,7 @@ private:
     bool learning_ = true;
     std::unordered_map<std::uint64_t, std::vector<ViewTable>> view_tables_;
     std::size_t payload_bytes_ = 0, resident_bound_ = 0, process_host_limit_ = 0;
+    std::size_t predictor_resident_bytes_ = 0;
     std::size_t ordinary_host_limit_;
     std::uint64_t source_reads_ = 0, source_batches_ = 0;
     std::vector<Source> sources_;
@@ -123,7 +137,7 @@ private:
     bool reserve_device(std::size_t bytes, int device);
     void adapt_routes(bool prefill);
     std::vector<::tyloi::encoding::TqTensor> get_locked(std::uint64_t source,const std::int64_t* ids,
-                                                       std::size_t count,int device,bool demand=true);
+        std::size_t count,int device,bool demand=true,UploadArena* arena=nullptr);
     void report() const;
     void upload(const ::tyloi::DenseTensor&, const std::vector<std::uint8_t>&);
 };

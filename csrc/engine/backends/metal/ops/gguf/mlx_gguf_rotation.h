@@ -3,7 +3,7 @@
 #include <vector>
 
 namespace tyloi::metal {
-struct MlxGgufRotation {
+struct MlxGgmlInputRotation {
     int block;
     std::vector<float> pattern;
     mlx::core::array signs;

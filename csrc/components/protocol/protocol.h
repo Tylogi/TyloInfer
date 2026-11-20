@@ -39,6 +39,7 @@ public:
     std::string type;
     std::string param;
 };
+[[noreturn]] void throw_request_failure(const engine::Failed& failure);
 
 using RequestWork = tyloi::engine::InferenceInput;
 using RequestInput = tyloi::engine::InferenceInput;

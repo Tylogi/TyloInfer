@@ -21,6 +21,8 @@ set_target_properties(mfq-model-graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(mfq-model-source STATIC
     model.cpp
     model.h
+    decision.cpp
+    decision.h
     tq_fixture_source.cpp
     tq_fixture_source.h
     mfq_source.cpp

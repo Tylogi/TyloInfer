@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/weights/encoding/encoded.h"
+#include "engine/tensor/encoding/encoded.h"
 #include "components/ggml/include/ggml.h"
 
 #include <cstdint>
@@ -10,13 +10,13 @@
 
 namespace tyloi {
 
-struct GgufRotation {
+struct GgmlInputRotation {
     int block = 1;
     std::vector<std::int8_t> signs_cpu;
     DenseTensor signs_device;
 };
 
-struct GgufCorrection {
+struct GgmlRowCorrection {
     DenseTensor packed;
     DenseTensor offsets;
     DenseTensor types;
@@ -27,9 +27,9 @@ struct GgufCorrection {
     std::int64_t columns = 0;
 };
 
-class GgufTensor final : public EncodedTensor {
+class GgmlQuantizedTensor final : public EncodedTensor {
     std::shared_ptr<EncodedTensor> cloned() const override {
-        return std::make_shared<GgufTensor>(*this);
+        return std::make_shared<GgmlQuantizedTensor>(*this);
     }
 
 public:
@@ -40,8 +40,8 @@ public:
     std::uint64_t row_bytes = 0;
     std::int64_t quad_storage_rows = 0;
     std::int64_t quad_row_begin = 0;
-    std::optional<GgufRotation> rotation;
-    std::optional<GgufCorrection> correction;
+    std::optional<GgmlInputRotation> rotation;
+    std::optional<GgmlRowCorrection> correction;
 
     std::shared_ptr<TensorImpl> relocated(Device target) const override;
 

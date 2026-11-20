@@ -88,7 +88,7 @@ void prepare_replay(const Model& model, State& state, DecodeGraphs& graphs, Deco
 StepSequence<models::Decoded> Model::decode(models::Input input, models::State& value,
         const models::ForwardOptions& forward, const models::DecodeOptions& options) const {
     auto* state = dynamic_cast<State*>(&value);
-    if (!options.enabled || options.routed || options.projection != models::DecodeOptions::Projection::hidden ||
+    if (layer_stream || !options.enabled || options.routed || options.projection != models::DecodeOptions::Projection::hidden ||
         !state || !state->belongs_to(*this) || state->batch != 1 || state->cache_pos <= 0 ||
         state->speculating() || state->decode_position_delta != 0 || metadata.num_experts ||
         !device.is_cuda() || forward.primary != device.index || forward.trace ||

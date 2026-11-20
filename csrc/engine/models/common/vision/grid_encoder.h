@@ -1,6 +1,5 @@
 #pragma once
 #include "engine/models/input.h"
-#include "engine/models/common/check.h"
 #include "engine/generation/sequence.h"
 
 #include "engine/weights/fields.h"
@@ -188,8 +187,8 @@ class Vision {
                     co_yield step.state;
             }
             const auto unit = encoder_.config().spatial_merge_size * encoder_.config().spatial_merge_size;
-            tyloi::models::require_model(unit > 0 && patches.size(0) > 0 && patches.size(0) % unit == 0,
-                          "grid-Vision patch count is not divisible by merge unit");
+            if (!(unit > 0 && patches.size(0) > 0 && patches.size(0) % unit == 0))
+                throw std::runtime_error("grid-Vision patch count is not divisible by merge unit");
             const auto merge = [&](const auto &norm, const auto &up, const auto &down) {
                 auto grouped = tyloi::ops::reshape(norm(patches),
                     {patches.size(0) / unit, unit * encoder_.config().hidden_size});

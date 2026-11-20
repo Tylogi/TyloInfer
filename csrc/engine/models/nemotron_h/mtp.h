@@ -12,6 +12,7 @@
 #include "engine/models/nemotron_h/predictor.h"
 #include "engine/state/kv/view.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -62,12 +63,12 @@ struct Mtp final : tyloi::models::Mtp {
                                               ::tyloi::Tensor embedding) {
         const bool fusion_present = weights.has("predictor.fusion.weight");
         if (!fusion_present) {
-            TYLOINFER_RUNTIME_CHECK(!weights.has_prefix("predictor."),
-                              "Nemotron-H source contains an incomplete MTP head");
+            if (!(!weights.has_prefix("predictor.")))
+                throw std::runtime_error("Nemotron-H source contains an incomplete MTP head");
             return std::nullopt;
         }
-        TYLOINFER_RUNTIME_CHECK(main.num_nextn_predict_layers == 1 && !main.mtp_mixers.empty(),
-                          "Nemotron-H MTP requires one declared predictor stage");
+        if (!(main.num_nextn_predict_layers == 1 && !main.mtp_mixers.empty()))
+            throw std::runtime_error("Nemotron-H MTP requires one declared predictor stage");
         Mtp result;
         result.config = main;
         result.embedding = std::move(embedding);
@@ -76,12 +77,12 @@ struct Mtp final : tyloi::models::Mtp {
         result.hidden_norm = weights.tensor("predictor.hidden_norm.weight");
         result.output_norm = weights.tensor("predictor.output_norm.weight");
         result.fusion = weights.weight("predictor.fusion.weight");
-        TYLOINFER_RUNTIME_CHECK(result.fusion.size(1) == 2 * main.hidden_size &&
+        if (!(result.fusion.size(1) == 2 * main.hidden_size &&
                               result.fusion.size(0) == main.hidden_size &&
                               result.embedding_norm.numel() == main.hidden_size &&
                               result.hidden_norm.numel() == main.hidden_size &&
-                              result.output_norm.numel() == main.hidden_size,
-                          "Nemotron-H MTP fusion/norm dimensions disagree with the backbone");
+                              result.output_norm.numel() == main.hidden_size))
+            throw std::runtime_error("Nemotron-H MTP fusion/norm dimensions disagree with the backbone");
         for (std::size_t index = 0; index < main.mtp_mixers.size(); ++index) {
             const auto type =
                 std::string(tyloi::models::nemotron_h::Config::mixer_name(main.mtp_mixers[index]));
@@ -117,7 +118,8 @@ struct Mtp final : tyloi::models::Mtp {
 
     void reset(tyloi::models::MtpState& value, int64_t next_batch = 1) const override {
         auto& state = this->state<PredictorState>(value);
-        TYLOINFER_RUNTIME_CHECK(next_batch > 0, "Nemotron-H MTP batch must be positive");
+        if (!(next_batch > 0))
+            throw std::runtime_error("Nemotron-H MTP batch must be positive");
         for (auto &layer : state.states)
             if (auto *cache = std::get_if<tyloi::state::KvView>(&layer))
                 if (!cache->defined() || cache->batch != next_batch)
@@ -212,8 +214,8 @@ struct Mtp final : tyloi::models::Mtp {
 
     void trim_cache_to(tyloi::models::MtpState& value, int64_t position) const override {
         auto& state = this->state<PredictorState>(value);
-        TYLOINFER_RUNTIME_CHECK(position >= 0 && position <= state.position(),
-                          "Nemotron-H MTP cache trim position is invalid");
+        if (!(position >= 0 && position <= state.position()))
+            throw std::runtime_error("Nemotron-H MTP cache trim position is invalid");
         // The attention sub-block's KV storage is position addressed. Lowering
         // the logical boundary overwrites the rejected draft suffix without
         // copying history-sized tensors.

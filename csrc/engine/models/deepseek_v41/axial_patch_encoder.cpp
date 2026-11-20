@@ -8,6 +8,7 @@
 #include "engine/weights/loader.h"
 #include "engine/generation/sequence.h"
 
+#include <string>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -20,8 +21,8 @@ using vision::RmsNorm;
 weights::BiasWeight affine(const ::tyloi::weights::Loader& loader,
               const std::string& prefix, std::int64_t input, std::int64_t output) {
     auto result = loader.affine(prefix + ".weight", prefix + ".bias");
-    TYLOINFER_RUNTIME_CHECK(result.weight.size(1) == input && result.weight.size(0) == output,
-                      "axial patch vision affine geometry mismatch: " + prefix);
+    if (!(result.weight.size(1) == input && result.weight.size(0) == output))
+        throw std::runtime_error("axial patch vision affine geometry mismatch: " + prefix);
     return result;
 }
 
@@ -182,7 +183,10 @@ CudaAxialPatchVisionTower CudaAxialPatchVisionTower::load(
     config.validate();
     for (const auto* name : {"vision.patch_embedding.weight", "vision.output_norm.weight",
                             "vision.aligner.input.weight", "vision.aligner.output.weight"})
-        TYLOINFER_RUNTIME_CHECK(loader.has(name), std::string("axial patch vision tensor missing: ") + name);
+        {
+            if (!loader.has(name))
+                throw std::runtime_error(std::string("axial patch vision tensor missing: ") + name);
+        }
     return CudaAxialPatchVisionTower(std::make_unique<Impl>(Impl{loader,
         config}));
 }

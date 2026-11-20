@@ -27,6 +27,8 @@ struct Input {
     // Draft rows for an already-started speculative suffix transaction.
     bool suffix = false;
     Tensor host_ids, image_mask;
+    // Complete leading state window for bidirectional readout attention.
+    std::int64_t bidirectional_prefix = 0;
 
     std::pair<std::int64_t, std::int64_t> shape() const {
         std::int64_t batch = 0, tokens = 0;

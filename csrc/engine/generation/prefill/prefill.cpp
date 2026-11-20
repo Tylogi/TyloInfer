@@ -12,9 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <exception>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -32,12 +32,12 @@ void exit_unmanaged_graph(models::State& state, weights::Cache& weights, Budget&
 }
 
 std::int64_t prefill_span(const models::CausalModel& model, const models::State& state,
-        const weights::Cache& weights, std::int64_t tokens, std::int64_t compute,
+        const weights::Cache& weights, const Budget& budget, std::int64_t tokens, std::int64_t compute,
         std::size_t reused, std::size_t stable, bool transformed) {
-    const auto mode = weights.prefill_mode(tokens, state.position() > 0);
+    const auto routing = weights.routing();
     models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
-        mode == weights::Cache::Prefill::retained, weights.decode() == weights::Cache::Decode::routed,
-        weights.transfer() == weights::Cache::Transfer::coordinated, weights.split_prefill(tokens)};
+        budget.retained_prefill(tokens, state.position() > 0), routing.fixed_views,
+        routing.shared_slots, !routing.fixed_views || tokens <= 8};
     const auto plan = model.prefill_plan(state, policy);
     if (!reused && (!stable || stable == std::size_t(tokens)) && plan.layered)
         return plan.max_span > 0 ? std::min(tokens, plan.max_span) : tokens;
@@ -48,6 +48,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
     weights::Cache& weights, Budget& budget, const models::ForwardOptions& options,
     models::Input input, std::int64_t compute, InferenceOutput& output, bool raw_host) {
     const auto device = input.ids.device();
+    weights::Cache::Routes routes;
     Capture capture(executor, weights, budget, device);
     std::unique_ptr<weights::Loan> loan;
     auto work = executor.work();
@@ -59,22 +60,24 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
     auto timer = executor.timer();
     try {
         const auto tokens = input.ids.size(1);
+        const int learning_rows = input.ids.size(0) == 1 && tokens > 8 && tokens <= INT_MAX
+            ? static_cast<int>(tokens) : 0;
+        routes.begin_prefill(weights, learning_rows);
         const bool transformed = bool(input.embeddings) || bool(input.positions) || bool(input.lengths) ||
             bool(input.cache_positions) || bool(input.image_mask) || bool(input.trace) ||
-            input.suffix || input.confirmed != 0;
-        const auto mode = weights.prefill_mode(tokens, state.position() > 0);
+            input.suffix || input.confirmed != 0 || input.bidirectional_prefix != 0;
+        const auto routing = weights.routing();
+        const bool decode_windows = !routing.fixed_views || tokens <= 8;
         models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
-            mode == ::tyloi::weights::Cache::Prefill::retained,
-            weights.decode() == ::tyloi::weights::Cache::Decode::routed,
-            weights.transfer() == ::tyloi::weights::Cache::Transfer::coordinated,
-            weights.split_prefill(tokens), raw_host};
+            budget.retained_prefill(tokens, state.position() > 0),
+            routing.fixed_views, routing.shared_slots, decode_windows, raw_host};
         const auto plan = model.prefill_plan(state, policy);
         for (const auto& [device, bytes] : state.reset_growth(input.ids.size(0)))
             if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
         if (!plan.layered)
             for (const auto& [device, bytes] : state.growth(input, options))
                 if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
-        if (!transformed && tokens <= 128 && (weights.split_prefill(tokens) || input.raw_hidden)) {
+        if (!transformed && tokens <= 128 && (decode_windows || input.raw_hidden)) {
             std::vector<Tensor> hidden_rows, raw_rows;
             for (std::int64_t offset = 0; offset < tokens && !output.stopped();) {
                 const auto rows = state.position() == 0 ? std::int64_t(1) : std::min<std::int64_t>(4, tokens - offset);
@@ -84,8 +87,8 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                 Tensor raw;
                 if (input.raw_hidden) part.raw_hidden = &raw;
                 models::DecodeOptions decode_options;
-                decode_options.enabled = weights.decode() != weights::Cache::Decode::none;
-                decode_options.routed = weights.decode() == weights::Cache::Decode::routed;
+                decode_options.enabled = routing.fixed_views && !routing.host_ids_required;
+                decode_options.routed = routing.fixed_views;
                 budget.reserve(state.graph_exit_growth());
                 auto decoded = engine::decode(model, state, executor, weights, budget, options, part, decode_options);
                 if (!decoded && offset == 0) break;
@@ -109,6 +112,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                 result.mode = models::Prefill::Mode::windows;
                 timer->stop({result.hidden, result.raw});
                 result.elapsed_ms = timer->elapsed_ms();
+                routes.finish_prefill(!output.stopped());
                 return result;
             }
         }
@@ -142,46 +146,8 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                         throw std::logic_error("invalid prefill workspace acquisition");
                     loan = std::make_unique<weights::Loan>(weights);
                     if (request.tile) {
-                        const auto tile = *request.tile;
-                        if (!tile.compute || *tile.compute <= 0 || tile.tokens <= 0 || !tile.row_bytes)
-                            throw std::invalid_argument("invalid prefill workspace geometry");
-                        const auto memory = [&] {
-                            const std::array<Device, 1> devices{device};
-                            return executor.memory(devices).at(0);
-                        };
-                        auto available = weights.prefill_budget(true);
-                        auto resources = memory();
-                        auto fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
-                        auto before = prefill_budget_add(prefill_budget_add(resources.allocatable, resources.workspace),
-                            available.lendable_bytes);
-                        const auto wanted = std::min({tile.tokens, *tile.compute, max_prefill_compute_chunk});
-                        const auto wanted_rows = std::size_t(wanted) > std::numeric_limits<std::size_t>::max() / tile.row_bytes
-                            ? std::numeric_limits<std::size_t>::max() : std::size_t(wanted) * tile.row_bytes;
-                        const auto required = prefill_budget_add(fixed, wanted_rows);
-                        if (required > before) {
-                            const auto reusable = prefill_budget_add(resources.workspace, available.lendable_bytes);
-                            budget.workspace(device, required > reusable ? required - reusable : 0);
-                            available = weights.prefill_budget(true);
-                            resources = memory();
-                            fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
-                            before = prefill_budget_add(prefill_budget_add(resources.allocatable, resources.workspace),
-                                available.lendable_bytes);
-                        }
-                        auto selected = select_prefill_chunk(tile.tokens, *tile.compute, before, fixed, tile.row_bytes);
-                        if (selected <= 0) throw std::runtime_error("insufficient CUDA prefill workspace before expert loan");
-                        const auto rows = std::size_t(selected) > std::numeric_limits<std::size_t>::max() / tile.row_bytes
-                            ? std::numeric_limits<std::size_t>::max() : std::size_t(selected) * tile.row_bytes;
-                        loan->begin(prefill_budget_add(fixed, rows));
-                        resources = memory();
-                        const auto after = prefill_budget_add(resources.allocatable, resources.workspace);
-                        const auto after_fixed = prefill_budget_add(request.bytes, loan->transfer_bytes());
-                        const auto requested = selected;
-                        selected = select_prefill_chunk(tile.tokens, selected, after, after_fixed, tile.row_bytes);
-                        if (selected <= 0) throw std::runtime_error("insufficient CUDA prefill workspace after expert loan");
-                        if (selected != requested)
-                            std::cerr << "runtime_prefill_chunk_budget requested=" << requested
-                                      << " compute=" << selected << " available_bytes=" << after << '\n';
-                        *tile.compute = selected;
+                        const auto admitted = budget.tiled_workspace(device, *loan, request);
+                        *request.tile->compute = admitted;
                     } else loan->begin(request.bytes);
                 } else {
                     if (!loan || !request.output || request.tile)
@@ -205,6 +171,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                 executor.submit(state.storage());
                 timer->stop({result.hidden, result.raw});
                 result.elapsed_ms = timer->elapsed_ms();
+                routes.finish_prefill(!output.stopped());
                 return result;
             }
             observed = true;
@@ -244,6 +211,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                     capture.finish();
                     work->finish();
                     result.elapsed_ms = timer->elapsed_ms();
+                    routes.finish_prefill(!output.stopped());
                     return result;
                 }
             } else throw std::logic_error("unknown prefill job phase");

@@ -2,6 +2,7 @@
 
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/device.h"
+#include "engine/tensor/tensor.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -11,6 +12,12 @@
 #include <vector>
 
 namespace tyloi::cuda {
+
+bool can_prefill_f16_residual(std::int64_t tokens, std::int64_t rows,
+    std::int64_t columns, Device device, const DenseTensor& residual);
+void prefill_f16_residual_tile(const DenseTensor& input, const DenseTensor& weights,
+    const DenseTensor& residual, const DenseTensor& output, std::int64_t first,
+    std::int64_t count, void* blas, DenseTensor& scratch);
 
 // Select a row tile once during warmup. Capture reuses that geometry, while
 // warmup admission checks the actual fragmented workspace holes.

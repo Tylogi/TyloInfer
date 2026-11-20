@@ -257,6 +257,8 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor
                                                        static_cast<float>(scale), m));
 }
 AttentionResult attention(const AttentionInput& request, const state::KvView& kv, const AttentionConfig& config) {
+    if (request.bidirectional_prefix)
+        throw std::invalid_argument("bidirectional readout attention is unavailable on Metal");
     if (kv.paged() || kv.ring) throw std::invalid_argument("Metal attention requires contiguous KV storage");
     const auto batch = static_cast<int>(request.query.size(0));
     const auto tokens = static_cast<int>(request.query.size(2));

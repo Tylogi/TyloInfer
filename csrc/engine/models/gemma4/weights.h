@@ -1,7 +1,7 @@
 #pragma once
 
 #include "config.h"
-#include "../common/check.h"
+#include <stdexcept>
 #include <array>
 #include <cmath>
 
@@ -14,8 +14,8 @@ struct LayerSpec {
 };
 
 inline LayerSpec layer_spec(const Config &c, std::string_view type) {
-    require_model(type == "full_attention" || type == "sliding_attention",
-                  "unsupported Gemma4 layer type");
+    if (!(type == "full_attention" || type == "sliding_attention"))
+        throw std::runtime_error("unsupported Gemma4 layer type");
     const bool sliding = type == "sliding_attention";
     const auto width = sliding ? c.head_dim : c.global_head_dim;
     return {c.num_experts > 0,
@@ -76,15 +76,14 @@ void load_layer(Attention &a, Layer &b, Loader &ops, const Config &c, int layer,
                                                                 std::sqrt(double(c.hidden_size)));
     b.gemma_expert_scale = ops.router_parameter(mlp + "router.expert_scale");
     b.gemma_top_k = static_cast<int>(c.num_experts_per_tok);
-    require_model(
-        ops.expert_shape(b.gemma_moe_gate_up) ==
-                std::array<int64_t, 3>{c.num_experts, 2 * c.moe_intermediate_size, c.hidden_size} &&
-            ops.expert_shape(b.gemma_moe_down) ==
-                std::array<int64_t, 3>{c.num_experts, c.hidden_size, c.moe_intermediate_size} &&
-            ops.shape(b.gemma_router) == std::vector<int64_t>{c.num_experts, c.hidden_size} &&
-            ops.elements(b.gemma_router_norm_scale) == c.hidden_size &&
-            ops.elements(b.gemma_expert_scale) == c.num_experts,
-        "Gemma4 MoE tensor shapes disagree with config");
+    if (!(ops.expert_shape(b.gemma_moe_gate_up) ==
+        std::array<int64_t, 3>{c.num_experts, 2 * c.moe_intermediate_size, c.hidden_size} &&
+        ops.expert_shape(b.gemma_moe_down) ==
+        std::array<int64_t, 3>{c.num_experts, c.hidden_size, c.moe_intermediate_size} &&
+        ops.shape(b.gemma_router) == std::vector<int64_t>{c.num_experts, c.hidden_size} &&
+        ops.elements(b.gemma_router_norm_scale) == c.hidden_size &&
+        ops.elements(b.gemma_expert_scale) == c.num_experts))
+        throw std::runtime_error("Gemma4 MoE tensor shapes disagree with config");
 }
 
 } // namespace tyloi::models::gemma4

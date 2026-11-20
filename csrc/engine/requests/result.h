@@ -86,7 +86,7 @@ struct Completed { std::string finish_reason; UsageUpdate usage; InferenceMetric
 struct Cancelled { UsageUpdate usage; InferenceMetrics metrics; };
 struct Failed { std::string code, message; bool retryable = false; };
 using EventData = std::variant<PrefillProgress, OutputDelta, UsageUpdate,
-                               Completed, Cancelled, Failed>;
+                               Completed, Cancelled, Failed, DecisionReadResult>;
 struct EngineEvent { RequestId id; EventData data; };
 
 class Scheduler;

@@ -247,9 +247,8 @@ MoeActivationWorkspace MoeScratch::prefill_activation_workspace(
             "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
     }
     if (use_kl_mmq) {
-        TYLOINFER_RUNTIME_CHECK(
-            route.map_ready && route.ids_dst.numel() == route.ids.numel(),
-            "KLD mixed routed FP16 requires the compact route map");
+        if (!(route.map_ready && route.ids_dst.numel() == route.ids.numel()))
+            throw std::runtime_error("KLD mixed routed FP16 requires the compact route map");
     }
 
     if (use_nvq_prefill) {

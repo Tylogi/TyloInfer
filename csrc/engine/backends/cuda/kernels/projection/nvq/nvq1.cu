@@ -1,6 +1,7 @@
 #include "env.h"
 #include "../../../ops/projection/vq/nvq1.h"
 #include "../packed/nvq.cuh"
+#include <stdexcept>
 #include <cstdlib>
 #include <type_traits>
 
@@ -157,10 +158,14 @@ bool tyloi::cuda::try_nvq_decode(Nvq1DecodeView w,::tyloi::DenseTensor records,:
     const int quant_warps=requested==2 || requested==4 || requested==8?requested:1;
     const auto records_ptr=records.defined()?reinterpret_cast<int64_t>(records.data_ptr()):0;
     const auto integer_book_ptr=integer_book.defined()?reinterpret_cast<int64_t>(integer_book.data_ptr()):0;
-    if(records_ptr)TYLOINFER_RUNTIME_CHECK(records.is_cuda() && records.device()==x.device(),
-        "NVQ decode records device disagrees with input");
-    if(integer_book_ptr)TYLOINFER_RUNTIME_CHECK(integer_book.is_cuda() && integer_book.device()==x.device(),
-        "NVQ integer codebook device disagrees with input");
+    if(records_ptr){
+        if (!(records.is_cuda() && records.device()==x.device()))
+            throw std::runtime_error("NVQ decode records device disagrees with input");
+    }
+    if(integer_book_ptr){
+        if (!(integer_book.is_cuda() && integer_book.device()==x.device()))
+            throw std::runtime_error("NVQ integer codebook device disagrees with input");
+    }
     w.pointers[5]=records_ptr;w.pointers[6]=integer_book_ptr;
     w.sizes[3]=records.defined()?records.numel():0;
     if(!quantized)quantize_input<<<dim3(input_rows,(w.groups+quant_warps-1)/quant_warps),dim3(32,quant_warps),0,stream>>>(

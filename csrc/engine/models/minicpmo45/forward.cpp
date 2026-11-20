@@ -1,6 +1,5 @@
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/common/ffn.h"
-#include "engine/models/common/check.h"
 
 #include <algorithm>
 #include <array>
@@ -11,10 +10,11 @@ namespace tyloi::cuda::minicpmo45 {
 
 namespace {
 Tensor token_ids(int primary, const Tensor& ids) {
-    tyloi::models::require_model(ids.defined() && (ids.dim() == 1 || ids.dim() == 2),
-        "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.defined() && (ids.dim() == 1 || ids.dim() == 2)))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto shaped = ids.dim() == 1 ? tyloi::ops::reshape(ids, {1, ids.size(0)}) : ids;
-    tyloi::models::require_model(shaped.size(0) > 0 && shaped.size(1) > 0, "token IDs must not be empty");
+    if (!(shaped.size(0) > 0 && shaped.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(shaped, tyloi::kInt64),
         tyloi::Device(tyloi::kCUDA, primary)));
 }
@@ -49,32 +49,36 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
     auto& state = dynamic_cast<State&>(state_value);
     auto ids = token_ids(mode.primary, input.ids);
     const auto batch = ids.size(0), tokens = ids.size(1);
-    tyloi::models::require_model(input.confirmed == 0, "MiniCPM TTS has no speculative predictor");
-    tyloi::models::require_model(state.layers.size() == layers.size(), "MiniCPM TTS layer state mismatch");
-    tyloi::models::require_model(state.cache_pos <= metadata.max_position_embeddings - tokens,
-        "MiniCPM TTS history exceeds context capacity");
+    if (!(input.confirmed == 0))
+        throw std::runtime_error("MiniCPM TTS has no speculative predictor");
+    if (!(state.layers.size() == layers.size()))
+        throw std::runtime_error("MiniCPM TTS layer state mismatch");
+    if (!(state.cache_pos <= metadata.max_position_embeddings - tokens))
+        throw std::runtime_error("MiniCPM TTS history exceeds context capacity");
     if (state.cache_pos == 0) state.reset(batch);
-    tyloi::models::require_model(state.batch == batch, "MiniCPM TTS cache batch does not match inputs");
+    if (!(state.batch == batch))
+        throw std::runtime_error("MiniCPM TTS cache batch does not match inputs");
     auto hidden = input.embeddings ? input.embeddings : embedding(ids, mode.primary);
-    tyloi::models::require_model(hidden.dim() == 3 && hidden.size(0) == batch && hidden.size(1) == tokens &&
-        hidden.size(2) == metadata.hidden_size, "inputs_embeds must match [batch,tokens,hidden_size]");
+    if (!(hidden.dim() == 3 && hidden.size(0) == batch && hidden.size(1) == tokens &&
+        hidden.size(2) == metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds must match [batch,tokens,hidden_size]");
     const tyloi::Device primary(tyloi::kCUDA, mode.primary);
     const auto copy_position = [&](const Tensor& value) {
         return tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(value, tyloi::kInt64), primary));
     };
     auto physical = input.cache_positions ? copy_position(input.cache_positions)
         : tyloi::ops::arange(state.cache_pos, state.cache_pos + tokens, primary);
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == tokens) ||
-        (physical.dim() == 2 && physical.size(0) == batch && physical.size(1) == tokens),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == tokens) ||
+        (physical.dim() == 2 && physical.size(0) == batch && physical.size(1) == tokens)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
     auto positions = input.positions ? copy_position(input.positions)
         : (state.decode_position_delta ? tyloi::ops::add(physical, state.decode_position_delta) : physical);
-    tyloi::models::require_model((positions.dim() == 1 && positions.numel() == tokens) ||
-        (positions.dim() == 2 && positions.size(0) == batch && positions.size(1) == tokens),
-        "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((positions.dim() == 1 && positions.numel() == tokens) ||
+        (positions.dim() == 2 && positions.size(0) == batch && positions.size(1) == tokens)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     if (input.lengths) {
-        tyloi::models::require_model(input.lengths.dim() == 1 && input.lengths.size(0) == batch,
-            "sequence lengths must have shape [batch]");
+        if (!(input.lengths.dim() == 1 && input.lengths.size(0) == batch))
+            throw std::runtime_error("sequence lengths must have shape [batch]");
         input.lengths = copy_position(input.lengths);
     } else if (state.cache_pos > 0 && tokens == 1) {
         input.lengths = tyloi::ops::full(std::array<int64_t, 1>{batch}, state.cache_pos + 1, primary);

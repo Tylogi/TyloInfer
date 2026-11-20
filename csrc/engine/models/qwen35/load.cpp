@@ -1,13 +1,13 @@
 #include "engine/models/source/model.h"
 #include "engine/ops/ops.h"
 #include "engine/models/qwen35/load.h"
+#include "engine/weights/memory.h"
 
 #include "engine/models/qwen35/metadata.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
-#include "engine/models/common/check.h"
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
@@ -16,6 +16,7 @@
 #include "engine/weights/source/read.h"
 
 #if TYLOINFER_HAS_CUDA
+#include "engine/backends/cuda/native/device.h"
 #include "engine/models/dflash2/model.h"
 #endif
 
@@ -226,6 +227,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     if (model.config.num_hidden_layers != model.graph.topology.text_layers)
         throw std::runtime_error("model graph/config text-layer topology mismatch");
     model.metadata = tyloi::models::qwen35::metadata_from_config(model.config);
+    model.decision = decision_spec(source_ref);
     return model;
 }
 
@@ -238,7 +240,9 @@ std::unique_ptr<Model> load(std::shared_ptr<const tyloi::ModelSource> source,
          {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
           .mirror_scalars = options.mirror_scalars,
           .recurrent_transposed = options.recurrent_transposed,
-          .kv_quantization = options.kv_quantization});
+          .kv_quantization = options.kv_quantization,
+          .stream_layer_weights = options.stream_layer_weights,
+          .prefetch_layer_weights = options.prefetch_layer_weights});
     return model;
 }
 
@@ -276,6 +280,29 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     cpu_layers = placed_cpu_layers;
     const auto& config = model.config;
     tyloi::ops::DeviceScope scope(model.device);
+#if TYLOINFER_HAS_CUDA
+    const bool streamed = model.device.is_cuda() &&
+        options.stream_layer_weights.value_or(bool(model.decision) && options.load_layers);
+    if (streamed) {
+        if (!options.load_layers || cpu_layers || placement.enabled() || weights.placement.tensor.enabled() ||
+                options.expert_parallel || config.num_experts > 0)
+            throw std::invalid_argument("layer weight streaming requires single-device dense Qwen layers");
+    }
+#else
+    constexpr bool streamed = false;
+#endif
+    if (model.decision) {
+        if (!model.device.is_cuda() || (model.decision->attention != DecisionAttention::causal &&
+                (cpu_layers > 0 || model.kv_quantization.enabled())))
+            throw std::invalid_argument("decision attention is unsupported by the selected placement or KV encoding");
+        if (!model.decision->vocabulary_readout) {
+            auto matrix = read_decision_matrix(*model.source, config.hidden_size);
+            auto host = ops::clone(ops::from_blob(matrix.bytes.data() + matrix.offset, {255, config.hidden_size},
+                TensorOptions{}.device(kCPU).dtype(matrix.dtype)));
+            model.decision_head = ops::copy(ops::cast(host, kFloat32), model.device);
+            tyloi::weights::observe_weight(model.decision_head);
+        }
+    }
     if (config.positional_encoding != tyloi::models::PositionalEncoding::none) {
         const auto make_rope = [&](::tyloi::Device device) {
             return tyloi::ops::make_rope(config.max_position_embeddings, config.rotary_dim,
@@ -293,12 +320,20 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     if (options.load_input_output) {
         const auto output_name = std::string("model.output.weight");
         const bool independent_output = !config.tie_word_embeddings && weights.has(output_name);
-        model.embed = weights.embedding("model.token_embedding.weight", independent_output);
+        auto tables = weights;
+#if TYLOINFER_HAS_CUDA
+        if (streamed && cuda::separate_memory(model.device.index)) tables.options.mapped_embedding = true;
+        if (model.decision && !streamed) tables.options.force_device_embedding = true;
+#endif
+        model.embed = tables.embedding("model.token_embedding.weight", independent_output || streamed,
+            &model.ram_embedding_bytes);
         model.output_norm = weights.tensor("model.output_norm.weight");
         if (config.tie_word_embeddings || !weights.has(output_name)) {
             model.lm_head = weights.placement.tensor.enabled()
                 ? weights.weight("model.token_embedding.weight", TensorParallelAxis::Output)
                 : model.embed;
+        } else if (streamed && model.decision) {
+            model.lm_head = tables.embedding(output_name, true, &model.ram_head_bytes);
         } else {
             model.lm_head = weights.weight(output_name, TensorParallelAxis::Output);
         }
@@ -309,13 +344,19 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                 const bool cpu = index < cpu_layers;
                 std::cerr << "loading layer " << index << ' '
                           << config.layer_types.at(static_cast<std::size_t>(index)) << ' '
-                          << (cpu ? "CPU" : "device") << std::endl;
+                          << (streamed ? "CUDA-streamed" : cpu ? "CPU" : "device") << std::endl;
                 const auto target = cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(model.device.type, device);
                 model.layers.push_back(load_layer(
-                    weights.for_layer(target), config, index,
+                    weights.for_layer(streamed ? Device(kCPU) : target), config, index,
                     config.layer_types.at(static_cast<std::size_t>(index)), options.mirror_scalars,
                     "model", model.kv_quantization));
+                model.layers.back().device = target;
             }
+#if TYLOINFER_HAS_CUDA
+            if (streamed)
+                model.layer_stream = tyloi::weights::LayerStream::prepare(
+                    model.device, options.prefetch_layer_weights, model.layers);
+#endif
         }
     } else {
         if (options.load_layers)
@@ -341,7 +382,7 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
         bool resident, bool preallocate, const std::string& dflash2_draft_path) {
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
-        weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;
+        !weights.cache().routing().shared_slots;
 
     load_vision(model, weights, resident);
     if (!dflash2_draft_path.empty()) {
@@ -380,11 +421,12 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(LayerLoader& load
         loader.has("predictor.output_norm.weight") ||
         loader.has("predictor.block.0.attention.query.weight");
     if (!fusion_present) {
-        tyloi::models::require_model(!any, "Qwen model source contains an incomplete MTP head");
+        if (any)
+            throw std::runtime_error("Qwen model source contains an incomplete MTP head");
         return {};
     }
-    tyloi::models::require_model(config.mtp_num_hidden_layers > 0 && !config.mtp_use_dedicated_embeddings,
-        "Qwen MTP requires declared predictor layers and shared embeddings");
+    if (!(config.mtp_num_hidden_layers > 0 && !config.mtp_use_dedicated_embeddings))
+        throw std::runtime_error("Qwen MTP requires declared predictor layers and shared embeddings");
     tyloi::models::qwen35::Predictor model;
     model.config = config;
     model.embedding = target.embed;
@@ -394,12 +436,12 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(LayerLoader& load
     model.embedding_norm = loader.weights.tensor("predictor.embedding_norm.weight");
     model.output_norm = loader.weights.tensor("predictor.output_norm.weight");
     model.fusion = loader.linear("predictor.fusion.weight");
-    tyloi::models::require_model(model.fusion.size(1) == 2 * config.hidden_size &&
+    if (!(model.fusion.size(1) == 2 * config.hidden_size &&
         model.fusion.size(0) == config.hidden_size &&
         model.hidden_norm.numel() == config.hidden_size &&
         model.embedding_norm.numel() == config.hidden_size &&
-        model.output_norm.numel() == config.hidden_size,
-        "Qwen MTP component dimensions disagree with the backbone");
+        model.output_norm.numel() == config.hidden_size))
+        throw std::runtime_error("Qwen MTP component dimensions disagree with the backbone");
     model.layers.reserve(config.mtp_num_hidden_layers);
     for (int index = 0; index < config.mtp_num_hidden_layers; ++index) {
         const auto prefix = "predictor.block." + std::to_string(index) + ".";

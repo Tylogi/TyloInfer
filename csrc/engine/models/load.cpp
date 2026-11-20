@@ -3,6 +3,7 @@
 #include "engine/models/causal_model.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen4_exp/load.h"
+#include "engine/models/source/decision.h"
 #include "engine/models/source/model.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
@@ -50,6 +51,7 @@ ModelFamily select_family(const tyloi::ModelGraph& model_graph, tyloi::Device ta
     if (target.is_cuda()) {
 #if TYLOINFER_HAS_CUDA
         if (qwen_family != ModelFamily::unsupported) return qwen_family;
+        if (model_graph.backbone == "qwen4") return ModelFamily::qwen4_exp;
         if (model_graph.backbone == "glm_dsa") return ModelFamily::glm_dsa;
         if (model_graph.backbone == "glm5_next") return ModelFamily::glm5_next;
         if (model_graph.backbone == "deepseek_v4") return ModelFamily::deepseek_v4;
@@ -113,6 +115,11 @@ void load(
     LoadOptions options) {
     const auto model_graph = graph(*source);
     const auto family = select_family(model_graph, weights.placement.target);
+    const bool cuda_qwen = family == ModelFamily::qwen35 && weights.placement.target.is_cuda();
+    if (!cuda_qwen && decision_spec(*source))
+        throw std::invalid_argument("Jev decision models require CUDA Qwen");
+    if (!cuda_qwen && options.stream_layer_weights.value_or(false))
+        throw std::invalid_argument("layer weight streaming requires CUDA Qwen");
     if (!options.dflash2_draft_path.empty() && ((family != ModelFamily::qwen35 && family != ModelFamily::qwen4_exp) ||
             !weights.placement.target.is_cuda() || !options.optional_components))
         throw std::invalid_argument("DFlash2 requires a CUDA Qwen3.5 or Qwen4 target");

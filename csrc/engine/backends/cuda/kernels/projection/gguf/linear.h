@@ -159,6 +159,7 @@ struct GemmJob {
     const std::int64_t* slots;
     std::int64_t count;
 };
+void stage_grouped_jobs(const GemmJob* host, GemmJob* device, std::size_t count, cudaStream_t stream);
 struct RouteGroup {
     std::int64_t expert;
     std::int32_t slots[8];

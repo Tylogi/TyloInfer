@@ -66,7 +66,7 @@ bool qwen4_family(
     if (found != config.end() && found->is_object()) text = &*found;
     const auto text_type = identity(text->value("model_type", std::string{}));
     const auto matches = [](std::string_view value) {
-        return starts_with(value, "qwen4_exp");
+        return value == "qwen4" || starts_with(value, "qwen4_");
     };
     return matches(stored) || matches(config_type) || matches(text_type);
 }

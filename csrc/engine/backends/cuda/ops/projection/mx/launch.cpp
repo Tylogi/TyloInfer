@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "engine/backends/cuda/kernels/projection/mx/raw.h"
+#include <stdexcept>
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <atomic>
@@ -27,44 +28,45 @@ void launch_mxfp8_small_m(const ::tyloi::DenseTensor& values,const ::tyloi::Dens
 void validate_mxfp8(
         const ::tyloi::DenseTensor & values,
         const ::tyloi::DenseTensor & scales) {
-    TYLOINFER_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
-                "MXFP8 values and scales must be CUDA tensors");
-    TYLOINFER_RUNTIME_CHECK(values.scalar_type() == ::tyloi::kUInt8 &&
-                    scales.scalar_type() == ::tyloi::kUInt8,
-                "MXFP8 values and scales must be uint8");
-    TYLOINFER_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
-                "MXFP8 values and scales must be contiguous");
-    TYLOINFER_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2,
-                "MXFP8 values and scales must be rank-2");
-    TYLOINFER_RUNTIME_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
+    if (!(values.is_cuda() && scales.is_cuda()))
+        throw std::runtime_error("MXFP8 values and scales must be CUDA tensors");
+    if (!(values.scalar_type() == ::tyloi::kUInt8 &&
+                    scales.scalar_type() == ::tyloi::kUInt8))
+        throw std::runtime_error("MXFP8 values and scales must be uint8");
+    if (!(values.is_contiguous() && scales.is_contiguous()))
+        throw std::runtime_error("MXFP8 values and scales must be contiguous");
+    if (!(values.dim() == 2 && scales.dim() == 2))
+        throw std::runtime_error("MXFP8 values and scales must be rank-2");
+    if (!(values.size(0) > 0 && values.size(1) > 0 &&
                     values.size(0) <= std::numeric_limits<int>::max() &&
                     values.size(1) <= std::numeric_limits<int>::max() &&
-                    values.size(1) % 32 == 0,
-                "MXFP8 input width must be divisible by 32");
+                    values.size(1) % 32 == 0))
+        throw std::runtime_error("MXFP8 input width must be divisible by 32");
     const bool block128=values.size(1)%128==0 && scales.size(0)==(values.size(0)+127)/128 && scales.size(1)==values.size(1)/128;
     const bool block32=scales.size(0)==(values.size(0)+31)/32 && scales.size(1)==values.size(1)/32;
     const bool row32=scales.size(0)==values.size(0) && scales.size(1)==values.size(1)/32;
-    TYLOINFER_RUNTIME_CHECK(block128 || block32 || row32,"MXFP8 scale geometry mismatch");
+    if (!(block128 || block32 || row32))
+        throw std::runtime_error("MXFP8 scale geometry mismatch");
 }
 
 void validate_mxfp4_dense(
         const ::tyloi::DenseTensor & values,
         const ::tyloi::DenseTensor & scales) {
-    TYLOINFER_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
-                "MXFP4 values and scales must be CUDA tensors");
-    TYLOINFER_RUNTIME_CHECK(values.scalar_type() == ::tyloi::kUInt8 &&
-                    scales.scalar_type() == ::tyloi::kUInt8,
-                "MXFP4 values and scales must be uint8");
-    TYLOINFER_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
-                "MXFP4 values and scales must be contiguous");
-    TYLOINFER_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2 &&
+    if (!(values.is_cuda() && scales.is_cuda()))
+        throw std::runtime_error("MXFP4 values and scales must be CUDA tensors");
+    if (!(values.scalar_type() == ::tyloi::kUInt8 &&
+                    scales.scalar_type() == ::tyloi::kUInt8))
+        throw std::runtime_error("MXFP4 values and scales must be uint8");
+    if (!(values.is_contiguous() && scales.is_contiguous()))
+        throw std::runtime_error("MXFP4 values and scales must be contiguous");
+    if (!(values.dim() == 2 && scales.dim() == 2 &&
                     values.size(0) > 0 && values.size(1) > 0 &&
                     values.size(0) <= std::numeric_limits<int>::max() &&
                     values.size(1) <= std::numeric_limits<int>::max() / 2 &&
                     values.size(1) % 16 == 0 &&
                     scales.size(0) == values.size(0) &&
-                    scales.size(1) == values.size(1) / 16,
-                "MXFP4 weight geometry mismatch");
+                    scales.size(1) == values.size(1) / 16))
+        throw std::runtime_error("MXFP4 weight geometry mismatch");
 }
 
 void validate_mxfp4_moe(
@@ -78,34 +80,34 @@ void validate_mxfp4_moe(
         int64_t pool_experts,
         int64_t out_per_expert,
         int64_t neuron_len) {
-    TYLOINFER_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda() && input.is_cuda() &&
-                    ids.is_cuda() && expert_local.is_cuda() && output.is_cuda(),
-                "MXFP4 routed tensors must be CUDA tensors");
-    TYLOINFER_RUNTIME_CHECK(values.scalar_type() == ::tyloi::kUInt8 &&
+    if (!(values.is_cuda() && scales.is_cuda() && input.is_cuda() &&
+                    ids.is_cuda() && expert_local.is_cuda() && output.is_cuda()))
+        throw std::runtime_error("MXFP4 routed tensors must be CUDA tensors");
+    if (!(values.scalar_type() == ::tyloi::kUInt8 &&
                     scales.scalar_type() == ::tyloi::kUInt8 &&
                     input.scalar_type() == ::tyloi::kFloat16 &&
                     ids.scalar_type() == ::tyloi::kInt32 &&
                     expert_local.scalar_type() == ::tyloi::kInt32 &&
-                    output.scalar_type() == ::tyloi::kFloat16,
-                "MXFP4 routed tensor dtypes are invalid");
-    TYLOINFER_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous() &&
+                    output.scalar_type() == ::tyloi::kFloat16))
+        throw std::runtime_error("MXFP4 routed tensor dtypes are invalid");
+    if (!(values.is_contiguous() && scales.is_contiguous() &&
                     input.is_contiguous() && ids.is_contiguous() &&
-                    expert_local.is_contiguous() && output.is_contiguous(),
-                "MXFP4 routed tensors must be contiguous");
-    TYLOINFER_RUNTIME_CHECK(neuron_len > 0 && neuron_len % 32 == 0 &&
+                    expert_local.is_contiguous() && output.is_contiguous()))
+        throw std::runtime_error("MXFP4 routed tensors must be contiguous");
+    if (!(neuron_len > 0 && neuron_len % 32 == 0 &&
                     values.dim() == 2 &&
                     values.size(0) == pool_experts * out_per_expert &&
                     values.size(1) == neuron_len / 2 &&
                     scales.sizes() == ::tyloi::IntArrayRef(
-                        {pool_experts * out_per_expert, neuron_len / 32}),
-                "MXFP4 routed weight geometry mismatch");
-    TYLOINFER_RUNTIME_CHECK((input.dim() == 2 || input.dim() == 3) &&
+                        {pool_experts * out_per_expert, neuron_len / 32})))
+        throw std::runtime_error("MXFP4 routed weight geometry mismatch");
+    if (!((input.dim() == 2 || input.dim() == 3) &&
                     input.size(-1) == neuron_len && ids.dim() == 2 &&
                     input.size(0) == ids.size(0) &&
                     output.sizes() == ::tyloi::IntArrayRef(
                         {ids.size(0), ids.size(1), out_per_expert}) &&
-                    expert_local.numel() == global_experts,
-                "MXFP4 routed activation/route geometry mismatch");
+                    expert_local.numel() == global_experts))
+        throw std::runtime_error("MXFP4 routed activation/route geometry mismatch");
 }
 
 } // namespace
@@ -126,11 +128,11 @@ void validate_mxfp4_moe(
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor token_ids) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+    if (!(token_ids.is_cuda() && token_ids.is_contiguous() &&
                     token_ids.scalar_type() == ::tyloi::kInt64 &&
                     token_ids.get_device() == values.get_device() &&
-                    token_ids.numel() <= std::numeric_limits<int>::max(),
-                "MXFP8 embedding ids must be contiguous CUDA int64 on the weight device");
+                    token_ids.numel() <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("MXFP8 embedding ids must be contiguous CUDA int64 on the weight device");
     const int count = static_cast<int>(token_ids.numel());
     const int vocab = static_cast<int>(values.size(0));
     const int width = static_cast<int>(values.size(1));
@@ -151,13 +153,13 @@ void validate_mxfp4_moe(
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor x) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
-                    x.is_contiguous() && x.dim() == 2,
-                "MXFP8 activation must be contiguous CUDA fp16 rank-2");
-    TYLOINFER_RUNTIME_CHECK(x.size(1) == values.size(1),
-                "MXFP8 activation width mismatch");
-    TYLOINFER_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
-                "MXFP8 small-M kernel supports M in [1, 8]");
+    if (!(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
+                    x.is_contiguous() && x.dim() == 2))
+        throw std::runtime_error("MXFP8 activation must be contiguous CUDA fp16 rank-2");
+    if (!(x.size(1) == values.size(1)))
+        throw std::runtime_error("MXFP8 activation width mismatch");
+    if (!(x.size(0) >= 1 && x.size(0) <= 8))
+        throw std::runtime_error("MXFP8 small-M kernel supports M in [1, 8]");
     auto y = ::tyloi::cuda::empty(
         {x.size(0), values.size(0)}, x.options());
     const cudaStream_t stream = mfq_current_cuda_stream();
@@ -183,11 +185,11 @@ void validate_mxfp4_moe(
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor input) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(input.is_cuda() && input.scalar_type() == ::tyloi::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 && input.size(1) == values.size(1) &&
-                    input.size(0) <= std::numeric_limits<int>::max(),
-                "MXFP8 activation must be non-empty contiguous CUDA fp16 rank-2");
+                    input.size(0) <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("MXFP8 activation must be non-empty contiguous CUDA fp16 rank-2");
     const int rows = static_cast<int>(input.size(0));
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
@@ -203,12 +205,12 @@ void validate_mxfp4_moe(
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor x) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2 &&
-                    x.size(1) == values.size(1),
-                "MXFP8 FP32-output activation geometry mismatch");
-    TYLOINFER_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
-                "MXFP8 FP32-output small-M kernel supports M in [1, 8]");
+                    x.size(1) == values.size(1)))
+        throw std::runtime_error("MXFP8 FP32-output activation geometry mismatch");
+    if (!(x.size(0) >= 1 && x.size(0) <= 8))
+        throw std::runtime_error("MXFP8 FP32-output small-M kernel supports M in [1, 8]");
     auto y = ::tyloi::cuda::empty(
         {x.size(0), values.size(0)},
         x.options().dtype(::tyloi::kFloat32));
@@ -235,10 +237,10 @@ void validate_mxfp4_moe(
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor x) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2 &&
-                    x.size(1) == values.size(1),
-                "MXFP8 FP32-output GEMM activation geometry mismatch");
+                    x.size(1) == values.size(1)))
+        throw std::runtime_error("MXFP8 FP32-output GEMM activation geometry mismatch");
     const int M = int(x.size(0));
     const int N = int(values.size(0));
     auto y = ::tyloi::cuda::empty(
@@ -255,12 +257,13 @@ template <typename Output>
         ::tyloi::DenseTensor values,::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor input,int64_t groups) {
     validate_mxfp8(values,scales);
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.scalar_type()==::tyloi::kFloat16 &&
+    if (!(input.is_cuda() && input.scalar_type()==::tyloi::kFloat16 &&
         input.is_contiguous() && input.dim()==3 && groups>0 && input.size(1)==groups &&
         values.size(0)%groups==0 && input.size(2)==values.size(1) && input.size(0)>0 &&
         input.size(0)<=std::numeric_limits<int>::max() && values.size(0)<=std::numeric_limits<int>::max() &&
         values.size(1)<=std::numeric_limits<int>::max() && input.device()==values.device() &&
-        scales.device()==values.device(),"invalid grouped MXFP8 GEMM geometry");
+        scales.device()==values.device()))
+        throw std::runtime_error("invalid grouped MXFP8 GEMM geometry");
     const int rows=int(input.size(0)),outputs=int(values.size(0)),width=int(values.size(1));
     const int per_group=int(values.size(0)/groups);
     auto options=input.options();
@@ -294,18 +297,18 @@ template <typename Output>
         ::tyloi::DenseTensor x,
         int64_t groups) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
-                    x.is_contiguous() && x.dim() == 3,
-                "MXFP8 groupwise activation must be contiguous CUDA fp16 rank-3");
-    TYLOINFER_RUNTIME_CHECK(groups > 0 && x.size(1) == groups &&
+    if (!(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
+                    x.is_contiguous() && x.dim() == 3))
+        throw std::runtime_error("MXFP8 groupwise activation must be contiguous CUDA fp16 rank-3");
+    if (!(groups > 0 && x.size(1) == groups &&
                     values.size(0) % groups == 0 &&
-                    x.size(2) == values.size(1),
-                "MXFP8 groupwise geometry mismatch");
-    TYLOINFER_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
-                "MXFP8 groupwise small-M kernel supports M in [1, 8]");
+                    x.size(2) == values.size(1)))
+        throw std::runtime_error("MXFP8 groupwise geometry mismatch");
+    if (!(x.size(0) >= 1 && x.size(0) <= 8))
+        throw std::runtime_error("MXFP8 groupwise small-M kernel supports M in [1, 8]");
     const int64_t outputs_per_group = values.size(0) / groups;
-    TYLOINFER_RUNTIME_CHECK(outputs_per_group % 32 == 0,
-                "MXFP8 groupwise outputs per group must be divisible by 32");
+    if (!(outputs_per_group % 32 == 0))
+        throw std::runtime_error("MXFP8 groupwise outputs per group must be divisible by 32");
     auto y = ::tyloi::cuda::empty({x.size(0), values.size(0)}, x.options());
     const cudaStream_t stream = mfq_current_cuda_stream();
 #define TYLOINFER_LAUNCH_GROUPED_MXFP8(TILE) \
@@ -331,17 +334,17 @@ template <typename Output>
         ::tyloi::DenseTensor x,
         int64_t groups) {
     validate_mxfp8(values, scales);
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(x.is_cuda() && x.scalar_type() == ::tyloi::kFloat16 &&
                     x.is_contiguous() && x.dim() == 3 &&
                     groups > 0 && x.size(1) == groups &&
                     values.size(0) % groups == 0 &&
-                    x.size(2) == values.size(1),
-                "MXFP8 groupwise FP32-output geometry mismatch");
-    TYLOINFER_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
-                "MXFP8 groupwise FP32-output kernel supports M in [1, 8]");
+                    x.size(2) == values.size(1)))
+        throw std::runtime_error("MXFP8 groupwise FP32-output geometry mismatch");
+    if (!(x.size(0) >= 1 && x.size(0) <= 8))
+        throw std::runtime_error("MXFP8 groupwise FP32-output kernel supports M in [1, 8]");
     const int64_t outputs_per_group = values.size(0) / groups;
-    TYLOINFER_RUNTIME_CHECK(outputs_per_group % 32 == 0,
-                "MXFP8 groupwise outputs per group must be divisible by 32");
+    if (!(outputs_per_group % 32 == 0))
+        throw std::runtime_error("MXFP8 groupwise outputs per group must be divisible by 32");
     auto y = ::tyloi::cuda::empty(
         {x.size(0), values.size(0)},
         x.options().dtype(::tyloi::kFloat32));
@@ -382,11 +385,11 @@ template <typename Output>
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor token_ids) {
     validate_mxfp4_dense(values, scales);
-    TYLOINFER_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+    if (!(token_ids.is_cuda() && token_ids.is_contiguous() &&
                     token_ids.scalar_type() == ::tyloi::kInt64 &&
                     token_ids.get_device() == values.get_device() &&
-                    token_ids.numel() <= std::numeric_limits<int>::max(),
-                "MXFP4 embedding ids must be contiguous CUDA int64 on the weight device");
+                    token_ids.numel() <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("MXFP4 embedding ids must be contiguous CUDA int64 on the weight device");
     const int count = static_cast<int>(token_ids.numel());
     const int vocab = static_cast<int>(values.size(0));
     const int width = static_cast<int>(values.size(1) * 2);
@@ -407,12 +410,12 @@ template <typename Output>
         ::tyloi::DenseTensor scales,
         ::tyloi::DenseTensor input) {
     validate_mxfp4_dense(values, scales);
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == ::tyloi::kFloat16 &&
+    if (!(input.is_cuda() && input.scalar_type() == ::tyloi::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 &&
                     input.size(0) <= std::numeric_limits<int>::max() &&
-                    input.size(1) == values.size(1) * 2,
-                "MXFP4 activation must be contiguous CUDA fp16 rank-2");
+                    input.size(1) == values.size(1) * 2))
+        throw std::runtime_error("MXFP4 activation must be contiguous CUDA fp16 rank-2");
     const int rows = static_cast<int>(input.size(0));
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
@@ -451,12 +454,12 @@ template <typename Output>
     a.out_per_expert=static_cast<int>(out_per_expert);a.width=static_cast<int>(neuron_len);
     a.routed_input=input.dim()==3;a.compact=ids_dst.numel()==ids.numel();
     if(a.compact) {
-        TYLOINFER_RUNTIME_CHECK(expert_bounds.is_cuda() && tile_bounds.is_cuda() && tile_experts.is_cuda() &&
+        if (!(expert_bounds.is_cuda() && tile_bounds.is_cuda() && tile_experts.is_cuda() &&
             expert_bounds.scalar_type()==::tyloi::kInt32 && tile_bounds.scalar_type()==::tyloi::kInt32 &&
             tile_experts.scalar_type()==::tyloi::kInt32 && expert_bounds.is_contiguous() &&
             tile_bounds.is_contiguous() && tile_experts.is_contiguous() &&
-            expert_bounds.numel()>=global_experts+1 && tile_bounds.numel()>=global_experts+1,
-            "MXFP4 compact route map is invalid");
+            expert_bounds.numel()>=global_experts+1 && tile_bounds.numel()>=global_experts+1))
+            throw std::runtime_error("MXFP4 compact route map is invalid");
         a.tensor_core=pairs>=8*global_experts;
         if(a.tensor_core) {
             static std::atomic<bool> reported{false};

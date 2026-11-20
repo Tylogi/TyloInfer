@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 #include <utility>
@@ -76,7 +77,7 @@ template <typename... Values>
             case ::tyloi::ScalarType::float64: { using scalar_t = double; return (__VA_ARGS__)(); } \
             case ::tyloi::ScalarType::float32: { using scalar_t = float; return (__VA_ARGS__)(); } \
             case ::tyloi::ScalarType::float16: { using scalar_t = __half; return (__VA_ARGS__)(); } \
-            default: ::mfq_runtime_check_failed(NAME, ": unsupported floating dtype"); \
+            default: throw std::runtime_error(std::string(NAME) + ": unsupported floating dtype"); \
         } \
     })()
 
@@ -87,7 +88,7 @@ template <typename... Values>
             case ::tyloi::ScalarType::float32: { using scalar_t = float; return (__VA_ARGS__)(); } \
             case ::tyloi::ScalarType::float16: { using scalar_t = __half; return (__VA_ARGS__)(); } \
             case ::tyloi::ScalarType::bfloat16: { using scalar_t = __nv_bfloat16; return (__VA_ARGS__)(); } \
-            default: ::mfq_runtime_check_failed(NAME, ": unsupported floating dtype"); \
+            default: throw std::runtime_error(std::string(NAME) + ": unsupported floating dtype"); \
         } \
     })()
 

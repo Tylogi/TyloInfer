@@ -16,7 +16,7 @@ std::optional<::tyloi::DenseTensor> try_shared_gate_multiply_cuda(
     const ::tyloi::DenseTensor& weight,
     const ::tyloi::DenseTensor& expert_output);
 
-struct NintWeight;
+namespace tyloi { class NintTensor; }
 std::optional<::tyloi::DenseTensor> try_nint_shared_gate_sigmoid_cuda(
-    const ::tyloi::DenseTensor& input,const NintWeight& weight,
+    const ::tyloi::DenseTensor& input,const tyloi::NintTensor& weight,
     const ::tyloi::DenseTensor& quantized={},const ::tyloi::DenseTensor& scales={});

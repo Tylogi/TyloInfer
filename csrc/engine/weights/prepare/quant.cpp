@@ -4,7 +4,7 @@
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/weights/encoding/fp8/tensor.h"
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/tensor/encoding/ggml.h"
 #include "engine/weights/format.h"
 #include "engine/weights/encoding/sq/fp8_blob.h"
 
@@ -12,6 +12,7 @@
 #include "engine/weights/encoding/sq/mxfp4_decode.h"
 #endif
 
+#include <string>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -32,7 +33,7 @@ static ::tyloi::DenseTensor dequant_quant_linear_f32(
     if (!sharded) {
         if (linear.representation<::tyloi::encoding::TqTensor>() != nullptr ||
                 linear.representation<::tyloi::ChannelFp8Tensor>() != nullptr ||
-                linear.representation<::tyloi::GgufTensor>() != nullptr)
+                linear.representation<::tyloi::GgmlQuantizedTensor>() != nullptr)
             return quant_linear_reference_weight(linear).to(::tyloi::kFloat32).contiguous();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         if (const auto* nint = linear.representation<tyloi::NintTensor>();
@@ -77,7 +78,7 @@ static ::tyloi::DenseTensor dequant_quant_linear_f32(
         const auto& payload = shard.weight;
         if (payload.representation<::tyloi::encoding::TqTensor>() != nullptr ||
                 payload.representation<::tyloi::ChannelFp8Tensor>() != nullptr ||
-                payload.representation<::tyloi::GgufTensor>() != nullptr) {
+                payload.representation<::tyloi::GgmlQuantizedTensor>() != nullptr) {
             part = quant_linear_reference_weight(payload).to(::tyloi::kFloat32).contiguous();
         } else
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -127,9 +128,8 @@ static ::tyloi::DenseTensor dequant_quant_linear_f32(
         parts.push_back(dequant_quant_linear_f32(collectives, primary, weight));
     }
     auto joined = ::tyloi::cuda::cat(parts, 0).contiguous();
-    TYLOINFER_RUNTIME_CHECK(
-        joined.dim() == 2 && joined.size(0) == rows,
-        "FP32 compressor projection shape mismatch");
+    if (!(joined.dim() == 2 && joined.size(0) == rows))
+        throw std::runtime_error("FP32 compressor projection shape mismatch");
     return ::tyloi::Tensor(std::move(joined));
 }
 

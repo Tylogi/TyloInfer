@@ -1,7 +1,8 @@
 #pragma once
 #include "engine/backends/cuda/native/tensor/backend.h"
-#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/tensor/encoding/ggml.h"
 #include <cuda_runtime_api.h>
+#include <array>
 #include <memory>
 #include <vector>
 namespace tyloi::cuda::gguf {
@@ -24,13 +25,15 @@ struct GgufPrefillProduct {
 };
 // A following operator may restore values at the point of consumption.
 // Empty means the ordinary streamed/reference projection should be used.
-GgufPrefillProduct gguf_prefill_product(const ::tyloi::GgufTensor& weight,
-    const ::tyloi::DenseTensor& input);
+GgufPrefillProduct gguf_prefill_product(const ::tyloi::GgmlQuantizedTensor& weight,
+    const DenseTensor& input, const DenseTensor& input_exponents = {});
+std::array<DenseTensor, 2> pack_rms_gated_input(const DenseTensor& attended, const DenseTensor& gate,
+    const DenseTensor& norm, double eps, bool silu, const GgufPrefillProduct& scaled_gate = {});
 
-GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgufTensor& weight,
+GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgmlQuantizedTensor& weight,
     const ::tyloi::DenseTensor& attended,const ::tyloi::DenseTensor& gate,
     const ::tyloi::DenseTensor& norm,double eps,bool silu);
-GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgufTensor& weight,
+GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgmlQuantizedTensor& weight,
     const ::tyloi::DenseTensor& attended,const GgufPrefillProduct& gate,
     const ::tyloi::DenseTensor& norm,double eps,bool silu);
 // Materialize a scaled [tokens, columns] product for an ordinary FP32 consumer.

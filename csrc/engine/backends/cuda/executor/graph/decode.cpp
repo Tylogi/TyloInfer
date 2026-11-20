@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/profile.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <exception>
 #include <iostream>
@@ -21,13 +22,15 @@ namespace {
 
 const ::tyloi::DenseTensor& dense(const ::tyloi::Tensor& tensor) {
     const auto* result = tensor.representation<::tyloi::DenseTensor>();
-    TYLOINFER_RUNTIME_CHECK(result, "decode graph requires a dense tensor");
+    if (!result)
+        throw std::runtime_error("decode graph requires a dense tensor");
     return *result;
 }
 
 ::tyloi::DenseTensor& dense(::tyloi::Tensor& tensor) {
     auto* result = tensor.representation<::tyloi::DenseTensor>();
-    TYLOINFER_RUNTIME_CHECK(result, "decode graph requires a dense tensor");
+    if (!result)
+        throw std::runtime_error("decode graph requires a dense tensor");
     return *result;
 }
 
@@ -201,11 +204,11 @@ public:
     void restore() override {
         dirty_ = true;
         for (const auto& state : saved_) {
-            TYLOINFER_RUNTIME_CHECK(decode_graph_detail::same_layout(state.layout, *state.target),
-                "decode warmup changed recurrent storage addresses");
+            if (!decode_graph_detail::same_layout(state.layout, *state.target))
+                throw std::runtime_error("decode warmup changed recurrent storage addresses");
             tyloi::ops::copy_into(*state.target, state.value);
-            TYLOINFER_RUNTIME_CHECK(decode_graph_detail::same_layout(state.layout, *state.target),
-                "decode warmup changed recurrent storage addresses");
+            if (!decode_graph_detail::same_layout(state.layout, *state.target))
+                throw std::runtime_error("decode warmup changed recurrent storage addresses");
         }
         wait();
     }

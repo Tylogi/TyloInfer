@@ -79,6 +79,10 @@ ModelGraph synthesize_legacy_model_graph(
                starts_with(config_family, "qwen4_exp") ||
                starts_with(stored_family, "qwen4_exp")) {
         family = backbone = "qwen4_exp";
+    } else if (text_family == "qwen4" || text_family == "qwen4_text" ||
+               config_family == "qwen4" || config_family == "qwen4_text" ||
+               stored_family == "qwen4" || starts_with(stored_family, "qwen4_")) {
+        family = backbone = "qwen4";
     } else if (starts_with(text_family, "glm5_next") ||
                starts_with(config_family, "glm5_next") ||
                starts_with(stored_family, "glm5_next")) {
@@ -142,7 +146,7 @@ ModelGraph synthesize_legacy_model_graph(
         }
     };
 
-    const bool qwen_grid = family == "qwen3_5" || family == "qwen4_exp";
+    const bool qwen_grid = family == "qwen3_5" || family == "qwen4_exp" || family == "qwen4";
     const bool glm_grid = family == "glm5_next";
     const bool has_grid_vision =
         contains_tensor("vision.patch_embedding.weight") ||

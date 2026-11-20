@@ -12,6 +12,7 @@
 #include "engine/models/minicpmo45/engine.h"
 #include "engine/models/minicpmo45/text/model.h"
 #include "engine/models/source/model_config.h"
+#include "engine/models/source/decision.h"
 #include "engine/models/session/cache.h"
 #include "engine/models/input.h"
 #include "engine/requests/processor.h"
@@ -114,10 +115,20 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                     {Device(kCUDA, load.layer_placement.primary_device()), load.drop_file_cache,
                         load.tensor_parallel, moe_parallel_config(load)});
                 auto policy = model_options(load, options.context_size, true, root->mode().transposed);
+                if (options.jev_full_vram) {
+                    if (!models::decision_spec(*source))
+                        throw std::invalid_argument("--jev-weights requires a Jev decision model");
+                    policy.stream_layer_weights = !*options.jev_full_vram;
+                } else if (env_value("TYLOINFER_LAYER_WEIGHT_STREAMING")) {
+                    policy.stream_layer_weights = env_int("TYLOINFER_LAYER_WEIGHT_STREAMING", 0, 0, 1) != 0;
+                }
+                policy.prefetch_layer_weights = env_int("TYLOINFER_LAYER_WEIGHT_PREFETCH", 1, 0, 1) != 0;
                 policy.dflash2_draft_path = options.dflash2_draft_path;
                 if (policy.dflash2_draft_path.empty())
                     if (const auto* path = env_lookup("TYLOINFER_DFLASH2_DRAFT")) policy.dflash2_draft_path = path;
                 models::load(model, source, definition, loader, load.layer_placement, policy);
+                if (model->info().streamed_weights && config.continuous_batch.max_sequences)
+                    throw std::invalid_argument("layer weight streaming requires serial inference");
                 load.dense_cpu_layer_count = load.n_gpu_layers >= 0
                     ? static_cast<int>(std::max<std::int64_t>(models::graph(*source).topology.text_layers - load.n_gpu_layers, 0)) : 0;
                 if (root->kv_offload() && !model->info().streamed_kv)
@@ -138,13 +149,11 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                         pending_kv += bytes;
                     }
                 }
-                if (weights->needs_finalize()) {
-                    const auto kv = root->kv_memory();
-                    const auto reserve = kv ? kv->growth_reserve() : 0;
-                    if (reserve > std::numeric_limits<std::size_t>::max() - pending_kv)
-                        throw std::overflow_error("KV reserve overflow");
-                    weights->finalize(reserve + pending_kv, kv ? kv->expert_budget_charge() : 0);
-                }
+                const auto kv = root->kv_memory();
+                const auto reserve = kv ? kv->growth_reserve() : 0;
+                if (reserve > std::numeric_limits<std::size_t>::max() - pending_kv)
+                    throw std::overflow_error("KV reserve overflow");
+                weights->finalize(reserve + pending_kv, kv ? kv->expert_budget_charge() : 0);
                 weights->drain();
                 root->drain();
                 report_cuda_memory(load.report_cuda_memory, "loaded");
@@ -172,7 +181,8 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
         configure_generation(config, load, *root, *weights, model->info());
         const auto model_info = model->info();
         const auto vocab_size = static_cast<std::int32_t>(model_info.vocab_size);
-        auto text = engine::TextProcessor::load(*source, options.tokenizer_model, vocab_size, model_info.model_type);
+        auto text = engine::TextProcessor::load(*source, options.tokenizer_model,
+            vocab_size, model_info.model_type, model->decisions());
         config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
         models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};

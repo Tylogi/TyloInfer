@@ -160,7 +160,8 @@ tyloi::models::qwen4_exp::LayerSnapshot capture_layer_session(
         const Layer& layer, const LayerState& state, std::int64_t position, std::size_t& bytes) {
     tyloi::models::qwen4_exp::LayerSnapshot snapshot;
     const auto save = [&](const Tensor& tensor) {
-        tyloi::models::require_model(tensor.defined(), "Qwen4 recurrent session state is unavailable");
+        if (!tensor.defined())
+            throw std::runtime_error("Qwen4 recurrent session state is unavailable");
         auto saved = tyloi::ops::clone(tensor);
         bytes += session_tensor_bytes(saved);
         return saved;
@@ -385,13 +386,15 @@ std::vector<std::pair<Device, std::size_t>> State::plan_growth(std::int64_t inpu
             const auto& layer = *layers[i];
             const auto device = block.device;
             if (block.gdn) {
-                tyloi::models::require_model(!layer.gdn.saved_conv.defined() && layer.gdn.conv.defined() &&
-                    layer.gdn.recurrent.defined(), "GDN suffix requires committed recurrent state");
+                if (!(!layer.gdn.saved_conv.defined() && layer.gdn.conv.defined() &&
+                    layer.gdn.recurrent.defined()))
+                    throw std::runtime_error("GDN suffix requires committed recurrent state");
                 add(device, layer.gdn.conv.nbytes());
                 add(device, layer.gdn.recurrent.nbytes());
             }
             if (block.ple) {
-                tyloi::models::require_model(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
+                if (!(!layer.ple.saved && layer.ple.conv.defined()))
+                    throw std::runtime_error("PLE suffix requires committed convolution state");
                 add(device, layer.ple.conv.nbytes());
                 const auto& context = block.ple->session_context(layer.ple);
                 if (context.tokens.size() > std::numeric_limits<std::size_t>::max() / sizeof(int64_t))
@@ -482,11 +485,11 @@ std::vector<tyloi::Tensor*> State::graph_state() {
 }
 
 void State::begin_speculative_suffix(std::int64_t draft_tokens) {
-    tyloi::models::require_model(model_.supports_suffix_speculation() && draft_tokens > 0 && batch == 1 &&
-                                     cache_pos > 0 && cache_pos <= model_.max_position_embeddings() &&
-                                     draft_tokens <= model_.max_position_embeddings() - cache_pos &&
-                                     speculative_start < 0 && !speculative_suffix_forward,
-                                 "invalid speculative suffix");
+    if (!(model_.supports_suffix_speculation() && draft_tokens > 0 && batch == 1 &&
+        cache_pos > 0 && cache_pos <= model_.max_position_embeddings() &&
+        draft_tokens <= model_.max_position_embeddings() - cache_pos &&
+        speculative_start < 0 && !speculative_suffix_forward))
+        throw std::runtime_error("invalid speculative suffix");
     struct Checkpoint {
         Tensor conv, recurrent, ple_conv;
         NgramEmbedding::Context context;
@@ -497,13 +500,15 @@ void State::begin_speculative_suffix(std::int64_t draft_tokens) {
         const auto& layer = *layers[i];
         ::tyloi::ops::DeviceScope guard(block.device);
         if (block.gdn) {
-            tyloi::models::require_model(!layer.gdn.saved_conv.defined() && layer.gdn.conv.defined() &&
-                layer.gdn.recurrent.defined(), "GDN suffix requires committed recurrent state");
+            if (!(!layer.gdn.saved_conv.defined() && layer.gdn.conv.defined() &&
+                layer.gdn.recurrent.defined()))
+                throw std::runtime_error("GDN suffix requires committed recurrent state");
             saved[i].conv = tyloi::ops::clone(layer.gdn.conv);
             saved[i].recurrent = tyloi::ops::clone(layer.gdn.recurrent);
         }
         if (block.ple) {
-            tyloi::models::require_model(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
+            if (!(!layer.ple.saved && layer.ple.conv.defined()))
+                throw std::runtime_error("PLE suffix requires committed convolution state");
             saved[i].ple_conv = tyloi::ops::clone(layer.ple.conv);
             saved[i].context = block.ple->session_context(layer.ple);
         }
@@ -527,7 +532,8 @@ void State::begin_speculative_suffix(std::int64_t draft_tokens) {
 }
 
 void State::commit_speculative() {
-    tyloi::models::require_model(speculative_start >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0))
+        throw std::runtime_error("no speculative transaction");
     for (std::size_t i=0; i<model_.layers.size(); ++i)
         layers[i]->commit(*model_.layers[i]);
     speculative_prefix_retention = false;
@@ -537,9 +543,10 @@ void State::commit_speculative() {
 }
 
 void State::rollback_speculative(std::int64_t accepted) {
-    tyloi::models::require_model(speculative_start >= 0 && accepted >= 0, "no speculative transaction");
-    tyloi::models::require_model(!speculative_suffix_journal || accepted == 0,
-        "suffix checkpoint cannot retain an accepted prefix");
+    if (!(speculative_start >= 0 && accepted >= 0))
+        throw std::runtime_error("no speculative transaction");
+    if (!(!speculative_suffix_journal || accepted == 0))
+        throw std::runtime_error("suffix checkpoint cannot retain an accepted prefix");
     const auto keep = speculative_start + speculative_confirmed + accepted;
     speculative_prefix_retention = false;
     for (std::size_t i = 0; i < model_.layers.size(); ++i)
@@ -571,10 +578,10 @@ bool State::supports_paged_text_session_state() const {
 }
 
 TextSessionState State::capture_text_session_state(const std::vector<std::int64_t>& tokens) const {
-    tyloi::models::require_model(text_session_state_kind() == TextSessionStateKind::Qwen4 && batch == 1 &&
-                                cache_pos > 0 && std::size_t(cache_pos) == tokens.size() &&
-                                speculative_start < 0,
-                            "Qwen4 text session boundary is unavailable");
+    if (!(text_session_state_kind() == TextSessionStateKind::Qwen4 && batch == 1 &&
+        cache_pos > 0 && std::size_t(cache_pos) == tokens.size() &&
+        speculative_start < 0))
+        throw std::runtime_error("Qwen4 text session boundary is unavailable");
     TextSessionState state;
     state.tokens = tokens;
     state.cache_pos = cache_pos;

@@ -138,14 +138,9 @@ public:
             try {release_direct_transfer_cache();}catch(const std::exception& error) {
                 std::cerr<<"runtime_direct_expert_cache destructor_error="<<error.what()<<'\n';
             }
-            if(pipeline_pool_context_) {
-                (void)cudaStreamSynchronize(pipeline_pool_stream_);
-            }
             // Drain and destroy copy graphs while their stream and graph buffers
             // are still alive. Every layer shares these two phase caches.
             for(auto& batch:pipeline_dma_batches_)batch.reset();
-            if(pipeline_pool_context_)
-                pipeline_pool_context_->end_graph_pool(pipeline_pool_stream_);
             if ((!registered_host_fields_.empty() || pinned_expert_arena_ ||
                     pipeline_prefill_host_ring_.defined() || pipeline_prefill_metadata_host_.defined()) &&
                     weight_stream_ != nullptr) {
@@ -1371,7 +1366,6 @@ private:
     friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,
         std::span<const std::uint8_t>, bool);
     friend void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&) noexcept;
-    friend bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
     friend struct MoeResidencyTestAccess;
     friend void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>&,bool);
     friend void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>&,bool,bool);
@@ -1443,8 +1437,6 @@ private:
     std::vector<DispatchRecord> pipeline_comparison_records_;
     std::vector<DispatchRecord> pipeline_dispatch_records_,pipeline_dispatch_replay_;
     std::size_t pipeline_dispatch_replay_cursor_=0;
-    std::shared_ptr<tyloi::cuda::Context> pipeline_pool_context_;
-    cudaStream_t pipeline_pool_stream_=nullptr;
 
     void append_source_transfers(
         MoeCachedSource & source,

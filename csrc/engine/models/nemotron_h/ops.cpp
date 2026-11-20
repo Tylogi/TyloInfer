@@ -1,4 +1,3 @@
-#include "engine/models/common/check.h"
 #include "engine/models/common/mtp.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
@@ -111,13 +110,13 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity,
             ::tyloi::cuda::zeros({B, conv_kernel - 1, conv_width}, f32),
             ::tyloi::cuda::zeros({B, heads, head_dim, state_width}, f32), false};
     }
-    TYLOINFER_RUNTIME_CHECK(state.convolution.size(0) == B &&
+    if (!(state.convolution.size(0) == B &&
                           state.convolution.size(1) == conv_kernel - 1 &&
                           state.convolution.size(2) == conv_width &&
                           state.recurrent.size(0) == B && state.recurrent.size(1) == heads &&
                           state.recurrent.size(2) == head_dim &&
-                          state.recurrent.size(3) == state_width,
-                      "mamba state geometry changed");
+                          state.recurrent.size(3) == state_width))
+        throw std::runtime_error("mamba state geometry changed");
     std::optional<DenseTensor> empty_bias;
     const auto& bias = conv_bias_value && conv_bias_value.defined()
                           ? conv_bias_value.dense()
@@ -133,8 +132,8 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity,
                     auto projected = measure("mamba.in_proj", [&] {
                         return project(xn, in_proj).to(::tyloi::kFloat32);
                     });
-                    TYLOINFER_RUNTIME_CHECK(projected.size(-1) == projection_width,
-                                      "mamba fused projection width disagrees with config");
+                    if (!(projected.size(-1) == projection_width))
+                        throw std::runtime_error("mamba fused projection width disagrees with config");
                     auto gate = projected.narrow(2, 0, inner).contiguous();
                     auto xbc = projected.narrow(2, inner, conv_width).contiguous();
                     auto dt = projected.narrow(2, inner + conv_width, heads).contiguous();
@@ -225,11 +224,11 @@ static void replay_recurrent(const Mamba& weights, MambaState& activity, int64_t
                  rms_norm_eps, time_step_limit_lo, time_step_limit_hi, mixer_norm, in_proj,
                  conv_weight_value, conv_bias_value, a_log_value, d_value, dt_bias_value, scan_norm, out_proj] = weights;
     auto& [mixer, speculative_xbc, speculative_dt] = activity;
-    TYLOINFER_RUNTIME_CHECK(retained_tokens > 0 &&
+    if (!(retained_tokens > 0 &&
                           speculative_xbc.defined() && speculative_dt.defined() &&
                           retained_tokens <= speculative_xbc.size(1) &&
-                          retained_tokens <= speculative_dt.size(1),
-                      "invalid mamba recurrent replay");
+                          retained_tokens <= speculative_dt.size(1)))
+        throw std::runtime_error("invalid mamba recurrent replay");
     auto& state = mixer.view();
     const int64_t B = speculative_xbc.size(0);
     const int64_t inner = mamba_heads * mamba_head_dim;
@@ -316,21 +315,21 @@ static DenseTensor attention_residual(DenseTensor residual, DenseTensor attentio
 }
 
 static DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids) {
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     if (ids.dim() == 1) ids = ids.unsqueeze(0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0,
-                               "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return collectives.copy(ids.to(::tyloi::kInt64), primary).contiguous();
 }
 
 ::tyloi::Tensor Model::embedding(const tyloi::Tensor& ids, int primary) const {
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto shaped = ids.dim() == 1 ? tyloi::Tensor(tyloi::ops::unsqueeze(ids, 0)) : tyloi::Tensor{};
     const auto& input = shaped ? shaped : ids;
-    tyloi::models::require_model(input.size(0) > 0 && input.size(1) > 0,
-                               "token IDs must not be empty");
+    if (!(input.size(0) > 0 && input.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     auto normalized = tyloi::ops::contiguous(tyloi::ops::copy(
         tyloi::ops::cast(input, tyloi::ScalarType::int64),
         tyloi::Device{tyloi::DeviceType::cuda, primary}));
@@ -379,9 +378,9 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor inp
             return mamba_forward(*mamba, activity, std::move(input));
         };
         if (confirmed == 0) return run();
-        TYLOINFER_RUNTIME_CHECK(input.is_cuda() && !activity.mixer.pending() && confirmed > 0 &&
-                               confirmed < input.size(1) && activity.mixer.defined(),
-                               "invalid Nemotron-H speculative mamba transaction");
+        if (!(input.is_cuda() && !activity.mixer.pending() && confirmed > 0 &&
+                               confirmed < input.size(1) && activity.mixer.defined()))
+            throw std::runtime_error("invalid Nemotron-H speculative mamba transaction");
         activity.mixer.begin(step.cache_position, confirmed, input.size(1));
         try {
             return run();
@@ -396,8 +395,8 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor inp
     const auto& attention = std::get<::tyloi::models::FullAttention>(layer.weights);
     auto& cache = std::get<tyloi::state::KvView>(state);
     const auto B = input.size(0), T = input.size(1), H = input.size(2);
-    TYLOINFER_RUNTIME_CHECK(confirmed == 0 || !attention.sliding,
-                            "block does not support speculative verification");
+    if (!(confirmed == 0 || !attention.sliding))
+        throw std::runtime_error("block does not support speculative verification");
     const auto capacity = attention.sliding ? attention.attention_window
         : (mode.kv_capacity > 0 ? std::max<std::int64_t>(step.cache_position + T, mode.kv_capacity)
                                 : attention.max_position_embeddings);
@@ -419,23 +418,23 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor inp
     auto& state = dynamic_cast<State&>(state_value);
     MfqCudaGuard guard(mode.primary);
     auto ids = input.ids.dim() == 1 ? tyloi::ops::unsqueeze(input.ids, 0) : input.ids;
-    tyloi::models::require_model(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0,
-                               "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     ids = tyloi::ops::contiguous(tyloi::ops::cast(ids, tyloi::kInt64, tyloi::Device(tyloi::kCUDA, mode.primary)));
     auto embeddings = input.embeddings ? input.embeddings : embedding(ids, mode.primary);
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size,
-        "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(state.speculative_start < 0,
-        "commit or roll back the pending speculative pass before forwarding");
-    tyloi::models::require_model(input.confirmed >= 0 &&
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(state.speculative_start < 0))
+        throw std::runtime_error("commit or roll back the pending speculative pass before forwarding");
+    if (!(input.confirmed >= 0 &&
         (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 &&
-        !input.positions && !input.cache_positions && supports_speculation())),
-        "unsupported speculative backbone geometry");
+        !input.positions && !input.cache_positions && supports_speculation()))))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (input.confirmed > 0) {
-        tyloi::models::require_model(state.cache_pos + T <= metadata.max_position_embeddings,
-            "speculative pass exceeds context capacity");
+        if (!(state.cache_pos + T <= metadata.max_position_embeddings))
+            throw std::runtime_error("speculative pass exceeds context capacity");
         state.speculative_start = state.cache_pos;
         state.speculative_confirmed = input.confirmed;
     }
@@ -448,12 +447,12 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor inp
         tyloi::ops::arange(state.cache_pos, state.cache_pos + T, primary);
     auto semantic = input.positions ? positions(input.positions) :
         (state.decode_position_delta == 0 ? physical : tyloi::ops::add(physical, state.decode_position_delta));
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((semantic.dim() == 1 && semantic.size(0) == T) ||
-        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T),
-        "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((semantic.dim() == 1 && semantic.size(0) == T) ||
+        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths && state.cache_pos > 0 && T == 1) {
         const std::array<std::int64_t, 1> shape{B};
         input.lengths = tyloi::ops::full(shape, state.cache_pos + 1, primary);
@@ -552,15 +551,15 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    tyloi::models::require_model(model.graph.backbone == "nemotron_h",
-                               "model backbone does not match the requested causal model");
+    if (!(model.graph.backbone == "nemotron_h"))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     tyloi::models::nemotron_h::load_config(definition, model.graph, model.config, model.metadata);
     validate_components(model.graph);
-    tyloi::models::require_model(model.config.num_hidden_layers == model.graph.topology.text_layers,
-                               "model graph/config text-layer topology mismatch");
+    if (!(model.config.num_hidden_layers == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context > 0) {
-        tyloi::models::require_model(context <= model.metadata.max_position_embeddings,
-                                   "--ctx-size exceeds max_position_embeddings");
+        if (!(context <= model.metadata.max_position_embeddings))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         model.config.max_position_embeddings = context;
         model.metadata.max_position_embeddings = context;
     }
@@ -687,7 +686,8 @@ void State::reset(std::int64_t next_batch) {
 }
 
 void State::commit_speculative() {
-    tyloi::models::require_model(speculative_start >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0))
+        throw std::runtime_error("no speculative transaction");
     for (std::size_t index = 0; index < layers.size(); ++index) {
         MfqCudaGuard guard(layout_[index].device);
         if (auto* mamba = std::get_if<MambaState>(&layers[index]))
@@ -762,7 +762,8 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
 }
 
 void State::rollback_speculative(std::int64_t accepted) {
-    tyloi::models::require_model(speculative_start >= 0 && accepted >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0 && accepted >= 0))
+        throw std::runtime_error("no speculative transaction");
     const auto keep = speculative_start + speculative_confirmed + accepted;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         auto* activity = std::get_if<MambaState>(&layers[index]);
@@ -803,8 +804,8 @@ std::vector<::tyloi::Tensor*> State::graph_state() {
     for (auto& layer : layers) {
         auto* mamba = std::get_if<MambaState>(&layer);
         if (mamba == nullptr) continue;
-        TYLOINFER_RUNTIME_CHECK(!mamba->mixer.pending() && mamba->mixer.defined(),
-                                "decode warmup requires confirmed mamba state");
+        if (!(!mamba->mixer.pending() && mamba->mixer.defined()))
+            throw std::runtime_error("decode warmup requires confirmed mamba state");
         result.push_back(&mamba->mixer.view().convolution);
         result.push_back(&mamba->mixer.view().recurrent);
     }

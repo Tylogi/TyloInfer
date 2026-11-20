@@ -49,8 +49,8 @@ class QsaCore {
               {
             const auto& c = model.c_;
             if (qsa_tq_cache_enabled()) {
-                TYLOINFER_RUNTIME_CHECK(c.pool == 4 && !c.quantization.enabled(),
-                    "adaptive QSA requires four-token blocks and its own KV codec");
+                if (!(c.pool == 4 && !c.quantization.enabled()))
+                    throw std::runtime_error("adaptive QSA requires four-token blocks and its own KV codec");
                 ResidentAllocationScope resident;
                 adaptive = std::make_unique<QsaTqCache>(c.maximum,c.heads,c.kv_heads,c.width,
                     c.index_heads,c.index_width,c.budget,model.w_->query_norm.options().device(c.device));
@@ -85,10 +85,10 @@ class QsaCore {
         bool fused_projection = true, bool grouped_projection = true)
         : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)), fused_projection_(fused_projection), grouped_projection_(grouped_projection)
           {
-        TYLOINFER_RUNTIME_CHECK(c_.heads > 0 && c_.kv_heads > 0 && c_.heads % c_.kv_heads == 0 &&
+        if (!(c_.heads > 0 && c_.kv_heads > 0 && c_.heads % c_.kv_heads == 0 &&
                               c_.width > 0 && c_.index_heads > 0 && c_.pool > 0 && c_.budget > 0 &&
-                              c_.budget % c_.pool == 0 && rotary_,
-                          "invalid Qwen4 QSA configuration");
+                              c_.budget % c_.pool == 0 && rotary_))
+            throw std::runtime_error("invalid Qwen4 QSA configuration");
     }
     int64_t position(const State& request) const {
         if (request.adaptive) return request.adaptive->position();
@@ -121,13 +121,15 @@ class QsaCore {
                 ::tyloi::ops::project(x,w_->input_projection[2]).dense(),
                 ::tyloi::ops::project(x,w_->input_projection[3]).dense()};
         if(grouped && w_->has_gate) {
-            TYLOINFER_RUNTIME_CHECK(projected.size()==5,"QSA input projection count mismatch");
+            if (!(projected.size()==5))
+                throw std::runtime_error("QSA input projection count mismatch");
             const auto b=x.size(0),t=x.size(1);
             projected[0]=::tyloi::cuda::cat({projected[0].reshape({b,t,c_.heads,c_.width}),
                 projected[4].reshape({b,t,c_.heads,c_.width})},-1).reshape({b,t,2*c_.heads*c_.width});
             projected.erase(projected.begin()+4);
         }
-        TYLOINFER_RUNTIME_CHECK(projected.size()==4,"QSA input projection count mismatch");
+        if (!(projected.size()==4))
+            throw std::runtime_error("QSA input projection count mismatch");
         return projected;
     }
     DenseTensor project_output(const DenseTensor& x) const {
@@ -145,7 +147,8 @@ class QsaCore {
         if(managed_memory(request))return request.memory->growth_bytes(position(request)+tokens);
         if (request.offload) return 0;
         const auto required = position(request) + tokens;
-        TYLOINFER_RUNTIME_CHECK(tokens > 0 && required <= c_.maximum, "QSA growth exceeds max_context");
+        if (!(tokens > 0 && required <= c_.maximum))
+            throw std::runtime_error("QSA growth exceeds max_context");
         if (request.adaptive) return 0;
         std::size_t bytes = 0;
         for (const auto* cache : {&request.keys, &request.values, &request.index}) {
@@ -164,10 +167,12 @@ class QsaCore {
     /** Estimate the backing required for an append or a fresh reset. */
     std::size_t allocation_bytes(const State& request, int64_t batch, int64_t tokens, bool reset) const {
         const auto start = reset ? int64_t(0) : position(request);
-        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && start >= 0 && start <= c_.maximum &&
-            tokens <= c_.maximum - start, "invalid QSA allocation window");
+        if (!(batch > 0 && tokens > 0 && start >= 0 && start <= c_.maximum &&
+            tokens <= c_.maximum - start))
+            throw std::runtime_error("invalid QSA allocation window");
         if (request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(batch == 1, "adaptive QSA needs one cache per sequence");
+            if (!(batch == 1))
+                throw std::runtime_error("adaptive QSA needs one cache per sequence");
             return 0;
         }
         const auto add = [](std::size_t a, std::size_t b) {
@@ -202,8 +207,9 @@ class QsaCore {
     /** Estimate temporary backing needed when leaving an unmanaged graph. */
     std::size_t exit_growth(const State& request, int64_t tokens) const {
         const auto start = position(request);
-        TYLOINFER_RUNTIME_CHECK(tokens > 0 && start >= 0 && start <= c_.maximum &&
-            tokens <= c_.maximum - start, "invalid QSA allocation window");
+        if (!(tokens > 0 && start >= 0 && start <= c_.maximum &&
+            tokens <= c_.maximum - start))
+            throw std::runtime_error("invalid QSA allocation window");
         if (!request.graph_keys.defined() || managed_memory(request)) return 0;
         const auto add = [](std::size_t a, std::size_t b) {
             if (a > std::numeric_limits<std::size_t>::max() - b)
@@ -253,27 +259,31 @@ class QsaCore {
     void validate_session(const State& request, const ::tyloi::ops::Qsa::Snapshot& state,
                           int64_t count, tyloi::Device device) const {
         if(request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(state.ram && !state.keys.defined() && !state.values.defined() && !state.index.defined() &&
-                device==c_.device, "incompatible Qwen4 QSA RAM session state");
+            if (!(state.ram && !state.keys.defined() && !state.values.defined() && !state.index.defined() &&
+                device==c_.device))
+                throw std::runtime_error("incompatible Qwen4 QSA RAM session state");
             request.adaptive->validate_session(*state.ram,count);
             return;
         }
-        TYLOINFER_RUNTIME_CHECK(!state.ram, "incompatible Qwen4 QSA session state");
+        if (!(!state.ram))
+            throw std::runtime_error("incompatible Qwen4 QSA session state");
         const auto check = [&](const tyloi::Tensor& tensor, int64_t width, tyloi::ScalarType type) {
             return tensor.defined() && tensor.representation<DenseTensor>() && tensor.device()==device &&
                 tensor.scalar_type()==type && tensor.dim()==3 && tensor.size(0)==1 &&
                 tensor.size(1)==count && tensor.size(2)==width;
         };
-        TYLOINFER_RUNTIME_CHECK(supports_session(request) && count>0 && count<=c_.maximum &&
+        if (!(supports_session(request) && count>0 && count<=c_.maximum &&
             check(state.keys,c_.kv_heads*key_width(),cache_dtype()) &&
             check(state.values,c_.kv_heads*value_width(),cache_dtype()) &&
-            check(state.index,c_.index_width,::tyloi::kFloat16), "incompatible Qwen4 QSA session state");
+            check(state.index,c_.index_width,::tyloi::kFloat16)))
+            throw std::runtime_error("incompatible Qwen4 QSA session state");
     }
     /** Estimate fresh unmanaged sequence backing; managed allocation has its own admission. */
     std::size_t fresh_session_growth(const State& current, int64_t count) const {
         if (current.adaptive) return current.adaptive->fresh_session_growth();
         if (current.memory && !current.offload) {
-            TYLOINFER_RUNTIME_CHECK(managed_memory(current), "Qwen4 managed session storage is not ready");
+            if (!managed_memory(current))
+                throw std::runtime_error("Qwen4 managed session storage is not ready");
             return 0;
         }
         SequenceCache keys(c_.maximum,c_.kv_heads*key_width(),cache_dtype());
@@ -288,7 +298,8 @@ class QsaCore {
     void stage_session(State& request, const ::tyloi::ops::Qsa::Snapshot& saved,
                        int64_t count, tyloi::Device device) {
         if (request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(device==c_.device, "QSA restore target differs from layer device");
+            if (!(device==c_.device))
+                throw std::runtime_error("QSA restore target differs from layer device");
             restore_session(request,saved,count);
             return;
         }
@@ -314,8 +325,8 @@ class QsaCore {
             c_.index_width*request.index.storage().element_size());
     }
     void capture_session(const State& request,::tyloi::ops::Qsa::Snapshot& state,int64_t count,std::size_t& bytes) const {
-        TYLOINFER_RUNTIME_CHECK(supports_session(request) && count>0 && count<=position(request),
-            "invalid Qwen4 QSA session boundary");
+        if (!(supports_session(request) && count>0 && count<=position(request)))
+            throw std::runtime_error("invalid Qwen4 QSA session boundary");
         if(request.adaptive) {
             state.keys={};state.values={};state.index={};
             state.ram=request.adaptive->capture_session(count);
@@ -351,13 +362,13 @@ class QsaCore {
         const auto* keys=state.keys.representation<DenseTensor>();
         const auto* values=state.values.representation<DenseTensor>();
         const auto* index=state.index.representation<DenseTensor>();
-        TYLOINFER_RUNTIME_CHECK(!request.adaptive && !request.offload && keys && values && index && keys->defined() && values->defined() && index->defined() &&
+        if (!(!request.adaptive && !request.offload && keys && values && index && keys->defined() && values->defined() && index->defined() &&
             keys->dim()==3 && keys->size(0)==1 && keys->size(1)==count &&
             keys->size(2)==c_.kv_heads*key_width() && keys->scalar_type()==cache_dtype() &&
             values->dim()==3 && values->size(0)==1 && values->size(1)==count &&
             values->size(2)==c_.kv_heads*value_width() && values->scalar_type()==cache_dtype() &&
-            index->dim()==3 && index->size(0)==1 && index->size(1)==count && index->size(2)==c_.index_width,
-            "incompatible Qwen4 QSA session state");
+            index->dim()==3 && index->size(0)==1 && index->size(1)==count && index->size(2)==c_.index_width))
+            throw std::runtime_error("incompatible Qwen4 QSA session state");
         reset(request);activate_memory(request);
         if(managed_memory(request)) {
             request.memory->ensure(count);
@@ -408,13 +419,14 @@ class QsaCore {
     }
     void prepare_graph(State& request,const DenseTensor& full_positions, int64_t capacity,int64_t pending_tokens) {
         if(request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(pending_tokens>0 && request.adaptive->pending_supported(),
-                "adaptive QSA requires an admitted pending graph");
+            if (!(pending_tokens>0 && request.adaptive->pending_supported()))
+                throw std::runtime_error("adaptive QSA requires an admitted pending graph");
             request.adaptive->prepare_decode_tokens(pending_tokens,true,0,full_positions);
             return;
         }
         activate_memory(request);
-        TYLOINFER_RUNTIME_CHECK(!request.offload || managed_memory(request), "streamed QSA graphs require a resident indexer");
+        if (!(!request.offload || managed_memory(request)))
+            throw std::runtime_error("streamed QSA graphs require a resident indexer");
         if(managed_memory(request)) {
             if(request.graph_prepared)return;
             const auto n=position(request),pools=n/c_.pool;
@@ -428,10 +440,11 @@ class QsaCore {
             request.graph_prepared=true;return;
         }
         if(request.graph_keys.defined())return;
-        TYLOINFER_RUNTIME_CHECK(position(request)>0 && request.keys.storage().size(0)==1,
-            "QSA graph requires a prefilled single sequence");
+        if (!(position(request)>0 && request.keys.storage().size(0)==1))
+            throw std::runtime_error("QSA graph requires a prefilled single sequence");
         const auto n=position(request);
-        TYLOINFER_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
+        if (!(capacity>=n && capacity<=c_.maximum))
+            throw std::runtime_error("invalid QSA graph capacity");
         auto graph_keys=::tyloi::cuda::zeros({1,c_.kv_heads,capacity,key_width()},request.keys.storage().options());
         auto graph_values=::tyloi::cuda::zeros({1,c_.kv_heads,capacity,value_width()},request.values.storage().options());
         graph_keys.narrow(2,0,n).copy_(request.keys.storage().dense().narrow(1,0,n).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}));
@@ -456,11 +469,11 @@ class QsaCore {
                          const DenseTensor& positions,const DenseTensor& cache_positions,
                          std::vector<DenseTensor> projections,bool project_output,bool history_only,bool query_tail,
                          const Projection* prepared=nullptr,const DenseTensor& pool_positions={}) {
-        TYLOINFER_RUNTIME_CHECK(!prepared || (!history_only && !query_tail && hidden.size(0)==1),
-            "QSA prepared graph projection requires a complete independent row");
+        if (!(!prepared || (!history_only && !query_tail && hidden.size(0)==1)))
+            throw std::runtime_error("QSA prepared graph projection requires a complete independent row");
         if(request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1 && request.adaptive->pending_graph_enabled(),
-                "adaptive QSA requires a complete pending graph window");
+            if (!(hidden.size(0)==1 && request.adaptive->pending_graph_enabled()))
+                throw std::runtime_error("adaptive QSA requires a complete pending graph window");
             const auto tokens=hidden.size(1);
             Projection p;
             if(prepared) p=*prepared;
@@ -484,13 +497,14 @@ class QsaCore {
             output=output.to(hidden.scalar_type());
             return project_output?this->project_output(output):output;
         }
-        TYLOINFER_RUNTIME_CHECK(!query_tail,"ordinary QSA requires separate graph history and tail writes");
+        if (!(!query_tail))
+            throw std::runtime_error("ordinary QSA requires separate graph history and tail writes");
         const auto mark=[](const char* phase) {
             if(auto* window=DecodeWindow::recording())window->mark_current(phase);
         };
         const bool streamed=bool(request.offload);
-        TYLOINFER_RUNTIME_CHECK((request.graph_keys.defined() || (streamed && managed_memory(request))) && hidden.size(0)==1 && cache_positions.dim()==1,
-            "QSA graph cache is not prepared");
+        if (!((request.graph_keys.defined() || (streamed && managed_memory(request))) && hidden.size(0)==1 && cache_positions.dim()==1))
+            throw std::runtime_error("QSA graph cache is not prepared");
         auto graph_keys = (request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{});
         auto graph_values = (request.graph_values.defined()?request.graph_values.dense():DenseTensor{});
         auto graph_pooled = (request.graph_pooled.defined()?request.graph_pooled.dense():DenseTensor{});
@@ -525,7 +539,8 @@ class QsaCore {
         mark("qsa_cache_end");
         if(history_only && streamed) {
             auto* window=DecodeWindow::recording();
-            TYLOINFER_RUNTIME_CHECK(window,"streamed QSA history requires a decode window");
+            if (!window)
+                throw std::runtime_error("streamed QSA history requires a decode window");
             struct HistoryStage {DenseTensor raw;};
             const auto stage=window->workspace<HistoryStage>(&request,[&] {
                 ResidentAllocationScope resident;
@@ -643,20 +658,23 @@ class QsaCore {
     }
     struct GraphRow { State* state; DenseTensor positions, cache_positions; };
     DenseTensor forward_independent_graph(const DenseTensor& hidden, std::span<const GraphRow> rows) {
-        TYLOINFER_RUNTIME_CHECK(hidden.dim()==3 && hidden.size(0)>0 && hidden.size(1)>0 &&
-            rows.size()==std::size_t(hidden.size(0)), "QSA independent graph batch mismatch");
+        if (!(hidden.dim()==3 && hidden.size(0)>0 && hidden.size(1)>0 &&
+            rows.size()==std::size_t(hidden.size(0))))
+            throw std::runtime_error("QSA independent graph batch mismatch");
         std::vector<DenseTensor> positions;
         positions.reserve(rows.size());
         for (const auto& row : rows) {
-            TYLOINFER_RUNTIME_CHECK(row.state && row.positions.defined() && row.positions.dim()==1 &&
+            if (!(row.state && row.positions.defined() && row.positions.dim()==1 &&
                 row.positions.size(0)==hidden.size(1) && row.positions.device()==hidden.device() &&
                 (row.positions.scalar_type()==::tyloi::kInt32 || row.positions.scalar_type()==::tyloi::kInt64) &&
                 row.cache_positions.defined() && row.cache_positions.dim()==1 &&
                 row.cache_positions.size(0)==hidden.size(1) && row.cache_positions.device()==hidden.device() &&
-                row.cache_positions.scalar_type()==::tyloi::kInt64,
-                "QSA independent graph row geometry mismatch");
-            if (!positions.empty()) TYLOINFER_RUNTIME_CHECK(row.positions.scalar_type()==positions.front().scalar_type(),
-                "QSA independent graph position types differ");
+                row.cache_positions.scalar_type()==::tyloi::kInt64))
+                throw std::runtime_error("QSA independent graph row geometry mismatch");
+            if (!positions.empty()) {
+                if (!(row.positions.scalar_type()==positions.front().scalar_type()))
+                    throw std::runtime_error("QSA independent graph position types differ");
+            }
             positions.push_back(row.positions);
         }
         auto axes=::tyloi::cuda::cat(positions,0).reshape({1,hidden.size(0),hidden.size(1)});
@@ -692,15 +710,16 @@ class QsaCore {
             return;
         }
         if (request.offload) {
-            TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= position(request), "invalid offloaded QSA truncation");
+            if (!(keep >= 0 && keep <= position(request)))
+                throw std::runtime_error("invalid offloaded QSA truncation");
             request.offloaded_kv->truncate(keep);
             if(managed_memory(request))request.index.truncate(keep);
             else {request.offloaded_index->truncate(keep);request.offloaded_pooled->truncate(keep/c_.pool);}
             return;
         }
-        TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= request.keys.position() && keep <= request.values.position() &&
-                              keep <= request.index.position(),
-                          "invalid Qwen4 QSA cache truncation");
+        if (!(keep >= 0 && keep <= request.keys.position() && keep <= request.values.position() &&
+                              keep <= request.index.position()))
+            throw std::runtime_error("invalid Qwen4 QSA cache truncation");
         request.keys.truncate(keep);
         request.values.truncate(keep);
         request.index.truncate(keep);
@@ -710,12 +729,14 @@ class QsaCore {
                    std::vector<DenseTensor> *selection_trace = nullptr,
                    std::vector<DenseTensor> projections = {}, bool project_output = true,
                    bool history_only = false) {
-        TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
-                              hidden.size(1) > 0,
-                          "Qwen4 QSA requires nonempty [B,T,H] input");
-        TYLOINFER_RUNTIME_CHECK(!history_only || use_cache,"QSA history priming requires a cache");
+        if (!(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
+                              hidden.size(1) > 0))
+            throw std::runtime_error("Qwen4 QSA requires nonempty [B,T,H] input");
+        if (!(!history_only || use_cache))
+            throw std::runtime_error("QSA history priming requires a cache");
         if (request.adaptive && use_cache) {
-            TYLOINFER_RUNTIME_CHECK(!selection_trace, "adaptive QSA does not expose a selection trace");
+            if (!(!selection_trace))
+                throw std::runtime_error("adaptive QSA does not expose a selection trace");
             return forward_adaptive(*request.adaptive,hidden,current_positions,full_positions,projections,
                 project_output,history_only);
         }
@@ -755,10 +776,9 @@ class QsaCore {
         // normalization/RoPE preparation as captured execution. Keeping short
         // eager calls on separate norms introduces extra FP16 rounding steps.
         const bool prepared_inputs=!projections.empty() || (!prefill_option || *prefill_option!=0);
-        TYLOINFER_RUNTIME_CHECK(
-            t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
-                (!use_cache || (offset == request.values.position() && offset == request.index.position())),
-            "Qwen4 QSA cache/position geometry mismatch");
+        if (!(t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
+                (!use_cache || (offset == request.values.position() && offset == request.index.position()))))
+            throw std::runtime_error("Qwen4 QSA cache/position geometry mismatch");
         auto project_inputs = [&] {
                 if(prepared_inputs)
                     return project(hidden,current_positions,!history_only && offset+t>c_.budget,{},{},{},std::move(projections));
@@ -785,7 +805,8 @@ class QsaCore {
             };
         auto append_inputs = [&](Projection &p) {
                 if(managed_memory(request)) {
-                    TYLOINFER_RUNTIME_CHECK(b==1,"preallocated QSA expects one sequence per cache");
+                    if (!(b==1))
+                        throw std::runtime_error("preallocated QSA expects one sequence per cache");
                     request.memory->ensure(offset+t);
                     if(request.memory->hot.exclusive())request.memory->hot.append(encode_key(p.key).permute({0,2,1,3}),
                         encode_value(p.value).permute({0,2,1,3}),::tyloi::cuda::arange(offset,offset+t,hidden.options().dtype(::tyloi::kInt64)));
@@ -928,9 +949,9 @@ class QsaCore {
             const DenseTensor& full_positions,const std::vector<DenseTensor>& projections,
             bool project_output,bool history_only) {
         const auto start=cache.position(),tokens=hidden.size(1);
-        TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1 && tokens<=c_.maximum-start &&
-            positions.size(-1)==tokens && full_positions.size(-1)==start+tokens,
-            "adaptive QSA cache/position geometry mismatch");
+        if (!(hidden.size(0)==1 && tokens<=c_.maximum-start &&
+            positions.size(-1)==tokens && full_positions.size(-1)==start+tokens))
+            throw std::runtime_error("adaptive QSA cache/position geometry mismatch");
         const auto rows=cache.prefill_rows(tokens);
         const auto type=hidden.scalar_type()==::tyloi::kFloat16 ? ::tyloi::kFloat16 : ::tyloi::kFloat32;
         auto output=history_only ? DenseTensor{} : ::tyloi::cuda::empty({1,tokens,c_.heads*c_.width},
@@ -959,7 +980,8 @@ class QsaCore {
     }
     DenseTensor streamed_graph_attention(State& request,const Projection& p,const DenseTensor& selected,::tyloi::ScalarType output_type) {
         auto* window=DecodeWindow::recording();
-        TYLOINFER_RUNTIME_CHECK(window && selected.size(1)<=8,"streamed QSA requires a decode window of at most eight rows");
+        if (!(window && selected.size(1)<=8))
+            throw std::runtime_error("streamed QSA requires a decode window of at most eight rows");
         struct Stage {
             DenseTensor raw,host_ids,ids;
             std::shared_ptr<::tyloi::ops::KvGatherWorkspace> gather;
@@ -1018,8 +1040,8 @@ class QsaCore {
             owner=request.offloaded_pooled->range(start,count);
             return owner.dense();
         };
-        TYLOINFER_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
-            "streamed QSA requires one sequence within its configured context");
+        if (!(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length))
+            throw std::runtime_error("streamed QSA requires one sequence within its configured context");
         const auto key_row = c_.kv_heads * key_width(), value_row = c_.kv_heads * value_width();
         const auto max_keys = std::min(length, c_.budget + c_.pool - 1);
         const auto row_bytes = std::size_t(key_row+value_row) * (quantization_.enabled()?4:2);
@@ -1164,7 +1186,8 @@ class QsaCore {
                 ::tyloi::ops::project(hidden,w_->input_projection[2]).dense(),
                 ::tyloi::ops::project(hidden,w_->input_projection[3]).dense()};
         }
-        TYLOINFER_RUNTIME_CHECK(projections.empty() || projections.size()==4,"QSA input projection count mismatch");
+        if (!(projections.empty() || projections.size()==4))
+            throw std::runtime_error("QSA input projection count mismatch");
         auto pair=projections[0].reshape({b,t,c_.heads,2*c_.width});
         auto gate=pair.narrow(-1,c_.width,c_.width);
         auto key_source=projections[1].reshape({b,t,c_.kv_heads,c_.width});
@@ -1336,7 +1359,8 @@ void Qsa::validate_session(const State& state, const Snapshot& snapshot, std::in
 std::shared_ptr<void> Qsa::reserve_session(State& state, const tyloi::state::qsa::Session& snapshot) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->device.is_cuda()) guard.emplace(impl_->device);
-    TYLOINFER_RUNTIME_CHECK(state.impl_->cache.adaptive, "incompatible Qwen4 QSA RAM session state");
+    if (!state.impl_->cache.adaptive)
+        throw std::runtime_error("incompatible Qwen4 QSA RAM session state");
     return state.impl_->cache.adaptive->reserve_session_restore(snapshot);
 }
 std::size_t Qsa::fresh_session_growth(const State& state, std::int64_t count) const {
@@ -1455,7 +1479,8 @@ Tensor Qsa::forward_independent_graph(const Tensor& hidden, std::span<const Grap
     std::vector<detail::QsaCore::GraphRow> values;
     values.reserve(rows.size());
     for (const auto& row : rows) {
-        TYLOINFER_RUNTIME_CHECK(row.state, "QSA independent graph row has no state");
+        if (!row.state)
+            throw std::runtime_error("QSA independent graph row has no state");
         values.push_back({&row.state->impl_->cache, row.positions.dense(), row.cache_positions.dense()});
     }
     return hold(impl_->core.forward_independent_graph(hidden.dense(), values));
@@ -1516,11 +1541,11 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         row.capacity = request.maximum;
         for (const auto& layer : request.layers) {
             const auto& cache = layer.second->impl_->cache.adaptive;
-            TYLOINFER_RUNTIME_CHECK(cache && cache->pending_supported() && cache->position()==request.position,
-                "incompatible adaptive QSA graph state");
+            if (!(cache && cache->pending_supported() && cache->position()==request.position))
+                throw std::runtime_error("incompatible adaptive QSA graph state");
             const auto kind = cache->device_graph_kind(tokens);
-            TYLOINFER_RUNTIME_CHECK(kind>0 && kind<4 && (!row.pending_kind || row.pending_kind==kind),
-                "invalid adaptive QSA graph append");
+            if (!(kind>0 && kind<4 && (!row.pending_kind || row.pending_kind==kind)))
+                throw std::runtime_error("invalid adaptive QSA graph append");
             row.pending_kind = kind;
             for (const auto& growth : cache->graph_growth(tokens)) {
                 plan.unmanaged_growth.push_back(growth);
@@ -1545,11 +1570,12 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
                 if (layer.second->impl_->cache.adaptive) plan.adaptive = true;
         for (std::size_t i = 0; i < plan.requests.size(); ++i) {
             const auto& request = plan.requests[i];
-            TYLOINFER_RUNTIME_CHECK(request.position >= 0 && request.maximum > 0 && request.position < request.maximum,
-                "Flash-Next batch graph exceeds max_context");
+            if (!(request.position >= 0 && request.maximum > 0 && request.position < request.maximum))
+                throw std::runtime_error("Flash-Next batch graph exceeds max_context");
             plan.required = std::max(plan.required, request.position + 1);
             if (plan.adaptive) {
-                TYLOINFER_RUNTIME_CHECK(!request.layers.empty(), "adaptive QSA graph requires attention layers");
+                if (request.layers.empty())
+                    throw std::runtime_error("adaptive QSA graph requires attention layers");
                 admit_pending(request, plan.rows[i]);
             }
         }
@@ -1557,9 +1583,9 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
     } else {
         if (plan.requests.size() != 1) throw std::invalid_argument("single QSA graph requires one request");
         const auto& request = plan.requests.front();
-        TYLOINFER_RUNTIME_CHECK(tokens > 0 && request.position >= 0 && request.maximum > 0 &&
-            request.position <= request.maximum && tokens <= request.maximum - request.position,
-            "Qwen4 graph exceeds context capacity");
+        if (!(tokens > 0 && request.position >= 0 && request.maximum > 0 &&
+            request.position <= request.maximum && tokens <= request.maximum - request.position))
+            throw std::runtime_error("Qwen4 graph exceeds context capacity");
         plan.required = request.position + tokens;
         auto capacity = previous_capacity;
         if (!request.layers.empty()) {
@@ -1624,7 +1650,8 @@ void Qsa::Graph::layout() {
         const auto& request = plan.requests.front();
         const auto required = request.position + plan.tokens;
         const auto planned = std::max(required, request.reserve);
-        TYLOINFER_RUNTIME_CHECK(planned <= request.maximum, "Qwen4 graph reserve exceeds context capacity");
+        if (!(planned <= request.maximum))
+            throw std::runtime_error("Qwen4 graph reserve exceeds context capacity");
         auto capacity = std::min<std::int64_t>(request.maximum,
             std::max<std::int64_t>(plan.hidden ? 2048 : 256, plan.rows.front().capacity));
         while (capacity < planned)
@@ -1641,7 +1668,8 @@ void Qsa::Graph::layout() {
     for (std::size_t i = 0; i < plan.requests.size(); ++i) {
         const auto& request = plan.requests[i];
         const auto required = request.position + 1;
-        TYLOINFER_RUNTIME_CHECK(required <= request.maximum, "Flash-Next batch graph exceeds max_context");
+        if (!(required <= request.maximum))
+            throw std::runtime_error("Flash-Next batch graph exceeds max_context");
         auto capacity = std::min<std::int64_t>(batch > 8 ? cuda::options::continuous_batch_kv_initial_capacity() : 256,
             request.maximum);
         if (batch > 16 && capacity < required) {

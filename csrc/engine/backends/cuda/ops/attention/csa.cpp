@@ -29,8 +29,8 @@ struct WorkShared {
 inline DenseTensor weighted_rms(const DenseTensor &input,
                                 const ::tyloi::Tensor &weight, double epsilon) {
     const auto shape = input.sizes().vec();
-    TYLOINFER_RUNTIME_CHECK(!shape.empty() && weight.numel() == shape.back(),
-                      "DeepSeek-V4.1 weighted RMS geometry mismatch");
+    if (!(!shape.empty() && weight.numel() == shape.back()))
+        throw std::runtime_error("DeepSeek-V4.1 weighted RMS geometry mismatch");
     return rms_norm_cuda(input.reshape({-1, shape.back()}).to(::tyloi::kFloat32),
                          weight.dense(),
                          epsilon)
@@ -41,7 +41,8 @@ inline DenseTensor weighted_rms(const DenseTensor &input,
 
 inline DenseTensor rotate_token_major_tail(DenseTensor input, const DenseTensor &positions,
                                       const ::tyloi::ops::TailRopeTable &rope, bool inverse = false) {
-    TYLOINFER_RUNTIME_CHECK(input.dim() == 3, "DeepSeek-V4.1 RoPE input must be [B,T,D]");
+    if (!(input.dim() == 3))
+        throw std::runtime_error("DeepSeek-V4.1 RoPE input must be [B,T,D]");
     auto value = input.unsqueeze(1).contiguous();
     auto rotated = ::tyloi::ops::tail_rope(value, positions, rope, inverse);
     return rotated.dense().squeeze(1).contiguous();
@@ -210,7 +211,8 @@ struct Csa::Impl {
                                     config.rms_eps);
             };
         const auto concat = [](const auto &emitted) { return ::tyloi::cuda::cat(emitted, 1).contiguous(); };
-        TYLOINFER_RUNTIME_CHECK(ratio > 0, "invalid compression ratio");
+        if (!(ratio > 0))
+            throw std::runtime_error("invalid compression ratio");
         if (ratio == 1) return std::optional<DenseTensor>(direct());
         project();
         std::vector<DenseTensor> emitted;
@@ -241,8 +243,8 @@ struct Csa::Impl {
             shared.keep(*latent);
             const auto count = latent->size(1);
             const auto begin = layer_state.compressed_length;
-            TYLOINFER_RUNTIME_CHECK(begin + count <= layer_state.compressed_kv.size(1),
-                              "DeepSeek-V4.1 compressed cache capacity exceeded");
+            if (!(begin + count <= layer_state.compressed_kv.size(1)))
+                throw std::runtime_error("DeepSeek-V4.1 compressed cache capacity exceeded");
             auto group_positions =
                 ::tyloi::cuda::arange(begin * ratio, (begin + count) * ratio, ratio,
                                            latent->options().dtype(::tyloi::kInt64));
@@ -281,8 +283,8 @@ struct Csa::Impl {
         const bool restricted = pool_length > config.candidate_topk_blocks * config.candidate_block_size;
                 const auto empty = [&] { return empty_topk(batch, tokens, input.device()); };
         const auto reuse = [&] {
-                TYLOINFER_RUNTIME_CHECK(shared.topk.defined(),
-                                  "DeepSeek-V4.1 CSA2 consumer has no published index plan");
+                if (!shared.topk.defined())
+                    throw std::runtime_error("DeepSeek-V4.1 CSA2 consumer has no published index plan");
                 return shared.topk;
             };
         const auto score = [&] {
@@ -306,8 +308,8 @@ struct Csa::Impl {
                 auto keys = shared.index_k.narrow(1, 0, pool_length).contiguous();
                 shared.keep(keys);
                 if (layer > config.candidate_source_layer && restricted) {
-                    TYLOINFER_RUNTIME_CHECK(shared.candidate_blocks.defined(),
-                                      "DeepSeek-V4.1 hierarchical indexer has no candidates");
+                    if (!shared.candidate_blocks.defined())
+                        throw std::runtime_error("DeepSeek-V4.1 hierarchical indexer has no candidates");
                     candidates = csa_candidates(Tensor{shared.candidate_blocks},
                                                 config.candidate_block_size, pool_length).dense();
                     shared.keep(candidates);
@@ -327,7 +329,8 @@ struct Csa::Impl {
             };
         const auto select_candidates = [&](DenseTensor scores) {
                 if (!restricted) return select_topk(scores, config.index_topk, pool_length);
-                TYLOINFER_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
+                if (!candidates.defined())
+                    throw std::runtime_error("DeepSeek-V4.1 candidate scores are unavailable");
                 return select_topk(scores, config.index_topk, pool_length, candidates);
             };
         const auto select = [&](DenseTensor scores) { return select_topk(scores, config.index_topk, pool_length); };
@@ -380,9 +383,9 @@ struct Csa::Impl {
             };
         const auto publish = [&] { publish_compressed_source(layer_state, shared, input, position); };
         const auto validate = [&] {
-                TYLOINFER_RUNTIME_CHECK(shared.compressed_kv.defined() && shared.index_k.defined() &&
-                                      shared.ratio == ratio,
-                                  "DeepSeek-V4.1 CSA2 consumer ran before its source layer");
+                if (!(shared.compressed_kv.defined() && shared.index_k.defined() &&
+                                      shared.ratio == ratio))
+                    throw std::runtime_error("DeepSeek-V4.1 CSA2 consumer ran before its source layer");
             };
         const auto index_stage = [&](DenseTensor q_rank) {
                 return compute_topk(layer_state, shared, input, q_rank, positions, position);
@@ -447,9 +450,8 @@ struct Csa::Impl {
                     plan = dsv4_build_decode_plan_cuda(
                         topk, lengths, pool_length, ratio > 0 ? ratio : 1, config.sliding_window);
                 } else {
-                    TYLOINFER_RUNTIME_CHECK(
-                        !sequence_lengths.has_value(),
-                        "DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
+                    if (sequence_lengths.has_value())
+                        throw std::runtime_error("DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
                     const auto history = local_history;
                     plan =
                         dsv4_build_prefill_plan_cuda(topk, position, history, pool_length,
@@ -533,9 +535,9 @@ struct Csa::Impl {
 
     /** Save the mutable cache state before a speculative window. */
     void begin_speculative(State& layer_state, std::int64_t draft_tokens) {
-        TYLOINFER_RUNTIME_CHECK(!layer_state.speculative_pending && draft_tokens > 0 &&
-                              draft_tokens <= config.sliding_window && layer_state.local_kv.defined(),
-                          "invalid DeepSeek-V4.1 speculative checkpoint");
+        if (!(!layer_state.speculative_pending && draft_tokens > 0 &&
+                              draft_tokens <= config.sliding_window && layer_state.local_kv.defined()))
+            throw std::runtime_error("invalid DeepSeek-V4.1 speculative checkpoint");
         layer_state.speculative_slot_ids = Tensor{DenseTensor{}};
         layer_state.speculative_local_slots = Tensor{DenseTensor{}};
         layer_state.speculative_partial_kv = Tensor{DenseTensor{}};
@@ -568,12 +570,13 @@ struct Csa::Impl {
 
     /** Restore rejected cache writes while retaining the accepted prefix. */
     void rollback_speculative(State& layer_state, std::int64_t position) {
-        TYLOINFER_RUNTIME_CHECK(layer_state.speculative_pending && position >= layer_state.speculative_position &&
+        if (!(layer_state.speculative_pending && position >= layer_state.speculative_position &&
                               position <= layer_state.position &&
-                              layer_state.speculative_local_slots.defined() && layer_state.speculative_slot_ids.defined(),
-                          "DeepSeek-V4.1 speculative checkpoint is unavailable");
+                              layer_state.speculative_local_slots.defined() && layer_state.speculative_slot_ids.defined()))
+            throw std::runtime_error("DeepSeek-V4.1 speculative checkpoint is unavailable");
         const auto kept=position-layer_state.speculative_position;
-        TYLOINFER_RUNTIME_CHECK(kept<=layer_state.speculative_slot_ids.numel(),"DeepSeek-V4.1 retained prefix is out of range");
+        if (!(kept<=layer_state.speculative_slot_ids.numel()))
+            throw std::runtime_error("DeepSeek-V4.1 retained prefix is out of range");
         const auto rejected=layer_state.speculative_slot_ids.numel()-kept;
         if(rejected)layer_state.local_kv.dense().index_copy_(1,layer_state.speculative_slot_ids.dense().narrow(0,kept,rejected),
             layer_state.speculative_local_slots.dense().narrow(1,kept,rejected));
@@ -594,8 +597,8 @@ struct Csa::Impl {
             for(int64_t slot=0;slot<layer_state.partial_length;++slot) {
                 const auto source=total-layer_state.partial_length+slot-layer_state.speculative_partial_length;
                 if(source<0)continue; // The original partial group was restored above.
-                TYLOINFER_RUNTIME_CHECK(layer_state.speculative_projected_kv.defined() && layer_state.speculative_projected_score.defined(),
-                                  "DeepSeek-V4.1 retained compressor projections are unavailable");
+                if (!(layer_state.speculative_projected_kv.defined() && layer_state.speculative_projected_score.defined()))
+                    throw std::runtime_error("DeepSeek-V4.1 retained compressor projections are unavailable");
                 layer_state.partial_kv.dense().narrow(1,slot,1).copy_(layer_state.speculative_projected_kv.dense().narrow(1,source,1));
                 layer_state.partial_score.dense().narrow(1,slot,1).copy_(layer_state.speculative_projected_score.dense().narrow(1,source,1));
             }

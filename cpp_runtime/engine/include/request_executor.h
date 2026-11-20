@@ -211,15 +211,7 @@ template <class Backend> class EngineInstance final : public Engine {
         if (!loaded_) throw std::runtime_error("engine is unloaded");
         return std::visit([&](auto&& value) -> ControlResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr(std::is_same_v<T,DecisionText> || std::is_same_v<T,DecisionTokens>) {
-                if(!info_.decisions)throw std::invalid_argument("decision reads are unavailable for this model");
-                if(!requests_.empty())throw ControlBusyError("decision reads require an idle runtime");
-                if constexpr(std::is_same_v<T,DecisionText>) {
-                    if(!text_)throw std::invalid_argument("text decisions require a tokenizer");
-                    auto prepared=text_->prepare_decisions(value,info_.max_context);
-                    return backend.visit([&](auto& ops){return ops.control(std::move(prepared));});
-                } else return backend.visit([&](auto& ops){return ops.control(std::move(value));});
-            } else if constexpr (std::is_same_v<T, DecodeTokens> || std::is_same_v<T, CountTokens> ||
+            if constexpr (std::is_same_v<T, DecodeTokens> || std::is_same_v<T, CountTokens> ||
                           std::is_same_v<T, PrepareDuplex> || std::is_same_v<T, PrepareDuplexStep>) {
                 if (!text_) throw std::invalid_argument("text control requires a tokenizer");
                 if constexpr (std::is_same_v<T, DecodeTokens>)

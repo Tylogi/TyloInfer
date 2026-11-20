@@ -2,7 +2,6 @@
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/deepseek_v41/vision.h"
 
-#include "engine/models/common/check.h"
 #include "engine/models/common/load.h"
 #include "engine/models/load.h"
 #include "engine/weights/loader.h"
@@ -19,7 +18,6 @@
 
 namespace tyloi::cuda::deepseek_v41 {
 
-using tyloi::models::require_model;
 
 void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
           std::string_view definition, std::int64_t context_size) {
@@ -27,25 +25,25 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
     const auto& source = *model.source;
     ::tyloi::models::validate_model_source(source);
     model.graph = tyloi::models::graph(source);
-    require_model(Model::accepts_backbone(model.graph.backbone),
-                  "model backbone does not match the requested causal model");
+    if (!(Model::accepts_backbone(model.graph.backbone)))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     if (const auto* vision = model.graph.component("vision")) {
-        require_model(vision->tensor_root == "vision" && vision->implementation == "deepseek_v41_vision" &&
-                      vision->input_contract == "deepseek_v41_vision.v1" &&
-                      vision->position_policy == "deepseek_v41_positions",
-                      "unsupported DeepSeek-V4.1 vision component declaration");
+        if (!(vision->tensor_root == "vision" && vision->implementation == "deepseek_v41_vision" &&
+            vision->input_contract == "deepseek_v41_vision.v1" &&
+            vision->position_policy == "deepseek_v41_positions"))
+            throw std::runtime_error("unsupported DeepSeek-V4.1 vision component declaration");
     }
     if (const auto* predictor = model.graph.component("predictor")) {
-        require_model(predictor->tensor_root == "predictor" && predictor->implementation == "deepseek_v41_dspark" &&
-                      predictor->input_contract.empty() && predictor->position_policy.empty(),
-                      "unsupported DeepSeek-V4.1 predictor component declaration");
+        if (!(predictor->tensor_root == "predictor" && predictor->implementation == "deepseek_v41_dspark" &&
+            predictor->input_contract.empty() && predictor->position_policy.empty()))
+            throw std::runtime_error("unsupported DeepSeek-V4.1 predictor component declaration");
     }
     model.load_config(definition);
-    require_model(model.num_hidden_layers() == model.graph.topology.text_layers,
-                  "model graph/config text-layer topology mismatch");
+    if (!(model.num_hidden_layers() == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context_size > 0) {
-        require_model(context_size <= model.max_position_embeddings(),
-                      "--ctx-size exceeds max_position_embeddings");
+        if (!(context_size <= model.max_position_embeddings()))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         model.config.max_position_embeddings = context_size;
         model.metadata.max_position_embeddings = context_size;
     }
@@ -72,8 +70,8 @@ void load_weights(Model& model, const tyloi::weights::Loader& tensors,
             std::cerr << "loading layer " << layer << ' ' << type << ' '
                       << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
             auto placed = tensors.for_layer(cpu_offloaded ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, device));
-            TYLOINFER_RUNTIME_CHECK(type == "deepseek_v41" && model.tables.engram_parameters,
-                                    "invalid DeepSeek-V4.1 block loader state");
+            if (!(type == "deepseek_v41" && model.tables.engram_parameters))
+                throw std::runtime_error("invalid DeepSeek-V4.1 block loader state");
             auto block = deepseek_v41_runtime::load_block(placed,
                 layer, model.config, model.tables, cache_rows);
             block->cuda_device = device;

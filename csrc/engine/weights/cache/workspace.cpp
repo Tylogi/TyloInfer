@@ -2,6 +2,9 @@
 
 #include "engine/ops/ops.h"
 #include "engine/weights/moe/residency/expert_cache.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/weights/moe/residency/expert_cache_internal.h"
+#endif
 #include "engine/weights/moe/residency/kv_expert_loan.h"
 #include "engine/weights/cache/resources.h"
 #include "engine/weights/tq/cache.h"
@@ -307,16 +310,109 @@ void Cache::append_workspace_metrics(
         {"prefill_workspace_expert_reclaimed_used_bytes", double(prefill_reclaimed_used)}});
 }
 
-} // namespace tyloi::weights
+struct Loan::Impl {
+    Cache& weights;
+    std::shared_ptr<MoeExpertCache> moe;
+    std::shared_ptr<cuda::Context> context;
+    cuda::StreamHandle compute;
+};
 
-tyloi::weights::Loan::Loan(Cache& cache, std::size_t bytes) : Loan(cache) { begin(bytes); }
+Loan::Loan(Cache& cache) { cache.lend(*this); }
 
-void tyloi::weights::Loan::finish(Tensor& output) {
+void Cache::lend(Loan& loan) {
+    loan.impl_ = std::make_unique<Loan::Impl>(*this,
+        moe_expert_cache_has_sources(data_->moe) ? data_->moe : nullptr);
+}
+
+Loan::Loan(Cache& cache, std::size_t bytes) : Loan(cache) { begin(bytes); }
+
+Loan::~Loan() {
+    if (!active_) return;
+    try {
+        finish();
+    } catch (const std::exception& error) {
+        if (impl_->context) impl_->context->retire_workspace_loan();
+        std::cerr << "runtime_prefill_loan cleanup_error=" << error.what() << '\n';
+    }
+}
+
+std::size_t Loan::begin(std::size_t bytes) {
+    if (active_) throw std::logic_error("prefill workspace loan is already active");
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (impl_->moe) {
+        const auto borrowed = impl_->moe->begin_prefill_loan(bytes);
+        active_ = borrowed != 0;
+        return borrowed;
+    }
+#endif
+    if (const auto& tq = impl_->weights.data_->tq; tq && bytes) {
+        const auto device = mfq_current_cuda_device();
+        const auto context = cuda::default_context(device);
+        if (context->available_memory() >= bytes) return 0;
+        const auto compute = cuda::current_stream(device);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(compute.stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone || cuda::GraphAllocationPlan::warming()) return 0;
+        if (!context->workspace_loan_active() && tq->lendable_bytes(device)) {
+            context->reclaim_idle_memory();
+            const auto available = context->available_memory();
+            if (available >= bytes) return 0;
+            if (auto storage = tq->take_workspace(device, bytes - available)) {
+                // The cache no longer hands out this image. Drain its submitted readers before reuse.
+                TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
+                storage->record_stream(reinterpret_cast<std::uintptr_t>(compute.stream()), compute.lifetime());
+                const auto capacity = storage->bytes & ~std::size_t(255);
+                context->begin_workspace_loan({{storage->base, capacity}}, compute.stream(), storage);
+                impl_->context = context;
+                impl_->compute = compute;
+                active_ = true;
+                return capacity;
+            }
+        }
+    }
+    impl_->weights.workspace(bytes);
+    return 0;
+}
+
+std::size_t Loan::predictor(std::size_t bytes) {
+    prepare_moe_decode_residency(impl_->moe);
+    return begin(bytes + moe_prefill_transfer_bytes(impl_->moe, true));
+}
+
+std::size_t Loan::transfer_bytes() const {
+    return moe_prefill_transfer_bytes(impl_->moe, false);
+}
+
+void Loan::suspend() {
+    if (!active_) return;
+    if (impl_->context) impl_->context->suspend_workspace_loan();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    else impl_->moe->suspend_prefill_loan();
+#endif
+}
+
+void Loan::finish() {
+    if (!active_) return;
+    if (impl_->context) {
+        const MfqCudaGuard guard(impl_->compute.device_index());
+        suspend();
+        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(impl_->compute.stream()));
+        impl_->context->end_workspace_loan();
+        impl_->context.reset();
+        impl_->compute = {};
+    }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    else impl_->moe->end_prefill_loan();
+#endif
+    active_ = false;
+}
+
+void Loan::finish(Tensor& output) {
     Tensor* slot = &output;
     finish(std::span<Tensor* const>(&slot, 1));
 }
 
-void tyloi::weights::Loan::finish(std::span<Tensor* const> outputs) {
+void Loan::finish(std::span<Tensor* const> outputs) {
     for (std::size_t i = 0; i < outputs.size(); ++i) {
         if (!outputs[i]) throw std::invalid_argument("loan output slot is null");
         for (std::size_t j = 0; j < i; ++j)
@@ -328,3 +424,5 @@ void tyloi::weights::Loan::finish(std::span<Tensor* const> outputs) {
         finish();
     }
 }
+
+} // namespace tyloi::weights

@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/ops/attention/kv/paged.h"
 #include "engine/backends/cuda/executor/executor.h"
 
+#include <stdexcept>
 #include <optional>
 #include <utility>
 
@@ -48,11 +49,10 @@ std::pair<tyloi::DenseTensor, tyloi::DenseTensor> ops::append_kv(
         return {k,v};
     }
     if (cache.paged()) {
-        TYLOINFER_RUNTIME_CHECK(
-            paged_batch == kh.size(0) && paged_heads == kh.size(1) &&
+        if (!(paged_batch == kh.size(0) && paged_heads == kh.size(1) &&
             paged_head_dim == kh.size(3) &&
-            page_size > 0 && pages_per_chunk > 0,
-            "Paged KV cache geometry does not match the write");
+            page_size > 0 && pages_per_chunk > 0))
+            throw std::runtime_error("Paged KV cache geometry does not match the write");
         paged_kv_cache_write_cuda(
             k_chunk_ptrs, v_chunk_ptrs, page_table,
             kh, vh, pos, page_size, pages_per_chunk);
@@ -72,14 +72,13 @@ std::pair<tyloi::DenseTensor, tyloi::DenseTensor> ops::append_kv(
         }
         return {kh, vh};
     }
-    TYLOINFER_RUNTIME_CHECK(
-        kh.dim() == 4 && vh.sizes() == kh.sizes() &&
+    if (!(kh.dim() == 4 && vh.sizes() == kh.sizes() &&
         kh.size(0) == k.size(0) && kh.size(1) == k.size(1) &&
         kh.size(3) == k.size(3) &&
         ((pos.dim() == 1 && pos.numel() == kh.size(2)) ||
          (pos.dim() == 2 && pos.size(0) == kh.size(0) &&
-          pos.size(1) == kh.size(2))),
-        "KV cache write requires positions [T] or [B,T]");
+          pos.size(1) == kh.size(2)))))
+        throw std::runtime_error("KV cache write requires positions [T] or [B,T]");
     if (k.is_cuda() && !aten_write && !ring) {
         auto out = kv_cache_write_cuda(k, v, kh, vh, pos);
         (void)out;

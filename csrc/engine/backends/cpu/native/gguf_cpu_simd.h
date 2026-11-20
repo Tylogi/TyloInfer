@@ -1,4 +1,4 @@
-// Adapted from Strata (MIT), cpp_runtime/third_party/strata.LICENSE.
+// Adapted from Strata (MIT), LICENSES/Strata-MIT.txt.
 // include/strata/kernels/cpu/iq_avx2.hpp - AVX-2 multi-token dot products for the i-quant expert
 // formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) against Q8_K activations (ggml's block_q8_K).
 //

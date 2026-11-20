@@ -1,4 +1,5 @@
 #pragma once
+#include <stdexcept>
 #include "env.h"
 
 // FP32 batched GR projection from compressed NINT weights. The only decoded
@@ -122,11 +123,11 @@ __global__ __launch_bounds__(BM*TileN/(RegisterN*RegisterM),1) void gr_prefill_m
 ::tyloi::DenseTensor gr_prefill_matmul(const tyloi::NintTensor& weight,
         const ::tyloi::DenseTensor& input) {
     auto x=input.scalar_type()==::tyloi::kFloat16 ? input.contiguous() : input.to(::tyloi::kFloat32).contiguous();
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.size(-1)==weight.neuron_len && weight.q_packed.is_cuda() &&
+    if (!(input.is_cuda() && input.size(-1)==weight.neuron_len && weight.q_packed.is_cuda() &&
         input.device()==weight.q_packed.device() && weight.gs>0 && weight.neuron_len>0 &&
         weight.neuron_len<=std::numeric_limits<int>::max() && weight.out>0 && weight.out<=std::numeric_limits<int>::max() &&
-        weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,
-        "GR prefill projection geometry mismatch");
+        weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs))
+        throw std::runtime_error("GR prefill projection geometry mismatch");
     const auto rows=x.numel()/weight.neuron_len;
     if(gr_prefill_blas_selected(weight,input))return gr_prefill_blas_fp32(weight,x);
     const auto* trace_geometry=tyloi::cuda::env_lookup("TYLOINFER_GR_PREFILL_GEOMETRY_TRACE");
@@ -138,7 +139,8 @@ __global__ __launch_bounds__(BM*TileN/(RegisterN*RegisterM),1) void gr_prefill_m
             (long long)rows,(long long)weight.out,(long long)weight.neuron_len,(long long)weight.gs,
             int(x.scalar_type()==::tyloi::kFloat16),int(weight.q8_zero));
     }
-    TYLOINFER_RUNTIME_CHECK(rows<=65535*16,"GR prefill projection exceeds CUDA grid geometry");
+    if (!(rows<=65535*16))
+        throw std::runtime_error("GR prefill projection exceeds CUDA grid geometry");
     MfqCudaGuard guard(input.device());
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_GR_PREFILL_MATMUL");
     int major=0;

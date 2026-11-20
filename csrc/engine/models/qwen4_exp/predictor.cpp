@@ -1,7 +1,6 @@
 #include "engine/models/qwen4_exp/predictor.h"
 #include "engine/models/qwen4_exp/state.h"
 #include "engine/models/qwen4_exp/layer.h"
-#include "engine/models/common/check.h"
 #include "engine/config.h"
 #include "engine/ops/ops.h"
 #include "engine/ops/residual.h"
@@ -89,11 +88,11 @@ Tensor Predictor::fuse(const Tensor& hidden, Tensor embeddings) const {
 void Predictor::validate_positions(const Tensor& positions, int64_t batch, int64_t tokens) {
     if (!positions.defined()) return;
     const auto dims = positions.dim();
-    tyloi::models::require_model((dims == 1 && positions.size(0) == tokens) ||
+    if (!((dims == 1 && positions.size(0) == tokens) ||
         (dims == 2 && (positions.size(0) == 3 || positions.size(0) == 4) && positions.size(1) == tokens) ||
         (dims == 3 && (positions.size(0) == 3 || positions.size(0) == 4) &&
-            (positions.size(1) == 1 || positions.size(1) == batch) && positions.size(2) == tokens),
-        "Qwen4 MTP positions require [T]/[3,T]/[4,T]/[3,B,T]/[4,B,T]");
+        (positions.size(1) == 1 || positions.size(1) == batch) && positions.size(2) == tokens)))
+        throw std::runtime_error("Qwen4 MTP positions require [T]/[3,T]/[4,T]/[3,B,T]/[4,B,T]");
 }
 
 Tensor Predictor::normalize_positions(const Tensor& positions, int64_t batch, int64_t tokens) const {
@@ -132,7 +131,8 @@ std::size_t Predictor::position_growth(const Tensor& positions, int64_t batch, i
 
 void Predictor::reset(tyloi::models::MtpState& value, int64_t next_batch) const {
     auto& request=state<PredictorState>(value);
-    tyloi::models::require_model(next_batch > 0, "Qwen4-Exp MTP batch must be positive");
+    if (!(next_batch > 0))
+        throw std::runtime_error("Qwen4-Exp MTP batch must be positive");
     request.release_graphs();
     for (std::size_t i=0; i<layers.size(); ++i)
         request.layer_states[i]->reset(*layers[i]);
@@ -146,15 +146,16 @@ std::vector<std::pair<Device, std::size_t>> Predictor::growth(
         const tyloi::models::MtpState& value, const Tensor& hidden, const Tensor& ids,
         const Tensor& positions, const tyloi::models::ForwardOptions&) const {
     const auto& request = state<PredictorState>(value);
-    tyloi::models::require_model(!layers.empty() && request.layer_states.size() == layers.size() &&
+    if (!(!layers.empty() && request.layer_states.size() == layers.size() &&
         ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 && hidden.dim() == 3 &&
         hidden.size(0) == ids.size(0) && hidden.size(1) == ids.size(1) &&
-        hidden.size(2) == hidden_norm.numel(), "invalid Qwen4 predictor growth geometry");
+        hidden.size(2) == hidden_norm.numel()))
+        throw std::runtime_error("invalid Qwen4 predictor growth geometry");
     const auto b = ids.size(0), t = ids.size(1);
     const bool reset = request.batch && request.batch != b;
     const auto start = reset ? 0 : request.lengths.front();
-    tyloi::models::require_model(start >= 0 && start <= config.maximum && t <= config.maximum - start,
-        "predictor history exceeds context capacity");
+    if (!(start >= 0 && start <= config.maximum && t <= config.maximum - start))
+        throw std::runtime_error("predictor history exceeds context capacity");
     std::vector<std::pair<Device, std::size_t>> result;
     const auto add = [&](Device target, std::size_t bytes) {
         if (!bytes) return;
@@ -186,29 +187,30 @@ std::pair<Tensor, Tensor> Predictor::evaluate(tyloi::models::MtpState& value, co
                                        const Tensor &supplied_positions,
                                        const Tensor &supplied_embeddings, bool history_only) const {
     auto& request=state<PredictorState>(value);
-    tyloi::models::require_model(!history_only || (cache && layers.size()==1),
-        "cache-only MTP priming requires a single predictor layer");
-    tyloi::models::require_model(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
-                          hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
-                          hidden.size(1) == ids.size(1) &&
-                          hidden.size(2) == hidden_norm.numel(),
-                      "Qwen4-Exp MTP input geometry mismatch");
+    if (!(!history_only || (cache && layers.size()==1)))
+        throw std::runtime_error("cache-only MTP priming requires a single predictor layer");
+    if (!(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
+        hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
+        hidden.size(1) == ids.size(1) &&
+        hidden.size(2) == hidden_norm.numel()))
+        throw std::runtime_error("Qwen4-Exp MTP input geometry mismatch");
     const auto b = ids.size(0), t = ids.size(1);
     validate_positions(supplied_positions, b, t);
     const auto capacity = config.maximum;
     const auto count = int64_t(request.lengths.size());
-    tyloi::models::require_model(count > 0 && b > 0 && t > 0, "invalid predictor geometry");
+    if (!(count > 0 && b > 0 && t > 0))
+        throw std::runtime_error("invalid predictor geometry");
     const auto layer = (depth % count + count) % count;
     if (cache && request.batch && request.batch != b)
         reset(value,b);
     const auto start = cache ? request.lengths[layer] : 0;
-    tyloi::models::require_model(start >= 0 && t <= capacity - start,
-                                 "predictor history exceeds context capacity");
+    if (!(start >= 0 && t <= capacity - start))
+        throw std::runtime_error("predictor history exceeds context capacity");
     auto embeds =
         supplied_embeddings.defined() ? supplied_embeddings : embed(ids);
-    tyloi::models::require_model(embeds.dim() == 3 && embeds.size(0) == b &&
-                          embeds.size(1) == t && embeds.size(2) == config.hidden,
-                      "Qwen4-Exp MTP embedding shape mismatch");
+    if (!(embeds.dim() == 3 && embeds.size(0) == b &&
+        embeds.size(1) == t && embeds.size(2) == config.hidden))
+        throw std::runtime_error("Qwen4-Exp MTP embedding shape mismatch");
     std::array<Tensor, 2> pos;
     {
         // Full positions persist across predictor priming tiles and must
@@ -268,13 +270,13 @@ tyloi::models::MtpStep Predictor::step(tyloi::models::MtpState& value, const tyl
 std::vector<tyloi::models::MtpStep> Predictor::batch_step(
         std::span<const tyloi::models::MtpRow> rows,
         const tyloi::models::ForwardOptions&) const {
-    tyloi::models::require_model(!rows.empty() && !layers.empty(),
-                                 "invalid Qwen4 predictor batch");
+    if (!(!rows.empty() && !layers.empty()))
+        throw std::runtime_error("invalid Qwen4 predictor batch");
 
     const auto& block = *layers.front();
-    tyloi::models::require_model(block.qsa && rows.size() <=
-                                     static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()),
-                                 "Qwen4 predictor batch requires QSA layers");
+    if (!(block.qsa && rows.size() <=
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())))
+        throw std::runtime_error("Qwen4 predictor batch requires QSA layers");
 
     std::vector<PredictorState*> requests;
     std::vector<Tensor> hidden_rows, id_rows, current_positions, full_positions;
@@ -286,21 +288,21 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
 
     const auto batch = static_cast<std::int64_t>(rows.size());
     for (const auto& row : rows) {
-        tyloi::models::require_model(row.state && row.state->belongs_to(*this),
-                                     "Qwen4 predictor batch state belongs to another model");
+        if (!(row.state && row.state->belongs_to(*this)))
+            throw std::runtime_error("Qwen4 predictor batch state belongs to another model");
         auto& request = state<PredictorState>(*row.state);
-        tyloi::models::require_model(request.layer_states.size() == layers.size() &&
-                request.positions.size() == layers.size() && request.lengths.size() == layers.size() &&
-                request.batch <= 1 && row.hidden.dim() == 3 && row.hidden.size(0) == 1 &&
-                row.hidden.size(1) == 1 && row.hidden.size(2) == hidden_norm.numel() &&
-                row.ids.dim() == 2 && row.ids.size(0) == 1 && row.ids.size(1) == 1,
-            "invalid Qwen4 predictor batch row geometry");
-        tyloi::models::require_model(request.layer_states.front() &&
-                request.layer_states.front()->qsa,
-            "Qwen4 predictor batch state has no QSA cache");
-        tyloi::models::require_model(request.lengths.front() >= 0 &&
-                request.lengths.front() <= config.maximum - 1,
-            "Qwen4 predictor batch history exceeds context capacity");
+        if (!(request.layer_states.size() == layers.size() &&
+            request.positions.size() == layers.size() && request.lengths.size() == layers.size() &&
+            request.batch <= 1 && row.hidden.dim() == 3 && row.hidden.size(0) == 1 &&
+            row.hidden.size(1) == 1 && row.hidden.size(2) == hidden_norm.numel() &&
+            row.ids.dim() == 2 && row.ids.size(0) == 1 && row.ids.size(1) == 1))
+            throw std::runtime_error("invalid Qwen4 predictor batch row geometry");
+        if (!(request.layer_states.front() &&
+            request.layer_states.front()->qsa))
+            throw std::runtime_error("Qwen4 predictor batch state has no QSA cache");
+        if (!(request.lengths.front() >= 0 &&
+            request.lengths.front() <= config.maximum - 1))
+            throw std::runtime_error("Qwen4 predictor batch history exceeds context capacity");
 
         requests.push_back(&request);
         hidden_rows.push_back(ops::copy(row.hidden, device));
@@ -376,8 +378,8 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
 
 void Predictor::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const {
     auto& request=state<PredictorState>(value);
-    tyloi::models::require_model(position >= 0 && position <= request.position(),
-                      "Qwen4-Exp MTP cache trim position is invalid");
+    if (!(position >= 0 && position <= request.position()))
+        throw std::runtime_error("Qwen4-Exp MTP cache trim position is invalid");
     constexpr size_t index = 0;
     if (index < layers.size() && layers[index]->qsa)
         layers[index]->qsa->truncate(*request.layer_states[index]->qsa,position);
@@ -450,9 +452,9 @@ MtpSessionState Predictor::capture_session_state(const tyloi::models::MtpState& 
     const auto& request=this->state<PredictorState>(value);
     const auto& hidden=input_hidden;
     const auto position=target_position-1;
-    tyloi::models::require_model(supports_session_state(value) && position>0 && position<=request.position() &&
-        hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
-        "Qwen4 MTP session boundary is unavailable");
+    if (!(supports_session_state(value) && position>0 && position<=request.position() &&
+        hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel()))
+        throw std::runtime_error("Qwen4 MTP session boundary is unavailable");
     MtpSessionState state;state.cache_pos=position;
     auto& snapshot=state.payload.emplace<tyloi::models::qwen4_exp::MtpSnapshot>();
     for(std::size_t i=0;i<layers.size();++i) {

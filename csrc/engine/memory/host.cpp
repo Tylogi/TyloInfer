@@ -80,14 +80,16 @@ std::size_t tyloi::reclaim_host_caches(std::size_t bytes) noexcept {
     return released;
 }
 
-void tyloi::reclaim_host(std::size_t bytes, std::uint64_t process_limit) noexcept {
-    if (!bytes) return;
+std::size_t tyloi::reclaim_host(std::size_t bytes, std::uint64_t process_limit) noexcept {
+    if (!bytes) return 0;
     try {
         const auto available = sample_host_memory().headroom(process_limit);
-        if (available >= bytes) return;
-        (void)reclaim_host_caches(bytes - available);
+        if (available >= bytes) return 0;
+        const auto reclaimed = reclaim_host_caches(bytes - available);
         trim_host_cache();
+        return reclaimed;
     } catch (...) {}
+    return 0;
 }
 
 tyloi::HostMemorySample tyloi::sample_host_memory() {

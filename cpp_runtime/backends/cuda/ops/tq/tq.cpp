@@ -2794,7 +2794,10 @@ public:
             CpuTimer source_timer(profile_?&source_prepare_ms_:nullptr);
             auto wire=[&] {
                 CpuTimer timer(profile_?&source_slice_ms_:nullptr);
-                if(!prefetched.empty())return std::move(prefetched.at(source_images.at(expert)));
+                // Earlier admissions can evict a hit that was absent from the initial miss batch.
+                if(const auto prepared=source_images.find(expert);
+                        !prefetched.empty() && prepared!=source_images.end())
+                    return std::move(prefetched.at(prepared->second));
                 return table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
             }();
             // Only source misses allocate new host images. Reclaim optional
@@ -3628,7 +3631,11 @@ struct TqMoeGraphStage {
                     hidden.data_ptr(),pairs.data_ptr(),int(count),int(banks[2]->out),type,plane.tile,stream.stream()));
                 if(recording && !direct) {
                     cudaStreamCaptureStatus capture;const cudaGraphNode_t* dependencies=nullptr;std::size_t n=0;
+#if CUDART_VERSION >= 13000
+                    TYLOINFER_CUDA_CHECK(cudaStreamGetCaptureInfo(stream.stream(),&capture,nullptr,nullptr,&dependencies,nullptr,&n));
+#else
                     TYLOINFER_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream.stream(),&capture,nullptr,nullptr,&dependencies,&n));
+#endif
                     if(capture!=cudaStreamCaptureStatusActive || n!=1)throw std::logic_error("TQ kernel capture has no unique node");
                     kernels.push_back({i,first,window.segments()-1,capacity,dependencies[0]});
                 }

@@ -11,8 +11,9 @@
 #include <unordered_map>
 #include <utility>
 
+namespace tyloi { struct Workspace; }
 namespace tyloi::state { class Sessions; }
-namespace tyloi::weights { class Memory; }
+namespace tyloi::weights { class Loan; class Memory; }
 namespace tyloi::engine {
 struct SessionCommand;
 struct SessionResult;
@@ -64,11 +65,11 @@ public:
     void share_ram(const void* worker, std::size_t bytes);
     void reserve(std::span<const std::pair<Device, std::size_t>> growth);
     void workspace(Device device, std::size_t bytes);
+    std::int64_t tiled_workspace(Device device, weights::Loan& loan, const Workspace& request);
     PrefillChunk batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
         std::size_t growth = 0);
     void request(Device device, bool retire_decode);
-    void prepare_prefill(Device device, std::size_t tokens, std::int64_t limit,
-        ::tyloi::weights::Cache::Prefill mode, bool retire_decode = false);
+    bool retained_prefill(std::size_t tokens, bool resumed) const;
     std::int64_t prefill(std::size_t tokens, std::int64_t limit,
         std::size_t row_bytes, bool resumed, bool automatic);
     std::int64_t chunk(Device device, std::size_t tokens, std::int64_t limit,

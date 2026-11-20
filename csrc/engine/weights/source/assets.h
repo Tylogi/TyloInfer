@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -16,7 +17,8 @@ public:
     void add_directory(const std::filesystem::path& directory);
 
     bool has(std::string_view name) const noexcept;
-    std::vector<std::byte> read(std::string_view name) const;
+    std::vector<std::byte> read(std::string_view name,
+        std::size_t maximum = std::numeric_limits<std::size_t>::max()) const;
     std::vector<std::string> names() const;
 
 private:

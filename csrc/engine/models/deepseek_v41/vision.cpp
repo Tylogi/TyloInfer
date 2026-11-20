@@ -2,6 +2,7 @@
 #include "vision.h"
 #include "engine/models/deepseek_v41/axial_patch_encoder.h"
 #include "engine/state/session/prefix_cache.h"
+#include <string>
 #include <stdexcept>
 #include "engine/ops/ops.h"
 
@@ -11,7 +12,8 @@ namespace {
 ::tyloi::Tensor vector_weight(const tyloi::weights::Loader& weights,
                      const std::string& name,int64_t width) {
     auto value=weights.tensor(name);
-    TYLOINFER_RUNTIME_CHECK(value.dim()==1 && value.size(0)==width,"DeepSeek-V4.1 vision vector shape mismatch: "+name);
+    if (!(value.dim()==1 && value.size(0)==width))
+        throw std::runtime_error("DeepSeek-V4.1 vision vector shape mismatch: "+name);
     return value;
 }
 
@@ -54,13 +56,17 @@ std::vector<Span> validate_media(const CommonConfig& config,const std::vector<in
 
 Vision Vision::load(std::shared_ptr<const tyloi::ModelSource> source, tyloi::weights::Loader weights,
         const CommonConfig& config) {
-    TYLOINFER_RUNTIME_CHECK(source && config.has_vision() && config.image_token_id>=0 &&
+    if (!(source && config.has_vision() && config.image_token_id>=0 &&
         config.image_token_id<config.vocab && config.vision.hidden%config.vision.n_heads==0 &&
-        (config.vision.hidden/config.vision.n_heads)%4==0,"invalid DeepSeek-V4.1 CUDA vision config");
+        (config.vision.hidden/config.vision.n_heads)%4==0))
+        throw std::runtime_error("invalid DeepSeek-V4.1 CUDA vision config");
     for(const auto* name:{"vision.patch_embedding.weight","vision.output_norm.weight",
             "vision.aligner.input.weight","vision.aligner.output.weight","vision.special_token.start",
             "vision.special_token.newline","vision.special_token.end"})
-        TYLOINFER_RUNTIME_CHECK(has_tensor(*source,name),std::string("DeepSeek-V4.1 vision tensor missing: ")+name);
+        {
+            if (!has_tensor(*source,name))
+                throw std::runtime_error(std::string("DeepSeek-V4.1 vision tensor missing: ")+name);
+        }
     return Vision(std::move(source), std::move(weights),
         config);
 }
@@ -119,8 +125,8 @@ tyloi::StepSequence<tyloi::models::Prepared> Vision::prepare(
             images.store(key,visual);
         }
         const bool aligned=visual && visual.dim()==2 && visual.size(0)==span.rows*span.columns && visual.size(1)==config_.hidden;
-        TYLOINFER_RUNTIME_CHECK(aligned,
-                          "DeepSeek-V4.1 aligned image shape mismatch");
+        if (!aligned)
+            throw std::runtime_error("DeepSeek-V4.1 aligned image shape mismatch");
         const auto host=weights_.for_layer(::tyloi::Device(::tyloi::kCPU));
         auto start_weight=vector_weight(host,"vision.special_token.start",config_.hidden);
         auto newline_weight=vector_weight(host,"vision.special_token.newline",config_.hidden);

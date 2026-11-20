@@ -3174,8 +3174,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         return append_tail && remaining<=batch_tokens+1024?remaining:std::min(batch_tokens,remaining);
     };
     TYLOINFER_RUNTIME_CHECK(!batch_experts || batch_tokens>=1024,"expert prefill batch must cover at least 1024 tokens");
-    const auto audit_option=mfq::cuda::runtime_options::prefill_expert_batch_audit();
-    const bool audit_batch=audit_option && *audit_option!=0;
     const auto started=std::chrono::steady_clock::now();
     int layer=0;
     for(auto& block:model.blocks) {
@@ -3304,28 +3302,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
                 return result;
             });
             if(!branch.defined())return {};
-            if(audit_batch) {
-                auto expected=tb::empty(branch.sizes(),branch.options());
-                for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
-                    const auto count=std::min(compute_chunk,tokens-begin);
-                    expected.narrow(1,begin,count).copy_(
-                        qwen_block.ffn(*model.execution,ffn_inputs.narrow(1,begin,count)));
-                }
-                auto a=branch.to(tb::kCPU,tb::kFloat32).contiguous();
-                auto b=expected.to(tb::kCPU,tb::kFloat32).contiguous();
-                double error=0,scale=0,maximum=0;
-                for(int64_t i=0;i<a.numel();++i) {
-                    const double delta=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
-                    error+=delta*delta;scale+=double(b.data_ptr<float>()[i])*b.data_ptr<float>()[i];
-                    maximum=std::max(maximum,std::abs(delta));
-                }
-                std::cout<<"prefill_expert_batch_layer_oracle layer="<<layer<<" tokens="<<tokens
-                    <<" relative_rms="<<std::sqrt(error/std::max(1e-30,scale))
-                    <<" maximum_absolute="<<maximum<<std::endl;
-                // Diagnostic only: continue with the reference so later
-                // layers are tested with their original input distribution.
-                branch=std::move(expected);
-            }
             Tensor post_hidden=next_hidden;
             profiler.measure("prefill.gr_ffn_post",[&] {
                 for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {

@@ -1,11 +1,13 @@
 #include "engine/memory/budget.h"
 
 #include "engine/generation/prefill/budget.h"
+#include "engine/generation/sequence.h"
 #include "engine/memory/host.h"
 #include "engine/state/session/sessions.h"
 #include "engine/requests/processor.h"
 #include "engine/engine.h"
 #include "engine/weights/memory.h"
+#include "engine/weights/cache/workspace.h"
 #include "components/error.h"
 
 #include <algorithm>
@@ -173,6 +175,44 @@ void Budget::workspace(Device device, std::size_t bytes) {
         <<" available_bytes="<<memory(device).allocatable<<" prefix_released_bytes="<<released<<'\n';
 }
 
+std::int64_t Budget::tiled_workspace(Device device, weights::Loan& loan, const Workspace& request) {
+    require_device(device);
+    if (!request.bytes || !request.tile || !request.tile->compute ||
+        *request.tile->compute <= 0 || request.tile->tokens <= 0 || !request.tile->row_bytes)
+        throw std::invalid_argument("invalid prefill workspace geometry");
+    const auto& tile = *request.tile;
+    const auto bytes_for = [&](std::int64_t rows) {
+        constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+        return std::size_t(rows) > maximum / tile.row_bytes ? maximum : std::size_t(rows) * tile.row_bytes;
+    };
+    auto resources = memory(device);
+    auto experts = weights_.prefill_budget(true);
+    auto reusable = prefill_budget_add(resources.workspace, experts.lendable_bytes);
+    auto fixed = prefill_budget_add(request.bytes, experts.transfer_bytes);
+    const auto wanted = std::min({tile.tokens, *tile.compute, max_prefill_compute_chunk});
+    const auto required = prefill_budget_add(fixed, bytes_for(wanted));
+    if (required > prefill_budget_add(resources.allocatable, reusable)) {
+        workspace(device, required - reusable);
+        resources = memory(device);
+        experts = weights_.prefill_budget(true);
+        reusable = prefill_budget_add(resources.workspace, experts.lendable_bytes);
+        fixed = prefill_budget_add(request.bytes, experts.transfer_bytes);
+    }
+    const auto before = prefill_budget_add(resources.allocatable, reusable);
+    const auto requested = select_prefill_chunk(tile.tokens, wanted, before, fixed, tile.row_bytes);
+    if (!requested) throw std::runtime_error("insufficient prefill workspace before expert loan");
+    loan.begin(prefill_budget_add(fixed, bytes_for(requested)));
+    resources = memory(device);
+    const auto after = prefill_budget_add(resources.allocatable, resources.workspace);
+    const auto admitted = select_prefill_chunk(tile.tokens, requested, after,
+        prefill_budget_add(request.bytes, loan.transfer_bytes()), tile.row_bytes);
+    if (!admitted) throw std::runtime_error("insufficient prefill workspace after expert loan");
+    if (admitted != requested)
+        std::cerr << "runtime_prefill_chunk_budget requested=" << requested
+                  << " compute=" << admitted << " available_bytes=" << after << '\n';
+    return admitted;
+}
+
 PrefillChunk Budget::batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
         std::size_t growth) {
     require_device(device);
@@ -196,23 +236,28 @@ void Budget::request(Device device, bool retire_decode) {
     executor_.reclaim(device);
 }
 
-void Budget::prepare_prefill(Device device, std::size_t tokens, std::int64_t limit,
-        ::tyloi::weights::Cache::Prefill mode, bool retire_decode) {
-    require_device(device);
-    if (auto bytes = weights_.prepare_prefill(device, tokens, limit, mode, retire_decode))
-        workspace(device, *bytes);
+bool Budget::retained_prefill(std::size_t tokens, bool resumed) const {
+    return resumed && tokens <= 128 && weights_.routing().storage_misses;
 }
 
 std::int64_t Budget::prefill(std::size_t tokens, std::int64_t limit,
         std::size_t row_bytes, bool resumed, bool automatic) {
-    prepare_prefill(primary_, tokens, limit, weights_.prefill_mode(tokens, resumed));
+    const auto routing = weights_.routing();
+    if (retained_prefill(tokens, resumed)) {
+        std::cerr << "runtime_streamed_prefill retained_decode=1 tokens=" << tokens
+                  << " chunk=" << std::min<std::int64_t>(4, limit) << '\n';
+    } else if (primary_.is_cuda() && (!routing.fixed_views || routing.shared_slots)) {
+        const auto reserve = weights_.storage_workspace_reserve();
+        if (tokens > 8 && routing.storage_misses) weights_.lend_decode_storage(reserve);
+        if (tokens > 1024 || routing.storage_misses) workspace(primary_, reserve);
+    }
     return chunk(primary_, tokens, limit, row_bytes, resumed, automatic);
 }
 
 std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit,
         std::size_t row_bytes, bool resumed, bool automatic, bool allow_borrow) {
     require_device(device);
-    if (weights_.prefill_mode(tokens, resumed) == ::tyloi::weights::Cache::Prefill::retained)
+    if (retained_prefill(tokens, resumed))
         return std::min<int64_t>(4, limit);
     if (tokens <= 128) return std::min<int64_t>(std::max<std::size_t>(1, tokens), limit);
 

@@ -34,6 +34,11 @@ struct QuantLinearGroup;
 
 class TqExec;
 namespace tyloi::cuda { class Collectives; }
+namespace tyloi::cuda::gguf { struct GgufPrefillProduct; }
+namespace tyloi::cuda {
+gguf::GgufPrefillProduct mfq_prefill_product(const Tensor& weight, const DenseTensor& input,
+    const DenseTensor& input_exponents = {});
+}
 
 ::tyloi::DenseTensor run_nint_linear(
     CudaProfiler& profiler, KlMmqState& kl_mmq,
@@ -67,7 +72,8 @@ struct NintLinearGroup {
 template <class Format>
 const Format& payload_as(const ::tyloi::Tensor& weight) {
     const auto* found = weight.representation<Format>();
-    TYLOINFER_RUNTIME_CHECK(found, "projection weight has an unexpected representation");
+    if (!found)
+        throw std::runtime_error("projection weight has an unexpected representation");
     return *found;
 }
 
@@ -147,3 +153,4 @@ bool nvq_fused_residual_format(std::int64_t kernel_format);
 
 ::tyloi::DenseTensor quant_linear_reference_weight(
     const ::tyloi::Tensor& linear);
+::tyloi::DenseTensor prefill_linear_weight(const ::tyloi::Tensor& linear);

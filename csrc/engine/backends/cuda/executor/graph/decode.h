@@ -5,6 +5,7 @@
 #include "engine/ops/ops.h"
 #include "engine/executor.h"
 
+#include <stdexcept>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -107,14 +108,14 @@ void prepare_decode_graph_memory(
     const int64_t saved_position = position_state.position();
     auto restore = [&]() {
         for (const auto& state : saved) {
-            TYLOINFER_RUNTIME_CHECK(decode_graph_detail::same_layout(state.layout, *state.target),
-                "decode warmup changed recurrent storage addresses");
+            if (!decode_graph_detail::same_layout(state.layout, *state.target))
+                throw std::runtime_error("decode warmup changed recurrent storage addresses");
             ::tyloi::ops::copy_into(*state.target, state.value);
-            TYLOINFER_RUNTIME_CHECK(decode_graph_detail::same_layout(state.layout, *state.target),
-                "decode warmup changed recurrent storage addresses");
+            if (!decode_graph_detail::same_layout(state.layout, *state.target))
+                throw std::runtime_error("decode warmup changed recurrent storage addresses");
         }
-        TYLOINFER_RUNTIME_CHECK(position_state.position() == saved_position,
-            "static decode warmup changed cache position");
+        if (!(position_state.position() == saved_position))
+            throw std::runtime_error("static decode warmup changed cache position");
         if (participant_streams.empty()) {
             TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(
                 mfq_get_current_cuda_stream().stream()));

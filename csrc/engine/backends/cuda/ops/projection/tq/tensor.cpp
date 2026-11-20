@@ -4,7 +4,12 @@
 #include "engine/weights/tq/image.h"
 #include "engine/backends/cuda/native/blas.h"
 #include "engine/backends/cuda/ops/activation.h"
+#include "engine/backends/cuda/ops/gguf/prefill_fusion.h"
+#include "engine/backends/cuda/kernels/projection/gguf/linear.h"
+#include "engine/backends/cuda/ops/projection/prefill.h"
+#include "components/error.h"
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -81,6 +86,90 @@ void project_tokens(const TrellisProjectionView& view,tyloi::cuda::BlasResources
             static_cast<unsigned long long>(bytes));
     return ::tyloi::cuda::empty({static_cast<std::int64_t>(bytes)},weight.options().dtype(::tyloi::kUInt8));
 }
+
+bool scaled_prefill(const tyloi::encoding::TqTensor& weight,
+        const tyloi::DenseTensor& source, const tyloi::DenseTensor& output,
+        tyloi::cuda::gguf::GgufPrefillProduct* deferred = nullptr,
+        const tyloi::DenseTensor& input_exponents = {}) {
+    using namespace tyloi;
+    using namespace tyloi::cuda;
+    const auto columns = weight.size(1), rows = weight.size(0);
+    const bool packed_input = input_exponents.defined();
+    if (columns <= 0 || rows <= 0 || !source.is_cuda() ||
+        source.device() != weight.device() || !source.is_contiguous() ||
+        source.scalar_type() != (packed_input ? kFloat16 : kFloat32) ||
+        source.dim() < 1 || source.size(-1) != columns)
+        return false;
+    const auto tokens = source.numel() / columns;
+    if (packed_input && (input_exponents.device() != source.device() || input_exponents.scalar_type() != kInt32 ||
+        !input_exponents.is_contiguous() || input_exponents.numel() != tokens))
+        return false;
+    const auto* setting = env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+    if (tokens <= 32 || tokens > INT_MAX ||
+        (setting && setting[0] != '1' && setting[0] != 'a') ||
+        ((!setting || setting[0] == 'a') && tokens < 512)) return false;
+    const auto device = source.get_device();
+    const DeviceGuard guard(device);
+    const auto stream = current_stream(device);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone || GraphAllocationPlan::warming() ||
+        !gguf::grouped_f16_available(device)) return false;
+
+    const auto half = source.options().dtype(kFloat16);
+    const auto integers = source.options().dtype(kInt32);
+    const auto bytes_per_row = 2 * (std::uint64_t(columns) + tokens) + sizeof(std::int32_t);
+    const auto cap = std::clamp<std::int64_t>((64ull << 20) / bytes_per_row, 1, 65535);
+    const auto tile = std::min(cap, prefill_weight_rows(rows, bytes_per_row, 32, device));
+    // shortcut: defer restoration only if one tile fits, extend once multi-tile products are validated.
+    if (deferred && tile != rows) return false;
+    DenseTensor input, row_exponents, image, column_exponents, product;
+    if (packed_input) {
+        input = source;
+        row_exponents = input_exponents;
+    }
+    const bool prepared = packed_input || gguf::GgufPrefillInputScope::lookup(source, input, row_exponents);
+    try {
+        if (!prepared) {
+            input = empty({tokens, columns}, half);
+            row_exponents = empty({tokens}, integers);
+        }
+        image = empty({tile, columns}, half);
+        column_exponents = empty({tile}, integers);
+        product = empty({tokens, tile}, half);
+    } catch (const MfqResourceExhausted&) {
+        return false;
+    }
+    if (!prepared) gguf::pack_scaled_f16_unit(source.data_ptr<float>(), input.data_ptr(),
+        row_exponents.data_ptr<std::int32_t>(), tokens, columns, stream.stream());
+    mfq_cuda_record_stream(weight.image(), stream);
+    auto& blas = default_context(device)->blas(stream.stream());
+    const auto packed = tq::view(weight);
+    for (std::int64_t first = 0; first < rows; first += tile) {
+        const auto count = std::min(tile, rows - first);
+        // shortcut: compute scales per tile, cache them if profiling shows repeated row scans dominate.
+        tq_detail::status(tq_decode_scaled_rows(packed, static_cast<int>(first), static_cast<int>(count),
+            column_exponents.data_ptr<std::int32_t>(), image.data_ptr(), stream.stream()));
+        if (deferred) {
+            assert(first == 0 && count == rows);
+            gguf::prefill_gemm_f16_accum(input.data_ptr(), image.data_ptr(), nullptr, product.data_ptr(),
+                true, nullptr, nullptr, tokens, rows, columns, rows, blas.get(), stream.stream());
+            *deferred = {std::move(product), std::move(row_exponents), std::move(column_exponents)};
+            return true;
+        }
+        gguf::prefill_gemm_f16_accum(input.data_ptr(), image.data_ptr(), product.data_ptr(),
+            output.data_ptr<float>() + first, false, row_exponents.data_ptr<std::int32_t>(),
+            column_exponents.data_ptr<std::int32_t>(), tokens, count, columns, rows, blas.get(), stream.stream());
+    }
+    return true;
+}
+}
+
+tyloi::cuda::gguf::GgufPrefillProduct tyloi::cuda::tq::prefill_product(
+        const encoding::TqTensor& weight, const DenseTensor& input, const DenseTensor& input_exponents) {
+    gguf::GgufPrefillProduct product;
+    scaled_prefill(weight, input, {}, &product, input_exponents);
+    return product;
 }
 
 ::tyloi::DenseTensor tyloi::cuda::tq::project(const ::tyloi::encoding::TqTensor& weight, BlasResources* blas,DenseTensor input) {
@@ -92,11 +181,12 @@ void project_tokens(const TrellisProjectionView& view,tyloi::cuda::BlasResources
     const auto out=weight.size(0),neuron_len=weight.size(1);
     if(input.size(-1)!=neuron_len || !input.is_cuda() || input.get_device()!=weight.get_device())
         throw std::invalid_argument("TQ projection input shape or device differs");
-    const auto kernel_view=view(weight);
     const MfqCudaGuard guard(weight.get_device());
     const auto source=input.contiguous();auto shape=input.sizes().vec();shape.back()=out;
     auto result=::tyloi::cuda::empty(shape,input.options());
     const auto tokens=source.numel()/neuron_len;
+    if(blas && scaled_prefill(weight,source,result))return result;
+    const auto kernel_view=view(weight);
     const auto element=source.element_size();
     const auto workspace=projection_workspace(weight,static_cast<int>(std::min<std::int64_t>(tokens,65535)),source.scalar_type());
     auto* gemm = tokens >= tq_detail::gemm_min_tokens(source.scalar_type()) ? blas : nullptr;
@@ -108,6 +198,35 @@ void project_tokens(const TrellisProjectionView& view,tyloi::cuda::BlasResources
     }
     return result;
 }
+::tyloi::DenseTensor tyloi::cuda::tq::project_prefill_residual(const encoding::TqTensor& weight,
+        const DenseTensor& input, const DenseTensor& residual) {
+    const auto rows = weight.size(0), columns = weight.size(1);
+    if (input.dim() != 2 || input.size(1) != columns || input.scalar_type() != kFloat16 ||
+        !input.is_contiguous() || input.device() != weight.device() ||
+        !can_prefill_f16_residual(input.size(0), rows, columns, weight.device(), residual)) return {};
+    const MfqCudaGuard guard(weight.get_device());
+    const auto stream = current_stream(weight.get_device());
+    const auto tile = std::min<std::int64_t>(65535,
+        prefill_weight_rows(rows, columns * sizeof(std::uint16_t), 32, weight.get_device()));
+    DenseTensor decoded, output, scratch;
+    try {
+        output = empty_like(residual);
+        decoded = empty({tile, columns}, input.options());
+    } catch (const MfqResourceExhausted&) {
+        return {};
+    }
+    for (const auto& tensor : {weight.image(), input, residual}) mfq_cuda_record_stream(tensor, stream);
+    const auto packed = view(weight);
+    auto& blas = default_context(weight.get_device())->blas(stream.stream());
+    for (std::int64_t first = 0; first < rows; first += tile) {
+        const auto count = std::min(tile, rows - first);
+        tq_detail::status(mfq_tq_decode_rows(packed, static_cast<int>(first), static_cast<int>(count),
+            decoded.data_ptr(), stream.stream()));
+        prefill_f16_residual_tile(input, decoded, residual, output, first, count, blas.get(), scratch);
+    }
+    return output;
+}
+
 ::tyloi::DenseTensor tyloi::cuda::tq::groupwise(const ::tyloi::encoding::TqTensor& weight, BlasResources* blas,DenseTensor input,std::int64_t groups) {
     input.require_dense();
     if(!input.is_cuda())throw std::invalid_argument("TQ grouped input must match the weight's group rows and width");

@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "env.h"
 #include "engine/backends/cuda/kernels/projection/sq/mxfp4_raw.h"
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -21,11 +22,10 @@ tyloi::sq::Layout validate(
     const auto q = bits == 0
         ? tyloi::sq::adaptive_layout(outputs, width, base, q_sum, sq4_rows)
         : tyloi::sq::layout(bits, outputs, width, base);
-    TYLOINFER_RUNTIME_CHECK(blob.is_cuda() && blob.scalar_type() == ::tyloi::kUInt8 &&
-        blob.dim() == 1 && blob.is_contiguous() && std::size_t(blob.numel()) == q.bytes,
-        "MXFP4-SQ blob requires contiguous rank-1 CUDA uint8 and exact payload length");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
+    if (!(blob.is_cuda() && blob.scalar_type() == ::tyloi::kUInt8 &&
+        blob.dim() == 1 && blob.is_contiguous() && std::size_t(blob.numel()) == q.bytes))
+        throw std::runtime_error("MXFP4-SQ blob requires contiguous rank-1 CUDA uint8 and exact payload length");
+    if (!(row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
         row_q.scalar_type() == ::tyloi::kUInt8 &&
         row_q.dim() == 1 && row_q.is_contiguous() && row_q.numel() == outputs &&
         row_symbol_byte_offsets.is_cuda() &&
@@ -37,10 +37,10 @@ tyloi::sq::Layout validate(
         row_auxiliary.is_cuda() && row_auxiliary.get_device() == blob.get_device() &&
         row_auxiliary.scalar_type() == ::tyloi::kInt32 &&
         row_auxiliary.dim() == 1 && row_auxiliary.is_contiguous() &&
-        row_auxiliary.numel() == outputs,
-        "MXFP4-SQ row metadata requires matching contiguous CUDA arrays");
-    TYLOINFER_RUNTIME_CHECK(reinterpret_cast<std::uintptr_t>(blob.data_ptr<std::uint8_t>()) % 4 == 0,
-        "MXFP4-SQ blob must be 4-byte aligned");
+        row_auxiliary.numel() == outputs))
+        throw std::runtime_error("MXFP4-SQ row metadata requires matching contiguous CUDA arrays");
+    if (!(reinterpret_cast<std::uintptr_t>(blob.data_ptr<std::uint8_t>()) % 4 == 0))
+        throw std::runtime_error("MXFP4-SQ blob must be 4-byte aligned");
     return q;
 }
 
@@ -77,12 +77,12 @@ tyloi::sq::Layout validate(
     const auto q = validate(
         blob, row_q, row_symbol_byte_offsets, row_auxiliary,
         bits, outputs, width, base, q_sum, sq4_rows);
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.get_device() == blob.get_device() &&
+    if (!(input.is_cuda() && input.get_device() == blob.get_device() &&
         input.dim() == 2 && input.is_contiguous() && input.size(1) == width &&
         input.size(0) <= std::numeric_limits<int>::max() &&
         (input.scalar_type() == ::tyloi::kFloat16 ||
-         input.scalar_type() == ::tyloi::kFloat32),
-        "MXFP4-SQ activation requires contiguous rank-2 CUDA FP16/FP32 on the weight device");
+         input.scalar_type() == ::tyloi::kFloat32)))
+        throw std::runtime_error("MXFP4-SQ activation requires contiguous rank-2 CUDA FP16/FP32 on the weight device");
     const MfqCudaGuard guard(blob.device());
     auto out = ::tyloi::cuda::empty({input.size(0), outputs}, input.options());
     const int rows = int(input.size(0));
@@ -122,8 +122,7 @@ void mxfp4_sq_moe_matmul_cuda(
         blob, row_q, row_symbol_byte_offsets, row_auxiliary,
         bits, local_experts * out_per_expert, width, base,
         q_sum, sq4_rows);
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.get_device() == blob.get_device() &&
+    if (!(input.is_cuda() && input.get_device() == blob.get_device() &&
         input.is_contiguous() && input.scalar_type() == ::tyloi::kFloat16 &&
         (input.dim() == 2 || input.dim() == 3) && input.size(-1) == width &&
         expert_ids.is_cuda() && expert_ids.get_device() == blob.get_device() &&
@@ -140,12 +139,11 @@ void mxfp4_sq_moe_matmul_cuda(
         n_experts > 0 && local_experts > 0 && out_per_expert > 0 &&
         n_experts <= std::numeric_limits<int>::max() &&
         local_experts <= std::numeric_limits<int>::max() &&
-        out_per_expert <= std::numeric_limits<int>::max(),
-        "MXFP4-SQ routed matmul requires matching contiguous CUDA FP16 tensors");
+        out_per_expert <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("MXFP4-SQ routed matmul requires matching contiguous CUDA FP16 tensors");
     const auto route_count64 = expert_ids.numel();
-    TYLOINFER_RUNTIME_CHECK(
-        route_count64 <= std::numeric_limits<int>::max(),
-        "MXFP4-SQ route count exceeds CUDA limits");
+    if (!(route_count64 <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("MXFP4-SQ route count exceeds CUDA limits");
     if (route_count64 == 0) return;
     const MfqCudaGuard guard(blob.device());
     const auto stream = mfq_current_cuda_stream();

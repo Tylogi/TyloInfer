@@ -1,11 +1,11 @@
-# `mfq build`
+# `tyloinfer build`
 
-`mfq build` compiles the native inference runtime for the current machine. It
+`tyloinfer build` compiles the native inference runtime for the current machine. It
 detects Metal or CUDA, invokes CMake, and records the resulting executable so
-that [`mfq serve`](serve.md) can find it without a binary path.
+that [`tyloinfer serve`](serve.md) can find it without a binary path.
 
-The `mfq` command must come from an MFQ source checkout containing
-`csrc/CMakeLists.txt`. MFQ derives the repository root from the installed
+The `tyloinfer` command must come from a TyloInfer source checkout containing
+`csrc/CMakeLists.txt`. TyloInfer derives the repository root from the installed
 Python package, not from the current working directory. In an editable
 development environment, run the CLI through uv from that checkout.
 
@@ -27,7 +27,7 @@ uv sync
 Build with automatic backend detection:
 
 ```shell
-uv run mfq build
+uv run tyloinfer build
 ```
 
 Automatic backend selection uses:
@@ -39,8 +39,8 @@ Backend detection does not check every compiler dependency. Requirements are
 listed below. Pass the backend explicitly when debugging a build:
 
 ```shell
-uv run mfq build --backend metal
-uv run mfq build --backend cuda
+uv run tyloinfer build --backend metal
+uv run tyloinfer build --backend cuda
 ```
 
 ## Native format profiles
@@ -59,16 +59,17 @@ uv run tyloinfer build --build-dir build/native-compat -- -DTYLOINFER_ENABLE_MFQ
 Compatibility adds legacy NINT/NVQ/MFE/SQ inference; it does not add offline
 quantization or calibration. CMake and release packaging default to `OFF`;
 packaging accepts the same `TYLOINFER_ENABLE_MFQ_COMPAT=ON` environment setting.
+Native Metal can page streamable MFE/NINT expert banks with `--moe-gpu-cache-gb`;
+native MFE preload remains unsupported. Device and allocator acceptance is pending.
 ROCm's existing model/format coverage is unchanged; this switch does not add a
 TQ HIP implementation.
 
 ## CUDA backend layout
 
-Directory responsibilities and remaining work are defined by the
 CUDA numerical implementation lives under `csrc/engine/backends/cuda/`;
 shared state and weight management live under `csrc/engine/state/` and
-`csrc/engine/weights/`. Entry points and tools live under `csrc/apps/`,
-`csrc/commands/`, `csrc/eval/` and `csrc/diagnostics/`.
+`csrc/engine/weights/`. Entry points live under `csrc/apps/` and `csrc/commands/`.
+The diagnostic Program and its native eval wrappers have been removed.
 
 `mfq-weight-source` provides container reads and HF/GGUF/TQ weight preparation
 without model interpretation. `mfq-model-source` provides canonical model
@@ -84,20 +85,14 @@ loading assembly/finalization and shared model generation/MTP template instantia
 `mfq-engine` provides shared generation, request and state code. The shared
 session stores retain the `mfq-prefix-blocks` and `mfq-qsa-kv-store` targets,
 defined by `engine/state/CMakeLists.txt`.
-Compute, loading, evaluation and diagnostics can build without service
-communication. The full service and Torch reference runtime require
-`TYLOINFER_BUILD_RUNTIME_COMMUNICATION=ON`.
+Engine HTTP and stdio use `TYLOINFER_BUILD_TRANSPORT=ON`. Enable the separate
+`tyloinfer-server` target with `TYLOINFER_BUILD_SERVER=ON` in CMake.
 
 CUDA kernels have one source root: `csrc/engine/backends/cuda/kernels`.
-Native CMake and `tyloinfer.kernels.cuda._ext` compile sources from that root.
-JIT native headers and `env.cpp` use `engine/backends/cuda/native`.
-`packaging/python/build.py` collects kernel resources into the wheel's
-`tyloinfer/kernels/cuda` layout; `tq.py` uses checkout sources or installed
-wheel resources. Standalone releases install that wheel for PyInstaller.
+The CUDA and HIP backends retain native raw kernel launchers where used.
 
-Directory and interface changes have only been checked statically.
-Compilation, runtime behavior and Qwen35 full-chain acceptance remain unverified;
-public Engine/Executor assembly is still being refactored.
+The Linux CUDA 13.2 build compiled and linked both `tyloi-engine` and
+`tyloinfer-server`. Model execution, Metal and distribution checks remain pending.
 
 ## Output and build manifest
 
@@ -106,18 +101,13 @@ paths:
 
 | Backend | Executable |
 | --- | --- |
-| Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
+| Metal | `<repo>/build/csrc/metal/tyloi-engine` |
 | CUDA | `<repo>/build/csrc/tyloi-engine` |
 | CUDA on Windows | Usually `<repo>\build\csrc\tyloi-engine.exe`; multi-configuration generators may add `Release\` |
 
-`tyloi-engine` runs inference and service mode; CUDA checks and benchmarks use
-`mfq-diagnostics`, which is built separately:
-
-```shell
-uv run tyloinfer build -- -DTYLOINFER_BUILD_DIAGNOSTICS=ON
-cmake --build build/csrc --target mfq-diagnostics
-build/csrc/mfq-diagnostics --check-deepseek-v41
-```
+`tyloi-engine` runs inference and service mode. `tyloinfer build` defaults to
+the Engine target with `BUILD_TESTING=OFF`. Some native test targets still
+reference old source paths or removed diagnostics and bindings.
 
 MFQ searches the build tree after compilation, so generators may place the
 executable in a configuration subdirectory.
@@ -136,8 +126,8 @@ selected backend in the manifest:
 uv run -m json.tool build/tyloi-engine.json
 ```
 
-`mfq serve` reads this manifest automatically. If the executable exists, it is
-used directly. If it was deleted, MFQ rebuilds it in the recorded directory with
+`tyloinfer serve` reads this manifest automatically. If the executable exists, it is
+used directly. If it was deleted, TyloInfer rebuilds it in the recorded directory with
 the recorded configuration.
 
 ## Custom build directory
@@ -210,9 +200,8 @@ uv run mfq build
 - a C++/CUDA toolchain with `nvcc`;
 - CUDA Toolkit 12 or newer, including `nvcc`, cuBLAS, and the CUDA runtime.
 
-The default CUDA runtime needs no Python, PyTorch, or LibTorch. Migration A/B
-builds may set `-DTYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that reference target
-has separate Python and LibTorch requirements.
+The native CUDA runtime needs no Python, PyTorch, or LibTorch. Independent
+offline reference generation has its own environment.
 
 MFQ checks `CUDACXX`, `PATH`, `CUDA_HOME`, and `CUDA_PATH` when locating
 `nvcc`.

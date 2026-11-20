@@ -2,7 +2,7 @@
 #include "config.h"
 #include "engine/models/common/ffn.h"
 #include "engine/models/metadata.h"
-#include "../common/check.h"
+#include <stdexcept>
 #include <memory>
 #include <utility>
 
@@ -97,8 +97,8 @@ template <class Predictor, class Loader>
 bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
     const auto count = c.predictor_layers;
     if (!ops.has("predictor.embedding_norm.weight") || count <= 0) {
-        require_model(!ops.has_prefix("predictor"),
-                      "GLM5-Next model source contains an incomplete or undeclared MTP head");
+        if (ops.has_prefix("predictor"))
+            throw std::runtime_error("GLM5-Next model source contains an incomplete or undeclared MTP head");
         return false;
     }
     result.config = c;
@@ -119,10 +119,10 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
         layer.ffn = load_ffn(ops, c, int(i), p + ".mlp", true);
         layer.attention = load_mla(ops, c, int(i), p + ".attention");
     }
-    require_model(result.embedding_norm.dim() == 1 && result.embedding_norm.size(0) == c.hidden &&
-                      result.hidden_norm.dim() == 1 && result.hidden_norm.size(0) == c.hidden &&
-                      result.output_norm.numel() == c.hidden,
-                  "GLM5-Next MTP normalization width disagrees with backbone");
+    if (!(result.embedding_norm.dim() == 1 && result.embedding_norm.size(0) == c.hidden &&
+        result.hidden_norm.dim() == 1 && result.hidden_norm.size(0) == c.hidden &&
+        result.output_norm.numel() == c.hidden))
+        throw std::runtime_error("GLM5-Next MTP normalization width disagrees with backbone");
     return true;
 }
 

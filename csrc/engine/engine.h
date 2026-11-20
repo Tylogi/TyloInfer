@@ -43,6 +43,7 @@ struct EngineInfo {
     MfqModelCapabilities capabilities;
     bool probability = false;
     std::unordered_set<std::int64_t> stop_token_ids;
+    bool decisions = false;
 };
 struct EngineStatus {
     std::size_t available = 0;
@@ -126,6 +127,7 @@ private:
     friend class Scheduler;
     friend std::unique_ptr<Engine> load(EngineOptions options);
     void install(std::unique_ptr<tyloi::Executor::Graph> graph);
+    tyloi::StepSequence<EventData> generate_decisions(Request& request);
     void start_reload(EngineOptions options);
     void stop_reload() noexcept;
 

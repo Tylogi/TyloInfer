@@ -95,6 +95,10 @@ StepSequence<tyloi::models::MtpDraft> Mtp::greedy_draft(const tyloi::models::Cau
         tyloi::models::MtpRow, int, const tyloi::models::ForwardOptions&) const {
     return {};
 }
+StepSequence<tyloi::models::MtpStep> Mtp::graph_step(const tyloi::models::CausalModel&,
+        tyloi::models::MtpRow, MtpStepMode, const ForwardOptions&) const {
+    return {};
+}
 #endif
 
 } // namespace tyloi::models::qwen35

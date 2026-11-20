@@ -1,5 +1,4 @@
 #include "engine/models/load.h"
-#include "engine/models/common/check.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
@@ -17,6 +16,7 @@
 #include "engine/models/common/ffn.h"
 #include "engine/ops/ops.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -312,17 +312,17 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    tyloi::models::require_model(model.graph.backbone == "glm_dsa",
-                               "model backbone does not match the requested causal model");
+    if (!(model.graph.backbone == "glm_dsa"))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     auto& c = model.config;
     auto& m = model.metadata;
     tyloi::models::glm_dsa::load_config(definition, c, m);
     validate_geometry(c);
-    tyloi::models::require_model(c.num_hidden_layers == model.graph.topology.text_layers,
-                               "model graph/config text-layer topology mismatch");
+    if (!(c.num_hidden_layers == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context > 0) {
-        tyloi::models::require_model(context <= m.max_position_embeddings,
-                                   "--ctx-size exceeds max_position_embeddings");
+        if (!(context <= m.max_position_embeddings))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         c.max_position_embeddings = m.max_position_embeddings = context;
     }
     return model;
@@ -403,10 +403,11 @@ void load(Model& model, const ::tyloi::weights::Loader& weights, LayerPlacementC
 
 namespace {
 Tensor normalize_ids(int primary, const Tensor& ids) {
-    tyloi::models::require_model(ids.defined() && (ids.dim() == 1 || ids.dim() == 2),
-        "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.defined() && (ids.dim() == 1 || ids.dim() == 2)))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     auto shaped = ids.dim() == 1 ? tyloi::ops::reshape(ids, {1, ids.size(0)}) : ids;
-    tyloi::models::require_model(shaped.size(0) > 0 && shaped.size(1) > 0, "token IDs must not be empty");
+    if (!(shaped.size(0) > 0 && shaped.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     return tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(shaped, tyloi::kInt64),
                                                   tyloi::Device(tyloi::kCUDA, primary)));
 }
@@ -447,10 +448,11 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
     auto ids = normalize_ids(mode.primary, input.ids);
     auto embeddings = input.embeddings.defined() ? input.embeddings : embedding(ids, mode.primary);
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size,
-        "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(input.confirmed == 0, "unsupported speculative backbone geometry");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(input.confirmed == 0))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (state.cache_pos == 0) state.reset(B);
     const tyloi::Device primary(tyloi::kCUDA, mode.primary);
     const auto positions = [&](const Tensor& value) {
@@ -460,12 +462,12 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
         : tyloi::ops::arange(state.cache_pos, state.cache_pos + T, primary);
     auto semantic = input.positions.defined() ? positions(input.positions)
         : (state.decode_position_delta == 0 ? physical : tyloi::ops::add(physical, state.decode_position_delta));
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((semantic.dim() == 1 && semantic.size(0) == T) ||
-        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T),
-        "position_ids must have shape [tokens] or [batch,tokens]");
+    if (!((physical.dim() == 1 && physical.numel() == T) ||
+        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T)))
+        throw std::runtime_error("cache_positions must have shape [tokens] or [batch,tokens]");
+    if (!((semantic.dim() == 1 && semantic.size(0) == T) ||
+        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T)))
+        throw std::runtime_error("position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths.defined() && state.cache_pos > 0 && T == 1)
         input.lengths = tyloi::ops::full(std::array<int64_t, 1>{B}, state.cache_pos + 1, primary);
     ::tyloi::models::AttentionStep step{semantic, input.lengths, input.cache_positions.defined() ? physical : Tensor{},
@@ -619,8 +621,8 @@ static DenseTensor forward_layer(const Layer& layer, LayerState& state, Selectio
             for (auto& value : projected) result.push_back(value.dense());
             return result;
         });
-        tyloi::models::require_model(first.size() == (full_indexer ? 4u : 2u),
-            "GLM DSA input projection count mismatch");
+        if (!(first.size() == (full_indexer ? 4u : 2u)))
+            throw std::runtime_error("GLM DSA input projection count mismatch");
         auto projected = first[0];
         auto qr = measure("glm.q_a_norm", [&]() {
             const auto& q_a_norm = layer.q_a_norm.dense();
@@ -638,8 +640,8 @@ static DenseTensor forward_layer(const Layer& layer, LayerState& state, Selectio
         });
         projected = {};
         qr = {};
-        tyloi::models::require_model(second.size() == (full_indexer ? 2u : 1u),
-            "GLM DSA q projection count mismatch");
+        if (!(second.size() == (full_indexer ? 2u : 1u)))
+            throw std::runtime_error("GLM DSA q projection count mismatch");
         auto key_value = first[1];
         auto query = second[0];
         auto q_main = query.to(::tyloi::kFloat16)
@@ -752,8 +754,8 @@ static DenseTensor forward_layer(const Layer& layer, LayerState& state, Selectio
                         step.sequence_lengths, {}, logical_len, planned_kv_length, scale).dense();
                 });
         } else {
-            tyloi::models::require_model(prefix >= 0 && sparse_rows > 0 && prefix + sparse_rows == T,
-                "GLM DSA shared index state has the wrong row count");
+            if (!(prefix >= 0 && sparse_rows > 0 && prefix + sparse_rows == T))
+                throw std::runtime_error("GLM DSA shared index state has the wrong row count");
             DenseTensor first_rows;
             if (prefix > 0) {
                 first_rows = measure("glm.attention_dense_prefix", [&]() {

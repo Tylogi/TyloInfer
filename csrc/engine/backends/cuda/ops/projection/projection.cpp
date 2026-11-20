@@ -12,13 +12,16 @@
 #include "engine/backends/cuda/ops/gguf/rows.h"
 #include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "engine/weights/tq/routed.h"
+#include "engine/weights/moe/ggml_bank.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/rows/gguf.h"
+#include "engine/weights/moe/prepare/projection.h"
 #include "engine/backends/cuda/ops/projection/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/backends/cuda/ops/projection/nint/tensor.h"
 #endif
 
+#include <stdexcept>
 #include <algorithm>
 #include <optional>
 #include <numeric>
@@ -80,14 +83,16 @@ bool extend_nint(tyloi::NintTensor& first, const tyloi::NintTensor& next) {
 
 QuantLinearGroup tyloi::cuda::Projector::group(
         std::span<const ::tyloi::Tensor> weights) const {
-    TYLOINFER_RUNTIME_CHECK(!weights.empty(), "empty quantized linear group");
+    if (weights.empty())
+        throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.decode_branch_parallel = !independent_;
     result.layers.assign(weights.begin(), weights.end());
     std::vector<::tyloi::encoding::TqTensor> tq_weights;
     bool all_tq = true;
     for (const auto& weight : weights) {
-        TYLOINFER_RUNTIME_CHECK(weight.defined(), "missing projection weight");
+        if (!weight.defined())
+            throw std::runtime_error("missing projection weight");
         result.outs.push_back(weight.size(0));
         result.cols.push_back(weight.size(1));
         result.placements.push_back(projection_placement(weight));
@@ -188,10 +193,10 @@ tyloi::DenseTensor tyloi::cuda::ops::head_project(tyloi::DenseTensor input, cons
 tyloi::DenseTensor tyloi::cuda::ops::low_rank(tyloi::DenseTensor input, const ::tyloi::Tensor& output_a,
                                             const ::tyloi::Tensor& output_b, int64_t groups,
                                             bool groupwise, bool profile) {
-    TYLOINFER_RUNTIME_CHECK(input.dim() >= 2 && groups > 0 && output_a && output_b &&
+    if (!(input.dim() >= 2 && groups > 0 && output_a && output_b &&
         output_a.dim() == 2 && output_b.dim() == 2 && output_a.size(0) > 0 &&
-        output_a.size(0) % groups == 0 && output_b.size(1) == output_a.size(0),
-        "invalid grouped low-rank projection geometry");
+        output_a.size(0) % groups == 0 && output_b.size(1) == output_a.size(0)))
+        throw std::runtime_error("invalid grouped low-rank projection geometry");
     std::optional<MfqCudaGuard> guard;
     if (input.is_cuda()) guard.emplace(input.device().index);
     return Executor::current().projector(Executor::current_ffn()).low_rank(
@@ -283,10 +288,10 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
     MfqCudaGuard guard(shard.device);
     const auto& weight = shard.weight;
     const auto gated = [&](InputGateMode first, InputGateMode second) {
-        TYLOINFER_RUNTIME_CHECK(gate_mode == first || gate_mode == second,
-            "input gate mode is not supported by this projection");
+        if (!(gate_mode == first || gate_mode == second))
+            throw std::runtime_error("input gate mode is not supported by this projection");
     };
-    if (const auto* gguf = weight.representation<tyloi::GgufTensor>()) {
+    if (const auto* gguf = weight.representation<tyloi::GgmlQuantizedTensor>()) {
         if (gate.has_value()) {
             gated(InputGateMode::Sigmoid, InputGateMode::Silu);
             auto local_gate = gate.value().to(x.scalar_type());
@@ -321,7 +326,8 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* sq4 = weight.representation<tyloi::Mxfp4SqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "MXFP4-SQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("MXFP4-SQ linear requires a compatibility build");
         if (gate.has_value()) gated(InputGateMode::Sigmoid, InputGateMode::Silu);
         check_device(*sq4, x);
         if (gate.has_value())
@@ -330,7 +336,8 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         return tyloi::cuda::sq_matmul(*sq4, x);
     }
     if (const auto* sq8 = weight.representation<tyloi::Fp8SqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "FP8-SQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("FP8-SQ linear requires a compatibility build");
         if (gate.has_value()) gated(InputGateMode::Sigmoid, InputGateMode::Silu);
         check_device(*sq8, x);
         if (gate.has_value())
@@ -339,21 +346,23 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         return tyloi::cuda::sq_matmul(*sq8, x);
     }
     if (const auto* nint = weight.representation<tyloi::NintTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NINT linear requires a compatibility build");
         if (!gate.has_value() || gate_mode == InputGateMode::Sigmoid || gate_mode == InputGateMode::Silu)
             check_device(*nint, x);
         return run_nint_linear(profiler, kl_mmq, *nint, x, gate, gate_mode);
     }
     if (const auto* nvq = weight.representation<tyloi::NvqTensor>()) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NVQ linear requires a compatibility build");
         if (!gate.has_value() || gate_mode == InputGateMode::Sigmoid || gate_mode == InputGateMode::Silu)
             check_device(*nvq, x);
         return run_nvq_linear(profiler, kl_mmq, *nvq, x, gate, gate_mode);
     }
 #endif
     if (const auto* mx4 = weight.representation<tyloi::Mxfp4Tensor>()) {
-        TYLOINFER_RUNTIME_CHECK(!gate.has_value(),
-            "MXFP4 tensor-parallel linear does not support input gating");
+        if (gate.has_value())
+            throw std::runtime_error("MXFP4 tensor-parallel linear does not support input gating");
         check_device(*mx4, x);
         return mxfp4_matmul(*mx4, x);
     }
@@ -370,9 +379,8 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         return dense_projection(std::move(local), *dense);
     }
     const auto& mx8 = payload_as<tyloi::Mxfp8Tensor>(weight);
-    TYLOINFER_RUNTIME_CHECK(
-        !gate.has_value(),
-        "MXFP8 tensor-parallel linear does not support input gating");
+    if (gate.has_value())
+        throw std::runtime_error("MXFP8 tensor-parallel linear does not support input gating");
     check_device(mx8, x);
     return mxfp8_matmul(profiler, mx8, x);
 }
@@ -471,9 +479,8 @@ std::vector<::tyloi::DenseTensor>
 Projector::grouped(
         const std::vector<::tyloi::Tensor>& projections,
         ::tyloi::DenseTensor x) const {
-    TYLOINFER_RUNTIME_CHECK(
-        tensor_parallel_output_projections_compatible(projections),
-        "tensor-parallel output projections are incompatible");
+    if (!tensor_parallel_output_projections_compatible(projections))
+        throw std::runtime_error("tensor-parallel output projections are incompatible");
     for (const auto& projection : projections) check_projection(projection, x);
     auto output_shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)});
@@ -570,10 +577,9 @@ Projector::grouped(
         ::tyloi::DenseTensor x,
         MfqOptional<::tyloi::DenseTensor> gate,
         InputGateMode gate_mode) const {
-    TYLOINFER_RUNTIME_CHECK(
-        weight.axis == TensorParallelAxis::Output ||
-        weight.axis == TensorParallelAxis::Input,
-        "tensor-parallel linear has an invalid axis");
+    if (!(weight.axis == TensorParallelAxis::Output ||
+        weight.axis == TensorParallelAxis::Input))
+        throw std::runtime_error("tensor-parallel linear has an invalid axis");
     std::vector<::tyloi::DenseTensor> local_outputs(
         weight.shards.size());
     for (size_t launch_position = 0;
@@ -604,9 +610,8 @@ Projector::grouped(
         }
         if (const auto* mx8 = shard.weight.representation<tyloi::Mxfp8Tensor>();
             mx8 != nullptr && weight.axis == TensorParallelAxis::Input) {
-            TYLOINFER_RUNTIME_CHECK(
-                !gate.has_value(),
-                "MXFP8 input-axis tensor parallelism does not support gating");
+            if (gate.has_value())
+                throw std::runtime_error("MXFP8 input-axis tensor parallelism does not support gating");
             check_device(*mx8, local_x);
             local_outputs[index] = mxfp8_matmul_f32(profiler_, *mx8, local_x);
         } else {
@@ -645,7 +650,7 @@ Projector::grouped(
         const ::tyloi::Tensor& weight,
         ::tyloi::DenseTensor x) const {
     check_projection(weight, x);
-    if (const auto* encoded = local_format<tyloi::GgufTensor>(weight))
+    if (const auto* encoded = local_format<tyloi::GgmlQuantizedTensor>(weight))
         return gguf::project(*encoded, std::move(x));
     if (const auto* fp8 = local_format<tyloi::ChannelFp8Tensor>(weight))
         return channel_fp8_projection(*fp8, std::move(x), &profiler_);
@@ -656,7 +661,8 @@ Projector::grouped(
         });
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* nint = local_format<tyloi::NintTensor>(weight); nint != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NINT linear requires a compatibility build");
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
         auto y = run_nint_linear(profiler_, mmq_, *nint, flat);
@@ -664,7 +670,8 @@ Projector::grouped(
         return y.reshape(shape);
     }
     if (const auto* nvq = local_format<tyloi::NvqTensor>(weight); nvq != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NVQ linear requires a compatibility build");
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
         auto y = run_nvq_linear(profiler_, mmq_, *nvq, flat);
@@ -686,11 +693,13 @@ Projector::grouped(
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* sq4 = local_format<tyloi::Mxfp4SqTensor>(weight); sq4 != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "MXFP4-SQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("MXFP4-SQ linear requires a compatibility build");
         return sq_matmul(*sq4, x);
     }
     if (const auto* sq8 = local_format<tyloi::Fp8SqTensor>(weight); sq8 != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "FP8-SQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("FP8-SQ linear requires a compatibility build");
         return sq_matmul(*sq8, x);
     }
 #endif
@@ -706,6 +715,8 @@ Projector::grouped(
 ::tyloi::DenseTensor Projector::run(
         const ::tyloi::Tensor& weight, ::tyloi::DenseTensor x,
         ::tyloi::DenseTensor ids) const {
+    if (const auto* bank = weight.representation<::tyloi::GgmlExpertBank>())
+        return run(weight, std::move(x), weights::group_expert_rows(ids, bank->experts));
     if (const auto* tq = weight.representation<::tyloi::TqBank>())
         return tq_ops::routed_projection(*tq, x, ids);
     if (const auto* w = weight.representation<::tyloi::DenseTensor>()) {
@@ -726,6 +737,36 @@ Projector::grouped(
 #endif
 }
 
+DenseTensor Projector::run(const ::tyloi::Tensor& weight, DenseTensor input,
+        const weights::ExpertRows& rows) const {
+    const auto* bank = weight.representation<GgmlExpertBank>();
+    if (!bank || !bank->defined() || input.device() != bank->device() ||
+        (input.dim() != 2 && input.dim() != 3) || rows.experts != bank->experts ||
+        input.size(0) != rows.tokens || input.size(-1) != bank->image.neuron_len ||
+        (input.dim() == 3 && input.size(1) != rows.routes) ||
+        (rows.tokens && (rows.device_ids.defined() ? rows.device_ids.device() : rows.slots.device()) != input.device()))
+        throw std::invalid_argument("invalid GGUF routed projection geometry");
+    const cuda::DeviceGuard guard(input.device().index);
+    if (rows.device_ids.defined())
+        return gguf::project_indexed(bank->image, bank->resident_addresses, rows, input);
+    auto result = cuda::empty({rows.tokens, rows.routes, bank->image.out}, input.options());
+    auto output = result.reshape({rows.tokens * rows.routes, bank->image.out});
+    const std::span selected(rows.groups);
+    for (std::size_t first = 0; first < selected.size();) {
+        auto prepared = weights::prepare_cached_projection(*bank, selected.subspan(first));
+        prepared.wait();
+        try {
+            gguf::project_routed(prepared.ggml, rows, first, input, output);
+        } catch (...) {
+            prepared.retire();
+            throw;
+        }
+        prepared.retire();
+        first += prepared.ggml.size();
+    }
+    return result;
+}
+
 bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
     if (weights.empty()) return false;
     const ::tyloi::encoding::TqTensor* first = nullptr;
@@ -733,9 +774,9 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
     bool all_nint = options_.nint_grouped && !independent_ && tyloi::mfq_compat_enabled;
     bool all_fp8 = true;
     bool all_gguf = true;
-    const tyloi::GgufTensor* first_gguf = nullptr;
+    const tyloi::GgmlQuantizedTensor* first_gguf = nullptr;
     for (const auto& weight : weights) {
-        const auto* encoded = weight.representation<tyloi::GgufTensor>();
+        const auto* encoded = weight.representation<tyloi::GgmlQuantizedTensor>();
         all_gguf = all_gguf && encoded && encoded->packed.is_cuda() &&
             weight.size(1) == weights.front().size(1) && weight.device() == weights.front().device() &&
             (!first_gguf || gguf::same_input_basis(*first_gguf, *encoded));
@@ -762,8 +803,8 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
 std::vector<::tyloi::DenseTensor> Projector::run(
         std::span<const ::tyloi::Tensor> weights,
         ::tyloi::DenseTensor x, size_t prefix) const {
-    TYLOINFER_RUNTIME_CHECK(prefix >= 1 && prefix <= weights.size(),
-        "invalid grouped projection prefix");
+    if (!(prefix >= 1 && prefix <= weights.size()))
+        throw std::runtime_error("invalid grouped projection prefix");
     struct {
         std::span<const ::tyloi::Tensor> weights;
         QuantLinearGroup group;
@@ -847,7 +888,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
 
     if (!projections.group.nint_grouped && !projections.group.layers.empty() &&
             x.is_cuda() && (x.numel() / x.size(-1) > 8 ||
-                projections.group.layers.front().representation<tyloi::GgufTensor>())) {
+                projections.group.layers.front().representation<tyloi::GgmlQuantizedTensor>())) {
         return join(run(projections.group, x));
     }
     if (projections.group.nint_grouped && x.is_cuda() &&
@@ -864,24 +905,21 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         ::tyloi::DenseTensor grouped,
         int64_t groups) const {
     check_projection(weight, grouped);
-    TYLOINFER_RUNTIME_CHECK(
-        holds<tyloi::Mxfp8Tensor>(weight),
-        "groupwise MXFP8 projection requires an MXFP8 tensor");
+    if (!(holds<tyloi::Mxfp8Tensor>(weight)))
+        throw std::runtime_error("groupwise MXFP8 projection requires an MXFP8 tensor");
     const auto* sharded_weight = weight.representation<tyloi::ShardedTensor>();
     if (!sharded_weight) {
         return mxfp8_groupwise_matmul(
             profiler_, payload_as<tyloi::Mxfp8Tensor>(weight), grouped, groups);
     }
-    TYLOINFER_RUNTIME_CHECK(
-        sharded_weight->axis == TensorParallelAxis::Input,
-        "groupwise MXFP8 tensor parallelism requires input-axis shards");
+    if (!(sharded_weight->axis == TensorParallelAxis::Input))
+        throw std::runtime_error("groupwise MXFP8 tensor parallelism requires input-axis shards");
     std::vector<::tyloi::DenseTensor> partials;
     partials.reserve(sharded_weight->shards.size());
     for (const auto & shard : sharded_weight->shards) {
         const auto* shard_mx8 = shard.weight.representation<tyloi::Mxfp8Tensor>();
-        TYLOINFER_RUNTIME_CHECK(
-            shard_mx8 != nullptr,
-            "groupwise MXFP8 tensor-parallel shard representation mismatch");
+        if (!(shard_mx8 != nullptr))
+            throw std::runtime_error("groupwise MXFP8 tensor-parallel shard representation mismatch");
         MfqCudaGuard guard(shard.device);
         auto local = grouped.narrow(
             -1, shard.input_begin,
@@ -912,7 +950,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     check_projection_width(weight, width);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* nint = local_format<tyloi::NintTensor>(weight); nint != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NINT linear requires a compatibility build");
         auto shape = x.sizes().vec();
         auto y = run_nint_linear(profiler_, mmq_, *nint, x.reshape({-1, x.size(-1)}),
                                  gate.reshape({-1, gate.size(-1)}), mode);
@@ -920,7 +959,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         return y.reshape(shape);
     }
     if (const auto* nvq = local_format<tyloi::NvqTensor>(weight); nvq != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ linear requires a compatibility build");
+        if (!tyloi::mfq_compat_enabled)
+            throw std::runtime_error("NVQ linear requires a compatibility build");
         auto shape = x.sizes().vec();
         auto y = run_nvq_linear(profiler_, mmq_, *nvq, x.reshape({-1, x.size(-1)}),
                                 gate.reshape({-1, gate.size(-1)}), mode);
@@ -936,8 +976,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         return y.reshape(shape);
     }
     if (const auto* dense = local_format<::tyloi::DenseTensor>(weight); dense != nullptr) {
-        TYLOINFER_RUNTIME_CHECK(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu,
-            "dense input gate mode must be sigmoid or SiLU");
+        if (!(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu))
+            throw std::runtime_error("dense input gate mode must be sigmoid or SiLU");
         // Match the existing dense shard path, including dtype rounding.
         auto local = x.to(dense->scalar_type());
         auto local_gate = gate.to(dense->scalar_type());
@@ -946,8 +986,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
             : local * ::tyloi::cuda::silu(local_gate);
         return dense_projection(gated, *dense);
     }
-    TYLOINFER_RUNTIME_CHECK(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu,
-        "input gate mode must be sigmoid or SiLU");
+    if (!(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu))
+        throw std::runtime_error("input gate mode must be sigmoid or SiLU");
     auto local_gate = gate.to(x.scalar_type());
     auto gated = mode == InputGateMode::Sigmoid
         ? x * ::tyloi::cuda::sigmoid(local_gate)
@@ -966,9 +1006,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     const bool default_mmq =
         mmq_.mode == KlMmqMode::Default;
     if (!x.is_cuda()) {
-        TYLOINFER_RUNTIME_CHECK(
-            !group.nint_grouped,
-            "CPU dense offload requires separate compact linear weights");
+        if (!(!group.nint_grouped))
+            throw std::runtime_error("CPU dense offload requires separate compact linear weights");
         std::vector<::tyloi::DenseTensor> result;
         result.reserve(group.layers.size());
         for (const auto & layer : group.layers) {
@@ -978,12 +1017,12 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     }
     if (!group.layers.empty() &&
         std::all_of(group.layers.begin(), group.layers.end(), [](const auto& layer) {
-            return layer.template representation<tyloi::GgufTensor>() != nullptr;
+            return layer.template representation<tyloi::GgmlQuantizedTensor>() != nullptr;
         })) {
-        std::vector<tyloi::GgufTensor> weights;
+        std::vector<tyloi::GgmlQuantizedTensor> weights;
         weights.reserve(group.layers.size());
         for (const auto& layer : group.layers)
-            weights.push_back(*layer.representation<tyloi::GgufTensor>());
+            weights.push_back(*layer.representation<tyloi::GgmlQuantizedTensor>());
         return gguf::project_group(weights, std::move(x));
     }
     if (x.numel() / x.size(-1) > 8 && !group.layers.empty() &&
@@ -1011,8 +1050,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     if (tyloi::mfq_compat_enabled && default_mmq && group.nvq_prefix2 && options_.nvq_fusion) {
         const auto* nvq0 = local_format<tyloi::NvqTensor>(group.layers[0]);
         const auto* nvq1 = local_format<tyloi::NvqTensor>(group.layers[1]);
-        TYLOINFER_RUNTIME_CHECK(nvq0 != nullptr && nvq1 != nullptr,
-            "NVQ group fusion requires two local NVQ projections");
+        if (!(nvq0 != nullptr && nvq1 != nullptr))
+            throw std::runtime_error("NVQ group fusion requires two local NVQ projections");
         if (nvq_pair_compatible(*nvq0, *nvq1)) {
             check_device(*nvq0, x);
             check_device(*nvq1, x);

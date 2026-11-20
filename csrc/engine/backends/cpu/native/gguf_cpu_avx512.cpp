@@ -1,6 +1,6 @@
 // Adapted from Strata src/kernels/cpu/iq_avx512.cpp (MIT).
 // Copyright (c) 2026 Niko1221 and contributors.
-// License: cpp_runtime/third_party/strata.LICENSE.
+// License: LICENSES/Strata-MIT.txt.
 // This translation unit is called only after the baseline ISA/OS check.
 #include "gguf_cpu_simd.h"
 #define GGML_COMMON_DECL_CPP

@@ -33,11 +33,11 @@ void rotate_cpu(float* values, std::int64_t rows, std::int64_t width, int block,
             x[i] *= normalization * (adjoint && !signs.empty() ? float(signs[i]) : 1.f);
     }
 }
-void rotate_gpu(const GgufRotation& rotation, const ::tyloi::DenseTensor& input, const ::tyloi::DenseTensor& output, bool adjoint) {
+void rotate_gpu(const GgmlInputRotation& rotation, const ::tyloi::DenseTensor& input, const ::tyloi::DenseTensor& output, bool adjoint) {
     const MfqCudaGuard guard(input.get_device());
     const auto stream = mfq_get_current_cuda_stream(input.get_device());
-    TYLOINFER_RUNTIME_CHECK(rotation.signs_cpu.empty() || (rotation.signs_device.defined() && rotation.signs_device.device() == input.device()),
-        "GGUF Hadamard signs are not on the activation device");
+    if (!(rotation.signs_cpu.empty() || (rotation.signs_device.defined() && rotation.signs_device.device() == input.device())))
+        throw std::runtime_error("GGUF Hadamard signs are not on the activation device");
     for (const auto& tensor : {input, output}) mfq_cuda_record_stream(tensor, stream);
     const std::int8_t* signs = nullptr;
     if (rotation.signs_device.defined()) { mfq_cuda_record_stream(rotation.signs_device, stream); signs = rotation.signs_device.data_ptr<std::int8_t>(); }
@@ -49,11 +49,11 @@ void rotate_gpu(const GgufRotation& rotation, const ::tyloi::DenseTensor& input,
 }
 
 
-void apply_rotation_inplace(const GgufRotation& r, ::tyloi::DenseTensor input, bool adjoint) {
-    TYLOINFER_RUNTIME_CHECK(r.block > 0 && !(r.block & (r.block - 1)) && input.dim() >= 1 && input.is_contiguous() && input.size(-1) > 0 &&
+void apply_rotation_inplace(const GgmlInputRotation& r, ::tyloi::DenseTensor input, bool adjoint) {
+    if (!(r.block > 0 && !(r.block & (r.block - 1)) && input.dim() >= 1 && input.is_contiguous() && input.size(-1) > 0 &&
         input.size(-1) % r.block == 0 && (r.signs_cpu.empty() || int64_t(r.signs_cpu.size()) == input.size(-1)) &&
-        (input.scalar_type() == ::tyloi::kFloat32 || input.scalar_type() == ::tyloi::kFloat16),
-        "GGUF Hadamard activation geometry/precision differs");
+        (input.scalar_type() == ::tyloi::kFloat32 || input.scalar_type() == ::tyloi::kFloat16)))
+        throw std::runtime_error("GGUF Hadamard activation geometry/precision differs");
     const auto width = input.size(-1), rows = input.numel() / width;
     if (!rows) return;
     if (input.is_cuda()) {
@@ -67,11 +67,11 @@ void apply_rotation_inplace(const GgufRotation& r, ::tyloi::DenseTensor input, b
         }
     }
 }
-::tyloi::DenseTensor apply_rotation(const GgufRotation& r, ::tyloi::DenseTensor input, bool adjoint) {
+::tyloi::DenseTensor apply_rotation(const GgmlInputRotation& r, ::tyloi::DenseTensor input, bool adjoint) {
     auto source = (input.scalar_type() == ::tyloi::kFloat16 ? input : input.to(::tyloi::kFloat32)).contiguous();
-    TYLOINFER_RUNTIME_CHECK(r.block > 0 && !(r.block & (r.block - 1)) && source.dim() >= 1 && source.size(-1) > 0 &&
-        source.size(-1) % r.block == 0 && (r.signs_cpu.empty() || int64_t(r.signs_cpu.size()) == source.size(-1)),
-        "GGUF Hadamard activation geometry differs");
+    if (!(r.block > 0 && !(r.block & (r.block - 1)) && source.dim() >= 1 && source.size(-1) > 0 &&
+        source.size(-1) % r.block == 0 && (r.signs_cpu.empty() || int64_t(r.signs_cpu.size()) == source.size(-1))))
+        throw std::runtime_error("GGUF Hadamard activation geometry differs");
     if (source.is_cuda()) {
         auto result = ::tyloi::cuda::empty_like(source);
         if (source.numel()) rotate_gpu(r, source, result, adjoint);

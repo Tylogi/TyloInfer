@@ -15,6 +15,7 @@ struct Request {
     EngineRequest submitted;
     std::shared_ptr<Output> outbox;
     InferenceRequest input;
+    std::optional<DecisionTokens> decisions;
     std::optional<InferenceOutput> output;
     std::unique_ptr<tyloi::models::State> state;
     Generation generation;

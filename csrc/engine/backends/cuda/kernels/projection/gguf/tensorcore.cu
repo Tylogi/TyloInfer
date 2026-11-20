@@ -68,6 +68,13 @@ __global__ void restore_scale_strided(float* output,const std::int32_t* input_ex
             (weight_exponents?weight_exponents[i%rows]:0));
     }
 }
+__global__ void prefill_residual_add(half* output,const half* residual,
+        std::int64_t elements,std::int64_t rows,std::int64_t stride) {
+    for(auto i=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<elements;i+=std::int64_t(gridDim.x)*blockDim.x) {
+        const auto index=i/rows*stride+i%rows;
+        output[index]=__hadd(output[index],residual[index]);
+    }
+}
 void checked(cudaError_t status) {if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));}
 }
 void pack_scaled_f16(const float* input,void* output,std::int32_t* exponents,

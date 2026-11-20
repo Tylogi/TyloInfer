@@ -9,6 +9,8 @@
 #include "engine/backends/cuda/ops/projection/vq/tensor.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 
+#include <stdexcept>
+#include <string>
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -20,10 +22,9 @@ static void validate_mfe_nint_pools(const std::vector<MfePoolWeight>& pools) {
     }
     const auto target = pools.front().weight.q_packed.device();
     for (const auto & pool : pools) {
-        TYLOINFER_RUNTIME_CHECK(
-            pool.weight.q_packed.is_cuda() &&
-            pool.weight.q_packed.device() == target,
-            "MFE NINT pools must share one CUDA device");
+        if (!(pool.weight.q_packed.is_cuda() &&
+            pool.weight.q_packed.device() == target))
+            throw std::runtime_error("MFE NINT pools must share one CUDA device");
     }
 }
 
@@ -439,11 +440,11 @@ tyloi::mfe::Data load_mfe_cpu(
         pool.payload = tyloi::read_tensor(mfq, name);
         pool.weight = tyloi::nint::unpack(pool.payload);
         const auto& shape = pool.weight.shape;
-        TYLOINFER_RUNTIME_CHECK(pool.weight.axis == 0 && shape.size() == 3 &&
+        if (!(pool.weight.axis == 0 && shape.size() == 3 &&
             shape[0] > 0 && shape[0] <= std::numeric_limits<int>::max() &&
             shape[1] > 0 && shape[1] <= std::numeric_limits<int>::max() &&
-            shape[2] == pool.weight.neuron_len && shape[0] * shape[1] == pool.weight.out,
-            "routed NINT tensor must use [experts,out,in]: ", name);
+            shape[2] == pool.weight.neuron_len && shape[0] * shape[1] == pool.weight.out))
+            throw std::runtime_error(std::string("routed NINT tensor must use [experts,out,in]: ") + name);
         tyloi::mfe::Data result;
         result.n_experts = static_cast<int>(shape[0]);
         result.out_per_expert = static_cast<int>(shape[1]);

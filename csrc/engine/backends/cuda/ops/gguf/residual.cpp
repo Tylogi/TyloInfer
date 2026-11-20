@@ -13,7 +13,7 @@
 
 namespace tyloi::cuda::gguf {
 
-::tyloi::DenseTensor residual_mix(const GgufTensor& weight,
+::tyloi::DenseTensor residual_mix(const GgmlQuantizedTensor& weight,
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized,std::int64_t streams) {
 
     if(const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_GR_MIX");setting && setting[0]=='0')return {};
@@ -43,7 +43,7 @@ namespace tyloi::cuda::gguf {
 
 std::vector<::tyloi::DenseTensor> gated_residual_pre(
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& norm,
-        const GgufTensor& down,const GgufTensor& up,const GgufTensor& injection,
+        const GgmlQuantizedTensor& down,const GgmlQuantizedTensor& up,const GgmlQuantizedTensor& injection,
         std::int64_t streams,double eps,const ::tyloi::DenseTensor& branch,
         const ::tyloi::DenseTensor& prior_injection) {
 
@@ -69,7 +69,7 @@ std::vector<::tyloi::DenseTensor> gated_residual_pre(
     } else if(prior_injection.defined())return {};
     const MfqCudaGuard guard(input.device());
     ::tyloi::DenseTensor updated=input,normalized,prepared_activation;
-    const std::vector<GgufTensor> pre_weights{down,injection};
+    const std::vector<GgmlQuantizedTensor> pre_weights{down,injection};
     // This preparation emits the native Q8 packet. Existing aligned and
     // position-major groups retain their corresponding preparation layouts.
     const bool fused_input=hidden%32==0 && !m1_aligned(pre_weights,tokens) &&

@@ -1,5 +1,4 @@
 #include "../../runtime/execution_options.h"
-#include "../../runtime/layer_weight_stream.h"
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
 #include "mfq_cuda_nint_route_hint.h"
@@ -1899,7 +1898,6 @@ mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor
 mfq_tensor_backend::Tensor QuantLinear::forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x) const {
-    mfq::cuda::LayerWeightPrefetchKick prefetch;
     if(is_tq() && !tensor_parallel())return execution.profiler.measure("tq.linear",[&] {return tq.forward(std::move(x));});
     if(is_gguf() && !tensor_parallel()) {
         if(!execution.profiler.enabled)return gguf.forward(std::move(x));
@@ -2376,7 +2374,6 @@ QuantLinearGroup::forward_tensor_parallel_output_group(
 std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x) const {
-    mfq::cuda::LayerWeightPrefetchKick prefetch;
     if(tq.defined())return execution.profiler.measure("tq.parallel",[&] {return tq.forward(std::move(x));});
     const bool default_mmq =
         execution.kl_mmq.mode == KlMmqMode::Default;

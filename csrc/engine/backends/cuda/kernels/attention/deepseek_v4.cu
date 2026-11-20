@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include <math_constants.h>
 #include <cuda_runtime.h>
 #include "engine/backends/cuda/kernels/attention/deepseek_v4.h"
@@ -851,26 +853,22 @@ __global__ void dsv4_decode_plan_kernel(
 } // namespace
 
 ::tyloi::DenseTensor dsv4_fp4_sim_cuda(::tyloi::DenseTensor input) {
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.is_contiguous() &&
+    if (!(input.is_cuda() && input.is_contiguous() &&
             input.scalar_type() == ::tyloi::kFloat16 &&
-            input.dim() >= 1 && input.size(-1) % 32 == 0,
-        "dsv4_fp4_sim: expected contiguous CUDA f16 with last dimension divisible by 32");
+            input.dim() >= 1 && input.size(-1) % 32 == 0))
+        throw std::runtime_error("dsv4_fp4_sim: expected contiguous CUDA f16 with last dimension divisible by 32");
     auto output = ::tyloi::cuda::empty_like(input);
     const int64_t groups = input.numel() / 32;
-    TYLOINFER_RUNTIME_CHECK(
-        groups > 0 && groups <= std::numeric_limits<int>::max(),
-        "dsv4_fp4_sim: invalid group count");
+    if (!(groups > 0 && groups <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("dsv4_fp4_sim: invalid group count");
     dsv4_fp4_sim_kernel<<<
         static_cast<int>(groups), 32, 0,
         mfq_current_cuda_stream()>>>(
         reinterpret_cast<const half *>(input.data_ptr<mfq_half>()),
         reinterpret_cast<half *>(output.data_ptr<mfq_half>()));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_fp4_sim launch failed: ",
-        cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_fp4_sim launch failed: ") + cudaGetErrorString(status));
     return output;
 }
 
@@ -890,32 +888,28 @@ __global__ void dsv4_decode_plan_kernel(
     double eps)
 {
     const auto scalar_type = kv.scalar_type();
-    TYLOINFER_RUNTIME_CHECK(
-        kv.is_cuda() && kv.is_contiguous() &&
+    if (!(kv.is_cuda() && kv.is_contiguous() &&
             (scalar_type == ::tyloi::kFloat16 ||
              scalar_type == ::tyloi::kFloat32) &&
             gate.is_cuda() && gate.is_contiguous() &&
             gate.scalar_type() == scalar_type &&
-            kv.sizes() == gate.sizes(),
-        "dsv4_compress: kv/gate must be matching contiguous CUDA f16/f32");
+            kv.sizes() == gate.sizes()))
+        throw std::runtime_error("dsv4_compress: kv/gate must be matching contiguous CUDA f16/f32");
     const int64_t head_dim = norm.numel();
-    TYLOINFER_RUNTIME_CHECK(
-        (head_dim == kHeadDim || head_dim == kIndexerDim) &&
+    if (!((head_dim == kHeadDim || head_dim == kIndexerDim) &&
             kv.dim() == 4 && kv.size(2) == ratio &&
             ratio > 0 && ratio <= 128 &&
-            kv.size(3) == (overlap ? 2 * head_dim : head_dim),
-        "dsv4_compress: expected [B,W,ratio,D or 2D], D=128 or 512");
-    TYLOINFER_RUNTIME_CHECK(
-        ape.is_cuda() && ape.is_contiguous() &&
+            kv.size(3) == (overlap ? 2 * head_dim : head_dim)))
+        throw std::runtime_error("dsv4_compress: expected [B,W,ratio,D or 2D], D=128 or 512");
+    if (!(ape.is_cuda() && ape.is_contiguous() &&
             ape.scalar_type() == ::tyloi::kFloat32 &&
             ape.dim() == 2 && ape.size(0) == ratio &&
             ape.size(1) == kv.size(3) &&
             norm.is_cuda() && norm.is_contiguous() &&
             norm.scalar_type() == ::tyloi::kFloat32 &&
-            norm.numel() == head_dim,
-        "dsv4_compress: invalid APE or norm");
-    TYLOINFER_RUNTIME_CHECK(
-        positions.is_cuda() && positions.is_contiguous() &&
+            norm.numel() == head_dim))
+        throw std::runtime_error("dsv4_compress: invalid APE or norm");
+    if (!(positions.is_cuda() && positions.is_contiguous() &&
             positions.scalar_type() == ::tyloi::kInt64 &&
             positions.numel() == kv.size(0) * kv.size(1) &&
             cos.is_cuda() && cos.is_contiguous() &&
@@ -923,24 +917,22 @@ __global__ void dsv4_decode_plan_kernel(
             sin.is_cuda() && sin.is_contiguous() &&
             sin.scalar_type() == ::tyloi::kFloat32 &&
             cos.dim() == 2 && sin.sizes() == cos.sizes() &&
-            cos.size(1) >= 32,
-        "dsv4_compress: invalid positions or RoPE table");
+            cos.size(1) >= 32))
+        throw std::runtime_error("dsv4_compress: invalid positions or RoPE table");
     const bool has_prev = prev_kv.numel() != 0;
-    TYLOINFER_RUNTIME_CHECK(
-        !has_prev ||
+    if (!(!has_prev ||
             (overlap && prev_kv.is_cuda() && prev_kv.is_contiguous() &&
              prev_kv.scalar_type() == scalar_type &&
              prev_gate.is_cuda() && prev_gate.is_contiguous() &&
              prev_gate.scalar_type() == scalar_type &&
              prev_kv.sizes() == prev_gate.sizes() &&
              prev_kv.dim() == 3 && prev_kv.size(0) == kv.size(0) &&
-             prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim),
-        "dsv4_compress: invalid overlap state");
-    TYLOINFER_RUNTIME_CHECK(
-        quant_mode == 0 ||
+             prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim)))
+        throw std::runtime_error("dsv4_compress: invalid overlap state");
+    if (!(quant_mode == 0 ||
             (quant_mode == 1 && head_dim == kHeadDim) ||
-            (quant_mode == 2 && head_dim == kIndexerDim),
-        "dsv4_compress: quant_mode must match D=512 FP8 or D=128 FP4 cache");
+            (quant_mode == 2 && head_dim == kIndexerDim)))
+        throw std::runtime_error("dsv4_compress: quant_mode must match D=512 FP8 or D=128 FP4 cache");
     auto out = ::tyloi::cuda::empty(
         {kv.size(0), kv.size(1), head_dim},
         kv.options().dtype(::tyloi::kFloat16));
@@ -983,9 +975,8 @@ __global__ void dsv4_decode_plan_kernel(
                std::integral_constant<int, kIndexerDim>{});
     }
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_compress launch failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_compress launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
@@ -1009,52 +1000,46 @@ __global__ void dsv4_decode_plan_kernel(
 {
     const int64_t head_dim = norm.numel();
     const auto scalar_type = kv_token.scalar_type();
-    TYLOINFER_RUNTIME_CHECK(
-        head_dim == kHeadDim || head_dim == kIndexerDim,
-        "dsv4_decode_pool_update: D must be 128 or 512");
+    if (!(head_dim == kHeadDim || head_dim == kIndexerDim))
+        throw std::runtime_error("dsv4_decode_pool_update: D must be 128 or 512");
     const int64_t out_dim = overlap ? 2 * head_dim : head_dim;
-    TYLOINFER_RUNTIME_CHECK(
-        kv_token.is_cuda() && kv_token.is_contiguous() &&
+    if (!(kv_token.is_cuda() && kv_token.is_contiguous() &&
             (scalar_type == ::tyloi::kFloat16 ||
              scalar_type == ::tyloi::kFloat32) &&
             gate_token.is_cuda() && gate_token.is_contiguous() &&
             gate_token.scalar_type() == scalar_type &&
             kv_token.sizes() == gate_token.sizes() &&
             kv_token.dim() == 3 && kv_token.size(1) == 1 &&
-            kv_token.size(2) == out_dim,
-        "dsv4_decode_pool_update: invalid projected token");
+            kv_token.size(2) == out_dim))
+        throw std::runtime_error("dsv4_decode_pool_update: invalid projected token");
     const int64_t B = kv_token.size(0);
-    TYLOINFER_RUNTIME_CHECK(
-        state_kv.is_cuda() && state_kv.is_contiguous() &&
+    if (!(state_kv.is_cuda() && state_kv.is_contiguous() &&
             state_kv.scalar_type() == scalar_type &&
             state_gate.is_cuda() && state_gate.is_contiguous() &&
             state_gate.scalar_type() == scalar_type &&
             state_kv.sizes() == state_gate.sizes() &&
             state_kv.dim() == 3 && state_kv.size(0) == B &&
             state_kv.size(1) == ratio && state_kv.size(2) == out_dim &&
-            ratio > 0 && ratio <= 128,
-        "dsv4_decode_pool_update: invalid remainder state");
-    TYLOINFER_RUNTIME_CHECK(
-        !overlap ||
+            ratio > 0 && ratio <= 128))
+        throw std::runtime_error("dsv4_decode_pool_update: invalid remainder state");
+    if (!(!overlap ||
             (prev_kv.is_cuda() && prev_kv.is_contiguous() &&
              prev_kv.scalar_type() == scalar_type &&
              prev_gate.is_cuda() && prev_gate.is_contiguous() &&
              prev_gate.scalar_type() == scalar_type &&
              prev_kv.sizes() == prev_gate.sizes() &&
              prev_kv.dim() == 3 && prev_kv.size(0) == B &&
-             prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim),
-        "dsv4_decode_pool_update: invalid overlap history");
-    TYLOINFER_RUNTIME_CHECK(
-        pool.is_cuda() && pool.is_contiguous() &&
+             prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim)))
+        throw std::runtime_error("dsv4_decode_pool_update: invalid overlap history");
+    if (!(pool.is_cuda() && pool.is_contiguous() &&
             pool.scalar_type() == ::tyloi::kFloat16 &&
             pool.dim() == 3 && pool.size(0) == B &&
             pool.size(1) > 0 && pool.size(2) == head_dim &&
             seq_len.is_cuda() && seq_len.is_contiguous() &&
             seq_len.scalar_type() == ::tyloi::kInt64 &&
-            seq_len.numel() == B,
-        "dsv4_decode_pool_update: invalid pool or sequence length");
-    TYLOINFER_RUNTIME_CHECK(
-        ape.is_cuda() && ape.is_contiguous() &&
+            seq_len.numel() == B))
+        throw std::runtime_error("dsv4_decode_pool_update: invalid pool or sequence length");
+    if (!(ape.is_cuda() && ape.is_contiguous() &&
             ape.scalar_type() == ::tyloi::kFloat32 &&
             ape.dim() == 2 && ape.size(0) == ratio &&
             ape.size(1) == out_dim &&
@@ -1066,13 +1051,12 @@ __global__ void dsv4_decode_plan_kernel(
             sin.is_cuda() && sin.is_contiguous() &&
             sin.scalar_type() == ::tyloi::kFloat32 &&
             cos.dim() == 2 && sin.sizes() == cos.sizes() &&
-            cos.size(1) >= 32,
-        "dsv4_decode_pool_update: invalid compressor parameters");
-    TYLOINFER_RUNTIME_CHECK(
-        quant_mode == 0 ||
+            cos.size(1) >= 32))
+        throw std::runtime_error("dsv4_decode_pool_update: invalid compressor parameters");
+    if (!(quant_mode == 0 ||
             (quant_mode == 1 && head_dim == kHeadDim) ||
-            (quant_mode == 2 && head_dim == kIndexerDim),
-        "dsv4_decode_pool_update: quant_mode must match D=512 FP8 or D=128 FP4 cache");
+            (quant_mode == 2 && head_dim == kIndexerDim)))
+        throw std::runtime_error("dsv4_decode_pool_update: quant_mode must match D=512 FP8 or D=128 FP4 cache");
     auto launch = [&](auto scalar_tag, auto head_tag) {
         using scalar_t = typename decltype(scalar_tag)::type;
         constexpr int D = decltype(head_tag)::value;
@@ -1114,10 +1098,8 @@ __global__ void dsv4_decode_plan_kernel(
                std::integral_constant<int, kIndexerDim>{});
     }
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_decode_pool_update launch failed: ",
-        cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_decode_pool_update launch failed: ") + cudaGetErrorString(status));
     return pool;
 }
 
@@ -1129,16 +1111,14 @@ static ::tyloi::DenseTensor dsv4_indexer_scores_impl(
     int64_t ratio,
     ::tyloi::DenseTensor candidates)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        q.is_cuda() && q.is_contiguous() &&
+    if (!(q.is_cuda() && q.is_contiguous() &&
             q.scalar_type() == ::tyloi::kFloat16 &&
             k.is_cuda() && k.is_contiguous() &&
             k.scalar_type() == ::tyloi::kFloat16 &&
             weights.is_cuda() && weights.is_contiguous() &&
-            weights.scalar_type() == ::tyloi::kFloat16,
-        "dsv4_indexer_scores: tensors must be contiguous CUDA f16");
-    TYLOINFER_RUNTIME_CHECK(
-        q.dim() == 4 &&
+            weights.scalar_type() == ::tyloi::kFloat16))
+        throw std::runtime_error("dsv4_indexer_scores: tensors must be contiguous CUDA f16");
+    if (!(q.dim() == 4 &&
             (q.size(2) == 32 || q.size(2) == 64) &&
             q.size(3) == kIndexerDim &&
             k.dim() == 3 && k.size(0) == q.size(0) &&
@@ -1146,13 +1126,15 @@ static ::tyloi::DenseTensor dsv4_indexer_scores_impl(
             weights.dim() == 3 && weights.size(0) == q.size(0) &&
             weights.size(1) == q.size(1) &&
             weights.size(2) == q.size(2) &&
-            query_offset >= 0 && ratio > 0,
-        "dsv4_indexer_scores: shape mismatch");
+            query_offset >= 0 && ratio > 0))
+        throw std::runtime_error("dsv4_indexer_scores: shape mismatch");
     const bool indexed = candidates.defined();
-    if (indexed) TYLOINFER_RUNTIME_CHECK(candidates.is_cuda() && candidates.is_contiguous() &&
+    if (indexed) {
+        if (!(candidates.is_cuda() && candidates.is_contiguous() &&
         candidates.device() == q.device() && candidates.scalar_type() == ::tyloi::kInt64 &&
-        candidates.dim() == 3 && candidates.size(0) == q.size(0) && candidates.size(1) == q.size(1),
-        "dsv4_indexer_scores: invalid candidate positions");
+        candidates.dim() == 3 && candidates.size(0) == q.size(0) && candidates.size(1) == q.size(1)))
+            throw std::runtime_error("dsv4_indexer_scores: invalid candidate positions");
+    }
     const int B = static_cast<int>(q.size(0));
     const int M = static_cast<int>(q.size(1));
     const int K = static_cast<int>(k.size(1));
@@ -1185,10 +1167,8 @@ static ::tyloi::DenseTensor dsv4_indexer_scores_impl(
     if (indexed) select_heads(std::true_type{});
     else select_heads(std::false_type{});
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_indexer_scores launch failed: ",
-        cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_indexer_scores launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
@@ -1207,13 +1187,12 @@ static ::tyloi::DenseTensor dsv4_indexer_scores_impl(
 
 
 ::tyloi::DenseTensor dsv4_topk512_cuda(::tyloi::DenseTensor scores) {
-    TYLOINFER_RUNTIME_CHECK(
-        scores.is_cuda() && scores.is_contiguous() &&
+    if (!(scores.is_cuda() && scores.is_contiguous() &&
             scores.scalar_type() == ::tyloi::kFloat16 &&
             scores.dim() == 3 && scores.size(2) > 0 &&
             scores.size(0) * scores.size(1) <= INT_MAX &&
-            scores.size(2) <= INT_MAX,
-        "dsv4_topk512: expected contiguous CUDA f16 [B,M,K]");
+            scores.size(2) <= INT_MAX))
+        throw std::runtime_error("dsv4_topk512: expected contiguous CUDA f16 [B,M,K]");
     const int rows =
         static_cast<int>(scores.size(0) * scores.size(1));
     const int K = static_cast<int>(scores.size(2));
@@ -1232,9 +1211,8 @@ static ::tyloi::DenseTensor dsv4_indexer_scores_impl(
         reinterpret_cast<const half *>(scores.data_ptr<mfq_half>()),
         out.data_ptr<int>(), rows, K);
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_topk512 launch failed: ", cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_topk512 launch failed: ") + cudaGetErrorString(status));
     return out;
 }
 
@@ -1246,13 +1224,12 @@ std::vector<::tyloi::DenseTensor> dsv4_build_prefill_plan_cuda(
     int64_t ratio,
     int64_t window)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        topk.is_cuda() && topk.is_contiguous() &&
+    if (!(topk.is_cuda() && topk.is_contiguous() &&
             topk.scalar_type() == ::tyloi::kInt32 &&
             topk.dim() == 3 && topk.size(1) > 0 &&
             query_offset >= 0 && local_history >= 0 &&
-            pool_len >= 0 && ratio > 0 && window > 0,
-        "dsv4_prefill_plan: invalid input");
+            pool_len >= 0 && ratio > 0 && window > 0))
+        throw std::runtime_error("dsv4_prefill_plan: invalid input");
     const int B = static_cast<int>(topk.size(0));
     const int M = static_cast<int>(topk.size(1));
     const int topk_count = static_cast<int>(topk.size(2));
@@ -1275,10 +1252,8 @@ std::vector<::tyloi::DenseTensor> dsv4_build_prefill_plan_cuda(
         static_cast<int>(local_history), static_cast<int>(pool_len),
         static_cast<int>(ratio), static_cast<int>(window));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_prefill_plan launch failed: ",
-        cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_prefill_plan launch failed: ") + cudaGetErrorString(status));
     return {indices, mask};
 }
 
@@ -1289,15 +1264,14 @@ std::vector<::tyloi::DenseTensor> dsv4_build_decode_plan_cuda(
     int64_t ratio,
     int64_t window)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        topk.is_cuda() && topk.is_contiguous() &&
+    if (!(topk.is_cuda() && topk.is_contiguous() &&
             topk.scalar_type() == ::tyloi::kInt32 &&
             topk.dim() == 3 && topk.size(1) == 1 &&
             seq_len.is_cuda() && seq_len.is_contiguous() &&
             seq_len.scalar_type() == ::tyloi::kInt64 &&
             seq_len.numel() == topk.size(0) &&
-            pool_len >= 0 && ratio > 0 && window > 0,
-        "dsv4_decode_plan: invalid input");
+            pool_len >= 0 && ratio > 0 && window > 0))
+        throw std::runtime_error("dsv4_decode_plan: invalid input");
     const int B = static_cast<int>(topk.size(0));
     const int topk_count = static_cast<int>(topk.size(2));
     const int selected =
@@ -1318,10 +1292,8 @@ std::vector<::tyloi::DenseTensor> dsv4_build_decode_plan_cuda(
         B, topk_count, selected, static_cast<int>(pool_len),
         static_cast<int>(ratio), static_cast<int>(window));
     const cudaError_t status = cudaGetLastError();
-    TYLOINFER_RUNTIME_CHECK(
-        status == cudaSuccess,
-        "dsv4_decode_plan launch failed: ",
-        cudaGetErrorString(status));
+    if (!(status == cudaSuccess))
+        throw std::runtime_error(std::string("dsv4_decode_plan launch failed: ") + cudaGetErrorString(status));
     return {indices, mask};
 }
 
@@ -1334,8 +1306,7 @@ std::vector<::tyloi::DenseTensor> dsv4_build_decode_plan_cuda(
     ::tyloi::DenseTensor meta,
     double scale)
 {
-    TYLOINFER_RUNTIME_CHECK(
-        q.is_cuda() && q.is_contiguous() &&
+    if (!(q.is_cuda() && q.is_contiguous() &&
             q.scalar_type() == ::tyloi::kFloat32 &&
             kv.is_cuda() && kv.is_contiguous() &&
             kv.scalar_type() == ::tyloi::kFloat16 &&
@@ -1346,10 +1317,9 @@ std::vector<::tyloi::DenseTensor> dsv4_build_decode_plan_cuda(
             sinks.is_cuda() && sinks.is_contiguous() &&
             sinks.scalar_type() == ::tyloi::kFloat32 &&
             meta.is_cuda() && meta.is_contiguous() &&
-            meta.scalar_type() == ::tyloi::kFloat32,
-        "dsv4_sparse_attention: unsupported dtype or placement");
-    TYLOINFER_RUNTIME_CHECK(
-        q.dim() == 4 && q.size(1) == kHeads &&
+            meta.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("dsv4_sparse_attention: unsupported dtype or placement");
+    if (!(q.dim() == 4 && q.size(1) == kHeads &&
             q.size(3) == kHeadDim &&
             kv.dim() == 3 && kv.size(0) == q.size(0) &&
             kv.size(2) == kHeadDim &&
@@ -1357,26 +1327,23 @@ std::vector<::tyloi::DenseTensor> dsv4_build_decode_plan_cuda(
             indices.size(1) == q.size(2) &&
             indices.size(2) > 0 && indices.size(2) % 32 == 0 &&
             mask.sizes() == indices.sizes() &&
-            sinks.numel() == kHeads,
-        "dsv4_sparse_attention: shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(
-        q.size(0) <= INT_MAX && q.size(2) <= INT_MAX &&
-            kv.size(1) <= INT_MAX && indices.size(2) <= INT_MAX,
-        "dsv4_sparse_attention: attention dimensions exceed 32-bit indexing");
-    TYLOINFER_RUNTIME_CHECK(
-        kv.device() == q.device() && indices.device() == q.device() &&
+            sinks.numel() == kHeads))
+        throw std::runtime_error("dsv4_sparse_attention: shape mismatch");
+    if (!(q.size(0) <= INT_MAX && q.size(2) <= INT_MAX &&
+            kv.size(1) <= INT_MAX && indices.size(2) <= INT_MAX))
+        throw std::runtime_error("dsv4_sparse_attention: attention dimensions exceed 32-bit indexing");
+    if (!(kv.device() == q.device() && indices.device() == q.device() &&
             mask.device() == q.device() && sinks.device() == q.device() &&
-            meta.device() == q.device(),
-        "dsv4_sparse_attention: tensors must share one CUDA device");
+            meta.device() == q.device()))
+        throw std::runtime_error("dsv4_sparse_attention: tensors must share one CUDA device");
     const MfqCudaGuard guard(q.device());
     namespace mma = tyloi::cuda::sparse_mma_raw;
     const int batch = static_cast<int>(q.size(0));
     const int tokens = static_cast<int>(q.size(2));
     const auto plan = mma::plan(batch, tokens, kHeads, 1,
         static_cast<int>(kv.size(1)), static_cast<int>(indices.size(2)), kHeadDim, kHeadDim, false);
-    TYLOINFER_RUNTIME_CHECK(
-        static_cast<size_t>(meta.numel()) >= plan.workspace_bytes / sizeof(float),
-        "dsv4_sparse_attention: meta workspace too small");
+    if (!(static_cast<size_t>(meta.numel()) >= plan.workspace_bytes / sizeof(float)))
+        throw std::runtime_error("dsv4_sparse_attention: meta workspace too small");
     auto output = ::tyloi::cuda::empty(
         {batch, tokens, kHeads, kHeadDim}, q.options().dtype(::tyloi::kFloat32));
     const int64_t strides[] = {q.stride(0), q.stride(1), q.stride(2), q.stride(3)};

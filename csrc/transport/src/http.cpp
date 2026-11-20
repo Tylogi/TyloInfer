@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include "decision.h"
 #include "transport.h"
 #include "components/error.h"
 
@@ -556,6 +557,7 @@ int run_mfq_http_transport(
             {"model", config.model_name},
             {"model_type", config.model_type},
             {"probability_available", engine.info().probability},
+            {"decisions_available", engine.info().decisions},
             {"model_capabilities", model_capabilities},
             {"vision_supported", vision_supported},
             {"vision_available", vision_available},
@@ -856,6 +858,28 @@ int run_mfq_http_transport(
         catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
         catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
     });
+
+    const auto decide = [&](const httplib::Request& req, httplib::Response& res) {
+        if (!authorized(req, res, config.api_key)) return;
+        try {
+            if (!engine.info().decisions)
+                throw ApiError(501, "decisions_unavailable", "decision reads are unavailable for this model");
+            auto decision = parse_decision_request(parse_body(req), req.path == "/runtime/decide");
+            if (!decision.model.empty() && decision.model != config.model_name)
+                throw ApiError(404, "model_not_found", "the requested decision model is not served", "model");
+            tyloi::engine::EngineRequest work;
+            const auto id = work.id = request_id("decide-");
+            work.decision = std::move(decision.input);
+            auto output = engine.submit(std::move(work));
+            res.set_header("X-Request-ID", id);
+            auto reads = collect_decisions(*output, req.is_connection_closed, [&] { engine.cancel(id); });
+            set_json(res, decision_result_json(decision, reads, config.model_name));
+        } catch (const ApiError& error) { handle_api_error(res, error); }
+        catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
+        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+    };
+    server.Post("/runtime/decide", decide);
+    server.Post("/v1/decisions", decide);
 
     server.Post("/runtime/score", [&](const httplib::Request& req, httplib::Response& res) {
         if (!authorized(req, res, config.api_key)) return;

@@ -49,6 +49,7 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/cache/routed.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/cache/ggml.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/cache/workspace.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/group.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/format.cpp
@@ -95,6 +96,7 @@ set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/engine.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/layer_stream.cpp
     ${TYLOINFER_CUDA_MODEL_SOURCES}
 )
 add_library(mfq-cuda-engine STATIC

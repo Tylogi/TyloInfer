@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "env.h"
 #include "engine/backends/cuda/kernels/recurrent/gdn/raw.h"
+#include <stdexcept>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdlib>
@@ -15,42 +16,43 @@ static std::vector<::tyloi::DenseTensor> gdn_cuda_impl(
     ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state,
     bool inplace_state, bool transposed_state=false, bool tiled_heads=false)
 {
-    TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat32,
-                "q must be cuda contiguous f32");
+    if (!(q.is_cuda() && q.is_contiguous() && q.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("q must be cuda contiguous f32");
     int B = q.size(0), Hq = q.size(1), T = q.size(2), D = q.size(3);
     int Hv = v.size(1);
     int kda = (g.dim() == 4) ? 1 : 0;
     auto opts = q.options();
-    TYLOINFER_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == ::tyloi::kFloat32,
-                "k must be cuda contiguous f32");
-    TYLOINFER_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == ::tyloi::kFloat32,
-                "v must be cuda contiguous f32");
-    TYLOINFER_RUNTIME_CHECK(k.size(0) == B && k.size(1) == Hq && k.size(2) == T && k.size(3) == D,
-                "GDN CUDA: k shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(v.size(0) == B && v.size(2) == T && v.size(3) == D,
-                "GDN CUDA: v shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(Hv % Hq == 0, "GDN CUDA: value heads must be divisible by key heads");
-    TYLOINFER_RUNTIME_CHECK(beta.is_cuda() && beta.is_contiguous() && beta.scalar_type() == ::tyloi::kFloat32,
-                "beta must be cuda contiguous f32");
-    TYLOINFER_RUNTIME_CHECK(beta.dim() == 3 && beta.size(0) == B && beta.size(1) == Hv && beta.size(2) == T,
-                "GDN CUDA: beta must be [B,Hv,T]");
-    TYLOINFER_RUNTIME_CHECK(g.is_cuda() && g.is_contiguous() && g.scalar_type() == ::tyloi::kFloat32,
-                "g must be cuda contiguous f32");
+    if (!(k.is_cuda() && k.is_contiguous() && k.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("k must be cuda contiguous f32");
+    if (!(v.is_cuda() && v.is_contiguous() && v.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("v must be cuda contiguous f32");
+    if (!(k.size(0) == B && k.size(1) == Hq && k.size(2) == T && k.size(3) == D))
+        throw std::runtime_error("GDN CUDA: k shape mismatch");
+    if (!(v.size(0) == B && v.size(2) == T && v.size(3) == D))
+        throw std::runtime_error("GDN CUDA: v shape mismatch");
+    if (!(Hv % Hq == 0))
+        throw std::runtime_error("GDN CUDA: value heads must be divisible by key heads");
+    if (!(beta.is_cuda() && beta.is_contiguous() && beta.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("beta must be cuda contiguous f32");
+    if (!(beta.dim() == 3 && beta.size(0) == B && beta.size(1) == Hv && beta.size(2) == T))
+        throw std::runtime_error("GDN CUDA: beta must be [B,Hv,T]");
+    if (!(g.is_cuda() && g.is_contiguous() && g.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("g must be cuda contiguous f32");
     if (kda) {
-        TYLOINFER_RUNTIME_CHECK(g.size(0) == B && g.size(1) == Hv && g.size(2) == T && g.size(3) == D,
-                    "GDN CUDA: KDA g must be [B,Hv,T,D]");
+        if (!(g.size(0) == B && g.size(1) == Hv && g.size(2) == T && g.size(3) == D))
+            throw std::runtime_error("GDN CUDA: KDA g must be [B,Hv,T,D]");
     } else {
-        TYLOINFER_RUNTIME_CHECK(g.dim() == 3 && g.size(0) == B && g.size(1) == Hv && g.size(2) == T,
-                    "GDN CUDA: g must be [B,Hv,T]");
+        if (!(g.dim() == 3 && g.size(0) == B && g.size(1) == Hv && g.size(2) == T))
+            throw std::runtime_error("GDN CUDA: g must be [B,Hv,T]");
     }
     auto out = ::tyloi::cuda::empty({B, Hv, T, D}, opts);
-    TYLOINFER_RUNTIME_CHECK(!inplace_state || (state.has_value() && state->defined() && state->numel() > 0),
-                "GDN CUDA inplace: state is required");
+    if (!(!inplace_state || (state.has_value() && state->defined() && state->numel() > 0)))
+        throw std::runtime_error("GDN CUDA inplace: state is required");
     auto s_out = inplace_state ? state.value() : ::tyloi::cuda::empty({B, Hv, D, D}, opts);
-    TYLOINFER_RUNTIME_CHECK(s_out.is_cuda() && s_out.is_contiguous() && s_out.scalar_type() == ::tyloi::kFloat32,
-                "GDN CUDA: output state must be cuda contiguous f32");
-    TYLOINFER_RUNTIME_CHECK(s_out.size(0) == B && s_out.size(1) == Hv && s_out.size(2) == D && s_out.size(3) == D,
-                "GDN CUDA: state shape must be [B,Hv,D,D]");
+    if (!(s_out.is_cuda() && s_out.is_contiguous() && s_out.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("GDN CUDA: output state must be cuda contiguous f32");
+    if (!(s_out.size(0) == B && s_out.size(1) == Hv && s_out.size(2) == D && s_out.size(3) == D))
+        throw std::runtime_error("GDN CUDA: state shape must be [B,Hv,D,D]");
 
     auto initial_state = state.has_value() && state->defined() && state->numel() > 0
         ? state->contiguous() : ::tyloi::DenseTensor{};
@@ -148,54 +150,61 @@ static std::vector<::tyloi::DenseTensor> gdn_decode_core_impl(
         if(!value || !*value || std::strcmp(value,"4")==0)return 4;
         if(std::strcmp(value,"2")==0)return 2;
         if(std::strcmp(value,"1")==0)return 1;
-        TYLOINFER_RUNTIME_CHECK(false,"TYLOINFER_GDN_DECODE_TILES must be 1, 2 or 4");
+        throw std::runtime_error("TYLOINFER_GDN_DECODE_TILES must be 1, 2 or 4");
         return 4;
     }();
-    TYLOINFER_RUNTIME_CHECK(width==32 || width==64 || width==128,"GDN decode core width unsupported");
-    TYLOINFER_RUNTIME_CHECK(threads==256 || threads==512 || threads==1024,"GDN decode core block width unsupported");
-    TYLOINFER_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(0)>0 && key_heads>0 && value_heads>0 &&
+    if (!(width==32 || width==64 || width==128))
+        throw std::runtime_error("GDN decode core width unsupported");
+    if (!(threads==256 || threads==512 || threads==1024))
+        throw std::runtime_error("GDN decode core block width unsupported");
+    if (!(qkv.dim()==3 && qkv.size(0)>0 && key_heads>0 && value_heads>0 &&
         value_heads%key_heads==0 && key_heads<=std::numeric_limits<int>::max()/width &&
-        value_heads<=std::numeric_limits<int>::max()/width,
-        "GDN decode core heads/batch disagree");
+        value_heads<=std::numeric_limits<int>::max()/width))
+        throw std::runtime_error("GDN decode core heads/batch disagree");
     const int64_t batch=qkv.size(0),channels=(2*key_heads+value_heads)*width,taps=convolution_state.size(1)+1;
-    TYLOINFER_RUNTIME_CHECK(channels<=std::numeric_limits<int>::max() && taps>1 &&
+    if (!(channels<=std::numeric_limits<int>::max() && taps>1 &&
         taps<=std::numeric_limits<int>::max() && batch<=std::numeric_limits<int>::max()/value_heads/tiles &&
-        std::isfinite(convolution_eps) && convolution_eps>0 && std::isfinite(norm_eps) && norm_eps>0,
-        "GDN decode core geometry/epsilon exceeds supported bounds");
-    TYLOINFER_RUNTIME_CHECK(qkv.is_cuda() && qkv.stride(2)==1 && qkv.stride(0)>=channels &&
+        std::isfinite(convolution_eps) && convolution_eps>0 && std::isfinite(norm_eps) && norm_eps>0))
+        throw std::runtime_error("GDN decode core geometry/epsilon exceeds supported bounds");
+    if (!(qkv.is_cuda() && qkv.stride(2)==1 && qkv.stride(0)>=channels &&
         (qkv.scalar_type()==::tyloi::kFloat16 || qkv.scalar_type()==::tyloi::kFloat32) &&
-        qkv.sizes().vec()==std::vector<int64_t>({batch,1,channels}),"GDN decode core qkv disagrees");
+        qkv.sizes().vec()==std::vector<int64_t>({batch,1,channels})))
+        throw std::runtime_error("GDN decode core qkv disagrees");
     const auto device=qkv.device();
     const auto real=[&](const ::tyloi::DenseTensor& t){return t.is_cuda() && t.device()==device && t.is_contiguous() && t.scalar_type()==::tyloi::kFloat32;};
     const bool independent=state_addresses.defined();
-    TYLOINFER_RUNTIME_CHECK(!independent || (inplace_state && state_addresses.is_cuda() &&
+    if (!(!independent || (inplace_state && state_addresses.is_cuda() &&
         state_addresses.device()==device && state_addresses.is_contiguous() &&
         state_addresses.scalar_type()==::tyloi::kInt64 &&
-        state_addresses.sizes().vec()==std::vector<int64_t>({batch,3})),
-        "GDN independent state addresses require inplace CUDA int64 [B,3]");
-    TYLOINFER_RUNTIME_CHECK(real(convolution_state) && real(recurrent_state) && real(convolution_weight) &&
-        real(dt_bias) && real(a_log) && real(norm_weight),"GDN decode core parameters disagree");
-    TYLOINFER_RUNTIME_CHECK(!checkpoint_convolution.defined() ||
+        state_addresses.sizes().vec()==std::vector<int64_t>({batch,3}))))
+        throw std::runtime_error("GDN independent state addresses require inplace CUDA int64 [B,3]");
+    if (!(real(convolution_state) && real(recurrent_state) && real(convolution_weight) &&
+        real(dt_bias) && real(a_log) && real(norm_weight)))
+        throw std::runtime_error("GDN decode core parameters disagree");
+    if (!(!checkpoint_convolution.defined() ||
         (!independent && real(checkpoint_convolution) && real(checkpoint_recurrent) &&
          checkpoint_convolution.sizes()==convolution_state.sizes() &&
          checkpoint_recurrent.sizes()==recurrent_state.sizes() &&
          checkpoint_convolution.data_ptr()!=convolution_state.data_ptr() &&
-         checkpoint_recurrent.data_ptr()!=recurrent_state.data_ptr()),
-        "GDN core checkpoint storage disagrees");
+         checkpoint_recurrent.data_ptr()!=recurrent_state.data_ptr())))
+        throw std::runtime_error("GDN core checkpoint storage disagrees");
     const int64_t state_batch=independent?1:batch;
-    TYLOINFER_RUNTIME_CHECK(convolution_state.sizes().vec()==std::vector<int64_t>({state_batch,taps-1,channels}) &&
-        recurrent_state.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width,width}),"GDN decode core state shape disagrees");
+    if (!(convolution_state.sizes().vec()==std::vector<int64_t>({state_batch,taps-1,channels}) &&
+        recurrent_state.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width,width})))
+        throw std::runtime_error("GDN decode core state shape disagrees");
     const bool channels_first=convolution_weight.sizes().vec()==std::vector<int64_t>({channels,1,taps});
-    TYLOINFER_RUNTIME_CHECK(channels_first || convolution_weight.sizes().vec()==std::vector<int64_t>({taps,channels}),"GDN decode core conv weight disagrees");
-    TYLOINFER_RUNTIME_CHECK(output_gate.is_cuda() && alpha.is_cuda() && beta.is_cuda() &&
+    if (!(channels_first || convolution_weight.sizes().vec()==std::vector<int64_t>({taps,channels})))
+        throw std::runtime_error("GDN decode core conv weight disagrees");
+    if (!(output_gate.is_cuda() && alpha.is_cuda() && beta.is_cuda() &&
         output_gate.device()==device && alpha.device()==device && beta.device()==device &&
         output_gate.dim()==3 && output_gate.stride(2)==1 && output_gate.stride(0)>=value_heads*width &&
         output_gate.sizes().vec()==std::vector<int64_t>({batch,1,value_heads*width}) &&
         alpha.sizes().vec()==std::vector<int64_t>({batch,1,value_heads}) && beta.sizes()==alpha.sizes() &&
         output_gate.scalar_type()==alpha.scalar_type() && alpha.scalar_type()==beta.scalar_type() &&
-        (alpha.scalar_type()==::tyloi::kFloat16 || alpha.scalar_type()==::tyloi::kFloat32),"GDN decode core gate inputs disagree");
-    TYLOINFER_RUNTIME_CHECK(dt_bias.numel()==value_heads && a_log.numel()==value_heads && norm_weight.numel()==width,
-        "GDN decode core vector width disagrees");
+        (alpha.scalar_type()==::tyloi::kFloat16 || alpha.scalar_type()==::tyloi::kFloat32)))
+        throw std::runtime_error("GDN decode core gate inputs disagree");
+    if (!(dt_bias.numel()==value_heads && a_log.numel()==value_heads && norm_weight.numel()==width))
+        throw std::runtime_error("GDN decode core vector width disagrees");
     MfqCudaGuard guard(device);
     auto output=quantize_output
         ? ::tyloi::cuda::empty({batch*value_heads*(width/32)*int64_t(sizeof(block_q8_1))},qkv.options().dtype(::tyloi::kUInt8))
@@ -207,9 +216,9 @@ static std::vector<::tyloi::DenseTensor> gdn_decode_core_impl(
     auto conv=inplace_conv && !independent?convolution_state: ::tyloi::cuda::empty({batch,taps-1,channels},convolution_state.options());
     auto state=inplace_state?recurrent_state: ::tyloi::cuda::empty_like(recurrent_state);
     if(tiles>1 && !workspace.defined() && !independent)workspace=::tyloi::cuda::zeros({batch,value_heads,width+1},convolution_state.options());
-    TYLOINFER_RUNTIME_CHECK(!workspace.defined() || (real(workspace) &&
-        workspace.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width+1})),
-        "GDN decode core workspace shape/device/dtype disagrees");
+    if (!(!workspace.defined() || (real(workspace) &&
+        workspace.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width+1}))))
+        throw std::runtime_error("GDN decode core workspace shape/device/dtype disagrees");
     const auto* reductions=tyloi::cuda::env_lookup("TYLOINFER_GDN_WARP_REDUCTIONS");
     raw::Decode args{};
     args.qkv=qkv.data_ptr();args.gate=output_gate.data_ptr();args.alpha=alpha.data_ptr();args.beta=beta.data_ptr();

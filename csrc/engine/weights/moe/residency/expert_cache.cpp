@@ -1401,36 +1401,6 @@ void MoeExpertCache::end_prefill_loan() {
         <<" cleanup_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-copies_restored).count()<<'\n';
 }
 
-struct tyloi::weights::Loan::Impl {
-    Impl(std::shared_ptr<MoeExpertCache> owner, Cache& weights) : cache(std::move(owner)), weights(weights) {}
-    std::shared_ptr<MoeExpertCache> cache;
-    Cache& weights;
-};
-
-tyloi::weights::Loan::Loan(Cache& cache) { cache.lend(*this); }
-
-void tyloi::weights::Cache::lend(Loan& loan) {
-    loan.impl_ = std::make_unique<Loan::Impl>(data_->moe, *this);
-}
-
-tyloi::weights::Loan::~Loan() {
-    if(active_)try{finish();}catch(const std::exception& e) {
-        std::cerr<<"runtime_prefill_loan cleanup_error="<<e.what()<<'\n';
-    }
-}
-std::size_t tyloi::weights::Loan::begin(std::size_t bytes) {
-    if(!impl_->cache){impl_->weights.workspace(bytes);return 0;}
-    const auto borrowed=impl_->cache?impl_->cache->begin_prefill_loan(bytes):0;active_=borrowed>0;return borrowed;
-}
-std::size_t tyloi::weights::Loan::predictor(std::size_t bytes) {
-    prepare_moe_decode_residency(impl_->cache);
-    return begin(bytes + moe_prefill_transfer_bytes(impl_->cache, true));
-}
-std::size_t tyloi::weights::Loan::transfer_bytes() const {
-    return moe_prefill_transfer_bytes(impl_->cache, false);
-}
-void tyloi::weights::Loan::suspend(){if(active_)impl_->cache->suspend_prefill_loan();}
-void tyloi::weights::Loan::finish(){if(active_){impl_->cache->end_prefill_loan();active_=false;}}
 std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor) {
     return cache?cache->prefill_transfer_bytes(predictor):0;
 }
@@ -2934,10 +2904,6 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     // Destroy captured DMA/FFN consumers before returning their storage.
     for(auto& batch:cache->pipeline_dma_batches_)batch.reset();
     for(auto& release:cache->pipeline_decode_release_)release();
-    if(cache->pipeline_pool_context_) {
-        cache->pipeline_pool_context_->end_graph_pool(cache->pipeline_pool_stream_);
-        cache->pipeline_pool_context_.reset();cache->pipeline_pool_stream_=nullptr;
-    }
     // Adaptation caches arena pointers independently of captured FFN cells.
     // Keep its heat history, but retire those pointers before freeing arenas.
     if(cache->moe_residency_)cache->moe_residency_->release_transfer_stages();
@@ -2948,20 +2914,6 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     cache->pipeline_prefetch_host_stage_={};
     cache->pipeline_prefetched_keys_.clear();cache->transfer_ready_recorded_=false;
 }
-
-bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) {
-    if (!cache || !moe_expert_cache_has_sources(cache)) return false;
-    const MfqCudaGuard guard(cache->device());
-    const auto stream = mfq_current_cuda_stream();
-    if (!cache->pipeline_pool_context_) {
-        cache->pipeline_pool_context_ = tyloi::cuda::default_context(mfq_current_cuda_device());
-        cache->pipeline_pool_stream_ = stream;
-        cache->pipeline_pool_context_->begin_graph_pool(stream);
-    } else if (cache->pipeline_pool_stream_ != stream)
-        throw std::runtime_error("MFE graph memory pool changed its CUDA stream");
-    return true;
-}
-
 
 void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
     if(!cache || !cache->complete_residency_ || cache->options_.policy.adapt ||

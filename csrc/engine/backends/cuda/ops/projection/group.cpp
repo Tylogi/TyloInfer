@@ -97,8 +97,8 @@ static NintLinearGroup make_linear_group(const std::vector<tyloi::NintTensor>& w
                 g.projection_w.push_back(std::move(projection));
                 offset += source.out;
             }
-            TYLOINFER_RUNTIME_CHECK(offset == g.w.out,
-                "Q8 projection views do not cover grouped output");
+            if (!(offset == g.w.out))
+                throw std::runtime_error("Q8 projection views do not cover grouped output");
         }
     } else {
         std::vector<tyloi::NintTensor> cur;

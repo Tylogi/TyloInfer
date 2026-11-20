@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/weights/encoding/encoded.h"
+#include "engine/tensor/encoding/encoded.h"
 
 #include <cstdint>
 #include <vector>

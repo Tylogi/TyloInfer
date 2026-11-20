@@ -1314,6 +1314,33 @@ int main()try {
 
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
     for(int device=0;device<devices;++device) {
+        MfqCudaGuard guard(device);Source source;
+        TqRowTable table(source,"gate");const auto wire=table.slice_rows(0,19);
+        const mfq::TqLayout layout(wire.data(),wire.size());
+        const auto bytes=((layout.packed+3)&~std::size_t(3))+layout.packed_bytes+32;
+        CudaExecutionContext bounded,reference;
+        bounded.config.moe_device_cache_bytes=reference.config.moe_device_cache_bytes=0;
+        bounded.config.moe_host_cache_bytes=bytes;reference.config.moe_host_cache_bytes=4*bytes;
+        auto gate=load_tq_routed_weight(bounded,source,"gate");
+        auto reference_gate=load_tq_routed_weight(reference,source,"gate");
+        const auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,device));
+        auto input=tb::ones({1,33},options.dtype(tb::kFloat16))*.1;
+        gate->forward(input,tb::zeros({1,1},options.dtype(tb::kInt64))).cpu();
+        require(metric(bounded,"resident_expert_cache_bytes")==0 &&
+            metric(bounded,"ram_expert_payload_bytes")==bytes,"TQ late-miss test did not prime its RAM cache");
+        // Loading experts 1 and 2 evicts cached expert 0 after the source batch was planned.
+        std::int64_t selected[]{1,2,0,0};
+        auto ids=tb::from_blob(selected,{1,4},tb::TensorOptions().dtype(tb::kInt64)).to(input.device());
+        const auto expected=reference_gate->forward(input,ids).cpu().contiguous();
+        const auto reads=metric(bounded,"ssd_expert_read_count");
+        const auto actual=gate->forward(input,ids).cpu().contiguous();
+        require(metric(bounded,"ssd_expert_read_count")==reads+3,
+            "TQ source batch did not reload a late cache miss exactly once");
+        require(actual.nbytes()==expected.nbytes() && !std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.nbytes()),
+            "TQ source batch changed output after evicting a later requested expert");
+        std::cout<<"TQ batched reads recover experts evicted after miss planning on device "<<device<<'\n';
+    }
+    for(int device=0;device<devices;++device) {
         MfqCudaGuard guard(device);Source source(1024,true);
         auto base=load_tq_weight(source,"linear",device);
         const auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,device));

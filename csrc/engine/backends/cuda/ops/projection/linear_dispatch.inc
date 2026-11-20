@@ -4,9 +4,8 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
         int64_t outputs,
         int64_t width,
         Decode decode) {
-    TYLOINFER_RUNTIME_CHECK(
-        !input.is_cuda() && input.size(-1) == width,
-        "SQ CPU activation device or width mismatch");
+    if (!(!input.is_cuda() && input.size(-1) == width))
+        throw std::runtime_error("SQ CPU activation device or width mismatch");
     const auto dtype = input.scalar_type();
     auto shape = input.sizes().vec();
     input = input.to(::tyloi::kFloat32)
@@ -36,7 +35,8 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
 ::tyloi::DenseTensor sq_matmul_cpu(
         const tyloi::Mxfp4SqTensor& weight,
         ::tyloi::DenseTensor input) {
-    TYLOINFER_RUNTIME_CHECK(!weight.blob.is_cuda(), "SQ CPU weights must be on CPU");
+    if (weight.blob.is_cuda())
+        throw std::runtime_error("SQ CPU weights must be on CPU");
     const auto* blob = weight.blob.data_ptr<uint8_t>();
     const auto layout = tyloi::sq::parse(blob, weight.blob.numel());
     return sq_matmul_cpu_impl(
@@ -52,7 +52,8 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
 ::tyloi::DenseTensor sq_matmul_cpu(
         const tyloi::Fp8SqTensor& weight,
         ::tyloi::DenseTensor input) {
-    TYLOINFER_RUNTIME_CHECK(!weight.blob.is_cuda(), "SQ CPU weights must be on CPU");
+    if (weight.blob.is_cuda())
+        throw std::runtime_error("SQ CPU weights must be on CPU");
     const auto* blob = weight.blob.data_ptr<uint8_t>();
     const auto layout = tyloi::fp8sq::parse(
         weight.dtype, blob, weight.blob.numel());
@@ -68,6 +69,76 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
         });
 }
 
+template<class Weight>
+static tyloi::DenseTensor scaled_prefill(
+        const Weight& weight, const tyloi::DenseTensor& input,
+        tyloi::cuda::gguf::GgufPrefillProduct* deferred = nullptr,
+        const tyloi::DenseTensor& input_exponents = {}) {
+    using namespace tyloi;
+    using namespace tyloi::cuda;
+    const bool packed_input = input_exponents.defined();
+    const auto* setting = env_lookup("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+    if ((setting && setting[0] != '1' && setting[0] != 'a') || !input.is_cuda() ||
+        input.device() != weight.device() || input.scalar_type() != (packed_input ? kFloat16 : kFloat32) ||
+        !input.is_contiguous() ||
+        input.dim() != 2 || input.size(0) < 512 || input.size(0) > INT_MAX ||
+        input.size(1) != weight.neuron_len || weight.neuron_len < 1 || weight.neuron_len > INT_MAX ||
+        weight.out < 1 || weight.out > INT_MAX) return {};
+    const std::int64_t tokens = input.size(0), columns = input.size(1), rows = weight.out;
+    if (packed_input && (input_exponents.device() != input.device() || input_exponents.scalar_type() != kInt32 ||
+        !input_exponents.is_contiguous() || input_exponents.numel() != tokens))
+        return {};
+    const auto device = input.get_device();
+    const DeviceGuard guard(device);
+    const auto stream = current_stream(device);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone || GraphAllocationPlan::warming() ||
+        !gguf::grouped_f16_available(device) ||
+        prefill_weight_rows(rows, std::uint64_t(columns) * 6 + std::uint64_t(tokens) * 2, 32, device) < rows) return {};
+
+    const auto half = input.options().dtype(kFloat16), integers = input.options().dtype(kInt32);
+    try {
+        DenseTensor packed, row_exponents;
+        if (packed_input) {
+            packed = input;
+            row_exponents = input_exponents;
+        } else if (!gguf::GgufPrefillInputScope::lookup(input, packed, row_exponents)) {
+            packed = empty({tokens, columns}, half);
+            row_exponents = empty({tokens}, integers);
+            gguf::pack_scaled_f16_unit(input.data_ptr<float>(), packed.data_ptr(),
+                row_exponents.data_ptr<std::int32_t>(), tokens, columns, stream.stream());
+        }
+        auto image = empty({rows, columns}, half);
+        auto column_exponents = empty({rows}, integers);
+        {
+            DenseTensor decoded;
+            if constexpr (std::is_same_v<Weight, NintTensor>) decoded = dequant_nint_dense_f32(weight);
+            else decoded = nvq_dequant(weight).to(kFloat32).contiguous();
+            if (decoded.device() != input.device() || decoded.scalar_type() != kFloat32 ||
+                !decoded.is_contiguous() || decoded.sizes() != IntArrayRef{rows, columns})
+                throw std::runtime_error("scaled prefill decoder returned an incompatible weight matrix");
+            gguf::pack_scaled_f16_unit(decoded.data_ptr<float>(), image.data_ptr(),
+                column_exponents.data_ptr<std::int32_t>(), rows, columns, stream.stream());
+        }
+        auto product = empty({tokens, rows}, half);
+        auto& blas = default_context(device)->blas(stream.stream());
+        if (deferred) {
+            gguf::prefill_gemm_f16_accum(packed.data_ptr(), image.data_ptr(), nullptr, product.data_ptr(),
+                true, nullptr, nullptr, tokens, rows, columns, rows, blas.get(), stream.stream());
+            *deferred = {std::move(product), std::move(row_exponents), std::move(column_exponents)};
+            return {};
+        }
+        auto output = empty({tokens, rows}, input.options());
+        gguf::prefill_gemm_f16_accum(packed.data_ptr(), image.data_ptr(), product.data_ptr(), output.data_ptr(),
+            false, row_exponents.data_ptr<std::int32_t>(), column_exponents.data_ptr<std::int32_t>(),
+            tokens, rows, columns, rows, blas.get(), stream.stream());
+        return output;
+    } catch (const MfqResourceExhausted&) {
+        return {};
+    }
+}
+
 // Execution policy stays here; the format operators only receive a profiler.
 ::tyloi::DenseTensor run_nint_linear(
         CudaProfiler& profiler,
@@ -76,6 +147,8 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
         ::tyloi::DenseTensor x,
         MfqOptional<::tyloi::DenseTensor> gate,
         InputGateMode mode) {
+    if (!gate.has_value() && kl_mmq.mode == KlMmqMode::Default)
+        if (auto output = scaled_prefill(w, x); output.defined()) return output;
     if (!x.is_cuda() || !w.q8_zero || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
             ? nint_matmul_input_mul(profiler, w, x, gate.value(), static_cast<int>(mode))
@@ -83,14 +156,17 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
     }
     x = x.contiguous().to(::tyloi::kFloat16);
     if (gate.has_value()) {
-        TYLOINFER_RUNTIME_CHECK(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu, "NINT input gate mode must be sigmoid or SiLU");
+        if (!(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu))
+            throw std::runtime_error("NINT input gate mode must be sigmoid or SiLU");
         auto g = gate.value().contiguous().to(::tyloi::kFloat16);
-        TYLOINFER_RUNTIME_CHECK(x.sizes() == g.sizes(), "NINT x and gate shapes must match");
+        if (!(x.sizes() == g.sizes()))
+            throw std::runtime_error("NINT x and gate shapes must match");
         x = mode == InputGateMode::Sigmoid ? x * ::tyloi::cuda::sigmoid(g) : x * ::tyloi::cuda::silu(g);
     }
     x = pad_last(x, w.neuron_len);
     const int64_t rows = x.size(0);
-    TYLOINFER_RUNTIME_CHECK(rows > 0, "KLD NINT8-0 MMQ requires activation rows");
+    if (!(rows > 0))
+        throw std::runtime_error("KLD NINT8-0 MMQ requires activation rows");
     if (rows < 16) {
         x = ::tyloi::cuda::cat({x, ::tyloi::cuda::zeros(
             {16 - rows, x.size(1)}, x.options())}, 0).contiguous();
@@ -111,6 +187,8 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
         ::tyloi::DenseTensor x,
         MfqOptional<::tyloi::DenseTensor> gate,
         InputGateMode mode) {
+    if (!gate.has_value() && kl_mmq.mode == KlMmqMode::Default)
+        if (auto output = scaled_prefill(w, x); output.defined()) return output;
     if (!x.is_cuda() || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
             ? nvq_matmul_input_mul(profiler, w, x, gate.value(), static_cast<int>(mode))
@@ -118,13 +196,16 @@ static ::tyloi::DenseTensor sq_matmul_cpu_impl(
     }
     x = x.contiguous().to(::tyloi::kFloat16);
     if (gate.has_value()) {
-        TYLOINFER_RUNTIME_CHECK(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu, "NVQ input gate mode must be sigmoid or SiLU");
+        if (!(mode == InputGateMode::Sigmoid || mode == InputGateMode::Silu))
+            throw std::runtime_error("NVQ input gate mode must be sigmoid or SiLU");
         auto g = gate.value().contiguous().to(::tyloi::kFloat16);
-        TYLOINFER_RUNTIME_CHECK(x.sizes() == g.sizes(), "NVQ x and gate shapes must match");
+        if (!(x.sizes() == g.sizes()))
+            throw std::runtime_error("NVQ x and gate shapes must match");
         x = mode == InputGateMode::Sigmoid ? x * ::tyloi::cuda::sigmoid(g) : x * ::tyloi::cuda::silu(g);
     }
     x = pad_last(x, w.neuron_len);
-    TYLOINFER_RUNTIME_CHECK(x.size(0) >= 16, "KLD common NVQ MMQ requires at least 16 activation rows");
+    if (!(x.size(0) >= 16))
+        throw std::runtime_error("KLD common NVQ MMQ requires at least 16 activation rows");
     x = kl_mmq.prepare_activation(x);
     ++kl_mmq.dense_calls;
     return profiler.measure("kld_mmq.nvq.fp16", [&]() {

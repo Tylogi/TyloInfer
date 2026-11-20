@@ -21,10 +21,12 @@ namespace tyloi::weights {
 // The owner drains consumers and enters the target device scope before workspace operations.
 class Cache {
 public:
-    enum class Graph { native, legacy, model_parallel };
-    enum class Transfer { automatic, coordinated };
-    enum class Decode { none, routed };
-    enum class Prefill { regular, streamed, retained };
+    struct Routing {
+        bool shared_slots = false;
+        bool fixed_views = false;
+        bool host_ids_required = false;
+        bool storage_misses = false;
+    };
     enum class Stage { loaded, decode, snapshot };
     struct PrefillBudget {
         std::size_t reserve_bytes = 0;
@@ -50,6 +52,12 @@ public:
         Routes& operator=(const Routes&) = delete;
         Routes& operator=(Routes&&) = delete;
         void begin(Cache& cache, int rows);
+        // Zero rows pause learning when the prefill cannot publish a complete sample.
+        void begin_prefill(Cache& cache, int rows);
+        bool begin_prefill(Cache& cache, std::span<const int> request_rows);
+        void detach_prefill() noexcept;
+        void finish_prefill(bool complete);
+        void finish_prefill(std::span<const std::uint8_t> accepted);
         void resolve(int rows, bool cancelled);
         void resolve(std::span<const std::uint8_t> keep);
     private:
@@ -103,13 +111,9 @@ public:
     std::size_t budget() const;
     std::size_t minimum() const;
     bool empty() const;
-    bool graph_safe(Graph kind = Graph::native, bool parallel = false) const;
-    Transfer transfer() const;
-    Decode decode() const;
+    Routing routing() const;
     /** Report whether registered legacy experts completed preloading. */
     bool legacy_experts_resident() const;
-    bool split_prefill(std::int64_t rows) const;
-    bool prepare_graph(Device device);
     bool needs_finalize() const;
     void finalize(std::size_t reserve = 0, std::size_t kv_charge = 0);
     void resize(std::size_t bytes);
@@ -127,12 +131,11 @@ public:
     void release_workspace(std::size_t required_available =
         std::numeric_limits<std::size_t>::max(), const char* reason = nullptr);
     void clear_workspace() noexcept;
-    Prefill prefill_mode(std::size_t tokens, bool resumed) const;
     PrefillBudget prefill_budget(bool allow_borrow) const;
     void workspace(std::size_t bytes);
     void request(bool retire_decode);
-    std::optional<std::size_t> prepare_prefill(Device device, std::size_t tokens,
-        std::int64_t limit, Prefill mode, bool retire_decode);
+    std::size_t storage_workspace_reserve() const;
+    bool lend_decode_storage(std::size_t workspace);
     void prepare(Stage stage, Device device, const source::Source* source);
     void prepare_kv();
     KvRegion lend_kv(const Tensor& backing, std::int64_t capacity, std::size_t row_bytes,
@@ -162,6 +165,7 @@ private:
     Tensor routed_tq(const source::Source& source, const std::string& name,
         const ParallelConfig& parallel, std::int64_t experts,
         std::int64_t output, std::int64_t input);
+    Tensor routed_gguf(const source::Source& source, const std::string& name, Device target);
     void restore_workspace(std::size_t reserve_bytes, const source::Source* source);
     std::size_t prefill_workspace_capacity() const noexcept;
     void append_workspace_metrics(std::vector<std::pair<std::string, double>>& metrics) const;

@@ -227,14 +227,6 @@ MoeDiagnostics moe_diagnostics() {
     if (const auto* path = std::getenv("TYLOINFER_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
     return result;
 }
-bool layer_weight_timings(){return exact_one("TYLOINFER_LAYER_WEIGHT_TIMINGS");}
-std::optional<bool> layer_weight_streaming() {
-    const auto* value=std::getenv("TYLOINFER_LAYER_WEIGHT_STREAMING");
-    if(!value)return {};
-    if(std::string_view(value)=="1")return true;
-    if(std::string_view(value)=="0")return false;
-    throw std::invalid_argument("TYLOINFER_LAYER_WEIGHT_STREAMING must be zero or one");
-}
 std::optional<int> embedding_mapped() {
     const auto* value=std::getenv("TYLOINFER_EMBEDDING_MAPPED");
     return value ? std::optional<int>(value[0] - '0') : std::nullopt;
@@ -382,10 +374,6 @@ bool nvq_dense_reference() {
 std::optional<bool> ple_file_map() {
     const auto* value=std::getenv("TYLOINFER_PLE_FILE_MAP");
     return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
-}
-std::optional<bool> prefill_expert_batch_audit() {
-    const auto* value=std::getenv("TYLOINFER_PREFILL_EXPERT_BATCH_AUDIT");
-    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> prefill_layer_major_trace() {
     const auto* value=std::getenv("TYLOINFER_PREFILL_LAYER_MAJOR_TRACE");
@@ -931,7 +919,6 @@ void CudaExecutionContext::reset() noexcept {
     gguf_expert_cache.reset();
     projection_executors.clear();
     shared_expert_executors.clear();
-    jev_full_vram.reset();
     model_parallel_collectives.reset();
     tensor_parallel = {};
     expert_parallel = {};

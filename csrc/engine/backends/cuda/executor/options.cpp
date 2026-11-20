@@ -299,10 +299,6 @@ bool nvq_dense_reference() {
     const auto* value=tyloi::cuda::env_lookup("TYLOINFER_NVQ_DENSE_REFERENCE");
     return value != nullptr;
 }
-std::optional<bool> prefill_expert_batch_audit() {
-    const auto* value=tyloi::cuda::env_lookup("TYLOINFER_PREFILL_EXPERT_BATCH_AUDIT");
-    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
-}
 std::optional<bool> prefill_layer_major_trace() {
     const auto* value=tyloi::cuda::env_lookup("TYLOINFER_PREFILL_LAYER_MAJOR_TRACE");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;

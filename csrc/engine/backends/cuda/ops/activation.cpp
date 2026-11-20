@@ -17,10 +17,10 @@ tyloi::cuda::activation_raw::Type raw_type(tyloi::ScalarType type) {
 
 ::tyloi::DenseTensor clipped_silu_mul_cuda(::tyloi::DenseTensor gate,
         ::tyloi::DenseTensor up,double limit) {
-    TYLOINFER_RUNTIME_CHECK(gate.is_cuda() && up.device()==gate.device() &&
+    if (!(gate.is_cuda() && up.device()==gate.device() &&
         gate.scalar_type()==::tyloi::kFloat16 && up.scalar_type()==::tyloi::kFloat16 &&
-        gate.sizes()==up.sizes() && gate.is_contiguous() && up.is_contiguous() && limit>0,
-        "clipped SwiGLU requires matching contiguous CUDA FP16 tensors and a positive limit");
+        gate.sizes()==up.sizes() && gate.is_contiguous() && up.is_contiguous() && limit>0))
+        throw std::runtime_error("clipped SwiGLU requires matching contiguous CUDA FP16 tensors and a positive limit");
     auto output=::tyloi::cuda::empty(gate.sizes(),gate.options());
     tyloi::cuda::activation_raw::clipped_silu_mul(gate.data_ptr(), up.data_ptr(), output.data_ptr(), gate.numel(), float(limit), mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
@@ -29,15 +29,18 @@ tyloi::cuda::activation_raw::Type raw_type(tyloi::ScalarType type) {
 
 ::tyloi::DenseTensor silu_mul_cuda(::tyloi::DenseTensor gate, ::tyloi::DenseTensor up)
 {
-    TYLOINFER_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous(), "silu_mul: gate must be cuda contiguous");
-    TYLOINFER_RUNTIME_CHECK(up.is_cuda() && up.is_contiguous(), "silu_mul: up must be cuda contiguous");
-    TYLOINFER_RUNTIME_CHECK(gate.sizes() == up.sizes(), "silu_mul: gate/up shapes must match");
-    TYLOINFER_RUNTIME_CHECK(gate.scalar_type() == up.scalar_type(), "silu_mul: gate/up dtype must match");
-    TYLOINFER_RUNTIME_CHECK(
-        gate.scalar_type() == ::tyloi::kFloat32 ||
+    if (!(gate.is_cuda() && gate.is_contiguous()))
+        throw std::runtime_error("silu_mul: gate must be cuda contiguous");
+    if (!(up.is_cuda() && up.is_contiguous()))
+        throw std::runtime_error("silu_mul: up must be cuda contiguous");
+    if (!(gate.sizes() == up.sizes()))
+        throw std::runtime_error("silu_mul: gate/up shapes must match");
+    if (!(gate.scalar_type() == up.scalar_type()))
+        throw std::runtime_error("silu_mul: gate/up dtype must match");
+    if (!(gate.scalar_type() == ::tyloi::kFloat32 ||
         gate.scalar_type() == ::tyloi::kFloat16 ||
-        gate.scalar_type() == ::tyloi::kBFloat16,
-        "silu_mul: dtype must be f32, f16, or bf16");
+        gate.scalar_type() == ::tyloi::kBFloat16))
+        throw std::runtime_error("silu_mul: dtype must be f32, f16, or bf16");
 
     auto out = ::tyloi::cuda::empty_like(gate);
     const auto dtype = gate.scalar_type() == ::tyloi::kFloat32
@@ -62,12 +65,16 @@ tyloi::cuda::activation_raw::Type raw_type(tyloi::ScalarType type) {
 
 ::tyloi::DenseTensor gelu_mul_cuda(::tyloi::DenseTensor gate, ::tyloi::DenseTensor up)
 {
-    TYLOINFER_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous(), "gelu_mul: gate must be cuda contiguous");
-    TYLOINFER_RUNTIME_CHECK(up.is_cuda() && up.is_contiguous(), "gelu_mul: up must be cuda contiguous");
-    TYLOINFER_RUNTIME_CHECK(gate.sizes() == up.sizes(), "gelu_mul: gate/up shapes must match");
-    TYLOINFER_RUNTIME_CHECK(gate.scalar_type() == up.scalar_type(), "gelu_mul: gate/up dtype must match");
-    TYLOINFER_RUNTIME_CHECK(gate.scalar_type() == ::tyloi::kFloat32 || gate.scalar_type() == ::tyloi::kFloat16,
-                "gelu_mul: dtype must be f32 or f16");
+    if (!(gate.is_cuda() && gate.is_contiguous()))
+        throw std::runtime_error("gelu_mul: gate must be cuda contiguous");
+    if (!(up.is_cuda() && up.is_contiguous()))
+        throw std::runtime_error("gelu_mul: up must be cuda contiguous");
+    if (!(gate.sizes() == up.sizes()))
+        throw std::runtime_error("gelu_mul: gate/up shapes must match");
+    if (!(gate.scalar_type() == up.scalar_type()))
+        throw std::runtime_error("gelu_mul: gate/up dtype must match");
+    if (!(gate.scalar_type() == ::tyloi::kFloat32 || gate.scalar_type() == ::tyloi::kFloat16))
+        throw std::runtime_error("gelu_mul: dtype must be f32 or f16");
 
     auto out = ::tyloi::cuda::empty_like(gate);
     const auto dtype = gate.scalar_type() == ::tyloi::kFloat32
@@ -90,13 +97,12 @@ tyloi::cuda::activation_raw::Type raw_type(tyloi::ScalarType type) {
 
 ::tyloi::DenseTensor relu_squared_cuda(::tyloi::DenseTensor input)
 {
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous(),
-        "relu_squared: input must be cuda contiguous");
-    TYLOINFER_RUNTIME_CHECK(
-        input.scalar_type() == ::tyloi::kFloat32 ||
+    if (!(input.is_cuda() && input.is_contiguous()))
+        throw std::runtime_error("relu_squared: input must be cuda contiguous");
+    if (!(input.scalar_type() == ::tyloi::kFloat32 ||
         input.scalar_type() == ::tyloi::kFloat16 ||
-        input.scalar_type() == ::tyloi::kBFloat16,
-        "relu_squared: dtype must be f32, f16, or bf16");
+        input.scalar_type() == ::tyloi::kBFloat16))
+        throw std::runtime_error("relu_squared: dtype must be f32, f16, or bf16");
     auto out = ::tyloi::cuda::empty_like(input);
     if (input.numel() == 0) return out;
     tyloi::cuda::activation_raw::relu_squared(input.data_ptr(), out.data_ptr(), input.numel(), raw_type(input.scalar_type()), mfq_current_cuda_stream());
@@ -108,20 +114,27 @@ std::vector<::tyloi::DenseTensor> linear_gate_beta_cuda(
     ::tyloi::DenseTensor alpha, ::tyloi::DenseTensor beta, ::tyloi::DenseTensor dt_bias, ::tyloi::DenseTensor a_log,
     bool stable_softplus)
 {
-    TYLOINFER_RUNTIME_CHECK(alpha.is_cuda() && beta.is_cuda(), "linear_gate_beta: alpha/beta must be cuda tensors");
-    TYLOINFER_RUNTIME_CHECK(dt_bias.is_cuda() && a_log.is_cuda(), "linear_gate_beta: dt_bias/a_log must be cuda tensors");
-    TYLOINFER_RUNTIME_CHECK(alpha.dim() == 3 && beta.dim() == 3, "linear_gate_beta: alpha/beta must be [B,T,V]");
-    TYLOINFER_RUNTIME_CHECK(alpha.sizes() == beta.sizes(), "linear_gate_beta: alpha/beta shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(alpha.scalar_type() == beta.scalar_type(), "linear_gate_beta: alpha/beta dtype mismatch");
-    TYLOINFER_RUNTIME_CHECK(alpha.scalar_type() == ::tyloi::kFloat32 || alpha.scalar_type() == ::tyloi::kFloat16,
-                "linear_gate_beta: alpha/beta dtype must be f32 or f16");
-    TYLOINFER_RUNTIME_CHECK(dt_bias.is_contiguous() && a_log.is_contiguous(), "linear_gate_beta: dt_bias/a_log must be contiguous");
-    TYLOINFER_RUNTIME_CHECK(dt_bias.scalar_type() == ::tyloi::kFloat32 && a_log.scalar_type() == ::tyloi::kFloat32,
-                "linear_gate_beta: dt_bias/a_log must be f32");
+    if (!(alpha.is_cuda() && beta.is_cuda()))
+        throw std::runtime_error("linear_gate_beta: alpha/beta must be cuda tensors");
+    if (!(dt_bias.is_cuda() && a_log.is_cuda()))
+        throw std::runtime_error("linear_gate_beta: dt_bias/a_log must be cuda tensors");
+    if (!(alpha.dim() == 3 && beta.dim() == 3))
+        throw std::runtime_error("linear_gate_beta: alpha/beta must be [B,T,V]");
+    if (!(alpha.sizes() == beta.sizes()))
+        throw std::runtime_error("linear_gate_beta: alpha/beta shape mismatch");
+    if (!(alpha.scalar_type() == beta.scalar_type()))
+        throw std::runtime_error("linear_gate_beta: alpha/beta dtype mismatch");
+    if (!(alpha.scalar_type() == ::tyloi::kFloat32 || alpha.scalar_type() == ::tyloi::kFloat16))
+        throw std::runtime_error("linear_gate_beta: alpha/beta dtype must be f32 or f16");
+    if (!(dt_bias.is_contiguous() && a_log.is_contiguous()))
+        throw std::runtime_error("linear_gate_beta: dt_bias/a_log must be contiguous");
+    if (!(dt_bias.scalar_type() == ::tyloi::kFloat32 && a_log.scalar_type() == ::tyloi::kFloat32))
+        throw std::runtime_error("linear_gate_beta: dt_bias/a_log must be f32");
     int64_t B = alpha.size(0);
     int64_t T = alpha.size(1);
     int64_t V = alpha.size(2);
-    TYLOINFER_RUNTIME_CHECK(dt_bias.numel() == V && a_log.numel() == V, "linear_gate_beta: parameter size mismatch");
+    if (!(dt_bias.numel() == V && a_log.numel() == V))
+        throw std::runtime_error("linear_gate_beta: parameter size mismatch");
 
     auto opts = ::tyloi::TensorOptions().device(alpha.device()).dtype(::tyloi::kFloat32);
     auto gate_t = ::tyloi::cuda::empty({B, V, T}, opts);

@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "engine/backends/cuda/kernels/projection/sq/fp8_raw.h"
+#include <stdexcept>
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cstdint>
@@ -15,12 +16,10 @@ void validate_metadata(
         const ::tyloi::DenseTensor& row_symbol_byte_offsets,
         const Layout& layout,
         bool mxfp8) {
-    TYLOINFER_RUNTIME_CHECK(
-        blob.is_cuda() && blob.scalar_type() == ::tyloi::kUInt8 &&
-        blob.dim() == 1 && blob.is_contiguous(),
-        "FP8-SQ blob must be contiguous rank-1 CUDA uint8");
-    TYLOINFER_RUNTIME_CHECK(
-        row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
+    if (!(blob.is_cuda() && blob.scalar_type() == ::tyloi::kUInt8 &&
+        blob.dim() == 1 && blob.is_contiguous()))
+        throw std::runtime_error("FP8-SQ blob must be contiguous rank-1 CUDA uint8");
+    if (!(row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
         row_q.scalar_type() == ::tyloi::kUInt8 &&
         row_q.dim() == 1 && row_q.is_contiguous() &&
         row_q.numel() == layout.outputs &&
@@ -29,41 +28,37 @@ void validate_metadata(
         row_symbol_byte_offsets.scalar_type() == ::tyloi::kInt32 &&
         row_symbol_byte_offsets.dim() == 1 &&
         row_symbol_byte_offsets.is_contiguous() &&
-        row_symbol_byte_offsets.numel() == layout.outputs,
-        "FP8-SQ row metadata must be matching CUDA arrays");
-    TYLOINFER_RUNTIME_CHECK(
-        layout.outputs > 0 && layout.width > 0 &&
+        row_symbol_byte_offsets.numel() == layout.outputs))
+        throw std::runtime_error("FP8-SQ row metadata must be matching CUDA arrays");
+    if (!(layout.outputs > 0 && layout.width > 0 &&
         layout.block_rows > 0 && layout.block_columns > 0 &&
         layout.scale_rows == (layout.outputs + layout.block_rows - 1) /
             layout.block_rows &&
         layout.scale_columns == (layout.width + layout.block_columns - 1) /
             layout.block_columns &&
         layout.palettes < layout.symbols && layout.symbols <= layout.scales &&
-        layout.scales < static_cast<std::size_t>(blob.numel()),
-        "FP8-SQ layout metadata is inconsistent");
+        layout.scales < static_cast<std::size_t>(blob.numel())))
+        throw std::runtime_error("FP8-SQ layout metadata is inconsistent");
     const std::size_t scale_count =
         static_cast<std::size_t>(layout.scale_rows) * layout.scale_columns;
     const std::size_t scale_itemsize = mxfp8 || layout.scale_kind == 1
         ? 1
         : layout.scale_kind == 4 ? 4 : 2;
-    TYLOINFER_RUNTIME_CHECK(
-        scale_count <=
+    if (!(scale_count <=
             (static_cast<std::size_t>(blob.numel()) - layout.scales) /
-                scale_itemsize,
-        "FP8-SQ scale payload exceeds its blob");
+                scale_itemsize))
+        throw std::runtime_error("FP8-SQ scale payload exceeds its blob");
     if (mxfp8) {
-        TYLOINFER_RUNTIME_CHECK(
-            layout.scale_kind == 1 &&
+        if (!(layout.scale_kind == 1 &&
             ((layout.block_rows == 1 && layout.block_columns == 32) ||
              (layout.block_rows == 32 && layout.block_columns == 32) ||
-             (layout.block_rows == 128 && layout.block_columns == 128)),
-            "MXFP8-SQ scale contract is invalid");
+             (layout.block_rows == 128 && layout.block_columns == 128))))
+            throw std::runtime_error("MXFP8-SQ scale contract is invalid");
     } else {
-        TYLOINFER_RUNTIME_CHECK(
-            layout.block_rows == 128 && layout.block_columns == 128 &&
+        if (!(layout.block_rows == 128 && layout.block_columns == 128 &&
             (layout.scale_kind == 2 || layout.scale_kind == 3 ||
-             layout.scale_kind == 4),
-            "FP8-128SQ scale contract is invalid");
+             layout.scale_kind == 4)))
+            throw std::runtime_error("FP8-128SQ scale contract is invalid");
     }
 }
 
@@ -78,15 +73,14 @@ Layout make_layout(
         std::int64_t palettes,
         std::int64_t symbols,
         std::int64_t scales) {
-    TYLOINFER_RUNTIME_CHECK(
-        outputs > 0 && outputs <= std::numeric_limits<int>::max() &&
+    if (!(outputs > 0 && outputs <= std::numeric_limits<int>::max() &&
         width > 0 && width <= std::numeric_limits<int>::max() &&
         block_rows > 0 && block_rows <= std::numeric_limits<int>::max() &&
         block_columns > 0 && block_columns <= std::numeric_limits<int>::max() &&
         scale_rows > 0 && scale_rows <= std::numeric_limits<int>::max() &&
         scale_columns > 0 && scale_columns <= std::numeric_limits<int>::max() &&
-        palettes >= 0 && symbols >= 0 && scales >= 0,
-        "FP8-SQ host layout exceeds CUDA limits");
+        palettes >= 0 && symbols >= 0 && scales >= 0))
+        throw std::runtime_error("FP8-SQ host layout exceeds CUDA limits");
     return {
         static_cast<int>(outputs),
         static_cast<int>(width),
@@ -123,10 +117,11 @@ template <bool MXFP8>
 void launch_dense_gemm_nt(const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,
         ::tyloi::DenseTensor& output,cudaStream_t stream) {
     auto handle=mfq_current_cublas_handle();
-    TYLOINFER_RUNTIME_CHECK(cublasSetStream(handle,stream)==CUBLAS_STATUS_SUCCESS,"FP8-SQ cublasSetStream failed");
+    if (!(cublasSetStream(handle,stream)==CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error("FP8-SQ cublasSetStream failed");
     const bool half=input.scalar_type()==::tyloi::kFloat16;
-    TYLOINFER_RUNTIME_CHECK(raw::gemm(handle,input.data_ptr(),weight.data_ptr(),output.data_ptr(),int(input.size(0)),int(input.size(1)),int(weight.size(0)),half?::tyloi::cuda::NumericType::f16 : ::tyloi::cuda::NumericType::f32,stream)==CUBLAS_STATUS_SUCCESS,
-        half?"FP8-SQ FP16 GEMM failed":"FP8-SQ FP32 GEMM failed");
+    if (!(raw::gemm(handle,input.data_ptr(),weight.data_ptr(),output.data_ptr(),int(input.size(0)),int(input.size(1)),int(weight.size(0)),half?::tyloi::cuda::NumericType::f16 : ::tyloi::cuda::NumericType::f32,stream)==CUBLAS_STATUS_SUCCESS))
+        throw std::runtime_error(half?"FP8-SQ FP16 GEMM failed":"FP8-SQ FP32 GEMM failed");
 }
 template <bool MXFP8>
 ::tyloi::DenseTensor matmul(
@@ -136,14 +131,13 @@ template <bool MXFP8>
         ::tyloi::DenseTensor input,
         Layout layout) {
     validate_metadata(blob, row_q, row_symbol_byte_offsets, layout, MXFP8);
-    TYLOINFER_RUNTIME_CHECK(
-        input.is_cuda() && input.get_device() == blob.get_device() &&
+    if (!(input.is_cuda() && input.get_device() == blob.get_device() &&
         input.dim() == 2 && input.is_contiguous() &&
         input.size(1) == layout.width &&
         input.size(0) <= std::numeric_limits<int>::max() &&
         (input.scalar_type() == ::tyloi::kFloat16 ||
-         input.scalar_type() == ::tyloi::kFloat32),
-        "FP8-SQ activation must be contiguous rank-2 CUDA FP16/FP32");
+         input.scalar_type() == ::tyloi::kFloat32)))
+        throw std::runtime_error("FP8-SQ activation must be contiguous rank-2 CUDA FP16/FP32");
     const MfqCudaGuard guard(blob.device());
     ::tyloi::DenseTensor output = ::tyloi::cuda::empty(
         {input.size(0), layout.outputs}, input.options());
@@ -179,8 +173,7 @@ void routed_matmul(
         Layout layout,
         ::tyloi::DenseTensor output) {
     validate_metadata(blob, row_q, row_symbol_byte_offsets, layout, MXFP8);
-    TYLOINFER_RUNTIME_CHECK(
-        layout.outputs == local_experts * out_per_expert &&
+    if (!(layout.outputs == local_experts * out_per_expert &&
         input.is_cuda() && input.get_device() == blob.get_device() &&
         input.is_contiguous() && input.scalar_type() == ::tyloi::kFloat16 &&
         (input.dim() == 2 || input.dim() == 3) && input.size(-1) == layout.width &&
@@ -199,11 +192,10 @@ void routed_matmul(
         (input.dim() == 2 || input.size(1) == expert_ids.size(1)) &&
         n_experts > 0 && n_experts <= std::numeric_limits<int>::max() &&
         local_experts > 0 && local_experts <= std::numeric_limits<int>::max() &&
-        out_per_expert > 0 && out_per_expert <= std::numeric_limits<int>::max(),
-        "FP8-SQ routed matmul requires matching contiguous CUDA FP16 tensors");
-    TYLOINFER_RUNTIME_CHECK(
-        expert_ids.numel() <= std::numeric_limits<int>::max(),
-        "FP8-SQ route count exceeds CUDA limits");
+        out_per_expert > 0 && out_per_expert <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("FP8-SQ routed matmul requires matching contiguous CUDA FP16 tensors");
+    if (!(expert_ids.numel() <= std::numeric_limits<int>::max()))
+        throw std::runtime_error("FP8-SQ route count exceeds CUDA limits");
     if (expert_ids.numel() == 0) return;
     const MfqCudaGuard guard(blob.device());
     raw::routed(blob.data_ptr<std::uint8_t>(),row_q.data_ptr<std::uint8_t>(),row_symbol_byte_offsets.data_ptr<std::int32_t>(),input.data_ptr(),output.data_ptr(),expert_ids.data_ptr<std::int32_t>(),expert_local.data_ptr<std::int32_t>(),layout,int(expert_ids.numel()),int(expert_ids.size(1)),int(n_experts),int(local_experts),int(out_per_expert),input.dim()==2,MXFP8,mfq_current_cuda_stream());

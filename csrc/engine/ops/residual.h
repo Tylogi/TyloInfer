@@ -15,6 +15,7 @@ struct ResidualConfig {
     Device target = Device(kCUDA, 0);
     /** Preserve the native GGUF/Affine hyper-connection precision policy. */
     bool native_hyper = false;
+    double norm_weight_offset = 0;
 };
 /** Identify the numerical stage in graph profiling. */
 enum class ResidualRole { none, attention, ffn, final };

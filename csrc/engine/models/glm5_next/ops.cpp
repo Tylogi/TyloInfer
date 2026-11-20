@@ -7,6 +7,7 @@
 #include "forward.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
+#include <stdexcept>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -99,8 +100,10 @@ static DenseTensor execute(const Layer& layer, LayerState& activity,
                       const DenseTensor &x, int64_t position, int64_t confirmed = 0) {
     const auto& [config, attention_hc, ffn_hc, attention_norm, ffn_norm, ffn, kda, mla, device] = layer;
     if (mla)
-        TYLOINFER_RUNTIME_CHECK(std::get<MlaState>(activity).position() == position,
-                               "GLM MLA/model cache positions diverged");
+        {
+            if (!(std::get<MlaState>(activity).position() == position))
+                throw std::runtime_error("GLM MLA/model cache positions diverged");
+        }
     auto attention_mix = attention_hc.pre(x, config);
     auto normalized = rms_norm(attention_mix[2], attention_norm.dense(), config.eps);
     auto branch = kda ? kda->forward(std::get<KdaState>(activity), std::move(normalized), true, confirmed)
@@ -126,8 +129,8 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    tyloi::models::require_model(model.graph.backbone == "glm5_next",
-                               "model backbone does not match the requested causal model");
+    if (!(model.graph.backbone == "glm5_next"))
+        throw std::runtime_error("model backbone does not match the requested causal model");
     for (const auto& component : model.graph.components)
         if (component.kind != "text" && component.kind != "predictor")
             throw std::runtime_error("GLM5-Next CUDA does not support component: " + component.kind);
@@ -135,11 +138,11 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
         (predictor->tensor_root != "predictor" || predictor->implementation != "next_token_prediction"))
         throw std::runtime_error("GLM5-Next CUDA requires a next_token_prediction predictor under the predictor tensor root");
     tyloi::models::glm5_next::load_config(definition, model.config, model.metadata);
-    tyloi::models::require_model(model.config.layers == model.graph.topology.text_layers,
-                               "model graph/config text-layer topology mismatch");
+    if (!(model.config.layers == model.graph.topology.text_layers))
+        throw std::runtime_error("model graph/config text-layer topology mismatch");
     if (context > 0) {
-        tyloi::models::require_model(context <= model.metadata.max_position_embeddings,
-                                   "--ctx-size exceeds max_position_embeddings");
+        if (!(context <= model.metadata.max_position_embeddings))
+            throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         model.config.maximum = context;
         model.metadata.max_position_embeddings = context;
     }
@@ -214,7 +217,8 @@ void State::reset(int64_t next_batch) {
 }
 
 void State::commit_speculative() {
-    tyloi::models::require_model(speculative_start >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0))
+        throw std::runtime_error("no speculative transaction");
     for (auto& layer : layers)
         if (auto* kda = std::get_if<KdaState>(&layer)) kda->commit();
     speculative_start = -1;
@@ -309,7 +313,8 @@ std::vector<::tyloi::Tensor> State::storage() const {
 }
 
 void State::rollback_speculative(std::int64_t accepted) {
-    tyloi::models::require_model(speculative_start >= 0 && accepted >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0 && accepted >= 0))
+        throw std::runtime_error("no speculative transaction");
     const auto keep = speculative_start + speculative_confirmed + accepted;
     for (std::size_t i = 0; i < layers.size(); ++i) {
         MfqCudaGuard guard(devices[i]);
@@ -346,10 +351,11 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 
 ::tyloi::Tensor Model::embedding(const ::tyloi::Tensor& input_ids, int primary) const {
     auto ids = input_ids.dense();
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                                 "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     if (ids.dim() == 1) ids = ids.unsqueeze(0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     auto normalized = tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(ids, tyloi::kInt64), tyloi::Device(tyloi::kCUDA, primary)));
     return tyloi::ops::measure("model.embed", normalized.device(), [&] {
         return tyloi::ops::embedding(normalized, embed);
@@ -371,27 +377,29 @@ bool Model::supports_speculation() const noexcept {
 ::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
                                const tyloi::models::ForwardOptions& mode) const {
     auto& state = static_cast<State&>(state_value);
-    tyloi::models::require_model(!input.suffix, "GLM Flash-Next does not support speculative suffix forwarding");
+    if (input.suffix)
+        throw std::runtime_error("GLM Flash-Next does not support speculative suffix forwarding");
     MfqCudaGuard guard(mode.primary);
     auto ids = input.ids.dense();
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-                                 "token IDs must have shape [tokens] or [batch,tokens]");
+    if (!(ids.dim() == 1 || ids.dim() == 2))
+        throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
     if (ids.dim() == 1) ids = ids.unsqueeze(0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
+    if (!(ids.size(0) > 0 && ids.size(1) > 0))
+        throw std::runtime_error("token IDs must not be empty");
     ids = tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(ids, tyloi::kInt64), tyloi::Device(tyloi::kCUDA, mode.primary))).dense();
     auto embeddings = input.embeddings.defined() ? input.embeddings.dense() : embedding(ids, mode.primary).dense();
     const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size,
-        "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(T > 0 && state.cache_pos + T <= metadata.max_position_embeddings &&
-        !input.positions.defined() && !input.cache_positions.defined(),
-        "GLM Flash-Next currently requires contiguous causal cache positions");
-    tyloi::models::require_model(state.speculative_start < 0,
-        "commit or roll back the pending speculative pass before forwarding");
-    tyloi::models::require_model(input.confirmed >= 0 &&
-        (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 && supports_speculation())),
-        "unsupported speculative backbone geometry");
+    if (!(embeddings.dim() == 3 && embeddings.size(0) == B &&
+        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size))
+        throw std::runtime_error("inputs_embeds shape must match [batch,tokens,hidden_size]");
+    if (!(T > 0 && state.cache_pos + T <= metadata.max_position_embeddings &&
+        !input.positions.defined() && !input.cache_positions.defined()))
+        throw std::runtime_error("GLM Flash-Next currently requires contiguous causal cache positions");
+    if (!(state.speculative_start < 0))
+        throw std::runtime_error("commit or roll back the pending speculative pass before forwarding");
+    if (!(input.confirmed >= 0 &&
+        (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 && supports_speculation()))))
+        throw std::runtime_error("unsupported speculative backbone geometry");
     if (input.confirmed > 0) {
         state.speculative_start = state.cache_pos;
         state.speculative_confirmed = input.confirmed;
@@ -433,7 +441,8 @@ bool Mtp::load_weights(const ::tyloi::weights::Loader& weights,
 
 void Mtp::reset(tyloi::models::MtpState& value, int64_t next_batch) const {
     auto& state = this->state<PredictorState>(value);
-    TYLOINFER_RUNTIME_CHECK(next_batch > 0, "GLM5-Next MTP batch must be positive");
+    if (!(next_batch > 0))
+        throw std::runtime_error("GLM5-Next MTP batch must be positive");
     for (auto &layer : state.states)
         layer.reset();
     std::fill(state.lengths.begin(), state.lengths.end(), 0);
@@ -446,21 +455,22 @@ std::pair<DenseTensor, DenseTensor> Mtp::evaluate(tyloi::models::MtpState& value
                                        const DenseTensor &supplied_positions,
                                        const DenseTensor &supplied_embeddings) const {
     auto& state = this->state<PredictorState>(value);
-    TYLOINFER_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
+    if (!(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
                           hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
-                          hidden.size(1) == ids.size(1) && hidden.size(2) == hidden_norm.numel(),
-                      "GLM5-Next MTP input geometry mismatch");
+                          hidden.size(1) == ids.size(1) && hidden.size(2) == hidden_norm.numel()))
+        throw std::runtime_error("GLM5-Next MTP input geometry mismatch");
     const auto b = ids.size(0), t = ids.size(1);
     auto dtype = ::tyloi::kFloat16;
     const auto capacity = config.maximum;
     const auto count = int64_t(state.lengths.size());
-    tyloi::models::require_model(count > 0 && b > 0 && t > 0, "invalid predictor geometry");
+    if (!(count > 0 && b > 0 && t > 0))
+        throw std::runtime_error("invalid predictor geometry");
     const auto layer = (depth % count + count) % count;
     if (cache && state.batch && state.batch != b)
         reset(state, b);
     const auto start = cache ? state.lengths[layer] : 0;
-    tyloi::models::require_model(start >= 0 && t <= capacity - start,
-                                 "predictor history exceeds context capacity");
+    if (!(start >= 0 && t <= capacity - start))
+        throw std::runtime_error("predictor history exceeds context capacity");
     auto embeds = supplied_embeddings;
     if (!embeds.defined()) {
         const auto device = ::tyloi::Device(::tyloi::kCUDA, primary_);
@@ -469,19 +479,19 @@ std::pair<DenseTensor, DenseTensor> Mtp::evaluate(tyloi::models::MtpState& value
             return ::tyloi::ops::embedding(normalized, embedding_);
         }).dense();
     }
-    TYLOINFER_RUNTIME_CHECK(embeds.sizes().vec() ==
-                          std::vector<int64_t>({b, t, config.hidden}),
-                      "GLM5-Next MTP embedding shape mismatch");
+    if (!(embeds.sizes().vec() ==
+                          std::vector<int64_t>({b, t, config.hidden})))
+        throw std::runtime_error("GLM5-Next MTP embedding shape mismatch");
     DenseTensor pos;
     {
         auto current = supplied_positions.defined()
                            ? supplied_positions
                            : ::tyloi::cuda::arange(start, start + t,
                                         ids.options().dtype(::tyloi::kInt32));
-        TYLOINFER_RUNTIME_CHECK((current.dim() == 1 || current.dim() == 2) &&
+        if (!((current.dim() == 1 || current.dim() == 2) &&
                               current.size(-1) == t &&
-                              (current.dim() == 1 || current.size(0) == b),
-                          "GLM MTP positions require [T] or [B,T]");
+                              (current.dim() == 1 || current.size(0) == b)))
+            throw std::runtime_error("GLM MTP positions require [T] or [B,T]");
         current = current.to(::tyloi::kInt32);
         pos = std::move(current);
     }
@@ -534,8 +544,8 @@ tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value,
 
 void Mtp::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const {
     auto& state = this->state<PredictorState>(value);
-    TYLOINFER_RUNTIME_CHECK(position >= 0 && position <= state.position(),
-                      "GLM5-Next MTP cache trim position is invalid");
+    if (!(position >= 0 && position <= state.position()))
+        throw std::runtime_error("GLM5-Next MTP cache trim position is invalid");
     constexpr size_t index = 0;
     if (index < layers.size() && layers[index].attention)
         state.states[index].truncate(position);

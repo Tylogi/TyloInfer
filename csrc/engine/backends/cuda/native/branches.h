@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace tyloi::cuda {
@@ -66,7 +67,8 @@ public:
 
     // The execution owner drains before clearing or destroying these resources.
     void clear() {
-        TYLOINFER_RUNTIME_CHECK(depth_ == 0, "cannot retire active CUDA branches");
+        if (depth_ != 0)
+            throw std::runtime_error("cannot retire active CUDA branches");
         devices_.clear();
     }
 

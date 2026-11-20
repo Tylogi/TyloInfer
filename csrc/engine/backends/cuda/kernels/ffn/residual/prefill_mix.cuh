@@ -1,4 +1,5 @@
 #pragma once
+#include <stdexcept>
 #include "env.h"
 
 // Four stream projections share the activation tile. Products overwrite the
@@ -160,9 +161,9 @@ bool gr_prefill_mix_selected(const tyloi::NintTensor& weight,const ::tyloi::Dens
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized) {
     MfqCudaGuard guard(input.device());
     const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/4;
-    TYLOINFER_RUNTIME_CHECK(rows<=65535*int64_t(128) && hidden<=std::numeric_limits<int>::max() &&
-        weight.neuron_len<=std::numeric_limits<int>::max() && weight.ng<=std::numeric_limits<int>::max(),
-        "fused GR prefill exceeds CUDA launch geometry");
+    if (!(rows<=65535*int64_t(128) && hidden<=std::numeric_limits<int>::max() &&
+        weight.neuron_len<=std::numeric_limits<int>::max() && weight.ng<=std::numeric_limits<int>::max()))
+        throw std::runtime_error("fused GR prefill exceeds CUDA launch geometry");
     auto shape=input.sizes().vec();shape.back()=hidden;
     const auto dtype=input.scalar_type()==::tyloi::kFloat32 || normalized.scalar_type()==::tyloi::kFloat32?::tyloi::kFloat32: ::tyloi::kFloat16;
     auto output=::tyloi::cuda::empty(shape,input.options().dtype(dtype));

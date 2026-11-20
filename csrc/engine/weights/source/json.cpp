@@ -15,15 +15,16 @@ constexpr std::uint64_t kMaxJsonSidecarBytes = std::uint64_t{256} << 20;
 
 } // namespace
 
-std::vector<std::byte> read_file(const std::filesystem::path& path) {
+std::vector<std::byte> read_file(const std::filesystem::path& path, std::size_t maximum) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) throw std::runtime_error("cannot open " + path.string());
     stream.seekg(0, std::ios::end);
     const auto end = stream.tellg();
-    if (end < 0 || static_cast<std::uintmax_t>(end) >
-                       std::numeric_limits<std::size_t>::max()) {
+    if (end < 0 || static_cast<std::uintmax_t>(end) > std::numeric_limits<std::streamsize>::max()) {
         throw std::runtime_error("cannot size " + path.string());
     }
+    if (static_cast<std::uintmax_t>(end) > maximum)
+        throw std::runtime_error("file exceeds read limit: " + path.string());
     std::vector<std::byte> result(static_cast<std::size_t>(end));
     stream.seekg(0, std::ios::beg);
     stream.read(reinterpret_cast<char*>(result.data()),

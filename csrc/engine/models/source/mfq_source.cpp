@@ -1,4 +1,5 @@
 #include "engine/models/source/model.h"
+#include "decision.h"
 #include "mfq_source.h"
 #include "mfq.h"
 #include "engine/weights/source/files.h"
@@ -311,7 +312,7 @@ std::vector<std::byte> MfqSource::read_asset(std::string_view name) const {
         throw std::runtime_error("model asset not found: " + std::string(name));
     }
     const auto& record = impl_->index.records[found->second];
-    if (record.tensor.nbytes > std::numeric_limits<std::size_t>::max()) {
+    if (record.tensor.nbytes > decision_asset_limit(name)) {
         throw std::overflow_error("model asset is too large to read");
     }
     std::vector<std::byte> result(static_cast<std::size_t>(record.tensor.nbytes));

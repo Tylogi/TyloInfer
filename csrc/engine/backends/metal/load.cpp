@@ -51,6 +51,8 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("expert cache budget must be finite and non-negative");
     if (!options.moe_cache_profile_path.empty())
         throw std::invalid_argument("Metal expert cache profiles are not supported");
+    if (options.jev_full_vram)
+        throw std::invalid_argument("--jev-weights requires a CUDA decision model");
 }
 
 std::unique_ptr<Engine> assemble(EngineOptions options, Engine* target) {

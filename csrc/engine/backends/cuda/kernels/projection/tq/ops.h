@@ -32,6 +32,10 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_swiglu(TrellisProjectionView gate,Tr
     const void* x,void* hidden,int dtype,int warps,int rows_per_block,cudaStream_t stream);
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_ffn(TrellisProjectionView gate,TrellisProjectionView up,
     TrellisProjectionView down,const void* x,void* hidden,void* output,int dtype,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_decode_rows(TrellisProjectionView weight,
+    int first,int count,void* output,cudaStream_t stream);
+int tq_decode_scaled_rows(TrellisProjectionView weight, int first, int count,
+    std::int32_t* exponents, void* output, cudaStream_t stream);
 
 // Device arrays of ordinary projections, with per-row precision dispatch.
 // The caller validates views before uploading them. max_rows must cover every
@@ -112,6 +116,10 @@ struct TrellisIndexedProjectionJob {
     int64_t input_offsets[4],output_offsets[4];
     int count;
 };
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prepare_resident_indexed(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const TrellisProjectionView* down,const int64_t* ids,
+    TrellisIndexedProjectionJob* gate_up,TrellisIndexedProjectionJob* output_jobs,
+    int slots,int routes,int experts,int input,int hidden,int output,int tile,cudaStream_t stream);
 // A single ordinary projection reused across up to eight input rows. Dropping
 // the unused SwiGLU view keeps this plan as small as the four-row pair plan.
 struct TrellisIndexedWideProjectionJob {
@@ -150,10 +158,11 @@ struct TrellisPrefillMoeJob {
 // Scratch bytes: align16(B*T*max(K,H)*2)+align16(B*T*H*2)+B*T*max(K,H)*2.
 // Scratch must not alias input, pairs, plans, slots or compressed images.
 // There are no allocations, persistent expanded weights or BLAS dependencies.
+// Gate and Up must be ready at launch; Down waits on the supplied event.
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe(const TrellisPrefillMoeJob* jobs,
     const int64_t* slots,const void* input,void* pairs,int batch,int capacity,
     int input_width,int hidden_width,int routes,float limit,void* activations,
-    uint64_t activation_bytes,cudaStream_t stream);
+    uint64_t activation_bytes,cudaEvent_t down_ready,cudaStream_t stream);
 
 // The same plan with bounded decoded FP16 tiles and batched cuBLAS GEMM.
 // All FP16 activations/bias semantics match mfq_tq_prefill_moe. The caller
@@ -164,7 +173,14 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_gemm(const TrellisPrefil
     const int64_t* slots,const void* input,void* pairs,int batch,int capacity,
     int input_width,int hidden_width,int routes,float limit,void* workspace,
     uint64_t workspace_bytes,void* activations,uint64_t activation_bytes,
-    void* blas,cudaStream_t stream);
+    void* blas,cudaEvent_t down_ready,cudaStream_t stream);
+
+// The WMMA launch packs only valid routes. Adjacent bounds delimit each job.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_compact(const TrellisPrefillMoeJob* jobs,
+    const int64_t* slots,const int64_t* bounds,const void* input,void* pairs,int batch,int capacity,
+    int64_t first_slot,int64_t rows,int input_width,int hidden_width,int routes,float limit,
+    void* workspace,uint64_t workspace_bytes,void* activations,uint64_t activation_bytes,
+    cudaEvent_t down_ready,cudaStream_t stream);
 
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_gemv_tokens(TrellisProjectionView weight,
     const void* x,void* output,int tokens,int dtype,cudaStream_t stream);

@@ -8,7 +8,7 @@
 
 namespace tyloi::cuda::gguf {
 
-::tyloi::DenseTensor add_correction(const GgufCorrection& c, ::tyloi::DenseTensor input,::tyloi::DenseTensor output,::tyloi::DenseTensor ids,std::int64_t experts,bool routed) {
+::tyloi::DenseTensor add_correction(const GgmlRowCorrection& c, ::tyloi::DenseTensor input,::tyloi::DenseTensor output,::tyloi::DenseTensor ids,std::int64_t experts,bool routed) {
     if(!input.is_cuda() && !output.is_cuda() && !ids.defined() && experts==1) {
         if(input.size(-1)!=c.columns || output.size(-1)!=c.rows)
             throw std::invalid_argument("CPU residual projection geometry differs");
@@ -46,7 +46,7 @@ namespace tyloi::cuda::gguf {
         ids.defined()?ids.data_ptr<std::int64_t>():nullptr,routes,experts,routed,stream.stream());
     return y.to(dtype);
 }
-::tyloi::DenseTensor add_correction_embedding(const GgufCorrection& c, ::tyloi::DenseTensor ids,::tyloi::DenseTensor output) {
+::tyloi::DenseTensor add_correction_embedding(const GgmlRowCorrection& c, ::tyloi::DenseTensor ids,::tyloi::DenseTensor output) {
     if(!output.is_cuda()) {
         auto full=dequantize_correction(c,-1),flat=ids.to(::tyloi::kInt64).cpu().contiguous().reshape({-1});
         auto y=output.to(::tyloi::kFloat32).contiguous();
@@ -75,7 +75,7 @@ namespace tyloi::cuda::gguf {
         y.data_ptr<float>(),output.numel()/c.columns,stream.stream());
     return y.to(dtype);
 }
-::tyloi::DenseTensor dequantize_correction(const GgufCorrection& c, int device) {
+::tyloi::DenseTensor dequantize_correction(const GgmlRowCorrection& c, int device) {
     if(device>=0) {
         if(device!=c.packed.get_device())throw std::invalid_argument("GGUF residual belongs to another device");
         return add_correction_embedding(c,{},::tyloi::cuda::zeros({c.rows,c.columns},c.offsets.options().dtype(::tyloi::kFloat32)));

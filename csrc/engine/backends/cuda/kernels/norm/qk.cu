@@ -1,6 +1,7 @@
 #include "../kernel_dispatch_trace.h"
 #include "engine/backends/cuda/ops/attention/launch.h"
 #include "../reduce.cuh"
+#include <stdexcept>
 #include <climits>
 #include <cmath>
 
@@ -131,38 +132,37 @@ prepare_qk(::tyloi::DenseTensor query, ::tyloi::DenseTensor key,
                (x.scalar_type() == ::tyloi::kFloat16 || x.scalar_type() == ::tyloi::kFloat32) &&
                x.dim() == 4 && x.size(0) > 0 && x.size(1) > 0 && x.size(2) > 0 && x.stride(3) == 1;
     };
-    TYLOINFER_RUNTIME_CHECK(input(query) && input(key) && input(value) &&
+    if (!(input(query) && input(key) && input(value) &&
                                 query.size(0) == key.size(0) && query.size(2) == key.size(2) &&
                                 query.size(3) == key.size(3) && key.sizes() == value.sizes() &&
                                 query.scalar_type() == key.scalar_type() &&
-                                key.scalar_type() == value.scalar_type(),
-                            "QK preparation requires matching CUDA FP16/FP32 head views");
+                                key.scalar_type() == value.scalar_type()))
+        throw std::runtime_error("QK preparation requires matching CUDA FP16/FP32 head views");
     const int64_t width = query.size(3);
-    TYLOINFER_RUNTIME_CHECK(width > 0 && width <= INT_MAX && query.size(1) <= INT_MAX &&
+    if (!(width > 0 && width <= INT_MAX && query.size(1) <= INT_MAX &&
                                 key.size(1) <= INT_MAX && query.size(1) + key.size(1) <= INT_MAX &&
                                 query.size(2) <= INT_MAX &&
                                 query.numel() / width <= INT_MAX - key.numel() / width &&
                                 rotary_dim > 0 && rotary_dim <= width && rotary_dim % 2 == 0 &&
-                                std::isfinite(eps) && eps >= 0 && std::isfinite(weight_offset),
-                            "QK preparation geometry/epsilon differs");
+                                std::isfinite(eps) && eps >= 0 && std::isfinite(weight_offset)))
+        throw std::runtime_error("QK preparation geometry/epsilon differs");
     const auto f32 = [&](const ::tyloi::DenseTensor &x) {
         return x.is_cuda() && x.device() == device && x.scalar_type() == ::tyloi::kFloat32 &&
                x.is_contiguous();
     };
-    TYLOINFER_RUNTIME_CHECK(
-        f32(query_weight) && f32(key_weight) && query_weight.dim() == 1 && key_weight.dim() == 1 &&
+    if (!(f32(query_weight) && f32(key_weight) && query_weight.dim() == 1 && key_weight.dim() == 1 &&
             query_weight.numel() == width && key_weight.numel() == width && f32(cosine) &&
             f32(sine) && cosine.dim() == 2 && cosine.size(0) > 0 && cosine.size(0) <= INT_MAX &&
-            cosine.size(1) == rotary_dim / 2 && sine.sizes() == cosine.sizes(),
-        "QK preparation norm/rotary storage differs");
+            cosine.size(1) == rotary_dim / 2 && sine.sizes() == cosine.sizes()))
+        throw std::runtime_error("QK preparation norm/rotary storage differs");
     const auto pos = [&](const ::tyloi::DenseTensor &x) {
         return x.is_cuda() && x.device() == device && x.scalar_type() == ::tyloi::kInt64 &&
                x.is_contiguous() &&
                ((x.dim() == 1 && x.size(0) == query.size(2)) ||
                 (x.dim() == 2 && x.size(0) == query.size(0) && x.size(1) == query.size(2)));
     };
-    TYLOINFER_RUNTIME_CHECK(pos(positions) && pos(write_positions),
-                            "QK preparation positions differ");
+    if (!(pos(positions) && pos(write_positions)))
+        throw std::runtime_error("QK preparation positions differ");
     MfqCudaGuard guard(device);
     auto output = ::tyloi::cuda::empty(query.sizes(), query.options().dtype(::tyloi::kFloat32));
     const auto layout = [](const ::tyloi::DenseTensor &x) {
@@ -207,15 +207,14 @@ prepare_qk(::tyloi::DenseTensor query, ::tyloi::DenseTensor key,
     ::tyloi::DenseTensor sine, ::tyloi::DenseTensor key_cache,
     ::tyloi::DenseTensor value_cache, int64_t rotary_dim, double eps, double weight_offset) {
 
-    TYLOINFER_RUNTIME_CHECK(
-        key.dim() == 4 && key_cache.is_cuda() && key_cache.device() == query.device() &&
+    if (!(key.dim() == 4 && key_cache.is_cuda() && key_cache.device() == query.device() &&
             key_cache.scalar_type() == ::tyloi::kFloat16 && key_cache.dim() == 4 &&
             key_cache.is_contiguous() && value_cache.is_cuda() &&
             value_cache.device() == query.device() && value_cache.is_contiguous() &&
             value_cache.scalar_type() == ::tyloi::kFloat16 && value_cache.sizes() == key_cache.sizes() &&
             key_cache.size(0) == key.size(0) && key_cache.size(1) == key.size(1) &&
-            key_cache.size(2) > 0 && key_cache.size(3) == key.size(3),
-        "QK preparation cache storage differs");
+            key_cache.size(2) > 0 && key_cache.size(3) == key.size(3)))
+        throw std::runtime_error("QK preparation cache storage differs");
     FlatCacheWrite cache{reinterpret_cast<__half *>(key_cache.data_ptr()),
                          reinterpret_cast<__half *>(value_cache.data_ptr()), key_cache.size(2)};
     return prepare_qk(query, key, value, query_weight, key_weight, positions, write_positions,
@@ -236,23 +235,23 @@ prepare_qk(::tyloi::DenseTensor query, ::tyloi::DenseTensor key,
                x.scalar_type() == ::tyloi::kInt64 && x.dim() == 1 && x.numel() > 0 &&
                x.numel() <= INT_MAX;
     };
-    TYLOINFER_RUNTIME_CHECK(pointers(key_chunks) && pointers(value_chunks) &&
-                                key_chunks.sizes() == value_chunks.sizes(),
-                            "QK preparation paged chunk tables differ");
-    TYLOINFER_RUNTIME_CHECK(key.dim() == 4 && pages.is_cuda() && pages.device() == query.device() &&
+    if (!(pointers(key_chunks) && pointers(value_chunks) &&
+                                key_chunks.sizes() == value_chunks.sizes()))
+        throw std::runtime_error("QK preparation paged chunk tables differ");
+    if (!(key.dim() == 4 && pages.is_cuda() && pages.device() == query.device() &&
                                 pages.is_contiguous() && pages.scalar_type() == ::tyloi::kInt32 &&
                                 pages.dim() == 2 && pages.size(0) >= key.size(0) &&
                                 pages.size(1) > 0 && pages.size(1) <= INT_MAX && page_size > 0 &&
                                 page_size <= INT_MAX && pages_per_chunk > 0 &&
-                                pages_per_chunk <= INT_MAX,
-                            "QK preparation page geometry differs");
+                                pages_per_chunk <= INT_MAX))
+        throw std::runtime_error("QK preparation page geometry differs");
     // Page addresses use signed 64-bit element offsets. Reject genuinely
     // unrepresentable chunks without constraining any device or model geometry.
     const auto width = key.size(3), heads = key.size(1);
-    TYLOINFER_RUNTIME_CHECK(width > 0 && heads > 0 && heads <= INT64_MAX / width &&
+    if (!(width > 0 && heads > 0 && heads <= INT64_MAX / width &&
                                 page_size <= INT64_MAX / (heads * width) &&
-                                pages_per_chunk <= INT64_MAX / (heads * width * page_size),
-                            "QK preparation paged chunk offset overflows");
+                                pages_per_chunk <= INT64_MAX / (heads * width * page_size)))
+        throw std::runtime_error("QK preparation paged chunk offset overflows");
     PagedCacheWrite cache{key_chunks.data_ptr<int64_t>(),
                           value_chunks.data_ptr<int64_t>(),
                           pages.data_ptr<int32_t>(),

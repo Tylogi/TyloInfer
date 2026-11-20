@@ -2,7 +2,6 @@
 #include "engine/models/deepseek_v41/ops.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/deepseek_v41/snapshot.h"
-#include "engine/models/common/check.h"
 #include "engine/models/session/state.h"
 
 #include <algorithm>
@@ -66,9 +65,9 @@ tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models
         return tensor.defined()?std::size_t(tensor.size(0))*rows*tensor.size(2)*tensor.element_size():0;
     };
     for(const auto& item:state.model_.blocks) {
-        TYLOINFER_RUNTIME_CHECK(state.shared && item->layer >= 0 &&
-                                  item->layer < std::int64_t(state.shared->layers.size()),
-                              "DeepSeek-V4.1 layer state is not allocated");
+        if (!(state.shared && item->layer >= 0 &&
+                                  item->layer < std::int64_t(state.shared->layers.size())))
+            throw std::runtime_error("DeepSeek-V4.1 layer state is not allocated");
         const auto& layer=state.shared->layers[static_cast<std::size_t>(item->layer)];
         incoming+=session_tensor_bytes(layer.local_kv)+session_tensor_bytes(layer.partial_kv)+
             session_tensor_bytes(layer.partial_score)+prefix_bytes(layer.compressed_kv,layer.compressed_length)+
@@ -94,9 +93,9 @@ void State::set_image_mask(::tyloi::Tensor mask) {
         return;
     }
     const auto& dense = mask.dense();
-    TYLOINFER_RUNTIME_CHECK(dense.is_cpu() && dense.dim()==2 && dense.is_contiguous() &&
-                            dense.scalar_type()==::tyloi::kUInt8,
-                            "DeepSeek-V4.1 image mask must be contiguous CPU uint8 [B,T]");
+    if (!(dense.is_cpu() && dense.dim()==2 && dense.is_contiguous() &&
+                            dense.scalar_type()==::tyloi::kUInt8))
+        throw std::runtime_error("DeepSeek-V4.1 image mask must be contiguous CPU uint8 [B,T]");
     std::vector<int64_t> images;
     state.text_row_ids.clear();
     const auto* flags=dense.data_ptr<uint8_t>();
@@ -326,13 +325,13 @@ std::vector<::tyloi::Tensor> State::storage() const {
 }
 
 void State::begin_speculative_suffix(std::int64_t draft_tokens) {
-    using tyloi::models::require_model;
-    require_model(model_.supports_suffix_speculation() && draft_tokens > 0 &&
-                      cache_pos + draft_tokens <= model_.max_position_embeddings(),
-                  "invalid speculative suffix");
+    if (!(model_.supports_suffix_speculation() && draft_tokens > 0 &&
+        cache_pos + draft_tokens <= model_.max_position_embeddings()))
+        throw std::runtime_error("invalid speculative suffix");
     speculative_start = cache_pos;
     speculative_confirmed = 0;
-    TYLOINFER_RUNTIME_CHECK(shared->engram_hash, "DeepSeek-V4.1 Engram state is unavailable");
+    if (!shared->engram_hash)
+        throw std::runtime_error("DeepSeek-V4.1 Engram state is unavailable");
     shared->engram_hash->begin_speculative();
     std::size_t begun = 0;
     try {
@@ -359,8 +358,8 @@ void State::begin_speculative_suffix(std::int64_t draft_tokens) {
 }
 
 void State::commit_speculative() {
-    using tyloi::models::require_model;
-    require_model(speculative_start >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0))
+        throw std::runtime_error("no speculative transaction");
     for (auto& block : model_.blocks) {
         MfqCudaGuard guard(block->cuda_device);
         block->commit_speculative(*shared);
@@ -371,12 +370,13 @@ void State::commit_speculative() {
 }
 
 void State::rollback_speculative(std::int64_t accepted) {
-    using tyloi::models::require_model;
-    require_model(speculative_start >= 0 && accepted >= 0, "no speculative transaction");
+    if (!(speculative_start >= 0 && accepted >= 0))
+        throw std::runtime_error("no speculative transaction");
     const auto keep = speculative_start + speculative_confirmed + accepted;
     for (auto& block : model_.blocks)
         block->rollback_speculative(*shared, keep);
-    TYLOINFER_RUNTIME_CHECK(shared->engram_hash, "DeepSeek-V4.1 Engram state is unavailable");
+    if (!shared->engram_hash)
+        throw std::runtime_error("DeepSeek-V4.1 Engram state is unavailable");
     shared->engram_hash->rollback_speculative(keep);
     cache_pos = keep;
     speculative_start = -1;

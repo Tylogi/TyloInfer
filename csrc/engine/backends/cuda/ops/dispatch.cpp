@@ -1,9 +1,15 @@
 #include "engine/ops/ops.h"
 #include "engine/ops/ffn.h"
 
+#include "components/error.h"
 #include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/native/context.h"
+#include "engine/weights/encoding/quant/nint_tensor.h"
+#include "engine/weights/encoding/quant/nvq_tensor.h"
+#include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/moe/batch_internal.h"
 #include "engine/weights/moe/experts.h"
+#include "engine/weights/moe/ggml_bank.h"
 #include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "engine/backends/cuda/ops/ffn/tq/routed.h"
 #include "engine/backends/cuda/native/collectives.h"
@@ -20,6 +26,7 @@
 #include "engine/backends/cuda/ops/ffn/experts/routed.h"
 #include "engine/backends/cuda/ops/ffn/residual.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
+#include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
 #include "engine/backends/cuda/ops/gguf/prefill_fusion.h"
 #include "engine/backends/cuda/ops/tensor.h"
@@ -35,7 +42,9 @@
 #include "engine/backends/cuda/ops/attention/gdn/launch.h"
 #include "engine/backends/cuda/ops/attention/gdn/replay.h"
 #include "engine/backends/cuda/ops/norm/launch.h"
+#include <stdexcept>
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -373,7 +382,7 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
     const bool tq_routed = bool(b.tq.gate || b.tq.up || b.tq.down);
     if ((b.ungated && spec.swiglu_limit != 0) ||
         (spec.activation == MlpActivation::gelu_gated &&
-         (tq_routed || b.sharded || !dense_routed)))
+         (tq_routed || b.sharded || (!dense_routed && !b.ggml))))
         throw std::invalid_argument("unsupported routed expert activation or clamp");
     if (gate.dim() != 3 || up.dim() != 3 || down.dim() != 3 ||
         gate.size(0) <= 0 || gate.size(0) != up.size(0) || gate.size(0) != down.size(0) ||
@@ -419,41 +428,47 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
             });
         }
         reduced = true;
-    } else if (dense_routed) {
-        if (!b.dense_down || (b.ungated && !b.dense_up) ||
-            (!b.ungated && !b.dense_gate && !b.dense_gate_up))
+    } else if (dense_routed || b.ggml) {
+        if (!b.ggml && (!b.dense_down || (b.ungated && !b.dense_up) ||
+            (!b.ungated && !b.dense_gate && !b.dense_gate_up)))
             throw std::runtime_error("dense routed MoE requires compatible Gate, Up and Down banks");
+        const auto& rows = b.ggml_rows;
+        const auto selected = [&](const Tensor& bank, const DenseTensor& input) {
+            return rows ? project.run(bank, input, *rows)
+                        : ::dense_routed_projection(bank.dense(), input, ids);
+        };
         auto expert_input = x;
         DenseTensor up_value;
         DenseTensor gate_value;
-        if (b.dense_gate_up) {
-            auto gate_up = profiler.measure("moe.dense_gate_up", [&] {
-                return ::dense_routed_projection(*b.dense_gate_up, expert_input, ids);
+        if (!b.split && !b.ungated) {
+            auto gate_up = profiler.measure(rows ? "moe.gguf_gate_up" : "moe.dense_gate_up", [&] {
+                return selected(gate, expert_input);
             });
             const auto width = gate_up.size(-1) / 2;
             gate_value = gate_up.narrow(-1, 0, width);
             up_value = gate_up.narrow(-1, width, width);
         } else {
-            up_value = profiler.measure("moe.dense_up", [&] {
-                return ::dense_routed_projection(*b.dense_up, expert_input, ids);
+            up_value = profiler.measure(rows ? "moe.gguf_up" : "moe.dense_up", [&] {
+                return selected(up, expert_input);
             });
         }
-        if (!b.ungated && !b.dense_gate_up)
-            gate_value = profiler.measure("moe.dense_gate", [&] { return ::dense_routed_projection(*b.dense_gate, expert_input, ids); });
-        auto hidden = profiler.measure("moe.dense_activation", [&] {
+        if (b.split)
+            gate_value = profiler.measure(rows ? "moe.gguf_gate" : "moe.dense_gate", [&] { return selected(gate, expert_input); });
+        auto hidden = profiler.measure(rows ? "moe.gguf_activation" : "moe.dense_activation", [&] {
             return cuda::expert_activation(spec.activation, std::move(gate_value), std::move(up_value), spec.swiglu_limit);
         });
-        auto pairs = profiler.measure("moe.dense_down", [&] { return ::dense_routed_projection(*b.dense_down, hidden, ids); });
-        result = profiler.measure("moe.dense_reduce", [&] { return moe_weighted_reduce_cuda(pairs, weights); });
+        auto pairs = profiler.measure(rows ? "moe.gguf_down" : "moe.dense_down", [&] { return selected(down, hidden); });
+        result = profiler.measure(rows ? "moe.gguf_reduce" : "moe.dense_reduce", [&] { return moe_weighted_reduce_cuda(pairs, weights); });
         stats.record(spec.layer, ids, weights, pairs,
-                     static_cast<int>((b.dense_up ? b.dense_up : b.dense_gate_up)->size(0)));
+                     static_cast<int>(gate.size(0)));
         reduced = true;
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     else if (b.sharded) {
         auto& collectives = executor.collectives();
         const auto& first = b.ungated ? b.up : b.gate_up;
-        TYLOINFER_RUNTIME_CHECK(first, "sharded routed expert bank is missing");
+        if (!first)
+            throw std::runtime_error("sharded routed expert bank is missing");
         const size_t count = first->shards.size();
         std::vector<DenseTensor> partials(count), down_partials;
         const bool energy = stats.energy();
@@ -516,17 +531,20 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
             gu = profiler.measure("moe.gate_up_split", [&] {
                 const bool reuse = mode.reuse_input && executor.mmq().mode == KlMmqMode::Default && x.size(0) <= 8 &&
                     active_gate && active_up && cuda::can_reuse_activation_for(*active_gate, *active_up);
-                TYLOINFER_RUNTIME_CHECK(active_gate, "MFE input must be contiguous CUDA f16 with exact K");
+                if (!active_gate)
+                    throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                 auto g = project.run(*active_gate, x, b.route);
                 if (!b.bundle_prefetched && active_up) cuda::prefetch_experts(*active_up, b.route);
-                TYLOINFER_RUNTIME_CHECK(active_up, "MFE input must be contiguous CUDA f16 with exact K");
+                if (!active_up)
+                    throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                 auto u = reuse ? project.run(*active_up, x, b.route, true) : project.run(*active_up, x, b.route);
                 return cuda::cat({g, u}, -1).contiguous();
             });
         } else if (b.ungated) {
             if (b.cpu_up) active_up = b.stage(b.cpu_up, "moe.cpu_offload_up_h2d");
             hidden = profiler.measure("moe.up_relu_squared", [&] {
-                TYLOINFER_RUNTIME_CHECK(active_up, "MFE input must be contiguous CUDA f16 with exact K");
+                if (!active_up)
+                    throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                 return ::relu_squared_cuda(project.run(*active_up, x, b.route));
             });
         } else {
@@ -535,7 +553,8 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
                 hidden = profiler.measure("moe.gate_up_swiglu", [&] { return project.glu(*active_gate_up, x, b.route, false); });
             else
                 gu = profiler.measure("moe.gate_up", [&] {
-                    TYLOINFER_RUNTIME_CHECK(active_gate_up, "MFE input must be contiguous CUDA f16 with exact K");
+                    if (!active_gate_up)
+                        throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                     return project.run(*active_gate_up, x, b.route);
                 });
         }
@@ -545,7 +564,8 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
         if (b.cpu_down) active_down = b.stage(b.cpu_down, "moe.cpu_offload_down_h2d");
         if (hidden.defined()) {
             result = profiler.measure("moe.down", [&] {
-                TYLOINFER_RUNTIME_CHECK(active_down, "MFE input must be contiguous CUDA f16 with exact K");
+                if (!active_down)
+                    throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                 return project.run(*active_down, hidden, b.route);
             });
         } else {
@@ -553,7 +573,8 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
                 (gu.size(0) == 1 || (gu.size(0) <= 4 && options.small_heterogeneous));
             if (fusion && spec.swiglu_limit <= 0)
                 result = profiler.measure("moe.swiglu_down", [&] {
-                    TYLOINFER_RUNTIME_CHECK(active_down, "fused MFE GLU input has an unsupported layout");
+                    if (!active_down)
+                        throw std::runtime_error("fused MFE GLU input has an unsupported layout");
                     return project.gated(*active_down, gu, b.route, false);
                 });
             else if (fusion && active_down && cuda::supports_clamped_swiglu(*active_down))
@@ -567,7 +588,8 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
                     return (cuda::silu(g) * u).to(kFloat16).contiguous();
                 });
                 result = profiler.measure("moe.down", [&] {
-                    TYLOINFER_RUNTIME_CHECK(active_down, "MFE input must be contiguous CUDA f16 with exact K");
+                    if (!active_down)
+                        throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
                     return project.run(*active_down, hidden, b.route);
                 });
             }
@@ -827,7 +849,7 @@ std::optional<LinearDecode> linear_decode(const Tensor& qkv, const Tensor& gate,
     for (const auto* tensor : tensors)
         if (!tensor->defined() || !tensor->representation<DenseTensor>() || tensor->is_encoded())
             return std::nullopt;
-    const auto* out = out_weight.representation<GgufTensor>();
+    const auto* out = out_weight.representation<GgmlQuantizedTensor>();
     const auto& x = dense(qkv);
     if (!x.is_cuda() || !out_weight.defined() || out_weight.representation<ShardedTensor>() ||
         cuda::Executor::current().mmq().mode != KlMmqMode::Default ||
@@ -899,17 +921,36 @@ Tensor materialize(const ScaledProjection& product) {
         dense(product.values), dense(product.row_exponents), dense(product.column_exponents)}));
 }
 
+static cuda::gguf::GgufPrefillProduct prefill_product(const Tensor& weight, const DenseTensor& input,
+        const DenseTensor& input_exponents = {}) {
+    try {
+        if (const auto* ggml = weight.representation<GgmlQuantizedTensor>())
+            return cuda::gguf::gguf_prefill_product(*ggml, input, input_exponents);
+        if (const auto* tq = weight.representation<encoding::TqTensor>())
+            return cuda::tq::prefill_product(*tq, input, input_exponents);
+        return cuda::mfq_prefill_product(weight, input, input_exponents);
+    } catch (const MfqResourceExhausted&) {
+        return {};
+    }
+}
+
 std::optional<std::array<Tensor, 2>> linear_readout(const Tensor& attended, const Tensor& gate,
         const ScaledProjection& scaled_gate, const Tensor& linear_norm, const Tensor& out_weight,
         const Tensor& residual, const Tensor& ffn_norm, double eps, double offset) {
-    const auto* out = out_weight.representation<GgufTensor>();
-    if (!out || !residual.is_cuda() || !residual.is_contiguous() || residual.dim() != 3 ||
+    if (!residual.is_cuda() || !residual.is_contiguous() || residual.dim() != 3 ||
+        !out_weight || out_weight.dim() != 2 || out_weight.device() != residual.device() ||
+        !(out_weight.representation<GgmlQuantizedTensor>() ||
+          out_weight.representation<encoding::TqTensor>() ||
+          out_weight.representation<NintTensor>() || out_weight.representation<NvqTensor>()) ||
         residual.scalar_type() != kFloat16 || residual.size(1) < 512 ||
-        out->out != residual.size(2) || !ffn_norm.defined() || ffn_norm.dim() < 1 ||
+        out_weight.size(0) != residual.size(2) || !ffn_norm.defined() || ffn_norm.dim() < 1 ||
         !ffn_norm.is_contiguous() || ffn_norm.device() != residual.device() ||
         ffn_norm.scalar_type() != kFloat32 || ffn_norm.numel() != residual.size(2) ||
         ffn_norm.size(-1) != residual.size(2) || !std::isfinite(float(eps)) || float(eps) <= 0 ||
         !std::isfinite(float(offset)))
+        return std::nullopt;
+    if (const auto* ggml = out_weight.representation<GgmlQuantizedTensor>();
+        ggml && cuda::gguf::original_input(*ggml))
         return std::nullopt;
     auto& executor = cuda::Executor::current();
     if (executor.mmq().mode != KlMmqMode::Default || executor.options().dense.fp32_residual)
@@ -918,17 +959,29 @@ std::optional<std::array<Tensor, 2>> linear_readout(const Tensor& attended, cons
     const auto& norm = dense(linear_norm);
     const auto& skip = dense(residual);
     if (y.device() != skip.device() || y.dim() != 4 ||
-        y.size(0) != skip.size(0) || y.size(2) != skip.size(1))
+        y.size(0) != skip.size(0) || y.size(2) != skip.size(1) ||
+        out_weight.size(1) != y.size(1) * y.size(3))
         return std::nullopt;
-    auto product = scaled_gate
-        ? cuda::gguf::gguf_rms_gated_product(*out, y, cuda::gguf::GgufPrefillProduct{
-              dense(scaled_gate.values), dense(scaled_gate.row_exponents),
-              dense(scaled_gate.column_exponents)}, norm, eps, true)
-        : cuda::gguf::gguf_rms_gated_product(*out, y, dense(gate), norm, eps, true);
-    if (!product.defined()) return std::nullopt;
-    auto pair = cuda::gguf::gguf_prefill_acc_rms(product, skip.reshape({-1, skip.size(-1)}),
-        dense(ffn_norm), eps, offset);
-    return std::array<Tensor, 2>{owner(pair[0].reshape(skip.sizes())), owner(pair[1].reshape(skip.sizes()))};
+    const cuda::DeviceGuard guard(y.get_device());
+    cudaStreamCaptureStatus capture;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(cuda::current_stream(y.get_device()).stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone || cuda::GraphAllocationPlan::warming()) return std::nullopt;
+    const auto gate_product = scaled_gate ? cuda::gguf::GgufPrefillProduct{dense(scaled_gate.values),
+        dense(scaled_gate.row_exponents), dense(scaled_gate.column_exponents)}
+        : cuda::gguf::GgufPrefillProduct{};
+    try {
+        const auto [packed, exponents] = cuda::gguf::pack_rms_gated_input(
+            y, gate ? dense(gate) : DenseTensor{}, norm, eps, true, gate_product);
+        if (!packed.defined()) return std::nullopt;
+        auto product = prefill_product(out_weight, packed, exponents);
+        if (!product.defined()) return std::nullopt;
+        assert(product.values.size(0) == packed.size(0) && product.values.size(1) == skip.size(-1));
+        auto pair = cuda::gguf::gguf_prefill_acc_rms(product, skip.reshape({-1, skip.size(-1)}),
+            dense(ffn_norm), eps, offset);
+        return std::array<Tensor, 2>{owner(pair[0].reshape(skip.sizes())), owner(pair[1].reshape(skip.sizes()))};
+    } catch (const MfqResourceExhausted&) {
+        return std::nullopt;
+    }
 }
 
 std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
@@ -947,44 +1000,62 @@ std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
     if (!x.is_contiguous() || scale.dim() < 1 || scale.size(-1) != width ||
         !std::isfinite(float(eps)) || float(eps) <= 0 || !std::isfinite(float(offset)) ||
         (rows > 32 && rows < 512)) return {};
-    std::vector<GgufTensor> weights;
-    weights.reserve(group.size());
+    std::vector<GgmlQuantizedTensor> short_weights;
     for (const auto& weight : group) {
-        const auto* gguf = weight.representation<GgufTensor>();
-        if (!gguf || gguf->neuron_len != width || gguf->packed.device() != x.device() ||
-            cuda::gguf::original_input(*gguf))
+        if (const auto* gguf = weight.representation<GgmlQuantizedTensor>()) {
+            if (gguf->neuron_len != width || gguf->packed.device() != x.device() ||
+                cuda::gguf::original_input(*gguf))
+                return {};
+            if (rows <= 32) short_weights.push_back(*gguf);
+            continue;
+        }
+        if (rows <= 32 || !weight || weight.dim() != 2 || weight.size(1) != width ||
+            weight.device() != x.device() ||
+            !(weight.representation<encoding::TqTensor>() ||
+              weight.representation<NintTensor>() || weight.representation<NvqTensor>()))
             return {};
-        weights.push_back(*gguf);
     }
     DenseTensor value;
     if (rows <= 32) {
-        auto prepared = cuda::gguf::prepare_rms_input(weights, x, scale, eps, offset, value);
+        auto prepared = cuda::gguf::prepare_rms_input(short_weights, x, scale, eps, offset, value);
         if (prepared.shape.empty()) return {};
-        auto result = owners(cuda::gguf::project_input(prepared, weights));
+        auto result = owners(cuda::gguf::project_input(prepared, short_weights));
         normalized = owner(std::move(value));
         return result;
     }
     // Use the same flat view in the prepared scope and grouped projection.
     // Each matrix can consume the same scaled FP16 input without repacking.
-    auto scope = cuda::gguf::GgufPrefillInputScope::prepare_rms(x.reshape({rows, width}),
-        scale, eps, offset, value);
+    const cuda::DeviceGuard guard(x.get_device());
+    const auto stream = cuda::current_stream(x.get_device());
+    cudaStreamCaptureStatus capture;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone || cuda::GraphAllocationPlan::warming()) return {};
+    std::unique_ptr<cuda::gguf::GgufPrefillInputScope> scope;
+    try {
+        scope = cuda::gguf::GgufPrefillInputScope::prepare_rms(x.reshape({rows, width}),
+            scale, eps, offset, value);
+    } catch (const MfqResourceExhausted&) {
+        return {};
+    }
     if (!scope) return {};
+    assert(value.scalar_type() == kFloat32);
     auto shape = x.sizes().vec();
     std::size_t prefix = 0;
-    const auto& executor = cuda::Executor::current();
+    auto& executor = cuda::Executor::current();
     if (!scaled.empty() && executor.mode().linear.fused_conv) {
-        const auto limit = std::min({scaled.size(), weights.size(), std::size_t{2}});
+        const auto limit = std::min({scaled.size(), group.size(), std::size_t{2}});
         for (; prefix < limit; ++prefix) {
             if (prefix == 1 && (x.scalar_type() != kFloat16 || executor.fp32_residual())) break;
-            auto product = cuda::gguf::gguf_prefill_product(weights[prefix], value);
+            auto product = prefill_product(group[prefix], value);
             if (!product.defined()) break;
             scaled[prefix] = {owner(std::move(product.values)), owner(std::move(product.row_exponents)),
                               owner(std::move(product.column_exponents))};
         }
     }
-    std::vector<Tensor> result(weights.size());
-    for (auto index = prefix; index < weights.size(); ++index) {
-        auto out = cuda::gguf::project(weights[index], value);
+    std::vector<Tensor> result(group.size());
+    auto projector = executor.projector(cuda::Executor::current_ffn());
+    for (auto index = prefix; index < group.size(); ++index) {
+        auto out = projector.run(group[index], value);
         shape.back() = out.size(-1);
         result[index] = owner(out.reshape(shape));
     }

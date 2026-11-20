@@ -1,6 +1,6 @@
 #pragma once
 // Shared activations and prepared weight reuse follow Strata iq_kernels.cu
-// (MIT, cpp_runtime/third_party/strata.LICENSE). Virtual sub-rows preserve the
+// (MIT, LICENSES/Strata-MIT.txt). Virtual sub-rows preserve the
 // bundled ggml 32-lane addition tree, including arbitrary output tails.
 namespace tyloi::cuda::gguf {
 namespace {

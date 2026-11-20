@@ -8,10 +8,15 @@
 #include <vector>
 
 namespace tyloi::cuda { class BlasResources; }
+namespace tyloi::cuda::gguf { struct GgufPrefillProduct; }
 
 namespace tyloi::cuda::tq {
 TrellisProjectionView view(const ::tyloi::encoding::TqTensor& weight);
 DenseTensor project(const ::tyloi::encoding::TqTensor& weight, BlasResources*, DenseTensor input);
+gguf::GgufPrefillProduct prefill_product(const encoding::TqTensor& weight, const DenseTensor& input,
+    const DenseTensor& input_exponents = {});
+DenseTensor project_prefill_residual(const ::tyloi::encoding::TqTensor& weight,
+    const DenseTensor& input, const DenseTensor& residual);
 DenseTensor groupwise(const ::tyloi::encoding::TqTensor& weight, BlasResources*, DenseTensor input, std::int64_t groups);
 DenseTensor embedding(const ::tyloi::encoding::TqTensor& weight, DenseTensor ids);
 void validate_group(const std::vector<::tyloi::encoding::TqTensor>& weights);

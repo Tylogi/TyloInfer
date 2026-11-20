@@ -356,6 +356,7 @@ extern "C" int mfq_tq_swiglu_batch(const TrellisProjectionView* gate,const Trell
 
 #include "float_tokens.cuh"
 #include "matmul.cuh"
+#include "scaled_rows.cuh"
 #include "prefill_float.cuh"
 #include "parallel_tokens.cuh"
 #include "q8_tokens.cuh"

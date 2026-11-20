@@ -160,7 +160,7 @@ std::vector<Tensor> Loader::gate_up(const std::vector<std::string>& names,
         const Tensor&, std::size_t prefix, bool preserve_boundaries) const {
     return group(names, std::min(prefix, names.size()), nullptr, preserve_boundaries);
 }
-Tensor Loader::embedding(const std::string& name, bool) const { return weight(name); }
+Tensor Loader::embedding(const std::string& name, bool, std::size_t*) const { return weight(name); }
 Tensor Loader::rows(const std::string& name) const {
     if (is_tq_table(source, name)) return std::make_shared<Rows>(tq_table(source, name));
 #if TYLOINFER_ENABLE_MFQ_COMPAT
