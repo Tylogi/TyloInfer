@@ -39,15 +39,15 @@ uint row = index / hidden, channel = index % hidden, conv = channel / params[2];
 uint dynamic_base = row * groups * 4u + stage * 2u * groups;
 uint weight_base = stage * 2u * hidden;
 float result = float(input[index]) * (float(base[weight_base + channel]) + float(dynamic[dynamic_base + conv]));
-if (row > 0u)
+if (row % params[4] != 0u)
     result += float(input[index - hidden]) *
         (float(base[weight_base + hidden + channel]) + float(dynamic[dynamic_base + groups + conv]));
 if (stage != 0u) result += float(residual[index]);
 output[index] = bfloat(result);
 )METAL");
-    const int hidden = input.shape(2), rows = input.shape(1);
+    const int hidden = input.shape(2), rows = input.shape(0) * input.shape(1);
     return kernel({input, dynamic, base, residual,
-        array({uint32_t(hidden), uint32_t(rows), uint32_t(group), uint32_t(finish)})},
+        array({uint32_t(hidden), uint32_t(rows), uint32_t(group), uint32_t(finish), uint32_t(input.shape(1))})},
         {input.shape()}, {bfloat16}, {hidden * rows, 1, 1}, {256, 1, 1}, {}, std::nullopt, false, {})[0];
 }
 
@@ -63,7 +63,7 @@ const uint end = FIRST ? width * (shard + 1u) / shards : width;
 float best[16]; uint best_id[16];
 for (uint rank = 0u; rank < 16u; ++rank) { best[rank] = -INFINITY; best_id[rank] = 0xffffffffu; }
 for (uint position = begin + tid; position < end; position += 128u) {
-    const ulong at = FIRST ? ulong(row + 1u) * width + position : ulong(row) * width + position;
+    const ulong at = ulong(row) * width + position;
     float score = float(values[at]); uint id = FIRST ? position : ids[at];
     if (score < best[15] || (score == best[15] && id >= best_id[15])) continue;
     for (uint rank = 0u; rank < 16u; ++rank) {
@@ -106,39 +106,50 @@ for (uint rank = 0u; rank < 16u; ++rank) {
 }
 
 MlxDFlash2Proposal select_proposals(const array& logits, const array& hidden,
-    const array& predecessor, const array& successor, int anchor, const MlxDFlash2Config& config) {
-    auto [unary, ids] = candidates(logits, config.block_size - 1, config.vocabulary);
+    const array& predecessor, const array& successor, const array& anchors,
+    const array& offsets, int maximum_depth, const MlxDFlash2Config& config) {
+    const auto batch = anchors.shape(0);
+    auto [unary, ids] = candidates(contiguous(logits), logits.size() / config.vocabulary, config.vocabulary);
     static const auto kernel = cached_metal_kernel("tinfer_dflash2_select_chain",
-        {"unary", "ids", "hidden", "predecessor", "successor", "params"}, {"tokens", "confidence"}, R"METAL(
+        {"unary", "ids", "hidden", "predecessor", "successor", "anchors", "offsets", "params"}, {"tokens", "confidence"}, R"METAL(
 uint lane = thread_index_in_simdgroup, candidate = simdgroup_index_in_threadgroup;
+const uint request = threadgroup_position_in_grid.x;
+const uint stride = params[0], vocab = params[1];
+const uint start = uint(offsets[request]), steps = uint(offsets[request + 1u]) - start;
+const uint output_base = request * stride;
 threadgroup float scores[16]; threadgroup uint previous;
-if (thread_index_in_threadgroup == 0u) previous = params[0];
+if (thread_index_in_threadgroup == 0u) previous = uint(anchors[request]);
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint row = 0u; row < params[1]; ++row) {
-    uint id = ids[row * 16u + candidate];
-    uint safe_id = min(id, params[2] - 1u), safe_previous = min(previous, params[2] - 1u);
+for (uint row = 0u; row < steps; ++row) {
+    const uint at = (start + row) * 16u;
+    uint id = ids[at + candidate];
+    uint safe_id = min(id, vocab - 1u), safe_previous = min(previous, vocab - 1u);
     float edge = 0.f;
     for (uint column = lane; column < uint(RANK); column += 32u)
         edge += (float(predecessor[ulong(safe_previous) * RANK + column]) *
-            float(hidden[ulong(row + 1u) * RANK + column])) * float(successor[ulong(safe_id) * RANK + column]);
+            float(hidden[ulong(start + row) * RANK + column])) * float(successor[ulong(safe_id) * RANK + column]);
     edge = simd_sum(edge);
-    if (lane == 0u) scores[candidate] = unary[row * 16u + candidate] + edge;
+    if (lane == 0u) scores[candidate] = unary[at + candidate] + edge;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (thread_index_in_threadgroup == 0u) {
         uint best = 0u;
         for (uint i = 1u; i < 16u; ++i) if (scores[i] > scores[best]) best = i;
         float mass = 0.f;
         for (uint i = 0u; i < 16u; ++i) mass += exp(scores[i] - scores[best]);
-        previous = ids[row * 16u + best];
-        tokens[row] = int(previous); confidence[row] = 1.f / mass;
+        previous = ids[at + best];
+        tokens[output_base + row] = int(previous); confidence[output_base + row] = 1.f / mass;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+if (thread_index_in_threadgroup == 0u) for (uint row = steps; row < stride; ++row) {
+    tokens[output_base + row] = -1;
+    confidence[output_base + row] = 0.f;
+}
 )METAL");
-    auto output = kernel({unary, ids, hidden, predecessor, successor,
-        array({uint32_t(anchor), uint32_t(config.block_size - 1), uint32_t(config.vocabulary)})},
-        {{config.block_size - 1}, {config.block_size - 1}}, {int32, float32},
-        {512, 1, 1}, {512, 1, 1}, {{"RANK", config.selector_rank}}, std::nullopt, false, {});
+    auto output = kernel({unary, ids, contiguous(hidden), predecessor, successor, anchors, offsets,
+        array({uint32_t(maximum_depth), uint32_t(config.vocabulary)})},
+        {{batch, maximum_depth}, {batch, maximum_depth}}, {int32, float32},
+        {batch * 512, 1, 1}, {512, 1, 1}, {{"RANK", config.selector_rank}}, std::nullopt, false, {});
     return {std::move(output[0]), std::move(output[1])};
 }
 
@@ -326,36 +337,85 @@ void MlxDFlash2::append_context(MlxDFlash2Context& context, const array& target_
 MlxDFlash2Proposal MlxDFlash2::propose(const MlxDFlash2Context& context, int anchor,
     const array& embeddings, const std::function<array(const array&)>& output_head,
     const std::function<void(std::string_view, const array&)>& trace) const {
+    const MlxDFlash2Context* lane = &context;
+    const auto token = static_cast<std::int32_t>(anchor);
+    auto result = propose_batch({&lane, 1}, {&token, 1}, embeddings, output_head, {}, trace);
+    return {reshape(result.tokens, {-1}), reshape(result.confidence, {-1})};
+}
+
+MlxDFlash2Proposal MlxDFlash2::propose_batch(std::span<const MlxDFlash2Context* const> contexts,
+    std::span<const std::int32_t> anchors, const array& embeddings,
+    const std::function<array(const array&)>& output_head,
+    std::span<const int> depths,
+    const std::function<void(std::string_view, const array&)>& trace) const {
     const auto& c = config();
-    impl_->validate_context(context);
-    if (anchor < 0 || anchor >= c.vocabulary || context.position < 0 ||
-        context.layers.size() != std::size_t(c.layers) || embeddings.shape() != Shape{1, c.block_size, c.hidden} || !output_head)
-        throw std::invalid_argument("invalid DFlash2 proposal context or embedding geometry");
-    auto hidden = astype(embeddings, bfloat16);
-    if (impl_->mask_embedding) hidden = concatenate({slice(hidden, {0, 0, 0}, {1, 1, c.hidden}),
-        broadcast_to(reshape(*impl_->mask_embedding, {1, 1, c.hidden}), {1, c.block_size - 1, c.hidden})}, 1);
+    if (contexts.empty() || contexts.size() != anchors.size() ||
+        contexts.size() > std::numeric_limits<int>::max() /
+            (c.block_size * std::int64_t(std::max(c.hidden, 1024))) ||
+        (!depths.empty() && depths.size() != contexts.size()) || !output_head)
+        throw std::invalid_argument("invalid DFlash2 proposal batch");
+    const int batch = static_cast<int>(contexts.size());
+    if (embeddings.shape() != Shape{batch, c.block_size, c.hidden})
+        throw std::invalid_argument("invalid DFlash2 proposal embedding geometry");
+
+    std::vector<int> positions;
+    std::vector<int> row_offsets{0};
+    int maximum_depth = 0;
+    std::vector<array> masks;
     auto slots = arange(c.window, int32);
-    auto logical = context.position < c.window ? slots : array(context.position - c.window, int32) +
-        remainder(slots - array(context.position % c.window, int32) + array(c.window, int32), array(c.window, int32));
-    auto lower = reshape(maximum(arange(c.block_size, int32) + array(context.position - (c.window - 1), int32), array(0, int32)), {c.block_size, 1});
-    auto past_mask = (expand_dims(logical, 0) >= lower) & (expand_dims(logical, 0) < array(context.position, int32));
-    auto mask = reshape(concatenate({past_mask, ones({c.block_size, c.block_size}, bool_)}, 1),
-        {1, 1, c.block_size, c.window + c.block_size});
+    const auto proposal_mask = ones({c.block_size, c.block_size}, bool_);
+    for (int lane = 0; lane < batch; ++lane) {
+        if (!contexts[lane] || anchors[lane] < 0 || anchors[lane] >= c.vocabulary)
+            throw std::invalid_argument("invalid DFlash2 proposal lane");
+        const auto& context = *contexts[lane];
+        impl_->validate_context(context);
+        const int depth = depths.empty() ? c.block_size - 1 : depths[lane];
+        if (depth < 1 || depth >= c.block_size) throw std::invalid_argument("invalid DFlash2 proposal depth");
+        row_offsets.push_back(row_offsets.back() + depth);
+        maximum_depth = std::max(maximum_depth, depth);
+        positions.push_back(context.position);
+        auto logical = context.position < c.window ? slots : array(context.position - c.window, int32) +
+            remainder(slots - array(context.position % c.window, int32) + array(c.window, int32), array(c.window, int32));
+        auto lower = reshape(maximum(arange(c.block_size, int32) + array(context.position - (c.window - 1), int32),
+            array(0, int32)), {c.block_size, 1});
+        auto past_mask = (expand_dims(logical, 0) >= lower) & (expand_dims(logical, 0) < array(context.position, int32));
+        masks.push_back(reshape(concatenate({past_mask, proposal_mask}, 1),
+            {1, 1, c.block_size, c.window + c.block_size}));
+    }
+    auto mask = batch == 1 ? masks.front() : concatenate(masks, 0);
+    auto offsets = array(positions.begin(), {batch}, int32);
+    auto hidden = astype(embeddings, bfloat16);
+    if (impl_->mask_embedding) hidden = concatenate({slice(hidden, {0, 0, 0}, {batch, 1, c.hidden}),
+        broadcast_to(reshape(*impl_->mask_embedding, {1, 1, c.hidden}), {batch, c.block_size - 1, c.hidden})}, 1);
     for (int index = 0; index < c.layers; ++index) {
         const auto& layer = *impl_->layers[index];
         auto input = normalized(hidden, layer.input_norm, c.epsilon);
         auto dynamic = layer.dynamic_attention(input);
         auto convolved = dynamic_convolution(input, dynamic, layer.attention_base, hidden, c.convolution_group, false);
         auto qkv = layer.qkv(convolved);
-        auto query = transpose(reshape(qkv[0], {1, c.block_size, c.query_heads, c.head_dimension}), {0, 2, 1, 3});
-        auto key = transpose(reshape(qkv[1], {1, c.block_size, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
-        auto value = transpose(reshape(qkv[2], {1, c.block_size, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
-        query = rotated(normalized(query, layer.q_norm, c.epsilon), c.head_dimension, c.rope_theta, context.position);
-        key = rotated(normalized(key, layer.k_norm, c.epsilon), c.head_dimension, c.rope_theta, context.position);
+        auto query = transpose(reshape(qkv[0], {batch, c.block_size, c.query_heads, c.head_dimension}), {0, 2, 1, 3});
+        auto key = transpose(reshape(qkv[1], {batch, c.block_size, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
+        auto value = transpose(reshape(qkv[2], {batch, c.block_size, c.kv_heads, c.head_dimension}), {0, 2, 1, 3});
+        query = normalized(query, layer.q_norm, c.epsilon);
+        key = normalized(key, layer.k_norm, c.epsilon);
+        if (batch == 1) {
+            query = rotated(query, c.head_dimension, c.rope_theta, positions.front());
+            key = rotated(key, c.head_dimension, c.rope_theta, positions.front());
+        } else {
+            query = fast::rope(query, c.head_dimension, false, c.rope_theta, 1.f, offsets);
+            key = fast::rope(key, c.head_dimension, false, c.rope_theta, 1.f, offsets);
+        }
+        std::vector<array> keys, values;
+        for (const auto* context : contexts) {
+            keys.push_back(*context->layers[index].keys);
+            values.push_back(*context->layers[index].values);
+        }
         auto attended = fast::scaled_dot_product_attention(query,
-            concatenate({*context.layers[index].keys, key}, 2), concatenate({*context.layers[index].values, value}, 2),
+            concatenate({batch == 1 ? keys.front() : concatenate(keys, 0), key}, 2),
+            concatenate({batch == 1 ? values.front() : concatenate(values, 0), value}, 2),
             1.f / std::sqrt(float(c.head_dimension)), "", mask);
-        auto projected = layer.output(reshape(transpose(attended, {0, 2, 1, 3}), {1, c.block_size, c.query_heads * c.head_dimension}));
+        auto projected = layer.output(reshape(transpose(attended, {0, 2, 1, 3}),
+            {batch, c.block_size, c.query_heads * c.head_dimension}));
         auto residual = dynamic_convolution(projected, dynamic, layer.attention_base, hidden, c.convolution_group, true);
         input = normalized(residual, layer.post_norm, c.epsilon);
         dynamic = layer.dynamic_mlp(input);
@@ -365,12 +425,22 @@ MlxDFlash2Proposal MlxDFlash2::propose(const MlxDFlash2Context& context, int anc
         if (trace) trace("layer_" + std::to_string(index), hidden);
     }
     hidden = normalized(hidden, impl_->final_norm, c.epsilon);
-    auto logits = output_head(hidden);
-    if (logits.shape() != Shape{1, c.block_size, c.vocabulary})
+    const auto pack = [&](const array& values) {
+        if (depths.empty()) return slice(values, {0, 1, 0}, {batch, c.block_size, values.shape(2)});
+        std::vector<array> rows;
+        for (int lane = 0; lane < batch; ++lane) rows.push_back(slice(values,
+            {lane, 1, 0}, {lane + 1, 1 + depths[lane], values.shape(2)}));
+        return batch == 1 ? rows.front() : concatenate(rows, 1);
+    };
+    auto head_hidden = depths.empty() ? hidden : pack(hidden);
+    auto logits = output_head(head_hidden);
+    if (logits.shape() != Shape{head_hidden.shape(0), head_hidden.shape(1), c.vocabulary})
         throw std::invalid_argument("DFlash2 target output head vocabulary differs");
-    auto selector = impl_->selector_projection(hidden);
-    if (trace) { trace("final_hidden", hidden); trace("logits", logits); trace("selector_hidden", selector); }
-    return select_proposals(logits, selector, impl_->predecessor, impl_->successor, anchor, c);
+    auto selector = impl_->selector_projection(head_hidden);
+    if (trace) { trace("final_hidden", head_hidden); trace("logits", logits); trace("selector_hidden", selector); }
+    return select_proposals(depths.empty() ? pack(logits) : logits, depths.empty() ? pack(selector) : selector,
+        impl_->predecessor, impl_->successor, array(anchors.begin(), {batch}, int32),
+        array(row_offsets.begin(), {batch + 1}, int32), maximum_depth, c);
 }
 
 void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head) const {

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 #include <mlx/mlx.h>
@@ -66,6 +67,13 @@ public:
     MlxDFlash2Proposal propose(const MlxDFlash2Context& context, int anchor,
         const mlx::core::array& embeddings,
         const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        const std::function<void(std::string_view, const mlx::core::array&)>& trace = {}) const;
+    // Returns [lanes, max_depth] with only the requested prefix valid in each lane.
+    // With no explicit depths, returns a full proposal for every lane.
+    MlxDFlash2Proposal propose_batch(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const int> depths = {},
         const std::function<void(std::string_view, const mlx::core::array&)>& trace = {}) const;
     std::int32_t generate(MlxQwen4CausalLm& target,
         const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,

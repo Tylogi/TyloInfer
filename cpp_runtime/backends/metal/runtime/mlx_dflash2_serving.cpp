@@ -2,17 +2,11 @@
 #include "../models/dflash2/mlx_dflash2.h"
 #include "mlx_resident_budget.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_server_components.h"
 
 #include <stdexcept>
 
 namespace mfq::metal {
-
-bool mlx_dflash2_sampling_supported(const MfqSamplingParams& sampling,
-    const MfqTokenConstraintPtr& constraint) noexcept {
-    return sampling.enable_mtp && sampling.max_tokens > 1 &&
-        sampling.presence_penalty == 0 && sampling.frequency_penalty == 0 &&
-        sampling.repetition_penalty == 1 && !constraint;
-}
 
 namespace {
 
@@ -21,6 +15,7 @@ void configure_dflash2(MlxEngineComponents& components,
     std::shared_ptr<std::optional<Runtime>> runtime,
     const std::filesystem::path& directory, const MlxSamplingParams& sampling) {
     auto draft = std::make_shared<MlxDFlash2>(MlxDFlash2::load(directory));
+    components.dflash2 = draft;
     components.prepare_speculative = [runtime, draft, sampling] {
         if (!runtime || !runtime->has_value()) throw std::logic_error("DFlash2 target is unavailable");
         auto& target = runtime->value();

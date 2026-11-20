@@ -50,7 +50,8 @@ public:
         return *acceptance_[position];
     }
     void observe(std::span<const BatchAcceptance> observations, Clock::time_point started,
-        Clock::time_point finished, bool time_sample, bool interrupted) {
+        Clock::time_point finished, bool time_sample, bool interrupted,
+        std::optional<int> budget_depth = std::nullopt) {
         if (observations.empty()) throw std::invalid_argument("batch MTP observations cannot be empty");
         for (const auto& sample : observations)
             if (sample.drafted < 0 || sample.drafted > maximum_ || sample.accepted < 0 ||
@@ -68,9 +69,10 @@ public:
             *acceptance_[position] += .08 / acceptance_weight_[position] *
                 (double(hits) / reached - *acceptance_[position]);
         }
-        const int depth = observations.front().drafted;
-        if (!time_sample || interrupted || std::any_of(observations.begin(), observations.end(),
-                [depth](const auto& sample) { return sample.drafted != depth; })) {
+        const int depth = budget_depth.value_or(observations.front().drafted);
+        if (depth < 0 || depth > maximum_) throw std::invalid_argument("invalid batch MTP budget depth");
+        if (!time_sample || interrupted || (!budget_depth && std::any_of(observations.begin(), observations.end(),
+                [depth](const auto& sample) { return sample.drafted != depth; }))) {
             interrupt();
             return;
         }
@@ -101,6 +103,13 @@ public:
         }
         if (!same_depth) return;
         append(costs_[depth], ms);
+        if (budget_depth) {
+            double accepted = 0;
+            for (const auto& sample : observations) accepted += sample.accepted;
+            accepted /= observations.size();
+            auto& estimate = accepted_by_budget_[depth];
+            estimate = estimate ? .9 * *estimate + .1 * accepted : accepted;
+        }
         last_seen_[depth] = elapsed_ms_;
         if (remaining_ || baseline_probe_) return;
         for (int candidate = maximum_; candidate > 0; --candidate) if (costs_[candidate].size() < 3) {
@@ -161,6 +170,7 @@ private:
         losing_ = clear_losing_ = 0;
         if (restart) {
             costs_ = {};
+            accepted_by_budget_ = {};
             last_seen_ = {};
             acceptance_ = {.6};
             acceptance_weight_ = {};
@@ -175,6 +185,8 @@ private:
     double score(int depth) const {
         const auto milliseconds = cost(depth);
         if (!milliseconds) return 0;
+        if (accepted_by_budget_[depth])
+            return (ordinary_requests_ + requests_.size() * (1 + *accepted_by_budget_[depth])) / *milliseconds;
         double expected = 1, reach = 1;
         for (int position = 0; position < depth; ++position) {
             reach *= conditional_acceptance(position);
@@ -188,6 +200,7 @@ private:
     std::array<std::optional<double>, kMaximumReportedDraftDepth> acceptance_{.6};
     std::array<double, kMaximumReportedDraftDepth> acceptance_weight_{};
     std::array<std::deque<double>, kMaximumReportedDraftDepth + 1> costs_;
+    std::array<std::optional<double>, kMaximumReportedDraftDepth + 1> accepted_by_budget_{};
     std::deque<double> standard_;
     std::array<double, kMaximumReportedDraftDepth + 1> last_seen_{};
     double elapsed_ms_ = 0, last_probe_ms_ = 0;

@@ -205,6 +205,9 @@ template <class Ops> class ContinuousBatch {
                 auto decoded = operations.decode(state);
                 decoding_operation = false;
                 for (const auto& request : state.active) if (request->eligible) {
+                    if constexpr (requires { operations.decode_completed(request, decoded); }) {
+                        if (!operations.decode_completed(request, decoded)) continue;
+                    }
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
                     if constexpr (requires { operations.cache_length(request); })

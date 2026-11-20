@@ -25,6 +25,21 @@ int main() {
     check_resident_depth_policy();
     using namespace mfq::engine::mtp;
     {
+        BatchDepthPolicy policy({"short", "long"}, 5, 1);
+        using namespace std::chrono_literals;
+        const BatchDepthPolicy::Clock::time_point zero{};
+        const std::array<BatchAcceptance, 2> standard{{{0, 0}, {0, 0}}};
+        for (int step = 0; step < 5; ++step)
+            policy.observe(standard, zero + step * 10ms, zero + (step + 1) * 10ms, true, false, 0);
+        require(policy.depth() == 5 && policy.cost(0) == 10.);
+        const std::array<BatchAcceptance, 2> ragged{{{1, 0}, {4, 3}}};
+        policy.observe(ragged, zero + 50ms, zero + 62ms, true, false, 3);
+        policy.observe(ragged, zero + 62ms, zero + 74ms, true, false, 3);
+        require(policy.cost(3) == 12. && !policy.cost(1) && !policy.cost(4));
+        policy.observe(ragged, zero + 74ms, zero + 100ms, false, false, 3);
+        require(policy.cost(3) == 12.);
+    }
+    {
         // Initialization invalidates timing, while its completed token
         // decisions remain real observations. The next valid cycle must be
         // usable immediately; unrelated gaps and interrupted work cannot

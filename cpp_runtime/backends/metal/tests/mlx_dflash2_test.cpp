@@ -59,6 +59,9 @@ int main() {
         weights.at("fc.weight") = eye(64, bfloat16);
         weights.at(p + "self_attn.k_proj.weight") = eye(64, bfloat16);
         weights.at(p + "self_attn.v_proj.weight") = eye(64, bfloat16);
+        weights.at(p + "self_attn.q_proj.weight") = eye(64, bfloat16);
+        weights.at(p + "self_attn.o_proj.weight") = eye(64, bfloat16);
+        weights.at(p + "attention_conv.base_kernel") = full({2, 2, 64}, .25f, bfloat16);
         save_safetensors((directory / "model.safetensors").string(), weights);
         std::vector<float> head(8 * 1024, -1000.f);
         for (int row = 0; row < 8; ++row) {
@@ -101,6 +104,39 @@ int main() {
             if (proposal.tokens.data<std::int32_t>()[i] != 777 ||
                 std::abs(proposal.confidence.data<float>()[i] - 1. / mass) > 1e-5)
                 throw std::runtime_error("joint selector differs from CPU reference");
+        {
+            MlxDFlash2Context other;
+            draft.reset(other);
+            const auto pattern = astype(reshape(arange(64, float32), {1, 1, 64}) / 32 - 1, bfloat16);
+            draft.append_context(other, broadcast_to(pattern, {1, 5, 64}), 0);
+            const std::array<const MlxDFlash2Context*, 2> contexts{&context, &other};
+            const std::array<std::int32_t, 2> anchors{7, 42};
+            const auto first = ones({1, 8, 64}, bfloat16);
+            const auto second = broadcast_to(pattern, {1, 8, 64});
+            const auto other_logits = roll(logits, 1, 2);
+            auto packed_hidden = zeros({1}, float32);
+            auto packed = draft.propose_batch(contexts, anchors, concatenate({first, second}, 0),
+                [&](const array&) { return concatenate({logits, other_logits}, 0); }, {},
+                [&](std::string_view name, const array& value) { if (name == "layer_0") packed_hidden = value; });
+            const std::array<int, 2> depths{2, 5};
+            auto ragged = draft.propose_batch(contexts, anchors, concatenate({first, second}, 0),
+                [&](const array&) { return concatenate({slice(logits, {0, 1, 0}, {1, 3, 1024}),
+                    slice(other_logits, {0, 1, 0}, {1, 6, 1024})}, 1); }, depths);
+            for (int lane = 0; lane < 2; ++lane) {
+                auto solo_hidden = zeros({1}, float32);
+                auto solo = draft.propose(*contexts[lane], anchors[lane], lane ? second : first,
+                    [&](const array&) { return lane ? other_logits : logits; },
+                    [&](std::string_view name, const array& value) { if (name == "layer_0") solo_hidden = value; });
+                const auto ids = reshape(slice(packed.tokens, {lane, 0}, {lane + 1, 7}), {7});
+                const auto confidence = reshape(slice(packed.confidence, {lane, 0}, {lane + 1, 7}), {7});
+                const auto hidden = slice(packed_hidden, {lane, 0, 0}, {lane + 1, 8, 64});
+                if (!all(ids == solo.tokens).item<bool>() || !allclose(confidence, solo.confidence, 1e-3, 1e-5).item<bool>() ||
+                    !allclose(astype(hidden, float32), astype(solo_hidden, float32), 1e-2, 1e-2).item<bool>() ||
+                    !all(reshape(slice(ragged.tokens, {lane, 0}, {lane + 1, depths[lane]}), {depths[lane]}) ==
+                        slice(solo.tokens, {0}, {depths[lane]})).item<bool>())
+                    throw std::runtime_error("batched DFlash2 lane differs from its independent proposal");
+            }
+        }
         auto invalid = context; invalid.layers[0].keys.reset();
         bool rejected = false;
         try { draft.propose(invalid, 7, ones({1, 8, 64}, bfloat16), [&](const array&) { return logits; }); }

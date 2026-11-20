@@ -1853,6 +1853,7 @@ public:
             if (configured_batch_capacity > 1) {
                 mfq::metal::MlxQwen4BatchOperations::Hooks hooks;
                 hooks.block_size = session_cache->block_size_tokens();
+                hooks.dflash2 = runtime_components.dflash2;
                 hooks.restore = [this](auto& request) {
                     request.prefix = session_cache->normalize_stable_prefix_tokens(std::min(
                         request.cache_plan.stable_prefix_tokens, request.prompt.size()));
@@ -1877,9 +1878,13 @@ public:
 
     std::size_t request_capacity() const override { return batching_capacity; }
     bool can_batch(const mfq::engine::EngineRequest& request) const override {
-        return batching && !request.input.media &&
-            !(runtime_components.speculative_generate && request.input.sampling.enable_mtp) &&
-            !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
+        if (!batching || request.input.media) return false;
+        if (runtime_components.dflash2 && mfq::metal::mlx_dflash2_sampling_supported(request.input.sampling, {})) {
+            if (!request.input.chat_input) return true;
+            const auto& chat = request.input.chat_input->template_inputs;
+            if (chat.grammar.empty() && chat.json_schema.empty() && chat.tools.empty()) return true;
+        }
+        return !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
     }
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
@@ -2974,7 +2979,7 @@ int run_loaded_runtime(
             std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) {
             mfq::metal::configure_mlx_dflash2(runtime_components, runtime_holder, arguments.dflash2_draft, preparation_sampling);
             runtime_components.prepare_speculative();
-            std::cout << "DFlash2 experimental: unconstrained text without penalties; DFlash2 requests bypass prefix reuse and batching"
+            std::cout << "DFlash2 experimental: unconstrained text without penalties; Flash-Next supports continuous batching"
                       << std::endl;
         } else throw std::invalid_argument("DFlash2 currently requires a supported Qwen target");
     }
