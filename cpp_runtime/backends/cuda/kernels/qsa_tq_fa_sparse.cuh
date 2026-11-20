@@ -102,8 +102,9 @@ static __global__ void qsa_fa_split(tyloinfer::qsa::TqPrefillAttention a,const h
         return;
     }
     const int stride=width/2;
-    const auto* k=reinterpret_cast<const half2*>(a.keys)+kv_head*4*width/2;
-    const auto* v=reinterpret_cast<const half2*>(a.values)+kv_head*4*width/2;
+    const auto head_stride=int64_t(a.resident_kv?a.kv_rows:4)*width/2;
+    const auto* k=reinterpret_cast<const half2*>(a.keys)+kv_head*head_stride;
+    const auto* v=reinterpret_cast<const half2*>(a.values)+kv_head*head_stride;
     const auto* q=reinterpret_cast<const float2*>(a.rotated)+head*width/2;
     auto* result=reinterpret_cast<float2*>(output)+head*width/2;
     flash_attn_ext_f16_process_tile<256,256,8,8,warps,false,false,true,false,false>(
