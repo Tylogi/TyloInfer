@@ -31,6 +31,23 @@ struct MlxGatedDeltaDecodeInput {
     mlx::core::array convolution_state, recurrent_state;
 };
 
+struct MlxGatedDeltaDecodeState {
+    mlx::core::array convolution, recurrent;
+};
+
+struct MlxGatedDeltaBatchDecodeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaDecodeState> states;
+};
+
+MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
+    const std::vector<mlx::core::array>& projections,
+    const std::vector<MlxGatedDeltaDecodeState>& states,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float convolution_eps, float norm_eps,
+    bool output_gate_silu, bool tiled_heads, mlx::core::Dtype output_dtype);
+
 std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     const std::vector<MlxGatedDeltaDecodeInput>& requests,
     const mlx::core::array& convolution_weight,

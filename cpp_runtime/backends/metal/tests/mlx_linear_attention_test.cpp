@@ -530,6 +530,43 @@ void test_gdn_decode_step(
         }
     }
 
+    for (int batch = 2; batch <= 8; ++batch) {
+        std::vector<std::vector<array>> projections(5);
+        std::vector<mfq::metal::MlxGatedDeltaDecodeState> states;
+        std::vector<mfq::metal::MlxGatedDeltaDecodeResult> expected;
+        states.reserve(batch);
+        expected.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            const auto scale = array(1.0f + 0.125f * row);
+            projections[0].push_back(astype(qk * scale, qk.dtype()));
+            projections[1].push_back(astype(value / scale, value.dtype()));
+            projections[2].push_back(astype(output_gate * scale, output_gate.dtype()));
+            projections[3].push_back(astype(alpha / scale, alpha.dtype()));
+            projections[4].push_back(astype(beta * scale, beta.dtype()));
+            states.push_back({convolution_state * scale, recurrent_state / scale});
+            expected.push_back(mfq::metal::gated_delta_decode_step(projections[0].back(), projections[1].back(),
+                projections[2].back(), projections[3].back(), projections[4].back(), states.back().convolution,
+                states.back().recurrent, convolution_weight, bias, decay, norm, key_heads, value_heads, dimension,
+                1e-6f, 1e-6f, true));
+        }
+        std::vector<array> packed;
+        for (const auto& projection : projections) packed.push_back(concatenate(projection, 1));
+        auto actual = mfq::metal::gated_delta_decode_batch(packed, states, convolution_weight, bias, decay, norm,
+            key_heads, value_heads, 1e-6f, 1e-6f, true, false, float32);
+        for (int row = 0; row < batch; ++row) {
+            auto output = slice(actual.output, {0, row, 0}, {1, row + 1, actual.output.shape(2)});
+            const std::array<array, 3> result{output, actual.states[row].convolution, actual.states[row].recurrent};
+            const std::array<array, 3> reference{expected[row].output, expected[row].convolution_state,
+                expected[row].recurrent_state};
+            for (int field = 0; field < 3; ++field) {
+                eval(result[field], reference[field]);
+                require_vector_close(result[field].data<float>(), std::vector<float>(
+                    reference[field].data<float>(), reference[field].data<float>() + reference[field].size()),
+                    0.0f, "GDN grouped decode must match independent requests");
+            }
+        }
+    }
+
     for (const bool transposed_state : {false, true})
     for (const bool tiled_heads : {false, true}) for (const bool silu_gate : {false, true}) {
         for (int tokens = 2; tokens <= 8; ++tokens) {

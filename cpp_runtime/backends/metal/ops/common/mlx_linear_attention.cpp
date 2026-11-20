@@ -412,11 +412,12 @@ struct GdnStepConfig {
     bool transposed_state;
     int head_splits = 1;
     bool round_fp16 = false;
+    int batch_size = 1;
 };
 
 std::string gdn_step_source(
     const GdnStepConfig& config,
-    const std::string& kernel_name) {
+    const std::string& kernel_name, int lanes) {
     const auto metal_type = [](Dtype dtype) {
         if (dtype == mlx::core::float16) return "half";
         if (dtype == mlx::core::bfloat16) return "bfloat";
@@ -451,14 +452,23 @@ std::string gdn_step_source(
         "dt_bias", "decay_scale", "norm_weight"};
     for (int index = 0; index < 6; ++index) {
         source += "device const float* " + std::string(state_names[index]) +
+            (lanes > 1 && index < 2 ? "0" : "") +
             " [[buffer(" + std::to_string(index + 5) + ")]], ";
     }
     source +=
         "constant float* params [[buffer(11)]], ";
     source += "device " + std::string(config.head_splits > 1 ? "float" : metal_type(config.output_dtype)) + "* output [[buffer(12)]], ";
-    source +=
-        "device float* convolution_out [[buffer(13)]], "
-        "device float* recurrent_out [[buffer(14)]], ";
+    const std::string state_suffix = lanes > 1 ? "0" : "";
+    source += "device float* convolution_out" + state_suffix + " [[buffer(13)]], ";
+    source += "device float* recurrent_out" + state_suffix + " [[buffer(14)]], ";
+    if (lanes > 1) for (int lane = 1; lane < lanes; ++lane) {
+        const auto suffix = std::to_string(lane);
+        const int slot = 15 + 4 * (lane - 1);
+        source += "device const float* convolution_state" + suffix + " [[buffer(" + std::to_string(slot) + ")]], ";
+        source += "device const float* recurrent_state" + suffix + " [[buffer(" + std::to_string(slot + 1) + ")]], ";
+        source += "device float* convolution_out" + suffix + " [[buffer(" + std::to_string(slot + 2) + ")]], ";
+        source += "device float* recurrent_out" + suffix + " [[buffer(" + std::to_string(slot + 3) + ")]], ";
+    }
     if (config.sequence) source +=
         "constant uint& tokens [[buffer(15)]], "
         "device float* gate_out [[buffer(16)]], "
@@ -467,6 +477,24 @@ std::string gdn_step_source(
         "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
         "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
         "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    if (lanes > 1) {
+        source += R"METAL(
+const uint row = threadgroup_position_in_grid.y;
+qk += row * uint(2 * HK * D);
+value += row * uint(HV * D);
+output_gate += row * uint(HV * D);
+alpha += row * uint(HV);
+beta += row * uint(HV);
+output += row * uint(HV * D);
+)METAL";
+        for (const auto* name : {"convolution_state", "recurrent_state", "convolution_out", "recurrent_out"}) {
+            const bool read_only = std::string_view(name).ends_with("_state");
+            source += (read_only ? "device const float* " : "device float* ") + std::string(name) + " = ";
+            for (int lane = 1; lane < lanes; ++lane)
+                source += "row == " + std::to_string(lane) + "u ? " + name + std::to_string(lane) + " : ";
+            source += std::string(name) + "0;\n";
+        }
+    }
     source += kGatedDeltaDecodeStepSource;
     source += "}\n";
     if (config.head_splits > 1) {
@@ -500,20 +528,30 @@ public:
         if (config_.round_fp16) kernel_name_ += "_round_f16";
     }
 
-    std::string preparation_key() const override { return kernel_name_; }
+    std::string preparation_key() const override {
+        if (config_.batch_size == 1) return kernel_name_;
+        auto key = kernel_name_;
+        for (int remaining = config_.batch_size; remaining; remaining -= batch_lanes(remaining))
+            key += "_rows" + std::to_string(batch_lanes(remaining));
+        return key;
+    }
     void prepare_gpu() override {
-        (void)prepared_kernel();
-        if (config_.head_splits > 1) (void)prepared_kernel(true);
+        if (config_.batch_size > 1) {
+            for (int remaining = config_.batch_size; remaining; remaining -= batch_lanes(remaining))
+                (void)prepared_kernel(false, batch_lanes(remaining));
+        } else {
+            (void)prepared_kernel();
+            if (config_.head_splits > 1) (void)prepared_kernel(true);
+        }
     }
 
-    MTL::ComputePipelineState* prepared_kernel(bool normalize = false) {
+    MTL::ComputePipelineState* prepared_kernel(bool normalize = false, int lanes = 1) {
         auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_, options,
-            [this] { return gdn_step_source(config_, kernel_name_); });
-        return device.get_kernel(normalize ? kernel_name_ + "_norm" : kernel_name_, library);
+        const auto name = lanes > 1 ? kernel_name_ + "_rows" + std::to_string(lanes) : kernel_name_;
+        auto* library = device.get_library(name, options, [&] { return gdn_step_source(config_, name, lanes); });
+        return device.get_kernel(normalize ? name + "_norm" : name, library);
     }
 
     void eval_cpu(
@@ -527,6 +565,10 @@ public:
         std::vector<array>& outputs) override {
         for (auto& output : outputs) {
             output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        if (config_.batch_size > 1) {
+            eval_batch(inputs, outputs);
+            return;
         }
         auto* kernel = prepared_kernel();
         auto* norm_kernel = config_.head_splits > 1 ? prepared_kernel(true) : nullptr;
@@ -572,6 +614,39 @@ public:
     const char* name() const override { return "GatedDeltaDecodeStep"; }
 
 private:
+    static int batch_lanes(int remaining) {
+        // The fixed Metal buffer bindings fit four requests. Use groups of three
+        // and two when five requests remain to avoid a singleton dispatch.
+        return remaining == 5 ? 3 : std::min(4, remaining);
+    }
+
+    void eval_batch(const std::vector<array>& inputs, std::vector<array>& outputs) {
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        auto concurrent = encoder.start_concurrent();
+        const auto row_bytes = [](const array& value) { return value.shape(-1) * value.itemsize(); };
+        for (int first = 0; first < config_.batch_size;) {
+            const int lanes = batch_lanes(config_.batch_size - first);
+            encoder.set_compute_pipeline_state(prepared_kernel(false, lanes));
+            for (int index = 0; index < 4; ++index)
+                encoder.set_input_array(inputs[index], index + 7);
+            encoder.set_bytes(config_.eps, 11);
+            for (int index = 0; index < 5; ++index)
+                encoder.set_input_array(inputs[4 + index], index, first * row_bytes(inputs[4 + index]));
+            encoder.set_output_array(outputs[0], 12, first * row_bytes(outputs[0]));
+            for (int row = 0; row < lanes; ++row) {
+                const int in = 9 + 2 * (first + row), out = 1 + 2 * (first + row);
+                const int slot = row == 0 ? 5 : 15 + 4 * (row - 1);
+                const int result = row == 0 ? 13 : slot + 2;
+                encoder.set_input_array(inputs[in], slot);
+                encoder.set_input_array(inputs[in + 1], slot + 1);
+                encoder.set_output_array(outputs[out], result);
+                encoder.set_output_array(outputs[out + 1], result + 1);
+            }
+            encoder.dispatch_threadgroups(MTL::Size(1, lanes, config_.value_heads), MTL::Size(32, 16, 1));
+            first += lanes;
+        }
+    }
+
     GdnStepConfig config_;
     std::string kernel_name_;
 };
@@ -1548,6 +1623,63 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
             std::move(outputs[row * fields + 2]),
             sequence ? std::optional<array>(std::move(outputs[row * fields + 3])) : std::nullopt,
             sequence ? std::optional<array>(std::move(outputs[row * fields + 4])) : std::nullopt});
+    return result;
+}
+
+MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
+    const std::vector<array>& projections, const std::vector<MlxGatedDeltaDecodeState>& states,
+    const array& convolution_weight, const array& dt_bias, const array& decay_scale, const array& norm_weight,
+    int key_heads, int value_heads, float convolution_eps, float norm_eps,
+    bool output_gate_silu, bool tiled_heads, Dtype output_dtype) {
+    if (states.size() < 2 || states.size() > 8 || projections.size() != 5 ||
+        key_heads <= 0 || value_heads <= 0 || value_heads % key_heads ||
+        !std::isfinite(convolution_eps) || convolution_eps <= 0.f || !std::isfinite(norm_eps) || norm_eps <= 0.f ||
+        (output_dtype != mlx::core::float16 && output_dtype != mlx::core::bfloat16 && output_dtype != mlx::core::float32))
+        throw std::invalid_argument("invalid Gated DeltaNet decode batch geometry");
+    constexpr int dimension = 128;
+    const int rows = static_cast<int>(states.size());
+    const int qk_width = 2 * key_heads * dimension, value_width = value_heads * dimension;
+    const int channels = qk_width + value_width;
+    auto bias = float32_contiguous(dt_bias);
+    auto decay = float32_contiguous(decay_scale);
+    auto norm = float32_contiguous(norm_weight);
+    const auto weight = normalize_conv_weight(convolution_weight, channels);
+    if (bias.shape() != Shape{value_heads} || decay.shape() != Shape{value_heads} ||
+        norm.shape() != Shape{dimension} || weight.kernel != 4)
+        throw std::invalid_argument("invalid Gated DeltaNet decode batch weights");
+
+    GdnStepConfig config{{mlx::core::float32, mlx::core::float32, mlx::core::float32,
+        mlx::core::float32, mlx::core::float32}, key_heads, value_heads, output_gate_silu, {convolution_eps, norm_eps},
+        false, tiled_heads, output_dtype, true};
+    config.batch_size = rows;
+    std::vector<array> inputs{weight.values, std::move(bias), std::move(decay), std::move(norm)};
+    inputs.reserve(9 + 2 * rows);
+    const std::array widths{qk_width, value_width, value_width, value_heads, value_heads};
+    for (int index = 0; index < 5; ++index) {
+        auto value = real_contiguous(projections[index]);
+        if (value.shape() != Shape{1, rows, widths[index]})
+            throw std::invalid_argument("invalid Gated DeltaNet decode batch projection");
+        config.projection_types[index] = value.dtype();
+        inputs.push_back(std::move(value));
+    }
+    const Shape convolution{1, 3, channels}, recurrent{1, value_heads, dimension, dimension};
+    std::vector<Shape> shapes{{1, rows, value_width}};
+    shapes.reserve(1 + 2 * rows);
+    for (const auto& state : states) {
+        if (state.convolution.shape() != convolution || state.recurrent.shape() != recurrent)
+            throw std::invalid_argument("invalid Gated DeltaNet decode batch state");
+        inputs.push_back(float32_contiguous(state.convolution));
+        inputs.push_back(float32_contiguous(state.recurrent));
+        shapes.insert(shapes.end(), {convolution, recurrent});
+    }
+    std::vector<Dtype> dtypes(shapes.size(), mlx::core::float32);
+    dtypes.front() = output_dtype;
+    auto outputs = array::make_arrays(shapes, dtypes,
+        std::make_shared<GdnStepPrimitive>(mlx::core::default_stream(mlx::core::default_device()), config), std::move(inputs));
+    MlxGatedDeltaBatchDecodeResult result{std::move(outputs[0]), {}};
+    result.states.reserve(rows);
+    for (int row = 0; row < rows; ++row)
+        result.states.push_back({std::move(outputs[1 + 2 * row]), std::move(outputs[2 + 2 * row])});
     return result;
 }
 

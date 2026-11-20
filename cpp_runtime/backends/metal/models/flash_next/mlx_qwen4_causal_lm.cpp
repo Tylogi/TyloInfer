@@ -2695,6 +2695,29 @@ public:
         auto grouped = mlx::core::reshape(hidden, {1, batch * tokens, hidden.shape(2)});
         auto projected = project_inputs(grouped);
         detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        if (tokens == 1 && batch >= 2 && batch <= 8) {
+            std::vector<MlxGatedDeltaDecodeState> states;
+            states.reserve(batch);
+            for (const auto* cache : caches) {
+                if (cache->batch != 1 || !cache->convolution || !cache->recurrent || cache->gdn_rollback)
+                    throw std::logic_error("cannot batch uninitialized GDN state");
+                states.push_back({*cache->convolution, *cache->recurrent});
+            }
+            auto decoded = gated_delta_decode_batch(projected, states, convolution_weight_, dt_bias_, decay_scale_,
+                output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
+                static_cast<int>(config_.linear_num_value_heads), 1e-6f, output_norm_.eps(),
+                config_.output_gate_silu, config_.linear_tiled_heads, hidden.dtype());
+            for (int row = 0; row < batch; ++row) {
+                auto& cache = *caches[row];
+                cache.convolution = std::move(decoded.states[row].convolution);
+                cache.recurrent = std::move(decoded.states[row].recurrent);
+                ++cache.position;
+            }
+            detail::profile_eval("qwen4.batch.attention.core", decoded.output);
+            auto output = output_(decoded.output);
+            detail::profile_eval("qwen4.batch.attention.output", output);
+            return mlx::core::reshape(output, {batch, 1, output.shape(2)});
+        }
         std::vector<MlxGatedDeltaDecodeInput> inputs;
         inputs.reserve(batch);
         for (int row = 0; row < batch; ++row) {
@@ -3097,6 +3120,15 @@ private:
                         output_norm_.eps(), config_.output_gate_silu, config_.linear_tiled_heads, hidden.dtype()).front();
                     for (const auto& output : {decoded.output, decoded.convolution_state,
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
+                    for (const int lanes : {2, 3, 4}) {
+                        const auto packed = mlx::core::zeros(
+                            {1, lanes, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
+                        const std::vector<MlxGatedDeltaDecodeState> states(lanes, {conv, state});
+                        preparation->add(gated_delta_decode_batch(project_inputs(packed), states, convolution_weight_,
+                            dt_bias_, decay_scale_, output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
+                            static_cast<int>(config_.linear_num_value_heads), 1e-6f, output_norm_.eps(),
+                            config_.output_gate_silu, config_.linear_tiled_heads, packed.dtype()).output);
+                    }
                 }
             });
         }
