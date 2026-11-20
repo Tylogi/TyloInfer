@@ -1,4 +1,5 @@
 #include "mlx_tensor.h"
+#include "mlx_moe_ops.h"
 #include "tyloinfer/channel_fp8.h"
 
 #include <algorithm>
@@ -23,6 +24,33 @@ float round_e4m3(float x) {
             nearest = code;
     }
     return std::copysign(fp8::decode(static_cast<std::uint8_t>(nearest)), x);
+}
+
+void check_fused_quantize() {
+    constexpr int tokens = 65, width = 5120;
+    std::vector<float> samples(tokens * width);
+    for (int row = 0; row < tokens; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const auto magnitude = row % 3 == 0 ? 448.f : (1.f + row) * .09375f;
+            samples[row * width + col] = std::sin((row + 1) * (col + 3) * .00713f) * magnitude;
+        }
+        if (row % 3 == 0) {
+            samples[row * width] = 448.f;
+            samples[row * width + 1] = 1.0625f;
+            samples[row * width + 2] = -1.1875f;
+            samples[row * width + 3] = .0009765625f;
+        }
+    }
+    std::fill(samples.end() - width, samples.end(), 0.f);
+    const auto source = mx::astype(mx::array(samples.data(), {tokens, width}), mx::bfloat16);
+    const auto actual = mfq::metal::MlxChannelFp8Weight::quantize(source);
+    const auto x = mx::astype(source, mx::float32);
+    const auto scales = mx::maximum(mx::max(mx::abs(x), -1, true), mx::array(1e-12f)) / mx::array(448.f);
+    const auto scaled = mx::clip(x / scales, mx::array(-448.f), mx::array(448.f));
+    const auto expected = mx::from_fp8(mx::to_fp8(scaled), mx::bfloat16);
+    if (!mx::all(actual.values == expected).item<bool>() ||
+        !mx::all(mx::abs(actual.scales - scales) <= mx::abs(scales) * 1e-7f).item<bool>())
+        throw std::runtime_error("fused channel FP8 rounding differs from MLX E4M3");
 }
 
 void check_channel_fp8(bool dynamic) {
@@ -80,6 +108,21 @@ void check_channel_fp8(bool dynamic) {
         }
     }
 
+    if (dynamic) {
+        constexpr int tokens = 65;
+        const auto input = mx::astype(
+            mx::reshape(mx::sin(mx::arange(tokens * width, mx::float32) * .011f), {1, tokens, width}),
+            mx::bfloat16);
+        const auto gate = weight.matmul(input);
+        blob[layout.scales] ^= 32;
+        const auto up = mfq::metal::MlxChannelFp8Weight::from_blob(blob);
+        const auto expected = mfq::metal::moe_swiglu_pair(gate, up.matmul(input));
+        const auto fused = weight.fused_swiglu(up, input);
+        if (!fused || !mx::all(*fused == expected).item<bool>())
+            throw std::runtime_error("fused channel FP8 SwiGLU changed output bits");
+        blob[layout.scales] ^= 32;
+    }
+
     auto rows = weight.embedding(mx::array({1, outputs - 1}, mx::int32), mx::float32);
     rows.eval();
     for (int k = 0; k < width; ++k)
@@ -92,6 +135,7 @@ void check_channel_fp8(bool dynamic) {
 
 int main() {
     mx::set_default_device(mx::Device::gpu);
+    check_fused_quantize();
     check_channel_fp8(false);
     check_channel_fp8(true);
 }

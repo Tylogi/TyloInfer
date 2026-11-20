@@ -48,10 +48,20 @@ public:
 
     int input_size() const noexcept { return values_.shape(1) * 4; }
     int output_size() const noexcept { return values_.shape(0); }
+    struct Activation {
+        mlx::core::array values;
+        mlx::core::array scales;
+    };
+    bool dynamic_activations() const noexcept { return dynamic_activations_; }
+    static Activation quantize(const mlx::core::array& input);
     mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul(const mlx::core::array& input, const Activation& activation) const;
+    std::optional<mlx::core::array> fused_swiglu(
+        const MlxChannelFp8Weight& up, const mlx::core::array& input) const;
     mlx::core::array embedding(const mlx::core::array& rows, mlx::core::Dtype dtype) const;
 
 private:
+    mlx::core::array product(const mlx::core::array& source) const;
     MlxChannelFp8Weight(mlx::core::array values, mlx::core::array unit_scales,
         mlx::core::array channel_scales, bool dynamic_activations);
 
@@ -137,6 +147,7 @@ public:
     const MlxTqWeight* tq_weight_ref() const noexcept;
     const MlxAffineWeight* affine_weight_ref() const noexcept;
     const MlxGgufWeight* gguf_weight_ref() const noexcept;
+    const MlxChannelFp8Weight* channel_fp8_weight_ref() const noexcept;
     void prepare_grouped_gguf();
     const mlx::core::array* dense_weight_ref() const noexcept;
 
