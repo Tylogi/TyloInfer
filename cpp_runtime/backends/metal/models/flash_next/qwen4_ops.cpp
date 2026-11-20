@@ -37,9 +37,11 @@ constexpr int kGatedHcUpThreads = 320;
 // Copyright © 2024 Apple Inc. See LICENSES/MLX-MIT.txt.
 class QsaDenseDecodeBatch final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
-    explicit QsaDenseDecodeBatch(mlx::core::Stream stream) : Primitive(stream) {}
+    QsaDenseDecodeBatch(mlx::core::Stream stream, bool gate) : Primitive(stream), gate_(gate) {}
 
-    std::string preparation_key() const override { return "mfq_qsa_dense_decode_batch"; }
+    std::string preparation_key() const override {
+        return gate_ ? "mfq_qsa_dense_decode_batch_gated" : "mfq_qsa_dense_decode_batch";
+    }
     void prepare_gpu() override { (void)prepared_kernel(); }
     const char* name() const override { return "QsaDenseDecodeBatch"; }
 
@@ -58,6 +60,7 @@ public:
                 source += "device const half *key" + suffix + " [[buffer(" + std::to_string(3 + row * 2) + ")]],";
                 source += "device const half *value" + suffix + " [[buffer(" + std::to_string(4 + row * 2) + ")]],";
             }
+            if (gate_) source += "device const bfloat* gate [[buffer(19)]],";
             source += R"METAL(
                 uint2 group [[threadgroup_position_in_grid]],
                 uint lane [[thread_index_in_simdgroup]],
@@ -101,7 +104,9 @@ public:
                     key += 32 * info[2];
                     value += 32 * info[4];
                 }
-                threadgroup float maxima[32], totals[32], partials[32 * 32];
+                threadgroup float maxima[32], totals[32];
+                constexpr uint Pitch = 33, Pack = 4;
+                threadgroup float partials[Pack][32 * Pitch];
                 if (lane == 0) {
                     maxima[simdgroup] = maximum;
                     totals[simdgroup] = total;
@@ -110,15 +115,35 @@ public:
                 maximum = maxima[lane];
                 const float scale = fast::exp(maximum - simd_max(maximum));
                 total = simd_sum(totals[lane] * scale);
-                for (uint j = 0; j < E; ++j) {
-                    partials[lane * 32 + simdgroup] = sums[j];
+                // Transpose the partials in groups of four to share the
+                // barriers while keeping the per-feature reduction order.
+                for (uint base = 0; base < E; base += Pack) {
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j)
+                        partials[j][lane * Pitch + simdgroup] = sums[base + j];
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    sums[j] = simd_sum(partials[simdgroup * 32 + lane] * scale);
-                    sums[j] = total == 0.f ? sums[j] : sums[j] / total;
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j) {
+                        const float sum = simd_sum(partials[j][simdgroup * Pitch + lane] * scale);
+                        sums[base + j] = total == 0.f ? sum : sum / total;
+                    }
+                    if (base + Pack < E) threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                if (lane == 0) for (uint j = 0; j < E; ++j) output[j] = bfloat(sums[j]);
-            })METAL";
+            )METAL";
+            if (gate_) source += R"METAL(
+                if (lane < E) {
+                    float reduced = 0.f;
+#pragma unroll
+                    for (uint j = 0; j < E; ++j)
+                        if (lane == j) reduced = sums[j];
+                    const float z = float(gate[(row * 24 + head) * HD + simdgroup * E + lane]);
+                    const float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+                    const float probability = z < 0.0f ? tail : 1.0f - tail;
+                    output[lane] = bfloat(float(bfloat(reduced)) * probability);
+                }
+            )METAL";
+            else source += "if (lane == 0) for (uint j = 0; j < E; ++j) output[j] = bfloat(sums[j]);\n";
+            source += "}\n";
             return source;
         });
         return device.get_kernel(name, library);
@@ -152,8 +177,11 @@ public:
             params[offset+4] = value.strides(2);
         }
         encoder.set_bytes(params, 2);
+        if (gate_) encoder.set_input_array(inputs.back(), 19);
         encoder.dispatch_threadgroups(MTL::Size(24, rows, 1), MTL::Size(1024, 1, 1));
     }
+private:
+    bool gate_;
 };
 
 class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
@@ -2750,13 +2778,14 @@ array qwen4_qsa_select_blocks(
 }
 
 array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,
-    const std::vector<array>& values) {
+    const std::vector<array>& values, const array* gate) {
     const int rows = static_cast<int>(keys.size());
     if (rows < 2 || rows > 8 || keys.size() != values.size() ||
-        query.dtype() != mlx::core::bfloat16 || query.shape() != Shape{1, 24, rows, 256})
+        query.dtype() != mlx::core::bfloat16 || query.shape() != Shape{1, 24, rows, 256} ||
+        (gate && (gate->dtype() != mlx::core::bfloat16 || gate->shape() != Shape{1, rows, 24 * 256})))
         throw std::invalid_argument("invalid grouped QSA decode query");
     std::vector<array> inputs{mlx::core::contiguous(query)};
-    inputs.reserve(1 + 2 * rows);
+    inputs.reserve(1 + 2 * rows + int(gate != nullptr));
     const auto with_contiguous_features = [](const array& input) {
         return input.strides(3) == 1 && input.strides(1) >= 0 && input.strides(2) >= 0
             ? input : mlx::core::contiguous(input);
@@ -2771,8 +2800,11 @@ array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>&
         inputs.push_back(with_contiguous_features(key));
         inputs.push_back(with_contiguous_features(value));
     }
-    return array({1, rows, 24, 256}, mlx::core::bfloat16,
-        std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu)), std::move(inputs));
+    if (gate) inputs.push_back(mlx::core::contiguous(*gate));
+    const auto shape = gate ? Shape{1, rows, 24 * 256} : Shape{1, rows, 24, 256};
+    return array(shape, mlx::core::bfloat16,
+        std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu), gate != nullptr),
+        std::move(inputs));
 }
 
 array qwen4_dense_gqa_attention(

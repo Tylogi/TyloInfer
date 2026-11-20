@@ -3393,9 +3393,9 @@ public:
             }
             exchange_cache(*caches[row]);
         }
-        auto attended = mlx::core::depends({qwen4_dense_gqa_decode_batch(packed.query, keys, values)}, index_updates).front();
-        detail::profile_eval("qwen4.batch.attention.core", attended);
-        auto gated = qwen4_qsa_output_gate(attended, mlx::core::reshape(packed.output_gate, attended.shape()), hidden.dtype());
+        auto gated = mlx::core::depends({qwen4_dense_gqa_decode_batch(packed.query, keys, values, &packed.output_gate)},
+            index_updates).front();
+        detail::profile_eval("qwen4.batch.attention.core", gated);
         auto output = output_(gated);
         detail::profile_eval("qwen4.batch.attention.output", output);
         return mlx::core::reshape(output, {rows, 1, output.shape(2)});

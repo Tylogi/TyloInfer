@@ -321,6 +321,11 @@ void test_qsa_grouped_decode() {
         }
         const auto actual = mfq::metal::qwen4_dense_gqa_decode_batch(query, keys, values);
         require_close(actual, concatenate(reference, 1), 0.0f, "QSA grouped decode with ragged KV views");
+        const auto gate = patterned_bfloat(static_cast<std::size_t>(rows) * heads * dimension,
+            {1, rows, heads * dimension}, 71, 1.0f / 97.0f);
+        const auto gated = mfq::metal::qwen4_dense_gqa_decode_batch(query, keys, values, &gate);
+        require_close(gated, mfq::metal::qwen4_qsa_output_gate(actual, reshape(gate, actual.shape()), bfloat16),
+            0.0f, "QSA grouped decode rounds before applying the output gate");
     }
 }
 

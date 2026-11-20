@@ -137,7 +137,8 @@ inline constexpr int kQsaGroupedDecodeMaxKeys = 1023;
 mlx::core::array qwen4_dense_gqa_decode_batch(
     const mlx::core::array& query,
     const std::vector<mlx::core::array>& keys,
-    const std::vector<mlx::core::array>& values);
+    const std::vector<mlx::core::array>& values,
+    const mlx::core::array* gate = nullptr);
 
 mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& query,
