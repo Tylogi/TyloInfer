@@ -111,6 +111,17 @@ std::shared_ptr<Pipeline> pipeline(const std::string& name, const std::vector<st
     return value;
 }
 
+template <typename Projection>
+struct RoutedProjectionParams {
+    Projection projection;
+    uint32_t routes;
+};
+
+using PairGateUpParams = RoutedProjectionParams<MoeGgufGateUpParams>;
+using DownCombineParams = RoutedProjectionParams<MoeGgufExpertParams>;
+static_assert(sizeof(PairGateUpParams) == 8 * sizeof(uint32_t));
+static_assert(sizeof(DownCombineParams) == 6 * sizeof(uint32_t));
+
 struct Graph {
     CommandGraph commands;
     std::vector<std::size_t> scratch;
@@ -134,13 +145,20 @@ struct Graph {
         if (!commands.command().events.empty()) throw std::invalid_argument("native GGUF graph contains unsupported host/event steps");
         for (const auto& dispatch : commands.dispatches()) {
             std::vector<std::uint32_t> formats;
-            if (dispatch.pipelineName == "moe_native_single_gate_up" || dispatch.pipelineName == "moe_native_single_gate_up_split" ||
-                dispatch.pipelineName == "moe_native_single_gate_up_split4") {
-                if (dispatch.bytes.size() != 1 || dispatch.bytes.front().sizeBytes != sizeof(MoeGgufGateUpParams))
+            const bool pair_gate_up = dispatch.pipelineName.starts_with("moe_native_pair_gate_up");
+            if (pair_gate_up || dispatch.pipelineName.starts_with("moe_native_single_gate_up")) {
+                const auto expected = pair_gate_up ? sizeof(PairGateUpParams) : sizeof(MoeGgufGateUpParams);
+                if (dispatch.bytes.size() != 1 || dispatch.bytes.front().sizeBytes != expected)
                     throw std::invalid_argument("native GGUF Gate/Up parameters differ");
                 MoeGgufGateUpParams p;
                 std::memcpy(&p, dispatch.bytes.front().data, sizeof(p));
                 formats = {p.gate_routed_format, p.gate_shared_format, p.up_routed_format, p.up_shared_format};
+            } else if (dispatch.pipelineName == "moe_native_pair_down_combine") {
+                if (dispatch.bytes.size() != 1 || dispatch.bytes.front().sizeBytes != sizeof(DownCombineParams))
+                    throw std::invalid_argument("native GGUF Down parameters differ");
+                DownCombineParams p;
+                std::memcpy(&p, dispatch.bytes.front().data, sizeof(p));
+                formats = {p.projection.routed_format, p.projection.shared_format};
             }
             pipelines.push_back(pipeline(dispatch.pipelineName, formats));
         }
@@ -897,8 +915,6 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
             const bool split_formats = grid_format(gate_format) || grid_format(up_format) ||
                 (gate_format != up_format && (gate_format == GGUF_FMT_IQ4XS || up_format == GGUF_FMT_IQ4XS));
             if (pair) {
-                struct PairGateUpParams { MoeGgufGateUpParams projection; uint32_t routes; };
-                static_assert(sizeof(PairGateUpParams) == 8 * sizeof(uint32_t));
                 const bool split_gate_up = width >= 1024 && intermediate < width && split_formats;
                 result->commands.add(split_gate_up ? "moe_native_pair_gate_up_split" : "moe_native_pair_gate_up", std::move(upper),
                     PairGateUpParams{{uint32_t(width), uint32_t(intermediate), uint32_t(experts),
@@ -928,8 +944,6 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
             if (!vector && routes <= 32) {
                 lower.push_back({result->inputs, std::uint64_t(actual * width) * 2});
                 lower.push_back(probabilities);
-                struct DownCombineParams { MoeGgufExpertParams projection; uint32_t routes; };
-                static_assert(sizeof(DownCombineParams) == 6 * sizeof(uint32_t));
                 result->commands.add(pair ? "moe_native_pair_down_combine" : "moe_native_single_down_combine", std::move(lower),
                     DownCombineParams{{uint32_t(intermediate), uint32_t(width), uint32_t(experts),
                         block.down.routed.formatId, block.down.shared.formatId}, uint32_t(routes)},

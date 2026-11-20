@@ -1,3 +1,8 @@
+constant uint moe_pair_routed [[function_constant(0)]];
+constant uint moe_pair_shared [[function_constant(1)]];
+constant uint moe_pair_up_routed [[function_constant(2)]];
+constant uint moe_pair_up_shared [[function_constant(3)]];
+
 struct MoeNativeSingleDownParams {
     MoeGgufExpertParams projection;
     uint routes;
@@ -16,25 +21,20 @@ inline uint moe_native_pair_peer(device const uint* ids, uint index, uint routes
     return 2 * routes;
 }
 
-__attribute__((noinline)) float2 moe_native_pair_dot(MoeGgufSegment weight, device const bfloat* input,
-    uint rows, uint width, uint column, threadgroup half2* table) {
+template <bool SplitK>
+__attribute__((always_inline)) inline float2 moe_native_pair_dot(uint format, MoeGgufSegment weight,
+    device const bfloat* input, uint rows, uint width, uint column, uint lane, threadgroup half2* table) {
     float sums[2];
-    quant_format_switch(weight.format, [&](auto f) {
+    constexpr uint columns = SplitK ? 16 : 32;
+    const uint per = width / (SplitK ? 64 : 32), split = lane / columns;
+    quant_format_switch(format, [&](auto f) {
         column_dot<decltype(f), 2>(input, rows, width, weight.w0, weight.w1, weight.meta,
-            column, 0, width / 32, table, sums);
+            column + lane % columns, split * per, (split + 1) * per, table, sums);
     });
-    return float2(sums[0], sums[1]);
-}
-
-__attribute__((noinline)) float2 moe_native_pair_split_dot(MoeGgufSegment weight, device const bfloat* input,
-    uint rows, uint width, uint column, uint split, threadgroup half2* table) {
-    float sums[2];
-    const uint per = width / 64;
-    quant_format_switch(weight.format, [&](auto f) {
-        column_dot<decltype(f), 2>(input, rows, width, weight.w0, weight.w1, weight.meta,
-            column, split * per, (split + 1) * per, table, sums);
-    });
-    return float2(sums[0], sums[1]);
+    const float2 value(sums[0], sums[1]);
+    if constexpr (SplitK)
+        return value + float2(simd_shuffle_xor(value.x, columns), simd_shuffle_xor(value.y, columns));
+    return value;
 }
 
 template <bool SplitK>
@@ -53,30 +53,31 @@ kernel void moe_native_pair_gate_up(device bfloat* input [[buffer(0)]], device c
     const uint peer = moe_native_pair_peer(ids, index, config.routes);
     const bool paired = peer < 2 * config.routes;
     if (token && paired) return;
+    const bool shared = ids[index] == p.experts;
+    const uint gate_format = shared ? moe_pair_shared : moe_pair_routed;
+    const uint up_format = shared ? moe_pair_up_shared : moe_pair_up_routed;
     const auto gs = moe_gguf_segment(ids[index], p.experts, p.input_size, p.output_size,
-        p.gate_routed_format, p.gate_shared_format, slots, g0, g1, gm, sg0, sg1, sgm);
+        moe_pair_routed, moe_pair_shared, slots, g0, g1, gm, sg0, sg1, sgm);
     const auto us = moe_gguf_segment(ids[index], p.experts, p.input_size, p.output_size,
-        p.up_routed_format, p.up_shared_format, slots, u0, u1, um, su0, su1, sumeta);
+        moe_pair_up_routed, moe_pair_up_shared, slots, u0, u1, um, su0, su1, sumeta);
     threadgroup half2 tables[2 * kQuantPairTableEntries];
     threadgroup bfloat gate[2 * 32];
+    threadgroup half2* up_table = tables + (gate_format == up_format ? 0 : kQuantPairTableEntries);
     bool initialized = false;
-    quant_format_switch(gs.format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(tables, tid, 64); });
-    quant_format_switch(us.format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(tables + kQuantPairTableEntries, tid, 64); });
+    quant_format_switch(gate_format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(tables, tid, 64); });
+    if (gate_format != up_format)
+        quant_format_switch(up_format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(up_table, tid, 64); });
     if (initialized) threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool up = simdgroup == 1;
-    const auto weight = up ? us : gs;
     const uint rows = paired ? 2 : 1;
     constexpr uint columns = SplitK ? 16 : 32;
-    float2 sums;
-    if constexpr (SplitK) {
-        const float2 partial = moe_native_pair_split_dot(weight, input + ulong(row_offset + token) * p.input_size,
-            rows, p.input_size, group.x * columns + (lane & 15), lane / 16,
-            tables + (up ? kQuantPairTableEntries : 0));
-        sums = partial + float2(simd_shuffle_xor(partial.x, 16), simd_shuffle_xor(partial.y, 16));
-    } else {
-        sums = moe_native_pair_dot(weight, input + ulong(row_offset + token) * p.input_size,
-            rows, p.input_size, group.x * columns + lane, tables + (up ? kQuantPairTableEntries : 0));
-    }
+    device const bfloat* x = input + ulong(row_offset + token) * p.input_size;
+    const uint column = group.x * columns;
+    const float2 sums = up
+        ? (shared ? moe_native_pair_dot<SplitK>(moe_pair_up_shared, us, x, rows, p.input_size, column, lane, up_table)
+                  : moe_native_pair_dot<SplitK>(moe_pair_up_routed, us, x, rows, p.input_size, column, lane, up_table))
+        : (shared ? moe_native_pair_dot<SplitK>(moe_pair_shared, gs, x, rows, p.input_size, column, lane, tables)
+                  : moe_native_pair_dot<SplitK>(moe_pair_routed, gs, x, rows, p.input_size, column, lane, tables));
     if (!up && lane < columns) for (uint row = 0; row < rows; ++row) gate[row * columns + lane] = bfloat(sums[row]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up && lane < columns) for (uint row = 0; row < rows; ++row)
@@ -103,16 +104,20 @@ kernel void moe_native_pair_down_combine(device const bfloat* input [[buffer(0)]
     const bool paired = peer < 2 * routes;
     threadgroup half2 table[2 * kQuantPairTableEntries];
     threadgroup bfloat values[2 * 16 * 32];
+    threadgroup half2* shared_table = table + (moe_pair_shared == moe_pair_routed ? 0 : kQuantPairTableEntries);
     bool initialized = false;
-    quant_format_switch(p.routed_format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(table, tid, routes * 64); });
-    quant_format_switch(p.shared_format, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(table + kQuantPairTableEntries, tid, routes * 64); });
+    quant_format_switch(moe_pair_routed, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(table, tid, routes * 64); });
+    if (moe_pair_shared != moe_pair_routed)
+        quant_format_switch(moe_pair_shared, [&](auto f) { initialized |= quant_pair_entries<decltype(f)>(shared_table, tid, routes * 64); });
     if (initialized) threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!token || !paired) {
-        const auto weight = moe_gguf_segment(ids[index], p, slots, w0, w1, wm, s0, s1, sm);
+        const auto weight = moe_gguf_segment(ids[index], p.experts, p.input_size, p.output_size,
+            moe_pair_routed, moe_pair_shared, slots, w0, w1, wm, s0, s1, sm);
         const uint rows = paired ? 2 : 1;
-        const float2 sums = moe_native_pair_dot(weight, input + ulong(row_offset * routes + index) * 2 * p.input_size,
-            rows, p.input_size, group.x * 32 + lane,
-            table + (ids[index] == p.experts ? kQuantPairTableEntries : 0));
+        device const bfloat* x = input + ulong(row_offset * routes + index) * 2 * p.input_size;
+        const float2 sums = ids[index] == p.experts
+            ? moe_native_pair_dot<false>(moe_pair_shared, weight, x, rows, p.input_size, group.x * 32, lane, shared_table)
+            : moe_native_pair_dot<false>(moe_pair_routed, weight, x, rows, p.input_size, group.x * 32, lane, table);
         values[(token * routes + rank) * 32 + lane] = bfloat(sums[0]);
         if (paired) values[peer * 32 + lane] = bfloat(sums[1]);
     }
