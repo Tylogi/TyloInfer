@@ -3,8 +3,10 @@
 #include "mlx_resident_budget.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_server_components.h"
+#include "runtime_config.h"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace mfq::metal {
 
@@ -25,7 +27,9 @@ void configure_dflash2(MlxEngineComponents& components,
             throw std::invalid_argument("DFlash2 checkpoint is incompatible with target geometry");
         draft->track_weights();
         target.set_hidden_capture_layers(config.target_layers);
-        draft->prepare([&](const auto& hidden) { return target.project_hidden_logits(hidden); });
+        const bool tree_batch = std::is_same_v<Runtime, MlxQwen4CausalLm> &&
+            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false);
+        draft->prepare([&](const auto& hidden) { return target.project_hidden_logits(hidden); }, tree_batch);
         if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
             for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
                 const auto logits = mlx::core::zeros({8, config.vocabulary}, dtype);

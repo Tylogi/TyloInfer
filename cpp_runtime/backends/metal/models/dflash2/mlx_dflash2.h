@@ -72,7 +72,8 @@ public:
     const MlxDFlash2Config& config() const noexcept;
     std::size_t weight_bytes() const noexcept;
     void track_weights() const;
-    void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head) const;
+    void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        bool tree_batch = false) const;
     void reset(MlxDFlash2Context& context) const;
     void append_context(MlxDFlash2Context& context, const mlx::core::array& target_hidden,
         int start_position) const;
@@ -117,6 +118,11 @@ public:
         MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7) const;
 
 private:
+    struct TreeProposals;
+    TreeProposals tree_proposals(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const MlxDFlash2TreeInput> inputs) const;
     struct ProposalLattice;
     ProposalLattice proposal_lattice(std::span<const MlxDFlash2Context* const> contexts,
         std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,

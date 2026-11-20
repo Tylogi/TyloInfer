@@ -501,7 +501,12 @@ MlxDFlash2Proposal MlxDFlash2::propose_batch(std::span<const MlxDFlash2Context* 
         lattice.maximum_depth, config());
 }
 
-std::vector<MlxDFlash2Tree> MlxDFlash2::propose_tree_batch(
+struct MlxDFlash2::TreeProposals {
+    array ids, edges;
+    std::vector<int> offsets;
+};
+
+MlxDFlash2::TreeProposals MlxDFlash2::tree_proposals(
     std::span<const MlxDFlash2Context* const> contexts, std::span<const std::int32_t> anchors,
     const array& embeddings, const std::function<array(const array&)>& output_head,
     std::span<const MlxDFlash2TreeInput> inputs) const {
@@ -557,6 +562,17 @@ if (lane == 0u) edges[pair] = unary[16u * row + candidate] + edge;
         array({static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(vocab)})},
         {{rows, choices, choices}}, {float32}, {groups * 128, 1, 1}, {128, 1, 1},
         {{"RANK", config().selector_rank}}, std::nullopt, false, {})[0];
+    return {std::move(ids), std::move(edges), std::move(draft.offsets)};
+}
+
+std::vector<MlxDFlash2Tree> MlxDFlash2::propose_tree_batch(
+    std::span<const MlxDFlash2Context* const> contexts, std::span<const std::int32_t> anchors,
+    const array& embeddings, const std::function<array(const array&)>& output_head,
+    std::span<const MlxDFlash2TreeInput> inputs) const {
+    constexpr int choices = 16;
+    const auto draft = tree_proposals(contexts, anchors, embeddings, output_head, inputs);
+    const auto& ids = draft.ids;
+    const auto& edges = draft.edges;
     eval(ids, edges);
 
     // Greedy portion of Splash's draft_select_tree. Lookup tokens and draft
@@ -641,7 +657,7 @@ if (lane == 0u) edges[pair] = unary[16u * row + candidate] + edge;
     return result;
 }
 
-void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head) const {
+void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head, bool tree_batch) const {
     if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
         const auto& c = config();
         MlxDFlash2Context context;
@@ -649,6 +665,21 @@ void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head) 
         append_context(context, zeros({1, c.block_size, c.hidden * int(c.target_layers.size())}, bfloat16), 0);
         auto proposal = propose(context, 0, zeros({1, c.block_size, c.hidden}, bfloat16), output_head);
         preparation->add(proposal.tokens); preparation->add(proposal.confidence);
+        if (tree_batch) {
+            MlxDFlash2Context second;
+            reset(second);
+            const auto features = zeros({1, c.block_size, c.hidden * int(c.target_layers.size())}, bfloat16);
+            const std::array<ContextCommit, 2> commits{{{&context, features, context.position}, {&second, features, 0}}};
+            append_context_batch(commits);
+            const std::array<std::int32_t, 2> anchors{0, 0};
+            const std::array<const MlxDFlash2Context*, 2> contexts{&context, &second};
+            const int depth = std::min(7, c.block_size - 1);
+            const MlxDFlash2TreeInput tree{depth, depth + 1, {}, {}};
+            const std::array<MlxDFlash2TreeInput, 2> inputs{tree, tree};
+            const auto batch = tree_proposals(contexts, anchors,
+                zeros({2, c.block_size, c.hidden}, bfloat16), output_head, inputs);
+            preparation->add(batch.edges);
+        }
         for (const auto dtype : {float16, bfloat16, float32})
             preparation->add(sample_greedy(zeros({c.block_size, c.vocabulary}, dtype)));
     });

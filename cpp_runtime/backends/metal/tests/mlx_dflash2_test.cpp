@@ -72,7 +72,9 @@ int main() {
         auto draft = MlxDFlash2::load(directory);
         {
             MlxKernelPreparation preparation(128, 32);
-            draft.prepare([&](const array&) { return logits; });
+            draft.prepare([&](const array& hidden) {
+                return zeros({hidden.shape(0), hidden.shape(1), draft.config().vocabulary}, float32);
+            }, true);
             preparation.finish();
         }
         MlxDFlash2Context context;

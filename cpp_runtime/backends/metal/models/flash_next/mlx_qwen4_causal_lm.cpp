@@ -3324,6 +3324,27 @@ private:
                         output_norm_.eps(), config_.output_gate_silu, config_.linear_tiled_heads, hidden.dtype()).front();
                     for (const auto& output : {decoded.output, decoded.convolution_state,
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
+                    if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
+                        const std::array parents{-1, 0, 1, 1, 3, 4, 4, 6};
+                        const auto packed = mlx::core::zeros(
+                            {1, 16, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
+                        const auto projected = project_inputs(packed);
+                        const int key_heads = static_cast<int>(config_.linear_num_key_heads);
+                        const int value_heads = static_cast<int>(config_.linear_num_value_heads);
+                        const std::array<MlxGatedDeltaTreeLane, 2> lanes{{
+                            {parents, conv, state}, {parents, conv, state}}};
+                        auto result = gated_delta_decode_packed_trees(projected, lanes, convolution_weight_,
+                            dt_bias_, decay_scale_, output_norm_.weight(), key_heads, value_heads, output_norm_.eps(),
+                            config_.output_gate_silu, config_.linear_tiled_heads, packed.dtype());
+                        preparation->add(result.output);
+                        const auto part = [&](const array& value) {
+                            return mlx::core::slice(value, {0, 0, 0}, {1, 8, value.shape(2)});
+                        };
+                        const auto& tape = result.tapes.front();
+                        auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
+                            tape.keys, tape.values, tape.decay, tape.beta, array({0, 1}), config_.linear_tiled_heads);
+                        preparation->add(folded.recurrent);
+                    }
                     for (const int lanes : {2, 3, 4}) {
                         const auto packed = mlx::core::zeros(
                             {1, lanes, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
