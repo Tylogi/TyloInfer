@@ -2303,7 +2303,9 @@ struct Qwen4DecodeGraph {
                     <<" ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-capture_started).count()<<'\n';
             }
             if(returned_expert_workspace && model.restore_decode_workspace)model.restore_decode_workspace();
-            for(auto* attention:qsa)attention->activate_graph_cache();
+            // Warmup has several capture widths and discards its synthetic
+            // history. Delay spare cache allocation until a request uses it.
+            if(!startup_warmup)for(auto* attention:qsa)attention->activate_graph_cache();
             const auto host_prepared=profile_host?HostClock::now():HostClock::time_point{};
             cell.window.run();cell.used_kinds|=1u<<result_kind;
             const auto host_replayed=profile_host?HostClock::now():HostClock::time_point{};
