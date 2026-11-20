@@ -177,6 +177,8 @@ __global__ void copy_mapped(const uint64_t* header,const uint32_t* cancelled) {
     // Keep the descriptor-aligned copy grid when a split falls inside a
     // vector. The first vector masks its already-copied Gate/Up bytes.
     const auto grid_begin=phase_begin&~uint64_t(15);
+    // Only the Gate/Up phase starts at a split; the other phases copy every byte.
+    const auto active=[&](uint64_t at){return Phase==1?at>=split:true;};
     for(auto offset=grid_begin+(uint64_t(blockIdx.x)*blockDim.x+threadIdx.x)*16;offset<total;offset+=stride) {
         uint64_t low=0,high=count;
         while(low<high) {
@@ -189,7 +191,7 @@ __global__ void copy_mapped(const uint64_t* header,const uint32_t* cancelled) {
         auto* output=reinterpret_cast<uint8_t*>(field.destination)+within;
         const auto* input=reinterpret_cast<const uint8_t*>(field.source)+within;
         const auto address=reinterpret_cast<uint64_t>(output);
-        if(offset>=phase_begin && field.bytes-within>=16 && total-offset>=16 && (reinterpret_cast<uint64_t>(input)&15)==0 && (address&3)==0) {
+        if(active(offset) && field.bytes-within>=16 && total-offset>=16 && (reinterpret_cast<uint64_t>(input)&15)==0 && (address&3)==0) {
             const auto value=*reinterpret_cast<const uint4*>(input);
             if((address&15)==0)*reinterpret_cast<uint4*>(output)=value;
             else if((address&7)==0) {
@@ -200,7 +202,7 @@ __global__ void copy_mapped(const uint64_t* header,const uint32_t* cancelled) {
                 words[0]=value.x;words[1]=value.y;words[2]=value.z;words[3]=value.w;
             }
         } else for(uint64_t byte=0;byte<16 && within+byte<field.bytes && offset+byte<total;++byte)
-            if(offset+byte>=phase_begin)output[byte]=input[byte];
+            if(active(offset+byte))output[byte]=input[byte];
     }
 }
 __global__ void await_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,

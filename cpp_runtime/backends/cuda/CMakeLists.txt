@@ -23,7 +23,7 @@ elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 enable_language(CUDA)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Keep the override cache empty unless explicitly set, so later changes to the
 # standard CMake option are honored on reconfigure.
@@ -712,7 +712,7 @@ if(BUILD_TESTING)
         ${TYLOINFER_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_byte_signs_test.cu)
     target_link_libraries(mfq-cuda-nvq-byte-signs-test PRIVATE CUDA::cudart)
     set_target_properties(mfq-cuda-nvq-byte-signs-test PROPERTIES
-        CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}" CUDA_STANDARD 17 CUDA_RUNTIME_LIBRARY Shared)
+        CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}" CUDA_STANDARD 20 CUDA_RUNTIME_LIBRARY Shared)
     add_test(NAME mfq-cuda-nvq-byte-signs-test COMMAND mfq-cuda-nvq-byte-signs-test)
     add_executable(mfq-cuda-real-gr-bench
         ${TYLOINFER_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_gr_bench.cpp)
@@ -1005,7 +1005,7 @@ if(BUILD_TESTING)
         ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_encode.cu)
     target_link_libraries(tyloinfer-cuda-qsa-tq-encode-test PRIVATE mfq-qsa-kv-store CUDA::cudart)
     set_target_properties(tyloinfer-cuda-qsa-tq-encode-test PROPERTIES
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
     if(MSVC)
         target_compile_options(tyloinfer-cuda-qsa-tq-encode-test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
     endif()
@@ -1016,7 +1016,7 @@ if(BUILD_TESTING)
         ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq.cu)
     target_link_libraries(tyloinfer-cuda-qsa-indexer-test PRIVATE CUDA::cudart)
     set_target_properties(tyloinfer-cuda-qsa-indexer-test PROPERTIES
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
     if(MSVC)
         target_compile_options(tyloinfer-cuda-qsa-indexer-test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
     endif()
@@ -1031,7 +1031,7 @@ if(BUILD_TESTING)
     target_compile_features(tyloinfer-cuda-moe-publication-test PRIVATE cxx_std_20)
     set_target_properties(tyloinfer-cuda-moe-publication-test PROPERTIES
         CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}"
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
     if(MSVC)
         target_compile_options(tyloinfer-cuda-moe-publication-test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
     endif()
@@ -1131,7 +1131,7 @@ if(BUILD_TESTING)
     add_test(NAME tyloinfer-cuda-row-residual-test COMMAND tyloinfer-cuda-row-residual-test)
     set_tests_properties(tyloinfer-cuda-row-residual-test PROPERTIES SKIP_RETURN_CODE 77)
     set_target_properties(tyloinfer-cuda-row-residual-test PROPERTIES
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
     if(MSVC)
         target_compile_options(tyloinfer-cuda-row-residual-test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
     endif()

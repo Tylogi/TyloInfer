@@ -74,7 +74,7 @@ void check_gpu() {
             const int n = first_rows + segment * 17, pn = (n + 31) / 32 * 32;
             auto packed = df::pack_q4_weight_cpu(values(n, columns, float(segment)));
             auto expanded =
-                tb::empty({int64_t(n) * (columns / 32) * sizeof(block_q8_0)}, packed.options());
+                tb::empty({int64_t(n) * (columns / 32) * int64_t(sizeof(block_q8_0))}, packed.options());
             const auto *q4 = static_cast<const block_q4_0 *>(packed.data_ptr());
             auto *q8 = static_cast<block_q8_0 *>(expanded.data_ptr());
             // An exact Q4 expansion shares the original FP16 scales and codes.
@@ -87,8 +87,8 @@ void check_gpu() {
                 }
             }
             auto g4 = packed.to(tb::kCUDA), g8 = expanded.to(tb::kCUDA);
-            auto t4 = tb::empty({int64_t(pn) * (pk / 32) * sizeof(block_q4_0)}, g4.options());
-            auto t8 = tb::empty({int64_t(pn) * (pk / 32) * sizeof(block_q8_0)}, g8.options());
+            auto t4 = tb::empty({int64_t(pn) * (pk / 32) * int64_t(sizeof(block_q4_0))}, g4.options());
+            auto t8 = tb::empty({int64_t(pn) * (pk / 32) * int64_t(sizeof(block_q8_0))}, g8.options());
             df::q4_tile(g4.data_ptr(), t4.data_ptr(), n, columns, stream);
             df::q8_tile(g8.data_ptr(), t8.data_ptr(), n, columns, stream);
             auto restored = tb::empty_like(g4);

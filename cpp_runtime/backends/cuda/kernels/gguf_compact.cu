@@ -158,12 +158,12 @@ __device__ __forceinline__ void project_compact_routed_staged_body(const std::ui
                 for(auto tile=std::int64_t(blockIdx.x);tile<(rows+RowTile-1)/RowTile;tile+=gridDim.x) {
                     const auto row=tile*RowTile+tid/Lanes;
                     const auto other_row=min(row+Threads/Lanes,rows-1);
-                    float sum[Count]{},sum2[Count]{};
+                    [[maybe_unused]] float sum[Count]{},sum2[Count]{};
                     const auto compute_block=[&](std::int64_t block,std::int64_t first,std::int64_t chunk) {
                         const auto* q=reinterpret_cast<const std::uint8_t*>(pointer)+row*stride+block*Bytes;
                         const auto* q2=reinterpret_cast<const std::uint8_t*>(pointer)+other_row*stride+block*Bytes;
                         const float scale=scale_at(q);
-                        const float scale2=Narrow?scale_at(q2):0.f;
+                        [[maybe_unused]] const float scale2=Narrow?scale_at(q2):0.f;
                         const auto window=[&] {if constexpr(Narrow)return compact_detail::sixteen_window<Bits,Steps>(q+2,lane);
                             else return compact_detail::eight_window<Bits,Steps>(q+2,lane);}();
                         const auto window2=[&] {if constexpr(Narrow)return compact_detail::sixteen_window<Bits,Steps>(q2+2,lane);

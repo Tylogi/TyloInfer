@@ -12,7 +12,7 @@ template<int F,int Offset,bool CachedSigns=false>struct QuadIqDot {
     static constexpr unsigned SignWords=SignPatterns*(F==GGML_TYPE_IQ3_XXS?2:1);
     __device__ static void stage_signs(unsigned tid) {
         extern __shared__ unsigned quad_codebook[];
-        for(unsigned i=tid;i<SignPatterns;i+=128) {
+        if constexpr(SignPatterns) for(unsigned i=tid;i<SignPatterns;i+=128) {
             const unsigned signs=F==GGML_TYPE_IQ2_S?i:i|((__popc(i)&1u)<<7);
             if constexpr(F==GGML_TYPE_IQ3_XXS) {
                 quad_codebook[Offset+GridCount+2*i]=iq_nibble_sign_mask(signs&15u);

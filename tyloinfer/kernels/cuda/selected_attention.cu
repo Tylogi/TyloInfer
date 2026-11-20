@@ -539,7 +539,7 @@ __global__ void mma_reduce_gate_kernel(const float* partial,const float2* metada
     const int tile=(((batch*kv_heads+head/grouped_heads)*head_tiles+
         (head%grouped_heads)/head_columns)*token_tiles+token/query_columns);
     const int tile_column=(token%query_columns)*head_columns+(head%grouped_heads)%head_columns;
-    const int columns=query_columns*head_columns,last=(tile+1)*parts-1;
+    const int columns=query_columns*head_columns;
     const size_t output_base=size_t(row)*heads*width+head*width;
     const float* contributions=reinterpret_cast<const float*>(metadata)+size_t(total_blocks)*4*columns;
     // Statistics are independent of the output column. Compute each part's

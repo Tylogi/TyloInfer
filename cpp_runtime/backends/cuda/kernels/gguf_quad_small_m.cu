@@ -187,7 +187,7 @@ __device__ __forceinline__ void quad_small_m_body(QuadProjection p,int columns,c
    int lo[Tokens]{},hi[Tokens]{};
    const auto dot=[&]<int J>() {
     const auto v=D::template decode<J>(w);
-    int word0[Capacity]{},word1[Capacity]{};
+    [[maybe_unused]] int word0[Capacity]{},word1[Capacity]{};
     if constexpr(VectorTokens) {
      const auto a=token_word4(input,Index(2*J)*groups+i),b=token_word4(input,Index(2*J+1)*groups+i);
      word0[0]=int(a.x);word0[1]=int(a.y);word0[2]=int(a.z);word0[3]=int(a.w);

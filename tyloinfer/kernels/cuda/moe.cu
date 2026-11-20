@@ -69,8 +69,8 @@ void launch_nint_matmul_routed_cuda(
 namespace {
 
 constexpr int kWarpSize = 32;
-constexpr int kRowsPerBlock = 4;
-constexpr int kRouteTile = 8;
+[[maybe_unused]] constexpr int kRowsPerBlock = 4;
+[[maybe_unused]] constexpr int kRouteTile = 8;
 
 __global__ void moe_cache_scatter_kernel(
         const std::uint8_t * staging,

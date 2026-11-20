@@ -33,7 +33,7 @@ template<bool M,int Rows,int W,int Offset,bool Aligned,bool Half,class Index,cla
  const auto* packed=static_cast<const uint8_t*>(p.projection.packed);const int rows=int(p.projection.rows);void* output=p.projection.output;
 
  using F=QuadIq1Dot<M,Offset>;
- const int lane=threadIdx.x,warp=threadIdx.y,tid=warp*32+lane;
+ [[maybe_unused]] const int lane=threadIdx.x,warp=threadIdx.y,tid=warp*32+lane;
 
  const unsigned row=(tile*(4/W)+warp/W)*Rows;
  const Index source_row=Index(row)+Index(p.row_begin),quad=source_row/4,pair=(source_row%4)/2,blocks=Index(columns/256),groups=blocks*8;

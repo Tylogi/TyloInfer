@@ -2042,7 +2042,7 @@ int main(int argc,char** argv)try {
             "routed driver operations failed on a fresh device worker");
         const auto driver_entry=[](const char* name) {
             void* function=nullptr;cudaDriverEntryPointQueryResult query=cudaDriverEntryPointSymbolNotFound;
-            TYLOINFER_CUDA_CHECK(cudaGetDriverEntryPoint(name,&function,cudaEnableDefault,&query));
+            TYLOINFER_CUDA_CHECK(cudaGetDriverEntryPointByVersion(name,&function,12000,cudaEnableDefault,&query));
             require(function && query==cudaDriverEntryPointSuccess,"missing context test entry");
             return function;
         };

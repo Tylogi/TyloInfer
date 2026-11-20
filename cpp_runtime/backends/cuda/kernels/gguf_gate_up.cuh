@@ -127,7 +127,7 @@ __global__ void __launch_bounds__(Quantized?32*Lanes:256,Quantized?1024/(32*Lane
         if(!grid_ready){F::stage(grid,tid,Threads);grid_ready=true;}
         const auto compute=[&]<int Count>() {
             auto* hidden_gate=reinterpret_cast<float*>(activation_words+Capacity*blocks*9);
-            auto* hidden_up=hidden_gate+Capacity*32;
+            [[maybe_unused]] auto* hidden_up=hidden_gate+Capacity*32;
             auto* words=reinterpret_cast<int4*>(activation_words);
             auto* scales=reinterpret_cast<float*>(activation_words+Count*blocks*8);
             if constexpr(Count>1)for(int t=0;t<Count;++t) {
@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(Quantized?32*Lanes:256,Quantized?1024/(32*Lane
                     const float value=warp_sums::reduce<P,Lanes>(values,lane);
                     const int t=warp_sums::index<P,Lanes>(lane);
                     if(t<Count && row<rows && lane==warp_sums::owner<P,Lanes>(t)) {
-                        const int slot=group?group->slots[t]:index;
+                        [[maybe_unused]] const int slot=group?group->slots[t]:index;
                         if constexpr(Quantized) {
                             auto* target=IsUp?hidden_up:hidden_gate;
                             target[t*32+tid/Lanes]=value;
@@ -267,7 +267,7 @@ __global__ void __launch_bounds__(Quantized?32*Lanes:256,Quantized?1024/(32*Lane
                 const int result=warp_sums::index<P,Lanes>(lane);
                 if(result<Outputs && row<rows && lane==warp_sums::owner<P,Lanes>(result)) {
                     const bool is_up=Paired && result>=Count;
-                    const int t=is_up?result-Count:result,slot=group?group->slots[t]:index;
+                    [[maybe_unused]] const int t=is_up?result-Count:result,slot=group?group->slots[t]:index;
                     if constexpr(Quantized) {
                         auto* target=is_up?hidden_up:hidden_gate;
                         target[t*32+tid/Lanes]=value;
