@@ -39,6 +39,7 @@ struct TensorFileRange {
     std::filesystem::path path;
     std::uint64_t offset = 0;
     std::uint64_t nbytes = 0;
+    FileReadMode read_mode = FileReadMode::Buffered;
 };
 
 struct HadamardTransform {

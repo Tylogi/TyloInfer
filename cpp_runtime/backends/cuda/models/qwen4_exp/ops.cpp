@@ -977,8 +977,12 @@ struct Qwen4Block final : Block {
             execution.profiler.measure("prefill.gdn",[&] {return gdn->forward(execution,input,true,0);}):
             execution.profiler.measure("prefill.qsa",[&] {return qsa->forward(execution,input,context.positions,context.full_positions,true);});
     }
-    std::vector<Tensor> prefill_attention(CudaExecutionContext& execution,Tensor x,const Context& context) {
+    std::vector<Tensor> prefill_attention(CudaExecutionContext& execution,Tensor x,const Context& context,
+            const Tensor& next_host_ids={}) {
         x=prefill_ple(execution,std::move(x),context);
+        // The current N-gram context is committed now. Read the next tile
+        // while this tile runs attention and the residual projections.
+        if(next_host_ids.defined())prefetch_token_ids(next_host_ids);
         auto mix=execution.profiler.measure("prefill.gr_attention",[&] {return attention_gr.pre(execution,x);});
         auto branch=prefill_attention_core(execution,mix[0],context);
         return execution.profiler.measure("prefill.gr_ffn_pre",[&] {return ffn_gr.pre_after(execution,branch,mix);});
@@ -3695,6 +3699,19 @@ int64_t qwen4_rebalance_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* mt
     const auto selected=mfq::engine::select_prefill_chunk(rows,rows,context->available_memory(),bytes,true);
     return std::max<int64_t>(1,selected);
 }
+mfq_tensor_backend::Tensor Qwen4BatchRequestState::prefill_layer_major(
+        Qwen4CausalLm& model, mfq_tensor_backend::Tensor ids,int64_t rows,
+        const std::function<void()>& computation_finished) {
+    rows=std::min(rows,mfq::engine::max_prefill_compute_chunk);
+    state_->swap(model);
+    try {
+        auto hidden=qwen4_layer_major_prefill_hidden(model,std::move(ids),rows,true,{},
+            nullptr,false,computation_finished);
+        state_->swap(model);
+        return hidden;
+    } catch(...) { state_->swap(model); throw; }
+}
+
 mfq_tensor_backend::Tensor Qwen4BatchRequestState::prefill(
         Qwen4CausalLm& model, mfq_tensor_backend::Tensor ids,
         const std::function<std::size_t(std::size_t)>& reclaim_pinned,mfq_tensor_backend::Tensor* raw_hidden) {
@@ -4697,6 +4714,8 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             host_loans.push_back(block->qsa->hold_adaptive_workspace(host_workspace));
     RoutedPrefillWorkspaceLoan workspace_loan(*model.execution);
     bool borrowed_workspace=false;
+    const auto batch_tokens_option=mfq::cuda::runtime_options::moe_prefill_expert_batch_tokens();
+    int64_t batch_tokens=batch_tokens_option.value_or(8192);
     if(!host_activations) {
         // Persistent decode graphs and prefill now coexist. Bound the compute
         // tile by actual remaining workspace instead of discarding those graphs
@@ -4741,12 +4760,21 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         }
         compute_chunk=mfq::engine::select_prefill_chunk(tokens,compute_chunk,planned_available,planned_fixed,row_bytes);
         TYLOINFER_RUNTIME_CHECK(compute_chunk>0,"insufficient CUDA prefill workspace before expert loan");
-        borrowed_workspace=workspace_loan.begin(mfq::engine::PrefillWorkspace{planned_fixed,row_bytes}.bytes(compute_chunk))>0;
+        const auto expert_batch=mfq::cuda::runtime_options::moe_prefill_expert_batch();
+        const auto workspace=mfq::engine::PrefillWorkspace{planned_fixed,row_bytes};
+        // Projection and attention tiles keep their compute limit. GGUF
+        // experts can share one layer upload across those tiles when it fits.
+        const bool join_experts=!batch_tokens_option && (!expert_batch || *expert_batch) &&
+            model.execution->gguf_expert_cache && !raw_hidden && tokens>batch_tokens &&
+            workspace.bytes(tokens)<=planned_available;
+        borrowed_workspace=workspace_loan.begin(workspace.bytes(join_experts?tokens:compute_chunk))>0;
         const auto available=context->available_memory()+context->workspace_available();
         const auto requested=compute_chunk;
         const auto fixed=reserve+sequence_reserve+routed_prefill_transfer_bytes(*model.execution);
         compute_chunk=mfq::engine::select_prefill_chunk(tokens,compute_chunk,available,fixed,row_bytes);
         TYLOINFER_RUNTIME_CHECK(compute_chunk>0,"insufficient CUDA prefill workspace after expert loan");
+        if(join_experts && mfq::engine::PrefillWorkspace{fixed,row_bytes}.bytes(tokens)<=available)
+            batch_tokens=tokens;
         if(compute_chunk!=requested)std::cerr<<"runtime_prefill_chunk_budget requested="<<requested
             <<" compute="<<compute_chunk<<" available_bytes="<<available<<'\n';
     }
@@ -4833,8 +4861,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const bool bulk_gdn=bulk_gr && bulk_gdn_option && *bulk_gdn_option;
 #endif
     const qwen4_exp::QwenPrefillReferenceRowsScope reference_rows(batch_experts?std::min<int64_t>(1024,compute_chunk):0);
-    const auto batch_tokens_option=mfq::cuda::runtime_options::moe_prefill_expert_batch_tokens();
-    const int64_t batch_tokens=batch_tokens_option?*batch_tokens_option:8192;
     const auto append_tail_option=mfq::cuda::runtime_options::moe_prefill_append_tail();
     const bool append_tail=append_tail_option && *append_tail_option;
     const auto expert_batch_count=[&](int64_t remaining) {
@@ -4862,7 +4888,11 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         Tensor ffn_inputs,ffn_injection;
         std::vector<Tensor> full_mix;
         Tensor full_branch;
-        if(bulk_gr) {
+        // Collecting all PLE tiles before GR leaves their reads serialized
+        // ahead of attention. Keep expert batching and pipeline the PLE layer.
+        const bool pipeline_ple=batch_experts && qwen_block.ple && tokens>compute_chunk;
+        const bool bulk_layer_gr=bulk_gr && !pipeline_ple;
+        if(bulk_layer_gr) {
             auto& qwen_block=static_cast<qwen4_exp::Qwen4Block&>(*block);
             Tensor source=hidden;
             if(qwen_block.ple) {
@@ -4892,9 +4922,9 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         }
         for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
             if(cancelled && cancelled())return {};
-            if(bulk_gdn && static_cast<qwen4_exp::Qwen4Block&>(*block).gdn)continue;
+            if(bulk_layer_gr && bulk_gdn && qwen_block.gdn)continue;
             const auto count=std::min(compute_chunk,tokens-begin);
-            profiler.enabled=restore.enabled;
+            profiler.enabled=restore.enabled || collect;
             Block::Context context;
             context.token_ids=ids.narrow(1,begin,count);
             context.host_token_ids=cpu_ids.narrow(1,begin,count);
@@ -4902,11 +4932,10 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             context.full_positions=prepared.full_positions.narrow(-1,0,cache_start+begin+count);
             context.cache_position=cache_start+begin;
             block->set_token_ids(context.token_ids);
-            block->prefetch_token_ids(context.host_token_ids);
             const auto tile=std::size_t(begin/compute_chunk);
             auto input=host_activations?host_tiles[tile].to(stage_device):hidden.narrow(1,begin,count);
             Tensor output;
-            if(bulk_gr) {
+            if(bulk_layer_gr) {
                 auto& qwen_block=static_cast<qwen4_exp::Qwen4Block&>(*block);
                 auto branch=qwen_block.prefill_attention_core(*model.execution,full_mix[0].narrow(1,begin,count),context);
                 if(!full_branch.defined()) {
@@ -4915,9 +4944,15 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
                 }
                 full_branch.narrow(1,begin,count).copy_(branch);
                 continue;
-            } else if(batch_experts) {
+            }
+            // The bulk residual pass already consumed its PLE rows above.
+            block->prefetch_token_ids(context.host_token_ids);
+            if(batch_experts) {
                 auto& qwen_block=static_cast<qwen4_exp::Qwen4Block&>(*block);
-                auto mix=qwen_block.prefill_attention(*model.execution,input,context);
+                const auto next=begin+count;
+                const auto next_host_ids=pipeline_ple && next<tokens
+                    ?cpu_ids.narrow(1,next,std::min(compute_chunk,tokens-next)):Tensor{};
+                auto mix=qwen_block.prefill_attention(*model.execution,input,context,next_host_ids);
                 if(!ffn_inputs.defined()) {
                     ffn_inputs=tb::empty({1,tokens,model.hidden_size()},mix[0].options().dtype(tb::kFloat16));
                     ffn_injection=tb::empty({1,tokens,mix[2].size(-1)},mix[2].options());
@@ -4949,7 +4984,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         // Attention's decoded matrices are no longer needed by FFN. Keep
         // reuse within each phase, without retaining both sets at peak memory.
         if(tokens>9216)decode_reuse.clear();
-        if(bulk_gr) {
+        if(bulk_layer_gr) {
             auto& qwen_block=static_cast<qwen4_exp::Qwen4Block&>(*block);
             auto mix=profiler.measure("prefill.gr_ffn_pre",[&] {
                 return qwen_block.ffn_gr.pre_after(*model.execution,full_branch,full_mix);
@@ -4965,7 +5000,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         if(batch_experts) {
             if(cancelled && cancelled())return {};
             auto& qwen_block=static_cast<qwen4_exp::Qwen4Block&>(*block);
-            profiler.enabled=restore.enabled;
+            profiler.enabled=restore.enabled || collect;
             auto branch=profiler.measure("prefill.ffn",[&] {
                 if(expert_batch_count(tokens)==tokens)return qwen_block.ffn(*model.execution,ffn_inputs);
                 Tensor result;

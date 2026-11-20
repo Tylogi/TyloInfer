@@ -73,14 +73,27 @@ public:
             size_ += bytes;
         }
     }
-    void enable_mirrors(uint64_t header_bytes) {
+    void configure_reads(uint64_t header_bytes,bool sparse_rows) {
         if (header_bytes > size_) throw std::out_of_range("GGUF header exceeds multipart file");
+        const auto mode=model_file_read_mode();
+        const auto* configured=std::getenv("TYLOINFER_MODEL_FILE_IO");
+        const bool prefer_direct=sparse_rows && mode==FileReadMode::Buffered && (!configured || !*configured);
         for (std::size_t i = 0; i < parts_.size(); ++i) {
             auto replicas = model_read_replica_paths(paths_[i]);
-            if (replicas.size() <= 1) continue;
             const auto header = parts_[i].begin < header_bytes ?
                 std::min<uint64_t>(parts_[i].size, header_bytes - parts_[i].begin) : 0;
-            parts_[i].file = std::make_shared<MirroredFileReader>(std::move(replicas), model_file_read_mode(), header);
+            if(prefer_direct) {
+                // A retained buffered handle serializes overlapping direct
+                // reads on some filesystems. Replace it before runtime reads.
+                try {
+                    parts_[i].file=std::make_shared<MirroredFileReader>(replicas,FileReadMode::Direct,header);
+                    continue;
+                }catch(const std::runtime_error&) {
+                    // Keep buffered I/O when direct I/O is unavailable.
+                }
+            }
+            if(replicas.size()>1)
+                parts_[i].file=std::make_shared<MirroredFileReader>(std::move(replicas),mode,header);
         }
     }
     FileReadStats stats()const noexcept {
@@ -598,6 +611,7 @@ std::vector<std::byte> deepseek_engram_asset(const json& meta, const json& confi
 } // namespace
 
 struct GgufModelSource::Impl {
+    FileReadMode default_read_mode=model_file_read_mode();
     struct Record {
         struct Piece {
             uint64_t begin, size, file_offset;
@@ -728,7 +742,10 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 throw std::runtime_error("inconsistent GGUF shard metadata");
         }
         const auto file_size = file->size();
-        file->enable_mirrors(gguf_get_data_offset(ctx.get()));
+        const std::string_view sole_tensor=gguf_get_n_tensors(ctx.get())==1?gguf_get_tensor_name(ctx.get(),0):"";
+        const bool ple_table=sole_tensor=="per_layer_token_embd.weight" ||
+            sole_tensor.find(".position_embedding.ngram.shard.")!=std::string_view::npos;
+        file->configure_reads(gguf_get_data_offset(ctx.get()),ple_table);
         if (shard == 0) {
             for (int64_t i = 0; i < gguf_get_n_kv(ctx.get()); ++i) {
                 const std::string name = gguf_get_key(ctx.get(), i);
@@ -1255,7 +1272,7 @@ std::optional<TensorFileRange> GgufModelSource::tensor_file_range(std::string_vi
     if (it == impl_->records.end()) return std::nullopt;
     if (it->second.external) return it->second.external->tensor_file_range(it->second.external_name);
     if (!it->second.prefix.empty() || !it->second.inline_bytes.empty() || !it->second.pieces.empty() || it->second.file->paths().size() != 1) return std::nullopt;
-    return TensorFileRange{it->second.path, it->second.offset, it->second.tensor.nbytes};
+    return TensorFileRange{it->second.path, it->second.offset, it->second.tensor.nbytes,it->second.file->stats().mode};
 }
 ModelSource::TensorBatchReader GgufModelSource::tensor_batch_reader(std::string_view name) const {
     const auto it = impl_->records.find(std::string(name));
@@ -1389,6 +1406,7 @@ void GgufModelSource::read_range_into(std::string_view name, uint64_t offset, st
 FileReadStats GgufModelSource::file_read_stats()const noexcept {
     FileReadStats result;
     for(const auto& file:impl_->files)add_file_read_stats(result,file->stats());
+    result.mode=impl_->default_read_mode;
     return result;
 }
 const std::vector<std::string>& GgufModelSource::assets() const noexcept { return impl_->assets; }

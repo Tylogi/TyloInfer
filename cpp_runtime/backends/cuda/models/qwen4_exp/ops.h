@@ -46,6 +46,8 @@ class Qwen4BatchRequestState {
     mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor,
         const std::function<std::size_t(std::size_t)>& reclaim_pinned,
         mfq_tensor_backend::Tensor* raw_hidden=nullptr);
+    mfq_tensor_backend::Tensor prefill_layer_major(Qwen4CausalLm&, mfq_tensor_backend::Tensor,int64_t rows,
+        const std::function<void()>& computation_finished);
     int64_t position() const;
     std::size_t host_recurrence_bytes() const;
     std::size_t reclaim_pinned_for_admission(std::size_t bytes);

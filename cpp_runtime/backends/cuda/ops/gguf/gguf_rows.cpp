@@ -3,6 +3,7 @@
 #include "tyloinfer/row_residual.h"
 #include "tyloinfer/encoded_row_cache.h"
 #include "tyloinfer/mapped_prefetch_scope.h"
+#include "strata/ngram/ple_reader.hpp"
 #include "runtime/row_stage_fence.h"
 #include "runtime/row_packet_prefetch.h"
 #include "../../kernels/gguf.h"
@@ -10,6 +11,7 @@
 #include "mfq_cuda_resident_allocations.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -25,14 +27,15 @@ namespace tb = mfq_tensor_backend;
 struct GgufRowTable::RowCache {
     std::mutex mutex;
     using Cache=mfq::EncodedRowCache<std::vector<std::byte>>;
-    std::shared_ptr<Cache> rows=std::make_shared<Cache>(8u<<20,[](const auto& bytes){return bytes.size();},
-        [](std::size_t bytes,bool retained) {
-            if(retained)mfq::cuda::charge_tensor_host_bytes(bytes);
-            else mfq::cuda::tensor_host_bytes.fetch_sub(bytes);
-        });
-    std::size_t capacity=0;
+    std::shared_ptr<Cache> rows;
     bool parallel=false;
-    RowCache(){mfq::register_host_cache(rows);}
+    std::unique_ptr<strata::ngram::PleReader> direct_prefill;
+    explicit RowCache(std::size_t bytes)
+        :rows(std::make_shared<Cache>(bytes,[](const auto& row){return row.size();},
+            [](std::size_t size,bool retained) {
+                if(retained)mfq::cuda::charge_tensor_host_bytes(size);
+                else mfq::cuda::tensor_host_bytes.fetch_sub(size);
+            })) {mfq::register_host_cache(rows);}
 };
 
 GgufRowTable::GgufRowTable(const mfq::ModelSource& source, const std::string& name) {
@@ -82,8 +85,24 @@ GgufRowTable::GgufRowTable(const mfq::ModelSource& source, const std::string& na
     };
     correction_=source.row_residual(name);
     if(correction_ && !correction_->payload_bytes())correction_.reset();
-    cache_ = std::make_unique<RowCache>();
+    std::unique_ptr<strata::ngram::PleReader> direct_prefill;
+    if(!correction_ && std::uint64_t(rows_)<=UINT32_MAX && row_bytes_<=strata::ngram::PAGE) {
+        if(const auto range=source.tensor_file_range(name);range && range->read_mode==mfq::FileReadMode::Direct) {
+            auto direct=std::make_unique<strata::ngram::PleReader>();
+            const auto path=range->path.u8string();
+            std::string error;
+            if(direct->open(std::string(path.begin(),path.end()),range->offset+payload_offset,rows_,256,0,error,true,row_bytes_)) {
+                direct->set_keepalive(100,60);
+                direct_prefill=std::move(direct);
+            }
+        }
+    }
+    // Direct I/O has no OS page cache. Retain recently used encoded rows
+    // in the reclaimable cache and charge them only when first read.
+    const auto cache_bytes=direct_prefill?std::clamp<std::uint64_t>(record->nbytes/64,8ULL<<20,64ULL<<20):8ULL<<20;
+    cache_ = std::make_unique<RowCache>(cache_bytes);
     cache_->parallel=source.supports_parallel_tensor_reads() || (mapped && !correction_);
+    cache_->direct_prefill=std::move(direct_prefill);
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
         static std::atomic<unsigned> reported{0};
         const auto bit=mapped?1u:batch_?2u:4u;
@@ -91,8 +110,6 @@ GgufRowTable::GgufRowTable(const mfq::ModelSource& source, const std::string& na
             "native_gguf_sparse_rows actual_match=1 mapped=%d batch=%d parallel=%d\n",
             int(mapped),int(bool(batch_)),int(cache_->parallel));
     }
-    // Include per-entry metadata in this small optional cache's bound.
-    cache_->capacity=row_bytes_>SIZE_MAX-128?0:(8ULL<<20)/(row_bytes_+128);
     mfq::cuda::observe_streamed_ple(read_, record->nbytes);
 }
 GgufRowTable::~GgufRowTable()=default;
@@ -143,13 +160,33 @@ void GgufRowTable::read_rows(const std::vector<mfq::ReadSpan>& requests) const {
     std::sort(missing.begin(),missing.end(),[](const auto& a,const auto& b){return a.offset<b.offset;});
     const auto count=std::max<std::size_t>(1,std::min<std::size_t>(256,(8ULL<<20)/std::max<std::uint64_t>(4096,row_bytes_)));
     const mfq::MappedPrefetchScope copied(missing.size()>128,true);
-    for(std::size_t begin=0;begin<missing.size();begin+=count) {
+    bool read_direct=false;
+    if(cache_->direct_prefill && missing.size()>=2*count) {
+        auto& direct=*cache_->direct_prefill;
+        const auto* dispatch=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");
+        const bool trace=dispatch && dispatch[0]=='1';
+        const auto before=trace?direct.snapshot().reads:0;
+        const auto start=std::chrono::steady_clock::now();
+        std::vector<std::uint32_t> ids;
+        ids.reserve(missing.size());
+        for(const auto& row:missing)ids.push_back(static_cast<std::uint32_t>(row.offset/row_bytes_));
+        std::vector<std::uint8_t> packed(ids.size()*row_bytes_);
+        std::string error;
+        read_direct=direct.collect(direct.issue(ids.data(),ids.size(),packed.data()),error);
+        if(read_direct) {
+            for(std::size_t i=0;i<missing.size();++i)
+                std::memcpy(missing[i].destination,packed.data()+i*row_bytes_,row_bytes_);
+            if(trace)std::fprintf(stderr,"native_ple_reference_io rows=%zu reads=%llu elapsed_ms=%.3f\n",
+                ids.size(),static_cast<unsigned long long>(direct.snapshot().reads-before),
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
+        } else cache_->direct_prefill.reset();
+    }
+    for(std::size_t begin=0;!read_direct && begin<missing.size();begin+=count) {
         const auto end=std::min(missing.size(),begin+count);
         if(batch_)batch_({missing.begin()+begin,missing.begin()+end});
         else for(auto i=begin;i<end;++i)(*read_)(missing[i].offset,missing[i].destination,missing[i].size);
     }
     for(const auto& [destination,source]:repeated)std::memcpy(destination,source,row_bytes_);
-    if(!cache_->capacity)return;
     // Physical reads are sorted, but retention follows the caller's token
     // order so a long prompt leaves its most recent rows hot for decode.
     for(const auto& row:requests) {

@@ -519,6 +519,19 @@ void qwen4_source(const std::filesystem::path& directory) {
     require(table && *table->shape == std::vector<int64_t>({4, 128}), "GGUF external PLE missing");
     const auto range = source.tensor_file_range(table->name);
     require(range && range->path == table_path && range->nbytes == 288, "GGUF PLE cannot be mapped without copying");
+    auto expected_ple_mode=mfq::model_file_read_mode();
+    const auto* file_io=std::getenv("TYLOINFER_MODEL_FILE_IO");
+    if(!file_io || !*file_io) {
+        try {
+            const mfq::FileRangeReader probe(table_path,mfq::FileReadMode::Direct);
+            expected_ple_mode=mfq::FileReadMode::Direct;
+        }catch(const std::runtime_error&) {}
+    }
+    require(range->read_mode==expected_ple_mode &&
+        source.file_read_stats().mode==mfq::model_file_read_mode(),
+        "dedicated PLE file I/O changed the backbone's configured read mode");
+    require(source.read(table->name)==std::vector<std::byte>(288,std::byte{17}),
+        "dedicated PLE reader changed the unaligned table payload");
     const auto bytes = source.read("model.block.0.position_embedding.ngram.head_vocab_sizes");
     int64_t vocab = 0; std::memcpy(&vocab, bytes.data() + 12, 8);
     require(vocab == 2, "GGUF PLE hash metadata missing");
