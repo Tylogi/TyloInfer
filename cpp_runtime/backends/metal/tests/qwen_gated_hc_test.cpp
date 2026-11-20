@@ -301,6 +301,29 @@ void test_qsa_dense_attention_causal_boundaries() {
     }
 }
 
+void test_qsa_grouped_decode() {
+    using namespace mlx::core;
+    constexpr int heads = 24, kv_heads = 2, dimension = 256, capacity = 1056;
+    for (int rows = 2; rows <= 8; ++rows) {
+        const auto query = patterned_bfloat(static_cast<std::size_t>(heads) * rows * dimension,
+            {1, heads, rows, dimension}, 37, 1.0f / 257.0f);
+        std::vector<array> keys, values, reference;
+        for (int row = 0; row < rows; ++row) {
+            const int length = row == 0 ? mfq::metal::kQsaGroupedDecodeMaxKeys : 128 + 51 * row;
+            const auto tensor = [&](int seed) {
+                return astype(patterned_bfloat(static_cast<std::size_t>(kv_heads) * capacity * dimension,
+                    {1, kv_heads, capacity, dimension}, seed, 1.0f / 257.0f), float16);
+            };
+            keys.push_back(slice(tensor(43 + row), {0, 0, 0, 0}, {1, kv_heads, length, dimension}));
+            values.push_back(slice(tensor(53 + row), {0, 0, 0, 0}, {1, kv_heads, length, dimension}));
+            const auto one_query = slice(query, {0, 0, row, 0}, {1, heads, row + 1, dimension});
+            reference.push_back(mfq::metal::qwen4_dense_gqa_attention(one_query, keys.back(), values.back(), length - 1));
+        }
+        const auto actual = mfq::metal::qwen4_dense_gqa_decode_batch(query, keys, values);
+        require_close(actual, concatenate(reference, 1), 0.0f, "QSA grouped decode with ragged KV views");
+    }
+}
+
 void test_qsa_canonical_prefill_prefix() {
     using namespace mlx::core;
     constexpr int heads = 24, kv_heads = 2, dimension = 256;
@@ -1344,6 +1367,7 @@ int main(int argc, char** argv) {
         test_qsa_block_scores();
         test_qsa_prefill_output_gate();
         test_qsa_dense_attention_causal_boundaries();
+        test_qsa_grouped_decode();
         test_qsa_canonical_prefill_prefix();
         for (auto dtype : {mlx::core::float16, mlx::core::bfloat16,
                            mlx::core::float32}) {

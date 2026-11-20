@@ -33,6 +33,129 @@ using mlx::core::MathMode;
 constexpr int kGatedHcProjectionThreads = 256;
 constexpr int kGatedHcUpThreads = 320;
 
+// The online softmax reduction order follows MLX vector SDPA.
+// Copyright © 2024 Apple Inc. See LICENSES/MLX-MIT.txt.
+class QsaDenseDecodeBatch final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    explicit QsaDenseDecodeBatch(mlx::core::Stream stream) : Primitive(stream) {}
+
+    std::string preparation_key() const override { return "mfq_qsa_dense_decode_batch"; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+    const char* name() const override { return "QsaDenseDecodeBatch"; }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [&] {
+            std::string source = "#include <metal_stdlib>\nusing namespace metal;\n";
+            source += "[[kernel, max_total_threads_per_threadgroup(1024)]] void " + name + R"METAL((
+                device const bfloat *query [[buffer(0)]],
+                device bfloat *output [[buffer(1)]],
+                constant ulong *params [[buffer(2)]],
+            )METAL";
+            for (int row = 0; row < 8; ++row) {
+                const auto suffix = std::to_string(row);
+                source += "device const half *key" + suffix + " [[buffer(" + std::to_string(3 + row * 2) + ")]],";
+                source += "device const half *value" + suffix + " [[buffer(" + std::to_string(4 + row * 2) + ")]],";
+            }
+            source += R"METAL(
+                uint2 group [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+                const uint row = group.y, head = group.x;
+            )METAL";
+            for (const auto* name : {"key", "value"}) {
+                source += "device const half *" + std::string(name) + " = ";
+                for (int row = 0; row < 7; ++row)
+                    source += "row == " + std::to_string(row) + "u ? " + name + std::to_string(row) + " : ";
+                source += std::string(name) + "7;\n";
+            }
+            // Match MLX vector SDPA's ordering. Convert FP16 cache elements to
+            // BF16 at the load instead of materializing the converted prefix.
+            source += R"METAL(
+                constexpr uint HD = 256, E = HD / 32;
+                constant ulong *info = params + 1 + row * 5;
+                const uint count = uint(info[0]), kv_head = head / 12;
+                const uint rows = uint(params[0]);
+                query += (head * rows + row) * HD + lane * E;
+                key += kv_head * info[1] + simdgroup * info[2] + lane * E;
+                value += kv_head * info[3] + simdgroup * info[4] + lane * E;
+                output += (row * 24 + head) * HD + simdgroup * E;
+                float q[E], k[E], sums[E];
+                for (uint i = 0; i < E; ++i) {
+                    q[i] = float(query[i]) * (1.0f / 16.0f);
+                    sums[i] = 0.f;
+                }
+                float maximum = -3.402823466e+38f, total = 0.f;
+                for (uint i = simdgroup; i < count; i += 32) {
+                    for (uint j = 0; j < E; ++j) k[j] = float(bfloat(float(key[j])));
+                    float score = 0.f;
+                    for (uint j = 0; j < E; ++j) score += q[j] * k[j];
+                    score = simd_sum(score);
+                    const float next = max(maximum, score);
+                    const float rescale = fast::exp(maximum - next), weight = fast::exp(score - next);
+                    maximum = next;
+                    total = total * rescale + weight;
+                    for (uint j = 0; j < E; ++j)
+                        sums[j] = sums[j] * rescale + weight * float(bfloat(float(value[j])));
+                    key += 32 * info[2];
+                    value += 32 * info[4];
+                }
+                threadgroup float maxima[32], totals[32], partials[32 * 32];
+                if (lane == 0) {
+                    maxima[simdgroup] = maximum;
+                    totals[simdgroup] = total;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maximum = maxima[lane];
+                const float scale = fast::exp(maximum - simd_max(maximum));
+                total = simd_sum(totals[lane] * scale);
+                for (uint j = 0; j < E; ++j) {
+                    partials[lane * 32 + simdgroup] = sums[j];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    sums[j] = simd_sum(partials[simdgroup * 32 + lane] * scale);
+                    sums[j] = total == 0.f ? sums[j] : sums[j] / total;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (lane == 0) for (uint j = 0; j < E; ++j) output[j] = bfloat(sums[j]);
+            })METAL";
+            return source;
+        });
+        return device.get_kernel(name, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA dense decode batch requires Metal");
+    }
+
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(prepared_kernel());
+        encoder.set_input_array(inputs.front(), 0);
+        encoder.set_output_array(output, 1);
+        const int rows = output.shape(1);
+        std::array<std::uint64_t, 1 + 5 * 8> params{};
+        params[0] = rows;
+        for (int row = 0; row < 8; ++row) {
+            const int index = std::min(row, rows - 1) * 2 + 1;
+            const auto& key = inputs[index];
+            const auto& value = inputs[index + 1];
+            encoder.set_input_array(key, 3 + row * 2);
+            encoder.set_input_array(value, 4 + row * 2);
+            const int offset = 1 + row * 5;
+            params[offset] = key.shape(2);
+            params[offset+1] = key.strides(1);
+            params[offset+2] = key.strides(2);
+            params[offset+3] = value.strides(1);
+            params[offset+4] = value.strides(2);
+        }
+        encoder.set_bytes(params, 2);
+        encoder.dispatch_threadgroups(MTL::Size(24, rows, 1), MTL::Size(1024, 1, 1));
+    }
+};
+
 class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     QsaOutputGatePrimitive(mlx::core::Stream stream, std::array<mlx::core::Dtype, 3> types,
@@ -2624,6 +2747,32 @@ array qwen4_qsa_select_blocks(
     int block_size) {
     return mlx_sparse_indexer_topk512(
         qsa_head_scores(query, pooled_keys), query_offset, block_size);
+}
+
+array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,
+    const std::vector<array>& values) {
+    const int rows = static_cast<int>(keys.size());
+    if (rows < 2 || rows > 8 || keys.size() != values.size() ||
+        query.dtype() != mlx::core::bfloat16 || query.shape() != Shape{1, 24, rows, 256})
+        throw std::invalid_argument("invalid grouped QSA decode query");
+    std::vector<array> inputs{mlx::core::contiguous(query)};
+    inputs.reserve(1 + 2 * rows);
+    const auto with_contiguous_features = [](const array& input) {
+        return input.strides(3) == 1 && input.strides(1) >= 0 && input.strides(2) >= 0
+            ? input : mlx::core::contiguous(input);
+    };
+    for (int row = 0; row < rows; ++row) {
+        const auto& key = keys[row];
+        const auto& value = values[row];
+        if (key.ndim() != 4 || key.shape(0) != 1 || key.shape(1) != 2 || key.shape(2) <= 0 ||
+            key.shape(2) > kQsaGroupedDecodeMaxKeys || key.shape(3) != 256 ||
+            key.shape() != value.shape() || key.dtype() != mlx::core::float16 || value.dtype() != mlx::core::float16)
+            throw std::invalid_argument("invalid grouped QSA decode KV state");
+        inputs.push_back(with_contiguous_features(key));
+        inputs.push_back(with_contiguous_features(value));
+    }
+    return array({1, rows, 24, 256}, mlx::core::bfloat16,
+        std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu)), std::move(inputs));
 }
 
 array qwen4_dense_gqa_attention(

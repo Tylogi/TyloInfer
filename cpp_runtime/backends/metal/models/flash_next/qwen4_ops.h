@@ -131,6 +131,14 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
     bool half_query = false,
     const mlx::core::array* separate_gate = nullptr);
 
+// MLX can select two-pass vector SDPA from 1024 keys on larger Apple GPUs.
+inline constexpr int kQsaGroupedDecodeMaxKeys = 1023;
+
+mlx::core::array qwen4_dense_gqa_decode_batch(
+    const mlx::core::array& query,
+    const std::vector<mlx::core::array>& keys,
+    const std::vector<mlx::core::array>& values);
+
 mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& query,
     const mlx::core::array& key,

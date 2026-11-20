@@ -3336,6 +3336,70 @@ public:
         auto full = mlx::core::arange(0, position + hidden.shape(1), 1, mlx::core::int32);
         return forward_projected(hidden, current, full, true, confirmed, projected, false);
     }
+    array forward_requests(const array& hidden,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, int confirmed = 0) override {
+        const int rows = hidden.shape(0);
+        if (hidden.shape(1) != 1 || rows < 2 || rows > 8 || hidden.dtype() != mlx::core::bfloat16 ||
+            config_.num_attention_heads != 24 || config_.num_key_value_heads != 2 || config_.head_dim != 256 ||
+            confirmed || config_.yarn.enabled ||
+            !qsa_decode_prologue_enabled() || MlxMtpLora::current() ||
+            query_norm_.eps() != key_norm_.eps() || query_norm_.eps() != index_query_norm_.eps())
+            return Qwen4Attention::forward_requests(hidden, caches, positions, confirmed);
+        for (int row = 0; row < rows; ++row) {
+            const auto& cache = *caches[row];
+            if (cache.batch != 1 || cache.qsa_speculative_trim || cache.offloaded_kv ||
+                !cache.kv || cache.kv->quantized() || cache.kv->position() != positions[row] ||
+                cache.index_position != positions[row] || cache.kv->key_storage().dtype() != mlx::core::float16 ||
+                positions[row] >= std::min<std::int64_t>(config_.indexer_budget, kQsaGroupedDecodeMaxKeys))
+                return Qwen4Attention::forward_requests(hidden, caches, positions, confirmed);
+        }
+
+        auto grouped = mlx::core::reshape(hidden, {1, rows, hidden.shape(2)});
+        auto projected = input_projections_(grouped);
+        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        for (auto& value : projected) if (value.dtype() != hidden.dtype())
+            value = mlx::core::astype(value, hidden.dtype());
+        const auto current = array(positions.begin(), {rows}, mlx::core::int32);
+        auto packed = qwen4_qsa_decode_prologue(projected[0], projected[1], projected[3],
+            query_norm_.weight(), key_norm_.weight(), index_query_norm_.weight(), current,
+            static_cast<int>(config_.num_attention_heads), static_cast<int>(config_.num_key_value_heads),
+            static_cast<int>(config_.indexer_n_heads), static_cast<int>(config_.head_dim),
+            static_cast<int>(config_.indexer_head_dim), static_cast<int>(config_.rotary_dim),
+            static_cast<float>(config_.rope_theta), query_norm_.eps(), &projected[2], false,
+            gate_ ? &projected[4] : nullptr);
+        std::vector<array> keys, values, index_updates;
+        keys.reserve(rows);
+        values.reserve(rows);
+        index_updates.reserve(2 * rows);
+        for (int row = 0; row < rows; ++row) {
+            const auto kv_row = [&](const array& value) {
+                return mlx::core::slice(value, {0, 0, row, 0}, {1, value.shape(1), row + 1, value.shape(3)});
+            };
+            auto full = mlx::core::arange(positions[row] + 1, mlx::core::int32);
+            auto index = mlx::core::slice(*packed.cache_index_key, {0, row, 0},
+                {1, row + 1, static_cast<int>(config_.indexer_head_dim)});
+            exchange_cache(*caches[row]);
+            try {
+                auto [key, value] = cache_->append(kv_row(packed.key), kv_row(*packed.cache_value));
+                keys.push_back(std::move(key));
+                values.push_back(std::move(value));
+                append_index_keys(index, full);
+                index_updates.push_back(*index_tail_);
+                index_updates.push_back(pooled_index_cache_.view());
+            } catch (...) {
+                exchange_cache(*caches[row]);
+                throw;
+            }
+            exchange_cache(*caches[row]);
+        }
+        auto attended = mlx::core::depends({qwen4_dense_gqa_decode_batch(packed.query, keys, values)}, index_updates).front();
+        detail::profile_eval("qwen4.batch.attention.core", attended);
+        auto gated = qwen4_qsa_output_gate(attended, mlx::core::reshape(packed.output_gate, attended.shape()), hidden.dtype());
+        auto output = output_(gated);
+        detail::profile_eval("qwen4.batch.attention.output", output);
+        return mlx::core::reshape(output, {rows, 1, output.shape(2)});
+    }
     array decode_output_projection(const array& hidden) override { return output_(hidden); }
     void exchange_cache(Qwen4RequestLayerCache& state) override {
         std::swap(speculative_trim_, state.qsa_speculative_trim);
@@ -3751,7 +3815,6 @@ public:
         auto raw_key = prologue.cache_index_key ? std::move(*prologue.cache_index_key) : mlx::core::reshape(
             index_parts.at(1),
             Shape{batch, tokens, static_cast<int>(config_.indexer_head_dim)});
-
         array key_cache = key;
         array value_cache = value;
         int query_offset = 0;
@@ -3995,6 +4058,13 @@ private:
             throw std::runtime_error("Qwen4 QSA query/gate projection geometry disagrees");
         if (auto* preparation = MlxKernelPreparation::current()) {
             preparation->collect([&] {
+                if (config_.num_attention_heads == 24 && config_.num_key_value_heads == 2 &&
+                    config_.head_dim == 256 && !config_.yarn.enabled && qsa_decode_prologue_enabled() &&
+                    preparation->activation_dtype() == mlx::core::bfloat16) {
+                    const auto query = mlx::core::zeros({1, 24, 2, 256}, mlx::core::bfloat16);
+                    const auto kv = mlx::core::zeros({1, 2, 2, 256}, mlx::core::float16);
+                    preparation->add(qwen4_dense_gqa_decode_batch(query, {kv, kv}, {kv, kv}));
+                }
                 for (const auto requested : preparation->row_buckets())
                     for (const auto dtype : {preparation->activation_dtype(), mlx::core::float32}) {
                     const int rows = std::min(maximum_, requested);

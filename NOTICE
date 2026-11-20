@@ -67,6 +67,14 @@ Copyright (c) 2026 David Dalcu
 License: MIT (`LICENSES/mlx-serve-MIT.txt`)
 Source: https://github.com/ddalcu/mlx-serve
 
+MLX
+---
+The grouped QSA decode kernel follows the online softmax reduction order of
+the MLX v0.32.4 vector SDPA kernel, with separate FP16 K/V inputs per request.
+Copyright (c) 2024 Apple Inc.
+License: MIT (`LICENSES/MLX-MIT.txt`)
+Source: https://github.com/ml-explore/mlx
+
 llama.cpp / GGML
 ----------------
 MFQ's GGUF reader, tokenizer, grammar, chat-template/Jinja implementation, and
