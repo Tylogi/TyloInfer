@@ -71,6 +71,8 @@ MLX
 ---
 The grouped QSA decode kernel follows the online softmax reduction order of
 the MLX v0.32.4 vector SDPA kernel, with separate FP16 K/V inputs per request.
+DFlash2 draft attention follows the same reduction order and reads BF16 K/V
+directly from each request's cache.
 Copyright (c) 2024 Apple Inc.
 License: MIT (`LICENSES/MLX-MIT.txt`)
 Source: https://github.com/ml-explore/mlx

@@ -4,6 +4,7 @@
 #include "mlx_tensor.h"
 #include "mlx_weight_residency.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_platform.h"
 #include "mtp_policy.h"
 #include "../flash_next/mlx_qwen4_causal_lm.h"
 #include "../qwen35/mlx_qwen35_causal_lm.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <queue>
@@ -28,6 +30,126 @@ array normalized(const array& value, const array& weight, float epsilon) {
 
 array rotated(const array& value, int dimension, float theta, int offset) {
     return fast::rope(value, dimension, false, theta, 1.f, offset);
+}
+
+array draft_ring_attention(const array& query, const array& key, const array& value,
+    const std::vector<array>& past_keys, const std::vector<array>& past_values, const array& positions) {
+    constexpr int blocks = 128;
+    // Keep the round-robin split and reduction order of MLX's padded
+    // two-pass vector SDPA. Skip masked entries and read the ring and
+    // proposal rows directly in the same four-token order. See NOTICE.
+    static const auto options = [] {
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Safe;
+        return compile_options;
+    }();
+    static const auto split = cached_metal_kernel("tinfer_draft_vector_ring_split",
+        {"query", "key", "value", "key0", "key1", "key2", "key3",
+         "value0", "value1", "value2", "value3", "positions"}, {"parts", "sums", "maxima"}, R"METAL(
+      const uint3 group = threadgroup_position_in_grid;
+      const uint3 local = thread_position_in_threadgroup;
+      constexpr uint D = 128, KV = 8, Q = 32, Rows = 8, Window = 2048;
+      const uint h = group.x, b = group.y, block = group.z, lane = thread_index_in_simdgroup;
+      const uint row = local.z, qhead = h * 4 + local.y;
+      const ulong q_offset = (ulong(b * Q + qhead) * Rows + row) * D + lane * 4;
+      device const bfloat* old_k = b == 0 ? key0 : (b == 1 ? key1 : (b == 2 ? key2 : key3));
+      device const bfloat* old_v = b == 0 ? value0 : (b == 1 ? value1 : (b == 2 ? value2 : value3));
+      old_k += ulong(h) * Window * D + lane * 4;
+      old_v += ulong(h) * Window * D + lane * 4;
+      const ulong new_base = ulong(b * KV + h) * Rows * D + lane * 4;
+      float q[4], o[4] = {0.f, 0.f, 0.f, 0.f};
+      for (uint j = 0; j < 4; ++j) q[j] = 0.08838834764831845f * float(query[q_offset + j]);
+      float maximum = -MAXFLOAT, denominator = 0.f;
+      const auto add = [&](const thread bfloat* k, const thread bfloat* v) {
+          float score = 0.f;
+          for (uint j = 0; j < 4; ++j) score += q[j] * float(k[j]);
+          score = simd_sum(score);
+          const float next = max(maximum, score);
+          const float previous = fast::exp(maximum-next);
+          const float probability = fast::exp(score-next);
+          maximum = next;
+          denominator = denominator * previous + probability;
+          for (uint j = 0; j < 4; ++j) o[j] = o[j] * previous + probability * float(v[j]);
+      };
+      const uint end = uint(positions[b]);
+      // Later proposal rows can expire a prefix even before the cache wraps.
+      const uint lower = end + row + 1 > Window ? end + row + 1 - Window : 0;
+      constexpr uint Prefetch = 4;
+      for (uint i = block; i < end; i += uint(Blocks) * Prefetch) {
+          bfloat kr[Prefetch][4], vr[Prefetch][4];
+          for (uint t = 0; t < Prefetch; ++t) {
+              const uint token = i + t * uint(Blocks);
+              if (token < end)
+                  for (uint j = 0; j < 4; ++j) kr[t][j] = old_k[ulong(token) * D + j];
+          }
+          for (uint t = 0; t < Prefetch; ++t) {
+              const uint token = i + t * uint(Blocks);
+              if (token < end)
+                  for (uint j = 0; j < 4; ++j) vr[t][j] = old_v[ulong(token) * D + j];
+          }
+          for (uint t = 0; t < Prefetch; ++t)
+              if (i + t * uint(Blocks) >= lower && i + t * uint(Blocks)<end)
+                  add(kr[t], vr[t]);
+      }
+      if (block < Rows) {
+          bfloat k[4], v[4];
+          for (uint j = 0; j < 4; ++j) {
+              k[j] = key[new_base + ulong(block) * D + j];
+              v[j] = value[new_base + ulong(block) * D + j];
+          }
+          add(k, v);
+      }
+      const ulong result = (ulong(b * Q + qhead) * Rows + row) * Blocks + block;
+      if (lane == 0) { sums[result] = denominator; maxima[result] = maximum; }
+      for (uint j = 0; j < 4; ++j) parts[result * D + lane * 4 + j] = bfloat(o[j]);
+)METAL", "", true, false, options);
+    static const auto reduce = cached_metal_kernel("tinfer_draft_vector_ring_reduce",
+        {"partials", "sums", "maxs"}, {"out"}, R"METAL(
+      constexpr uint D = 128, Rows = 8, Q = 32, BN = 32;
+      const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+      const uint h = threadgroup_position_in_grid.x, row = threadgroup_position_in_grid.y;
+      const ulong q = ulong(h) * Rows + row;
+      device const float* maxima = maxs + q * Blocks;
+      device const float* denominators = sums + q * Blocks;
+      device const bfloat* part = partials + (q * Blocks + sg) * D + lane * 4;
+      threadgroup float outputs[BN * BN];
+      float total = 0.f, maximum = -MAXFLOAT, o[4] = {0.f, 0.f, 0.f, 0.f};
+      for (uint k = 0; k < Blocks / BN; ++k) maximum = max(maximum, maxima[lane + BN * k]);
+      maximum = simd_max(maximum);
+      for (uint k = 0; k < Blocks / BN; ++k)
+          total += fast::exp(maxima[lane + BN * k]-maximum) * denominators[lane + BN * k];
+      total = simd_sum(total);
+      for (uint k = 0; k < Blocks / BN; ++k) {
+          const float factor = fast::exp(maxima[sg + BN * k]-maximum);
+          for (uint j = 0; j < 4; ++j) o[j] += factor * float(part[ulong(k) * BN * D + j]);
+      }
+      for (uint j = 0; j < 4; ++j) {
+          outputs[lane * BN + sg] = o[j];
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          o[j] = simd_sum(outputs[sg * BN + lane]);
+          if (total != 0) o[j] /= total;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if (lane == 0) {
+          const ulong base = (ulong(h / Q) * Rows * Q + ulong(row) * Q + h % Q) * D + sg * 4;
+          for (uint j = 0; j < 4; ++j) out[base + j] = bfloat(o[j]);
+      }
+)METAL", "", true, false, options);
+    const int lanes = query.shape(0);
+    std::vector<array> inputs{query, key, value};
+    inputs.reserve(12);
+    for (const auto* ring : {&past_keys, &past_values})
+        for (int lane = 0; lane < 4; ++lane)
+            inputs.push_back((*ring)[lane < lanes ? lane : 0]);
+    inputs.push_back(positions);
+    const Shape partial_shape{lanes, 32, 8, blocks, 128};
+    const Shape statistics_shape{lanes, 32, 8, blocks};
+    const std::vector<std::pair<std::string, fast::TemplateArg>> parameters{{"Blocks", blocks}};
+    const auto partials = split(inputs, {partial_shape, statistics_shape, statistics_shape},
+        {bfloat16, float32, float32}, {8 * 32, lanes * 4, blocks * 8}, {32, 4, 8},
+        parameters, std::nullopt, false, {});
+    return reduce(partials, {{lanes, 8, 4096}}, {bfloat16}, {lanes * 32 * 1024, 8, 1},
+        {1024, 1, 1}, parameters, std::nullopt, false, {}).front();
 }
 
 array dynamic_convolution(const array& input, const array& dynamic, const array& base,
@@ -409,9 +531,12 @@ MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFla
     std::vector<int> positions;
     std::vector<int> row_offsets{0};
     int maximum_depth = 0;
-    std::vector<array> masks;
-    auto slots = arange(c.window, int32);
-    const auto proposal_mask = ones({c.block_size, c.block_size}, bool_);
+    const bool direct_ring = batch >= 2 && batch <= 4 && c.block_size == 8 && c.window == 2048 &&
+        c.query_heads == 32 && c.kv_heads == 8 && c.head_dimension == 128 &&
+        mlx_apple_chip_is("Apple M5 Max") && !std::getenv("MLX_SDPA_BLOCKS") &&
+        std::all_of(contexts.begin(), contexts.end(), [&](const auto* context) {
+            return context && context->position < c.window;
+        });
     for (int lane = 0; lane < batch; ++lane) {
         if (!contexts[lane] || anchors[lane] < 0 || anchors[lane] >= c.vocabulary)
             throw std::invalid_argument("invalid DFlash2 proposal lane");
@@ -422,15 +547,23 @@ MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFla
         row_offsets.push_back(row_offsets.back() + depth);
         maximum_depth = std::max(maximum_depth, depth);
         positions.push_back(context.position);
-        auto logical = context.position < c.window ? slots : array(context.position - c.window, int32) +
-            remainder(slots - array(context.position % c.window, int32) + array(c.window, int32), array(c.window, int32));
-        auto lower = reshape(maximum(arange(c.block_size, int32) + array(context.position - (c.window - 1), int32),
-            array(0, int32)), {c.block_size, 1});
-        auto past_mask = (expand_dims(logical, 0) >= lower) & (expand_dims(logical, 0) < array(context.position, int32));
-        masks.push_back(reshape(concatenate({past_mask, proposal_mask}, 1),
-            {1, 1, c.block_size, c.window + c.block_size}));
     }
-    auto mask = batch == 1 ? masks.front() : concatenate(masks, 0);
+    std::optional<array> mask;
+    if (!direct_ring) {
+        const auto slots = arange(c.window, int32);
+        const auto proposal_mask = ones({c.block_size, c.block_size}, bool_);
+        std::vector<array> masks;
+        for (const int position : positions) {
+            auto logical = position < c.window ? slots : array(position - c.window, int32) +
+                remainder(slots - array(position % c.window, int32) + array(c.window, int32), array(c.window, int32));
+            auto lower = reshape(maximum(arange(c.block_size, int32) + array(position - (c.window - 1), int32),
+                array(0, int32)), {c.block_size, 1});
+            auto past_mask = (expand_dims(logical, 0) >= lower) & (expand_dims(logical, 0) < array(position, int32));
+            masks.push_back(reshape(concatenate({past_mask, proposal_mask}, 1),
+                {1, 1, c.block_size, c.window + c.block_size}));
+        }
+        mask = batch == 1 ? masks.front() : concatenate(masks, 0);
+    }
     auto offsets = array(positions.begin(), {batch}, int32);
     auto hidden = astype(embeddings, bfloat16);
     if (impl_->mask_embedding) hidden = concatenate({slice(hidden, {0, 0, 0}, {batch, 1, c.hidden}),
@@ -458,12 +591,16 @@ MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFla
             keys.push_back(*context->layers[index].keys);
             values.push_back(*context->layers[index].values);
         }
-        auto attended = fast::scaled_dot_product_attention(query,
-            concatenate({batch == 1 ? keys.front() : concatenate(keys, 0), key}, 2),
-            concatenate({batch == 1 ? values.front() : concatenate(values, 0), value}, 2),
-            1.f / std::sqrt(float(c.head_dimension)), "", mask);
-        auto projected = layer.output(reshape(transpose(attended, {0, 2, 1, 3}),
-            {batch, c.block_size, c.query_heads * c.head_dimension}));
+        auto attention = [&] {
+            if (direct_ring) return draft_ring_attention(query, key, value, keys, values, offsets);
+            auto attended = fast::scaled_dot_product_attention(query,
+                concatenate({batch == 1 ? keys.front() : concatenate(keys, 0), key}, 2),
+                concatenate({batch == 1 ? values.front() : concatenate(values, 0), value}, 2),
+                1.f / std::sqrt(float(c.head_dimension)), "", mask);
+            return reshape(transpose(attended, {0, 2, 1, 3}),
+                {batch, c.block_size, c.query_heads * c.head_dimension});
+        }();
+        auto projected = layer.output(attention);
         auto residual = dynamic_convolution(projected, dynamic, layer.attention_base, hidden, c.convolution_group, true);
         input = normalized(residual, layer.post_norm, c.epsilon);
         dynamic = layer.dynamic_mlp(input);
