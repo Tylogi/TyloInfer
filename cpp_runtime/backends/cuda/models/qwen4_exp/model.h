@@ -1920,14 +1920,27 @@ class Qsa {
                 return project_output?w_.output(execution,gated):gated;
             }catch(...){adaptive_->truncate(start);if(temporary)adaptive_->release_prefill_workspace();throw;}
         }
-        if(use_cache && hidden.size(1)>8 && !selection_trace && !history_only) {
+        const auto b=hidden.size(0),t=hidden.size(1),offset=use_cache?position():0,length=offset+t;
+        const auto select_fused=mfq::cuda::runtime_options::qsa_select_fused();
+        const auto* live_setting=std::getenv("TYLOINFER_QSA_LIVE_TOPK");
+        const auto live_count=std::min(c_.budget/c_.pool,length/c_.pool);
+        // One selector grid row per query must fit CUDA's grid.y.
+        const bool live_prefill=b==1 && t>=32 && t<=65535 && !offload_ && !selection_trace && !history_only &&
+            length>c_.budget && live_count<=1024 && (!select_fused || *select_fused) && (!live_setting || live_setting[0]!='0');
+        if(use_cache && t>8 && !selection_trace && !history_only) {
             // Index scores grow with both query rows and the accumulated
             // context. Bound that workspace independently of the FFN tile.
-            // Keep per-head products, reduction and top-k scratch below the
-            // same budget even at the final chunk of a long prompt.
-            const auto offset=position(),length=offset+hidden.size(1);
             const auto pools=std::max<int64_t>(1,length/c_.pool);
-            const auto row_bytes=std::size_t(hidden.size(0))*pools*(c_.index_heads+4)*sizeof(float);
+            auto row_bytes=std::size_t(b)*pools*(c_.index_heads+4)*sizeof(float);
+            if(live_prefill) {
+                // Native affine scoring reduces heads in the kernel. Single
+                // selector tiles write indices directly to the final output.
+                row_bytes=std::size_t(pools)*sizeof(float);
+                for(auto columns=pools;columns>4096;) {
+                    columns=((columns+4095)/4096)*live_count;
+                    row_bytes+=std::size_t(columns)*(sizeof(float)+sizeof(int64_t));
+                }
+            }
             const auto rows=std::max<int64_t>(32,int64_t((128ULL<<20)/row_bytes)/32*32);
             if(hidden.size(1)>rows) {
                 std::vector<Tensor> outputs;
@@ -1947,7 +1960,6 @@ class Qsa {
             return forward_offloaded(execution, hidden, current_positions, full_positions, selection_trace,
                                      std::move(projections),project_output,history_only);
         }
-        const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
         const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
         // Scalar decode and verification use the same grouped projections and
         // normalization/RoPE preparation as captured execution. Keeping short
@@ -2015,6 +2027,8 @@ class Qsa {
         const bool short_gate=prepared_inputs && fused_projection_ && rotary_->fused() &&
             t<=8 && !quantization_.enabled() &&
             (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32);
+        const auto live_positions=live_prefill?
+            tb::arange(offset,offset+t,hidden.options().dtype(tb::kInt64)):Tensor{};
         const auto attend_projected=[&](const Projection& p,const Tensor& selected) {
             auto key=p.key.permute({0,2,1,3}),value=p.value.permute({0,2,1,3});
             if(!short_gate)return attend(p.query,key,value,selected,offset);
@@ -2039,16 +2053,24 @@ class Qsa {
                 auto starts=tb::arange(pools,p.raw.options().dtype(tb::kInt64))*c_.pool;
                 return pool_index(p.raw.narrow(1,0,pools*c_.pool),full_positions.index_select(-1,starts));
             },
-            [](const Projection &p,const Tensor &pooled) {return qsa_indexer::scores(p.iq,pooled);},
+            [&](const Projection &p,const Tensor &pooled) {
+                return execution.profiler.measure("prefill.qsa.indexer",[&] {
+                    return qsa_indexer::scores(p.iq,pooled,live_positions,c_.pool);
+                });
+            },
             [&](const Tensor &scores, const Projection &p, const Tensor &pooled) {
-                auto ids =
-                    select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget, true);
+                auto ids = execution.profiler.measure(live_prefill?"prefill.qsa.live_selection":"prefill.qsa.selection",[&] {
+                    if(live_prefill) {
+                        return mfq_qwen4_exp::live_topk_selected_tokens(scores,live_positions,c_.pool,live_count,c_.budget);
+                    }
+                    return select_pooled_blocks(scores,offset,offset+t,c_.pool,c_.budget,true);
+                });
                 if (selection_trace)
                     *selection_trace = {scores, ids, p.iq, qsa_indexer::decode(pooled)};
                 return ids;
             },
             [&](const Projection &p, Tensor ids) {
-                return attend_projected(p,ids);
+                return execution.profiler.measure("prefill.qsa.selected_attention",[&] {return attend_projected(p,ids);});
             },
             [&](Tensor attended, const Projection &p) {
                 auto gated = short_gate?std::move(attended):

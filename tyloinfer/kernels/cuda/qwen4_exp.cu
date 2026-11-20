@@ -661,12 +661,14 @@ static Tensor live_topk_impl(const Tensor& scores,const Tensor& positions,int64_
         // The final emitter reuses this memory for public INT64 IDs, even
         // when the live candidate count is small enough to skip sorting.
         const auto bytes=std::max(std::max(sort_bytes,emit_blocks?std::size_t(8192):std::size_t(0)),budget?std::size_t(count)*sizeof(int64_t):std::size_t(0));
-        auto next=tb::empty({1,rows,tiles*count},scores.options());
-        auto next_ids=tb::empty(next.sizes(),scores.options().dtype(tb::kInt64));
+        const bool direct=tiles==1 && selected.defined();
+        const auto candidate_shape=std::array<int64_t,3>{1,rows,tiles*count};
+        auto next=direct?Tensor{}:tb::empty(candidate_shape,scores.options());
+        auto next_ids=direct?Tensor{}:tb::empty(candidate_shape,scores.options().dtype(tb::kInt64));
         const auto launch=[&]<bool Blocks,int Items=16>() {
         live_topk_blocks_kernel<Blocks,Items><<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
             keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
-            next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
+            direct?nullptr:next.data_ptr<float>(),direct?nullptr:next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
             columns,pools,int(pool),int(count),stage,compact,
             selected.defined()?selected.data_ptr<int32_t>():nullptr,int(budget));
         if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(
