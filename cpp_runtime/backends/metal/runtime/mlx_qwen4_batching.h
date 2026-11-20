@@ -188,6 +188,7 @@ struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
     std::optional<MlxDFlash2Tree> dflash_tree;
     std::optional<mlx::core::array> pending_dflash_features;
     int next_depth = 0, budget_depth = 0, budget_rows = 0;
+    std::size_t dflash_max_verify_width = 0;
     int scheduled_budget = 0, scheduled_rows = 0;
     std::array<std::uint64_t, mfq::engine::mtp::kMaximumReportedDraftDepth> reached{}, hits{};
     std::uint64_t mtp_parks = 0, mtp_reentries = 0;
@@ -869,7 +870,11 @@ private:
         std::vector<MlxDFlash2TreeInput> inputs;
         std::vector<std::size_t> draft_lanes;
         std::vector<MlxDFlash2Tree> trees;
+        const auto width = cohort.active.size();
+        bool two_way = true;
         for (const auto& request : cohort.active) {
+            request->dflash_max_verify_width = std::max(request->dflash_max_verify_width, width);
+            two_way = two_way && request->dflash_max_verify_width == 2;
             const auto anchor = request->target_work->pending_token;
             const int position = runtime_.request_cache_position(*request->cache);
             const int depth = std::min({draft_cap(*request), request->generation_limit - request->produced - 1,
@@ -894,8 +899,10 @@ private:
             dflash_draft_maximum_ = std::max(dflash_draft_maximum_, contexts.size());
         }
 
+        // Keep the current policy as a wider cohort drains. Changing its
+        // budget at two active lanes adds work to the end of a wider batch.
         const bool adaptive = trees.size() == plans.size() &&
-            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", true);
+            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
         if (adaptive) dflash_tree_budget_.choose(trees);
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
