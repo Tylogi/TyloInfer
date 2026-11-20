@@ -1545,6 +1545,8 @@ struct QsaTqCache::Impl {
         const auto complete=keep/4,remainder=keep%4;
         const bool local_tail=keep && ram && !ssd_cache && pending_graph && complete==tokens/4 &&
             (!remainder || tail_k.defined());
+        const bool archived_tail=remainder && complete<tokens/4 && complete>=graph_archive_first &&
+            complete<graph_archive_first+graph_archive_count;
         if(!keep && host_index_calls) {
             std::fprintf(stderr,"native_qsa_cpu_indexer calls=%llu score_ms=%.3f transfer_ms=%.3f\n",
                 static_cast<unsigned long long>(host_index_calls),host_index_ms,host_index_transfer_ms);
@@ -1561,7 +1563,10 @@ struct QsaTqCache::Impl {
         }
         // Trimming within the pending block touches only stream-ordered
         // buffers and leaves the published archive and its readers intact.
-        if(keep && !local_tail)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
+        // The completed graph already published this archive. Rebuilding its
+        // tail only reads the graph's own image and writes stream-ordered KV.
+        // Waiting here would serialize rollback with the preceding layer.
+        if(keep && !local_tail && !archived_tail)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
         if(remainder && keep==append_input_position && append_k.defined() && append_v.defined() && append_index.defined()) {
             // The input stage retains the original partial block even if the
             // append failed before writing its completed archive entry.
@@ -1572,7 +1577,7 @@ struct QsaTqCache::Impl {
             tail_index=tail_storage_index.narrow(1,0,remainder);
         }else if(remainder && keep/4==tokens/4 && tail_k.defined()) {
             tail_k=tail_k.narrow(1,0,remainder).contiguous();tail_v=tail_v.narrow(1,0,remainder).contiguous();tail_index=tail_index.narrow(1,0,remainder).contiguous();
-        }else if(remainder && complete>=graph_archive_first && complete<graph_archive_first+graph_archive_count) {
+        }else if(archived_tail) {
             const auto stream=mfq_current_cuda_stream();
             const auto* view=graph_destination.data_ptr<tq::TqBlockView>()+complete%graph_destination_slots();
             const auto* archive_data=graph_archive_mapped?graph_archive_mapped:graph_archive.data_ptr<std::uint8_t>();
