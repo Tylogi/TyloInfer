@@ -287,7 +287,7 @@ static constexpr __host__ __device__ fattn_mma_config mfq_fattn_mma_select_confi
     // Indirect gathers already share one K/V staging buffer. Four warps
     // divide a 64-key tile and halve stream-K intermediate chunks. Ordinary
     // dense attention retains its own double-buffered configuration.
-    if(indirect && DKQ==256 && DV==256 && ncols==16 && config.nthreads==64 && config.nbatch_fa==32) {
+    if(indirect && DKQ==256 && DV==256 && (ncols==8 || ncols==16) && config.nthreads==64 && config.nbatch_fa==32) {
         config.nthreads=128;config.occupancy=2;config.nbatch_fa=64;
     }
     // An eight-head gather retains the K/V tile size. Four warps split those
