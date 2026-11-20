@@ -162,6 +162,8 @@ int tq_publish_contiguous_views(TqBlockView base,TqBlockView* output,int image_b
 // Self-contained INT16 affine rows: width codes, FP16 scale bits, INT16 zero.
 // Raw and pooled Indexer caches use the same representation on every KV tier.
 int indexer_affine16_pack(const float* input,std::int16_t* records,int rows,int width,cudaStream_t stream);
+int indexer_affine16_pack_at(const void* input,bool half_input,std::int64_t row_stride,std::int16_t* records,
+    const void* positions,bool wide_positions,int rows,int width,int capacity,cudaStream_t stream);
 int indexer_affine16_unpack(const std::int16_t* records,float* output,int rows,int width,cudaStream_t stream);
 int indexer_affine16_record_scores(const float* query,const std::int16_t* records,const std::int64_t* positions,float* output,
     int queries,int heads,int width,int blocks,int pool,cudaStream_t stream);

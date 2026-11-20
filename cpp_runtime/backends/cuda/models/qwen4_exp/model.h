@@ -1733,7 +1733,8 @@ class Qsa {
             graph_values_.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
         if(managed_memory() && !exclusive && !streamed)memory_->hot.publish(graph_keys_,graph_values_,cache_positions);
-        if(!index_written)index_.append_fixed(qsa_indexer::encode(p.raw),cache_positions);
+        if(!index_written && !qsa_indexer::pack_at(p.raw,index_.storage(),cache_positions,index_.position()))
+            index_.append_fixed(qsa_indexer::encode(p.raw),cache_positions);
         mark("qsa_cache_end");
         if(history_only && streamed) {
             auto* window=DecodeWindow::recording();
