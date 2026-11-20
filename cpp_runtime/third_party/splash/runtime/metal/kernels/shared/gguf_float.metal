@@ -11,6 +11,7 @@
 // eight rows; no phase here rounds them.
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/sgmatrix.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -39,7 +40,6 @@ inline FloatProjection<W, T> float_projection(constant GgufFloatParams &p, uint 
 namespace gguf_float {
 
 constant constexpr uint kFragments = 4;          // 8-row fragments per threadgroup: 32 rows
-constant constexpr uint kRows = 8 * kFragments;
 constant constexpr uint kStep = 64;              // inputs per step: eight runs of 8
 // K parts, one per simdgroup. A decode dispatch has few threadgroups (64 at Flash-Next's router width, 32 at the
 // 35B's); on the M5 Max at 8 to 32 rows, 8 parts are the fastest at those widths, where 16 took up to 29% longer, and
@@ -74,12 +74,13 @@ template <> struct Eight<float> {
 // weights load a step ahead. Even and odd MMAs accumulate apart, which halves each chain of fp32 sums at no cost in
 // time: at the router's K = 2048 the mean error stays 5.5e-9 of sum |x w| (7.4e-9 with one chain per part). Rows of
 // K (a multiple of 8) start 16-byte aligned in page-aligned buffers.
-template <typename W, typename T>
+template <typename W, typename T, uint Fragments = kFragments, bool HyperLow = false>
 inline void project(device const bfloat *input, FloatProjection<W, T> projection, constant GgufFloatParams &p, uint y,
                     uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
-  const uint K = p.input_size, runs = K / 8, column = projection.tile * 8 + l.fn, row0 = y * kRows;
-  const uint live = min(kRows, p.rows - row0);
+  constexpr uint Rows = 8 * Fragments;
+  const uint K = p.input_size, runs = K / 8, column = projection.tile * 8 + l.fn, row0 = y * Rows;
+  const uint live = min(Rows, p.rows - row0);
   const uint steps = (K + kStep - 1) / kStep, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
   device const W *w = projection.weights + ulong(column) * K;
   const auto load = [&](uint step, thread Eight<W> (&b)[2]) {
@@ -87,9 +88,9 @@ inline void project(device const bfloat *input, FloatProjection<W, T> projection
     b[0] = Eight<W>::load(w + run * 8, run < runs);
     b[1] = Eight<W>::load(w + K + run * 8, run < runs);
   };
-  float2 acc[kFragments][2];
+  float2 acc[Fragments][2];
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) acc[f][0] = acc[f][1] = float2(0);
+  for (uint f = 0; f < Fragments; ++f) acc[f][0] = acc[f][1] = float2(0);
   Eight<W> next[2];
   load(first, next);
   for (uint step = first; step < last; ++step) {
@@ -97,7 +98,7 @@ inline void project(device const bfloat *input, FloatProjection<W, T> projection
     if (step + 1 < last) load(step + 1, next);
     const uint run = step * 8 + l.fn;
 #pragma unroll
-    for (uint f = 0; f < kFragments; ++f) {
+    for (uint f = 0; f < Fragments; ++f) {
       if (f * 8 >= live) break;
       const uint row = f * 8 + l.fm;
       device const bfloat *x = input + ulong(row0 + row) * K + run * 8;
@@ -109,15 +110,23 @@ inline void project(device const bfloat *input, FloatProjection<W, T> projection
     }
   }
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) parts[(sg * kFragments + f) * 32 + lane] = acc[f][0] + acc[f][1];
+  for (uint f = 0; f < Fragments; ++f) parts[(sg * Fragments + f) * 32 + lane] = acc[f][0] + acc[f][1];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint f = sg, row = f * 8 + l.fm;
-  if (f >= kFragments || row >= live) return;
+  if (f >= Fragments || row >= live) return;
   float2 total = float2(0);
-  for (uint s = 0; s < kSplits; ++s) total += parts[(s * kFragments + f) * 32 + lane];
+  for (uint s = 0; s < kSplits; ++s) total += parts[(s * Fragments + f) * 32 + lane];
   device T *out = projection.output + ulong(row0 + row) * projection.out_stride + projection.out_offset + column;
-  out[0] = T(total.x);
-  out[1] = T(total.y);
+  if constexpr (HyperLow) {
+    // Round the projection before SiLU, as in the separate low activation.
+    const float2 rounded = float2(bfloat2(total));
+    const float2 activated = splash_silu(rounded / 4.0f);
+    out[0] = T(activated.x);
+    out[1] = T(activated.y);
+  } else {
+    out[0] = T(total.x);
+    out[1] = T(total.y);
+  }
 }
 
 } // namespace gguf_float
@@ -141,6 +150,61 @@ GGUF_FLOAT_KERNEL(gguf_float_f32_f32, float, float)
 GGUF_FLOAT_KERNEL(gguf_float_bf16_bf16, bfloat, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_bf16_f32, bfloat, float)
 #undef GGUF_FLOAT_KERNEL
+
+kernel void gguf_float_bf16_hyper_low_m8(device const bfloat *input [[buffer(0)]],
+                                       device const bfloat *weights [[buffer(1)]],
+                                       device bfloat *output [[buffer(2)]],
+                                       constant GgufFloatParams &p [[buffer(3)]],
+                                       uint tile [[threadgroup_position_in_grid]],
+                                       uint sg [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float2 parts[gguf_float::kSplits * 32];
+  const FloatProjection<bfloat, bfloat> projection{weights, output, p.output_size[0], p.out_stride[0], 0, tile};
+  gguf_float::project<bfloat, bfloat, 1, true>(input, projection, p, 0, sg, lane, parts);
+}
+
+// One simdgroup per 64-input slice and one tile per eight hidden features.
+// Each group reuses its low activations across the four residual streams.
+kernel void gguf_float_bf16_hyper_up_mix_m8(device const bfloat *low [[buffer(0)]],
+                                          device const bfloat *weights [[buffer(1)]],
+                                          device const bfloat *normalized [[buffer(2)]],
+                                          device bfloat *output [[buffer(3)]],
+                                          uint tile [[threadgroup_position_in_grid]],
+                                          uint sg [[simdgroup_index_in_threadgroup]],
+                                          uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint Hidden = 2560, Rank = 320, Streams = 4, Splits = 5;
+  using Run = gguf_float::Eight<bfloat>;
+  const auto l = sgmatrix::lane_map(lane);
+  const uint column = tile * 8 + l.fn;
+  const uint a_start = l.fm * Rank + (sg * 8 + l.fn) * 8;
+  const uint b_start = column * Rank + (sg * 8 + l.fm) * 8;
+  const auto a0 = Run::load(low + a_start, true);
+  const auto a1 = Run::load(low + a_start + 8, true);
+  threadgroup float2 parts[Streams * Splits * 32];
+#pragma unroll
+  for (uint stream = 0; stream < Streams; ++stream) {
+    device const bfloat *w = weights + b_start + stream * Hidden * Rank;
+    const auto b0 = Run::load(w, true), b1 = Run::load(w + Rank, true);
+    float2 acc[2] = {float2(0), float2(0)};
+#pragma unroll
+    for (uint j = 0; j < 8; ++j)
+      sgmatrix::mma_acc<float>(acc[j % 2], float2(a0[j], a1[j]), float2(b0[j], b1[j]));
+    parts[(stream * Splits + sg) * 32 + lane] = acc[0] + acc[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  float2 mixed = 0;
+  for (uint stream = 0; stream < Streams; ++stream) {
+    float2 total = 0;
+#pragma unroll
+    for (uint split = 0; split < Splits; ++split) total += parts[(stream * Splits + split) * 32 + lane];
+    const float2 rounded = float2(bfloat2(total));
+    const float2 gate(splash_sigmoid(rounded.x), splash_sigmoid(rounded.y));
+    const auto values = reinterpret_cast<device const bfloat2 *>(normalized + l.fm * Hidden * Streams + stream * Hidden + column);
+    mixed += float2(*values) * gate;
+  }
+  *reinterpret_cast<device bfloat2 *>(output + l.fm * Hidden + column) = bfloat2(mixed / float(Streams));
+}
 
 // The same projections on the neural accelerator (ops::FloatTile::NeuralAccelerator), whose matmul takes bf16 operands:
 // each F32 weight is split into three bf16 parts, its leading 8 significant bits, the next 8 and the last 8, so

@@ -97,11 +97,14 @@ template [[host_name("moe_expert_gguf_m32_g")]] kernel MoeExpertGgufKernel moe_e
 // wrongly (row 0, columns 1, 3, 5 and 7 of each 32-column tile of an F16 shared expert's up; gguf-moe, both shapes),
 // the same kernel right without validation, as was the kernel before the column tile and the kernel without its column
 // branch.
+constant uint moe_gate_routed_format [[function_constant(0)]];
+
+template <bool FixedFormat = false>
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
                                                   threadgroup bfloat *gate, device bfloat *output, ulong out) {
   float sums[MOE_GGUF_COLUMN_ROWS];
-  quant_format_switch(s.format, [&](auto f) {
+  quant_format_switch(FixedFormat ? moe_gate_routed_format : s.format, [&](auto f) {
     column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
                                                   sums);
   });
@@ -113,7 +116,7 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
       output[out + ulong(row) * N + origin + simd_lane] =
           bfloat(float(bfloat(sums[row])) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
 }
-template <ushort Rows, ushort Tables>
+template <ushort Rows, ushort Tables, bool FixedColumn = false>
 kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     device const MoeTileDescriptor *tiles [[buffer(1)]],
                                     device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
@@ -132,6 +135,19 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const bool up = simd_group == 1;
+  const uint K = p.input_size, N = p.output_size, origin = group.x * GGUF_STAGED_COLUMNS;
+  device bfloat *x = input + ulong(group.y) * Rows * K;
+  const ulong out = ulong(group.y) * Rows * N;
+  threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
+  if constexpr (FixedColumn) {
+    if (tile.expert != p.experts && moe_column_tile(tiles, group.y)) {
+      // The routed formats selected for this kernel have no pair table.
+      const auto s = moe_gguf_segment(tile.expert, p.experts, K, N, moe_gate_routed_format,
+          0, slots, up ? uw0 : gw0, up ? uw1 : gw1, up ? umeta : gmeta, gsw0, gsw1, gsmeta);
+      moe_gate_up_column<true>(x, tile.rows, K, N, s, origin, simd_lane, tl, up, gate, output, out);
+      return;
+    }
+  }
   const MoeGgufSegment gs = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.gate_routed_format,
                                              p.gate_shared_format, slots, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
   const MoeGgufSegment us = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.up_routed_format,
@@ -148,12 +164,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   if (tables) threadgroup_barrier(mem_flags::mem_threadgroup);
   const MoeGgufSegment s = up ? us : gs;
   threadgroup half2 *table = tl + (Tables == 2 && up ? kQuantPairTableEntries : 0);
-  const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(group.y) * Rows * K;
-  const ulong out = ulong(group.y) * Rows * N;
-  const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   if (moe_column_tile(tiles, group.y)) {
     moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
     return;
@@ -189,3 +200,7 @@ template [[host_name("moe_expert_gguf_m8_gate_up_mixed")]] kernel MoeExpertGgufG
     moe_expert_gguf_gate_up<8, 2>;
 template [[host_name("moe_expert_gguf_m32_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<32, 2>;
+template [[host_name("moe_expert_gguf_m8_gate_up_fixed_column")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<8, 1, true>;
+template [[host_name("moe_expert_gguf_m8_gate_up_mixed_fixed_column")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<8, 2, true>;
