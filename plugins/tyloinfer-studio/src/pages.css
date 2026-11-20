@@ -25,7 +25,6 @@
 .tylo-page-guidance { padding: 20px 0; margin: 16px 0; border-block: 1px solid var(--dsw-alias-border-l1); }
 .tylo-page-guidance strong { font-size: 15px; font-weight: 550; }
 .tylo-page-guidance button { margin-right: 8px; }
-.tylo-page-error { overflow-wrap: anywhere; }
 .tylo-page-operation code { overflow-wrap: anywhere; }
 .tylo-page-operation > section { margin: 20px 0; padding: 18px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; }
 .tylo-page-directory { list-style: none; padding: 0; }

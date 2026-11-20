@@ -5,12 +5,14 @@
 #include "decision_readout.h"
 #include "core/full_block.h"
 #include "models/qwen35/linear_attention.h"
+#include "models/qwen35/mtp.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/kv_offload.h"
 #include "runtime/qsa_ram_cache.h"
 #include "runtime/kv_expert_loan.h"
+#include "runtime/layer_weight_stream.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq_cuda_process_memory.h"
 #include "runtime/execution_options.h"
@@ -271,6 +273,37 @@ struct CudaEngineState {
             <<" available_bytes="<<context->available_memory()<<" prefix_released_bytes="<<released<<'\n';
     }
 
+    void restore_dense_prefill_weights() {
+        auto& borrowed=execution->borrowed_prefill_weights;
+        if(borrowed.empty())return;
+        if constexpr(std::is_same_v<Model,Qwen35CausalLm>)
+            qwen35_release_decode_graphs(model,components.mtp.get(),graph);
+        const auto device=execution->layer_placement.primary_device();
+        const MfqCudaGuard guard(device);
+        const auto context=mfq::cuda::default_context(device);
+        context->reclaim_idle_memory();
+        const auto floor=execution->prefill_restore_headroom;
+        std::size_t remaining=0;
+        for(const auto* weight:borrowed)remaining+=weight->nbytes();
+        reclaim_prefix_workspace(remaining+floor);
+        std::size_t restored=0;
+        for(auto it=borrowed.begin();it!=borrowed.end();) {
+            try {
+                if(const auto moved=restore_prefill_weight(**it,*context,floor)) {
+                    restored+=moved;
+                    it=borrowed.erase(it);
+                    continue;
+                }
+            } catch(const MfqResourceExhausted&) {
+                (void)cudaGetLastError();
+                context->reclaim_idle_memory();
+            }
+            ++it;
+        }
+        std::cerr<<"runtime_dense_prefill_weight_restore restored="<<restored
+            <<" ram_bytes="<<remaining-restored<<'\n';
+    }
+
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
             RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,
             std::shared_ptr<WeightMemoryLedger> weights)
@@ -336,13 +369,17 @@ struct CudaEngineState {
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
                     language, *execution, config.continuous_batch);
-            else throw std::invalid_argument("continuous batching is unavailable for this model");
             if constexpr (std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching->set_prefix_cache(cache);
         }
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if(has_routed_expert_cache(*execution))
             language.restore_decode_workspace=[this]{restore_graph_expert_space();};
+        if constexpr (std::is_same_v<Model,Qwen35CausalLm>)
+            if(!language.config.num_experts) {
+                language.restore_decode_workspace=[this]{restore_dense_prefill_weights();};
+                language.reclaim_decode_workspace=[this](std::size_t bytes){reclaim_prefix_workspace(bytes);};
+            }
         if(has_routed_expert_cache(*execution) && components.mtp)
             components.mtp->decode_workspace_changed=[this]{restore_graph_expert_space();};
         if(execution->moe_expert_cache) {
@@ -454,6 +491,13 @@ struct CudaEngineState {
         preparing_graph_depth=false;
         trace_load("decode_workspace");
         restore_graph_expert_space();
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(language.source && execution->gguf_expert_cache && !model_parallel_enabled(*execution) &&
+                    !execution->layer_placement.enabled() && !execution->dense_cpu_layer_count) {
+                trace_load("expert_profile");
+                seed_gguf_expert_cache(execution->gguf_expert_cache,*language.source);
+            }
+        }
         trace_load("ready");
     }
     bool can_batch(const EngineRequest& request) const {
@@ -471,6 +515,7 @@ struct CudaEngineState {
     ~CudaEngineState() {
         ram_pinned_reclaimer.reset();ram_budget_reserver.reset();ram_duplicate_reclaimer.reset();ram_expert_reclaimer.reset();ram_prefix_reclaimer.reset();
         language.restore_decode_workspace={};
+        language.reclaim_decode_workspace={};
         if(components.mtp)components.mtp->decode_workspace_changed={};
         try {release_graph_expert_space();}
         catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
@@ -479,6 +524,13 @@ struct CudaEngineState {
         if (execution->qsa_kv_store) execution->qsa_kv_store->set_ram_reservation({});
     }
     SessionResult session(const SessionCommand& command) {
+        if(command.kind==SessionCommand::Kind::trim && cuda_has_separate_memory())
+            return {cache.trim_ram(command.bytes),{}};
+        if(command.kind==SessionCommand::Kind::budget && cuda_has_separate_memory()) {
+            auto budget=command;
+            budget.bytes=0;
+            return control_session(cache,budget);
+        }
         if(command.kind!=SessionCommand::Kind::memory_budget)return control_session(cache,command);
         if(!online_budget_supported())throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");
         const auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
@@ -715,6 +767,9 @@ struct CudaEngineState {
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
             auto experts = routed_expert_memory_metrics(*execution);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
+            if(!has_routed_expert_cache(*execution))
+                metrics.insert(metrics.end(),{{"ram_expert_enabled",0.0},{"ram_expert_payload_bytes",0.0},
+                    {"ssd_expert_enabled",0.0},{"ssd_expert_payload_bytes",0.0}});
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
                 auto phases=qwen4_decode_graph_profile_metrics(language,components.mtp.get());
                 metrics.insert(metrics.end(),phases.begin(),phases.end());
@@ -737,8 +792,12 @@ struct CudaEngineState {
             const auto embedding=weight_memory->embedding_bytes();
             const bool jev=bool(decision_model);
             auto streamed_weights=(language.layer_weights?language.layer_weights->host_bytes():0)+(jev?embedding:0);
+            std::size_t loaned_weights=0;
+            for(const auto* weight:execution->borrowed_prefill_weights)loaned_weights+=weight->nbytes();
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
-                streamed_weights+=qwen4_borrowed_dense_weight_bytes(language);
+                loaned_weights+=qwen4_borrowed_dense_weight_bytes(language);
+            streamed_weights+=loaned_weights;
+            resident_weights-=std::min(resident_weights,loaned_weights);
             metrics.insert(metrics.end(),{{"ram_embedding_bytes",double(jev?0:embedding)},
                 {"ram_weight_bytes",double(streamed_weights)},
                 {"jev_weights_streamed",language.layer_weights?1.0:0.0}});
@@ -756,23 +815,32 @@ struct CudaEngineState {
                     }
                 metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
             }
-            if(jev) {
+            const auto paged_kv_bytes=std::is_same_v<Model,Qwen35CausalLm> ? [&] {
+                for(const auto& [key,value]:batch_metrics)
+                    if(key=="paged_kv_reserved_bytes")return std::size_t(value);
+                return std::size_t(0);
+            }() : std::size_t(0);
+            const bool gqa_metrics=std::is_same_v<Model,Qwen35CausalLm> || jev;
+            if(gqa_metrics && !std::is_same_v<Model,Qwen4CausalLm>) {
                 std::map<std::pair<int,const void*>,std::size_t> allocations;
                 const auto add=[&](const mfq_tensor_backend::Tensor& tensor) {
                     if(!tensor.defined() || !tensor.is_cuda())return;
                     const auto storage=std::static_pointer_cast<mfq::cuda::TensorStorage>(tensor.weak_storage_owner().lock());
                     if(storage)allocations[{tensor.get_device(),storage->base}]=storage->bytes;
                 };
-                for(const auto& block:language.blocks) {
+                const auto add_block=[&](const auto& block) {
                     if(const auto* full=dynamic_cast<const FullBlock*>(block.get()))
                         for(const auto* tensor:{&full->cache.k,&full->cache.v,&full->cache.k_chunk_ptrs,
                             &full->cache.v_chunk_ptrs,&full->cache.page_table})add(*tensor);
-                    if(const auto* linear=dynamic_cast<const qwen35::LinearAttentionBlock*>(block.get()))
+                    if(const auto* linear=dynamic_cast<const qwen35::LinearAttentionBlock*>(block.get());jev && linear)
                         for(const auto* tensor:{&linear->mixer.convolution,&linear->mixer.recurrent,
                             &linear->mixer.speculative_convolution,&linear->mixer.speculative_recurrent})add(*tensor);
-                }
+                };
+                for(const auto& block:language.blocks)add_block(block);
+                if(const auto* predictor=dynamic_cast<const Qwen35Mtp*>(components.mtp.get()))
+                    for(const auto& block:predictor->blocks)add_block(block);
                 std::map<int,std::size_t> devices;
-                std::size_t bytes=0;
+                std::size_t bytes=paged_kv_bytes;
                 for(const auto& [address,size]:allocations){bytes+=size;devices[address.first]+=size;}
                 metrics.emplace_back("kv_cache_bytes",double(bytes));
                 metrics.emplace_back("kv_cache_contexts",language.cache_pos>0?1.0:0.0);
@@ -799,9 +867,13 @@ struct CudaEngineState {
                 const auto resident=std::max(memory.reserved_bytes,memory.allocated_bytes)+external;
                 const auto stem="gpu_"+std::to_string(device)+"_";
                 auto weights=weight_memory->resident_bytes(device);
-                if(device==primary)weights+=metric_bytes("resident_expert_cache_bytes");
+                if(device==primary) {
+                    weights+=metric_bytes("resident_expert_cache_bytes");
+                    weights-=std::min(weights,loaned_weights);
+                }
                 const auto hot=prefix_bytes[device];
                 auto live=metric_bytes(stem+"live_kv_bytes");
+                if(device==primary && devices.size()==1)live+=paged_kv_bytes;
                 if(device==primary)for(const auto& [name,value]:batch_metrics)
                     if(name=="continuous_batching_request_kv_bytes")live+=std::size_t(value);
                 metrics.insert(metrics.end(),{{stem+"resident_bytes",double(resident)},
@@ -817,7 +889,7 @@ struct CudaEngineState {
                         {stem+"process_memory_reservation_bytes",double(process->reservation)},
                         {stem+"process_shared_memory_budget_bytes",double(process->shared_budget)},
                         {stem+"process_shared_memory_usage_bytes",double(process->shared_usage)}});
-                if(std::is_same_v<Model,Qwen4CausalLm> || jev) {
+                if(std::is_same_v<Model,Qwen4CausalLm> || (gqa_metrics && (!paged_kv_bytes || devices.size()==1))) {
                     const auto categorized=weights+live+hot;
                     const auto buffer=resident>categorized?resident-categorized:0;
                     metrics.emplace_back(stem+"resident_buffer_bytes",double(buffer));
@@ -828,7 +900,8 @@ struct CudaEngineState {
             }
             metrics.insert(metrics.end(),{{"device_free_bytes",double(free_bytes)}, {"device_total_bytes",double(total_bytes)},
                 {"cuda_allocated_bytes",double(allocated)}, {"cuda_reserved_bytes",double(reserved)}});
-            if(std::is_same_v<Model,Qwen4CausalLm> || jev)metrics.emplace_back("resident_buffer_bytes",double(buffers));
+            if(std::is_same_v<Model,Qwen4CausalLm> || (gqa_metrics && (!paged_kv_bytes || devices.size()==1)))
+                metrics.emplace_back("resident_buffer_bytes",double(buffers));
             const auto expert_bytes=metric_bytes("resident_expert_cache_bytes");
             const auto minimum=moe_expert_cache_minimum_bytes(execution->moe_expert_cache);
             metrics.insert(metrics.end(),{{"resident_memory_dynamic_budget",online_budget_supported()?1.0:0.0},
@@ -906,6 +979,8 @@ struct CudaBackend {
         const WeightMemoryLoadScope memory_load(*weight_memory);
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
+        // Discrete workers retain paged prefixes in host memory and on disk.
+        if(cuda_has_separate_memory())config.prefix_cache.hot_bytes=0;
         const auto kv_options = runtime_options::qsa_kv_offload();
         execution->kv_memory=std::make_shared<KvMemoryManager>();
         if (kv_options.gpu_budget_bytes) {
@@ -927,7 +1002,7 @@ struct CudaBackend {
             });
         return visit([&](auto& state) {
             EngineInfo info;
-            info.max_requests = std::max<std::size_t>(1, config.continuous_batch.max_sequences);
+            info.max_requests = state.batching ? config.continuous_batch.max_sequences : 1;
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();

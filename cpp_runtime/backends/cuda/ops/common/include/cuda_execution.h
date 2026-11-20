@@ -303,6 +303,9 @@ struct CudaExecutionContext {
     bool force_moe_materialized_swiglu = false;
     bool force_moe_prefill_mma_off = false;
     KlMmqState kl_mmq;
+    int64_t full_attention_request_capacity = 0;
+    std::vector<mfq_tensor_backend::Tensor*> borrowed_prefill_weights;
+    std::size_t prefill_restore_headroom = 0;
     std::unordered_set<int> dsv4_cpu_offload_layers;
     int64_t dsv4_cpu_offload_host_bytes = 0;
     std::optional<bool> jev_full_vram;

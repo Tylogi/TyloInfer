@@ -43,7 +43,7 @@ test('never retries archival or global directory writes after unknown outcomes',
   }
 });
 
-test('passes registered companion identities outside the native request without accepting client paths', async () => {
+test('passes registered companion identities outside the native request and rejects relative paths', async () => {
   const calls = [], controller = new AbortController();
   const api = createModelApi({ rpc: { call: async (...args) => { calls.push(args); return ok({ status: 'accepted', operation_id: id }); } } });
   await api.load({ model: main, pin: false }, controller.signal, [companion]);
@@ -51,6 +51,21 @@ test('passes registered companion identities outside the native request without 
   for (const ids of [['arbitrary/path'], [companion, companion], Array.from({ length: 17 }, (_, index) => index.toString(16).padStart(32, '0'))]) await assert.rejects(api.load({ model: main }, undefined, ids), error => error.code === 'tyloinfer/bad-request');
   await assert.rejects(api.load({ model: main, gguf_companions: ['arbitrary/path'] }), error => error.code === 'tyloinfer/bad-request');
   assert.equal(calls.length, 1);
+});
+test('loads a model with an explicitly supplied absolute companion path', async () => {
+  const writes = [];
+  const model = { id: main, name: 'Main', format: 'gguf', complete: true, loadable: true, gguf_companion_required: true };
+  const connection = { rpc: { call: async (_channel, method, payload) => {
+    if (method === 'core/read') return ok({ data: payload.resource === 'models' ? [model] : [] });
+    writes.push({ method, payload }); return ok({ status: 'accepted', operation_id: id });
+  } } };
+  const manager = createModelManager(connection);
+  try {
+    const path = '/models/engram.gguf';
+    await manager.refresh();
+    assert.equal(await manager.load({ model: main }, [path]), true);
+    assert.deepEqual(writes, [{ method: 'models/load', payload: { request: { model: main }, companion_paths: [path] } }]);
+  } finally { manager.dispose(); }
 });
 
 test('offers only complete registered GGUF artifacts and rejects removed or incompatible identities', () => {

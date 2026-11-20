@@ -95,6 +95,10 @@ bool kv_vram_preallocated() {
     const auto* value = std::getenv("TYLOINFER_KV_VRAM_PREALLOCATED");
     return value && value[0] == '1';
 }
+bool kv_vram_request_sized() {
+    const auto* value = std::getenv("TYLOINFER_KV_VRAM_PREALLOCATED");
+    return value && value[0] == '0';
+}
 bool vision_resident() {
     const auto* value = std::getenv("TYLOINFER_CUDA_VISION_RESIDENT");
     return value && value[0] == '1';
@@ -745,7 +749,10 @@ void CudaProfiler::report(const std::string& title) {
                 if(event.name=="gguf.moe"){++layer;group=-1;}
             }
         }
-        for(const auto& event:pending)if(event.name.starts_with("prefill.")) {
+        for(const auto& event:pending)if(event.name.starts_with("prefill.") ||
+                event.name=="gguf.pp.route_readback" || event.name=="gguf.pp.residency" ||
+                event.name=="gguf.pp.host_stage" || event.name=="gguf.pp.metadata" ||
+                event.name=="gguf.pp.pipeline" || event.name=="gguf.pp.reduce") {
             float begin=0,end=0;
             TYLOINFER_CUDA_CHECK(cudaEventElapsedTime(&begin,pending.front().start,event.start));
             TYLOINFER_CUDA_CHECK(cudaEventElapsedTime(&end,pending.front().start,event.stop));

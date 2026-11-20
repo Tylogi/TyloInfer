@@ -90,6 +90,8 @@ mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
 mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor mfq_attention_mma256_prefix_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor mfq_attention_mma128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda(
     mfq_tensor_backend::Tensor q);

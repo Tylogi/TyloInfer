@@ -4,8 +4,8 @@ import { DownloadQueueView } from '../../../TyloInferStudio/src/features/models/
 import { useDownloadReuseView } from '../../../TyloInferStudio/src/features/models/useDownloadReuseView.ts';
 import { parseHubReference } from '../../../TyloInferStudio/src/features/models/hubReference.ts';
 import { Icon } from '../../../TyloInferStudio/src/app/display.tsx';
-import { bytes, CoreError, rows } from './page-kit.jsx';
-import { Dialog } from './shared-primitives.jsx';
+import { bytes, CoreError, Facts, rows } from './page-kit.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
 import { DownloadDirectory } from './download-directory.jsx';
 
 export function DownloadsContent({ values, api, mutation, tr, refreshKey }) {
@@ -89,11 +89,15 @@ export function DownloadsContent({ values, api, mutation, tr, refreshKey }) {
     <ModelBrowserView jobKinds={localReadFailed ? [] : kinds} onError={setError} onJobCreated={() => setTab('downloads')} tab={tab} onTabChange={setTab} downloadQueue={queue}
       downloadDirectory={directory} downloadDirectoryControl={<DownloadDirectory entry={values.download_directory} api={api} mutation={downloadMutation} tr={tr} refreshKey={refreshKey} />}
       tr={tr} services={services} initialLocalStateReady={['download_directory', 'jobs', 'job_kinds'].every(resource => Boolean(values[resource]))} autoLoadCatalog={false} autoSearch={false} allowSourceProbe allowRemoteImages={false} manualMetadataActions actionRevision={refreshKey} />
-    <Dialog open={Boolean(confirmation)} onOpenChange={open => { if (!open) cancel(); }} title={confirmation?.type === 'delete' ? tr('移除下载记录', 'Remove download record') : confirmation?.type === 'retry' ? tr('重试下载', 'Retry download') : tr('确认下载', 'Confirm download')} closeLabel={tr('关闭', 'Close')}>
-      <div className="tylo-model-confirm"><strong>{confirmation?.request.repo_id}</strong><p>{confirmation?.request.download_directory}</p><p>{bytes(confirmation?.request.expected_bytes)}</p><p>{confirmation?.type === 'delete' ? tr('仅移除已结束的下载任务记录，保留下载文件，不释放磁盘空间。', 'Remove only this finished download record. Downloaded files are kept; no disk space is reclaimed.') : tr('下载所选权重和配套文件，不会自动加载模型。', 'Download the selected weights and support files without loading the model.')}</p><ul>{confirmation?.request.include?.map(pattern => <li key={pattern}><code>{pattern}</code></li>)}</ul>
-        <div className="tylo-model-confirm-actions"><button type="button" onClick={cancel}>{tr('取消', 'Cancel')}</button><button type="button" className="primary" disabled={downloadMutation.busy || mutation.unknown} onClick={() => void submit()}>{confirmation?.type === 'delete' ? tr('移除记录', 'Remove record') : confirmation?.type === 'retry' ? tr('重试下载', 'Retry download') : tr('确认下载', 'Confirm download')}</button></div>
-      </div>
-    </Dialog>
+    <ConfirmationDialog open={Boolean(confirmation)} tr={tr}
+      title={confirmation?.type === 'delete' ? tr('移除下载记录', 'Remove download record') : confirmation?.type === 'retry' ? tr('重试下载', 'Retry download') : tr('确认下载', 'Confirm download')}
+      description={confirmation?.type === 'delete' ? tr('移除已结束的任务记录，已下载的文件会保留。', 'Remove this finished job record. Downloaded files are kept.') : tr('下载所选权重和配套文件，完成后可在模型页加载。', 'Download the selected weights and companion files. Load the model from the Models page when ready.')}
+      confirmLabel={confirmation?.type === 'delete' ? tr('移除记录', 'Remove record') : confirmation?.type === 'retry' ? tr('重试下载', 'Retry download') : tr('开始下载', 'Start download')}
+      onCancel={cancel} onConfirm={submit} disabled={downloadMutation.busy || mutation.unknown} danger={confirmation?.type === 'delete'}>
+      <Facts entries={[[tr('仓库', 'Repository'), confirmation?.request.repo_id],
+        ...(confirmation?.type === 'delete' ? [] : [[tr('下载目录', 'Download folder'), confirmation?.request.download_directory], [tr('预计大小', 'Estimated size'), bytes(confirmation?.request.expected_bytes)]])]} />
+      {confirmation?.type !== 'delete' && confirmation?.request.include?.length > 0 && <ul aria-label={tr('下载文件', 'Files to download')}>{confirmation.request.include.map(pattern => <li key={pattern}><code>{pattern}</code></li>)}</ul>}
+    </ConfirmationDialog>
     <button className="download-circle" type="button" aria-label={tr('转到下载队列', 'Go to download queue')} onClick={() => setTab('downloads')}><svg className="download-circle-ring" viewBox="0 0 56 56" aria-hidden="true"><circle cx="28" cy="28" r="24" /></svg><Icon name="download" size={22} />{jobs?.some(job => ['queued', 'running', 'cancelling'].includes(job.status)) && <span className="download-circle-count">{jobs.filter(job => ['queued', 'running', 'cancelling'].includes(job.status)).length}</span>}</button>
   </div>;
 }

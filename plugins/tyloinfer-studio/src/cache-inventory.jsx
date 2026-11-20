@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { PrefixCacheInventoryView, defaultCacheFilters } from '../../../TyloInferStudio/src/features/runtime/PrefixCacheInventoryView.tsx';
-import { Dialog } from './shared-primitives.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
 import { bytes, CoreError, number } from './page-kit.jsx';
 
 export function CacheInventory({ entry, api, mutation, tr, refreshKey, refresh }) {
@@ -65,11 +65,14 @@ export function CacheInventory({ entry, api, mutation, tr, refreshKey, refresh }
     <PrefixCacheInventoryView inventory={inventory} detail={detail} selected={selected} text={text} textBlock={textBlock}
       error={entry?.error?.message || ''} busy={mutation.busy || mutation.unknown} reading={reading} filters={filters}
       refresh={refresh} inspect={inspect} read={read} clear={clear} updateFilters={next => { request.current?.abort(); setFilters(next); setOffset(0); setTextConsent(false); }} onClose={close} />
-    <Dialog open={Boolean(confirmation)} onOpenChange={open => { if (!open) setConfirmation(null); }} title={confirmation?.kind === 'text' ? tr('查看缓存文本', 'View cached text') : tr('清理前缀缓存', 'Clear prefix caches')} closeLabel={tr('关闭', 'Close')}>
-      <div className="tylo-model-confirm">
-        {confirmation?.kind === 'text' ? <p>{tr('缓存文本可能包含对话内容。仅在本页读取所选缓存块，不会自动导出或上传。', 'Cached text may contain conversation content. Read only the selected block here; nothing is exported or uploaded automatically.')}</p> : <><strong>{confirmation?.name}</strong><p>{number(confirmation?.blocks)} {tr('个块', 'blocks')} · {bytes(confirmation?.bytes)}</p><p>{tr('永久删除所选持久前缀块及其文本侧文件，后续请求可能需要重新计算。不会删除模型文件或聊天记录。', 'Permanently delete the selected persistent prefix blocks and token sidecars. Later requests may need recomputation. Model files and chat history are kept.')}</p>{confirmation?.target.scope === 'all' && <p>{tr('全部范围还会清理各就绪实例的运行时缓存。', 'The all-caches scope also clears runtime caches of ready instances.')}</p>}</>}
-        <div className="tylo-model-confirm-actions"><button type="button" onClick={() => setConfirmation(null)}>{tr('取消', 'Cancel')}</button><button type="button" className={confirmation?.kind === 'text' ? 'primary' : 'danger'} disabled={mutation.busy || mutation.unknown} onClick={() => void confirm()}>{confirmation?.kind === 'text' ? tr('查看文本', 'View text') : tr('确认清理', 'Confirm clearing')}</button></div>
-      </div>
-    </Dialog>
+    <ConfirmationDialog open={Boolean(confirmation)} tr={tr}
+      title={confirmation?.kind === 'text' ? tr('查看缓存文本', 'View cached text') : tr('清理前缀缓存', 'Clear prefix caches')}
+      description={confirmation?.kind === 'text' ? tr('缓存文本可能包含对话内容。仅在本页显示所选缓存块。', 'Cached text may contain conversation content. This opens the selected block on this page.') : tr('永久删除所选的持久前缀块及文本。后续请求可能需要重算。', 'Permanently delete the selected prefix blocks and their cached text. Later requests may need to recompute them.')}
+      confirmLabel={confirmation?.kind === 'text' ? tr('查看文本', 'View text') : tr('清理缓存', 'Clear caches')}
+      onCancel={() => setConfirmation(null)} onConfirm={confirm} disabled={mutation.busy || mutation.unknown} danger={confirmation?.kind === 'purge'}>
+      {confirmation?.kind === 'purge' && <><div className="tylo-action-summary">
+        <strong>{confirmation.name}</strong><span>{number(confirmation.blocks)} {tr('个块', 'blocks')} · {bytes(confirmation.bytes)}</span>
+      </div>{confirmation.target.scope === 'all' && <p>{tr('同时清理各就绪实例的运行时缓存。', 'This also clears runtime caches of ready instances.')}</p>}</>}
+    </ConfirmationDialog>
   </>;
 }

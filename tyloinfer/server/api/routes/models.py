@@ -28,6 +28,7 @@ from tyloinfer.server.protocol.models import (
     ModelDeletionPlan,
     ModelDirectoryList,
     ModelLoadRequest,
+    ModelLoadPlan,
     ModelUnloadRequest,
     OfficialModelList,
     OpenModelDirectoryRequest,
@@ -236,8 +237,9 @@ async def open_model_directory(service: ServiceDependency, body: OpenModelDirect
 async def register_model_directory(
     service: ServiceDependency,
     body: RegisterModelDirectoryRequest,
+    allow_empty: bool = False,
 ) -> ModelArtifactList:
-    return await service.register_model_directory(body)
+    return await service.register_model_directory(body, allow_empty=allow_empty)
 
 
 @router.get(
@@ -270,6 +272,21 @@ async def delete_model_artifact(service: ServiceDependency, model_id: str, body:
 async def model_cache_profile(service: ServiceDependency, model_id: str,
     include_recurrent: bool = False) -> ModelCacheProfile | None:
     return await service.model_cache_profile(model_id, include_recurrent=include_recurrent)
+
+
+@router.get("/api/v1/models/{model_id}/load-plan", response_model=ModelLoadPlan,
+            responses=ERROR_RESPONSES, tags=["models"])
+async def model_load_plan(service: ServiceDependency, model_id: str,
+    reserve: Annotated[int, Query(ge=5, le=20)] = 10,
+    context_size: Annotated[int | None, Query(ge=512, le=2147483647)] = None,
+    precision: float | None = None, preallocate: bool = True,
+    device: Annotated[str | None, Query(max_length=64, pattern=r"^[A-Za-z0-9_-]+$")] = None,
+    streamed_jev: bool = True) -> ModelLoadPlan:
+    if reserve not in (5, 10, 20):
+        raise ServiceError(422, "invalid_memory_reserve", "Memory reserve must be 5, 10 or 20 percent")
+    return await service.model_load_plan(model_id, requested=context_size, reserve=reserve,
+        precision=precision, preallocate=preallocate, device_ids=[device] if device else [],
+        streamed_jev=streamed_jev)
 
 
 @router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,

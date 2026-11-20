@@ -108,6 +108,10 @@ export function resolveModelAction(endpoint, payload) {
   if (endpoint === 'context/configure') {
     if (!fields(payload, ['request', 'confirmed'], ['request', 'confirmed']) || payload.confirmed !== true) return null;
     const request = payload.request;
+    if (fields(request, ['apply_global_cap'], ['apply_global_cap']) && request.apply_global_cap === true) {
+      return { kind: 'write', path: '/api/v1/runtime/context', body: serialize(request), method: 'POST',
+        format: 'job', jobKinds: contextKinds, maintenance: true };
+    }
     if (!fields(request, ['instance_id', 'context_size', 'yarn_enabled', 'qsa_kv_offload', 'kv_quantization', 'kv_memory'], ['instance_id', 'context_size'])
       || !uuid(request.instance_id) || !nullable(value => integer(value, 512, 2147483647))(request.context_size)
       || !optional(request, 'yarn_enabled', nullable(value => typeof value === 'boolean'))

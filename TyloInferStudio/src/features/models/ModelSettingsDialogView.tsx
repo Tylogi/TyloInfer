@@ -53,7 +53,7 @@ export function ModelSettingsDialogView({ catalog, refreshRuntime, connectionSco
   }
 
   return <Dialog open title={name} closeLabel={tr('关闭模型设置', 'Close model settings')}
-    className="model-settings-dialog" returnFocusRef={catalog.modelSettingsTriggerRef}
+    className={loaded || wasLoaded.current ? 'model-settings-dialog' : 'model-settings-dialog model-load-dialog'} returnFocusRef={catalog.modelSettingsTriggerRef}
     onOpenChange={open => { if (!open) catalog.setSettingsModel(null); }}>
     <div className="configuration-tabs" role="tablist" aria-label={tr('模型设置分类', 'Model settings sections')}>
       {[
@@ -80,7 +80,6 @@ export function ModelSettingsDialogView({ catalog, refreshRuntime, connectionSco
           <p className="configuration-effect">{tr('保存到服务端；应用上下文或 KV 更改会重载此模型并清除活动 KV。', 'Saved on the server. Applying context or KV changes reloads this model and clears its active KV cache.')}</p>
           {renderContext(name)}
         </> : artifact ? <>
-          <p className="configuration-effect">{tr('下次加载此模型时生效；不影响其它模型。YaRN 和流式注意力可在加载后配置。', 'Applies on this model’s next load only. YaRN and streaming attention can be configured once loaded.')}</p>
           {renderLoadContext()}
         </> : <p role="status">{tr('模型已不在本地目录中。', 'This model is no longer in the local catalog.')}</p>}
       </section>

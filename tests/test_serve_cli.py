@@ -660,6 +660,21 @@ def test_serve_starts_without_loading_an_initial_model(
     assert (data_dir / "models").is_dir()
 
 
+@pytest.mark.parametrize(("override", "capacity"), [([], 8), (["--max-requests-per-runtime", "1"], 1)])
+def test_cuda_service_concurrency_default_and_override(tmp_path: Path, monkeypatch, override, capacity) -> None:
+    executable = tmp_path / "mfq-runtime"
+    executable.touch()
+    monkeypatch.setattr("tyloinfer.commands.serve._resolve_runtime_executable", lambda *_: executable)
+
+    def run(server):
+        assert server.config.app.state.service.runtime_manager.max_requests_per_instance == capacity
+
+    monkeypatch.setattr("tyloinfer.server.api.listener.RuntimeServer.run", run)
+    args = _build_parser().parse_args(["serve", "--backend", "cuda", "--no-web-ui",
+        "--data-dir", str(tmp_path / "data"), "--work-dir", str(tmp_path / "work"), *override])
+    assert _run(args) == 0
+
+
 def test_app_lifecycle_is_opt_in_and_has_bounded_request_shutdown(tmp_path: Path, monkeypatch) -> None:
     import io
     executable = tmp_path / "mfq-decode-metal"

@@ -8,6 +8,15 @@ const repo = value => text(value, 3, 255) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$
   && value.split('/').every(part => !['.', '..'].includes(part));
 const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const directoryId = value => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+const nodeUrl = value => {
+  if (!text(value, 1, 2048) || !/^https?:\/\/[^/\s]+/.test(value) || /\s/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+};
+const remoteNode = value => object(value) && uuid(value.id) && text(value.name, 1, 64) && nodeUrl(value.url)
+  && typeof value.healthy === 'boolean' && Array.isArray(value.models) && integer(value.active_requests, 0) && object(value.metrics);
 const downloadKinds = new Set(['download.huggingface', 'download.modelscope']);
 const serviceKinds = new Set(['runtime.memory.configure']);
 const body = value => {
@@ -34,6 +43,34 @@ const service = Object.freeze({
 
 /** Resolve explicit page actions into fixed routes without exposing arbitrary jobs or methods. */
 export function resolvePageAction(endpoint, payload) {
+  if (endpoint === 'service/configure-listener') {
+    if (!fields(payload, ['port', 'protocol'], ['port', 'protocol']) || !integer(payload.port, 1, 65535)
+      || !['openai', 'anthropic'].includes(payload.protocol)) return null;
+    return { kind: 'write', path: '/api/v1/runtime/listener', method: 'PUT', body: body(payload), format: 'value', maintenance: true,
+      listenerChange: payload, validResult: value => object(value) && value[payload.protocol === 'openai' ? 'port' : 'anthropic_port'] === payload.port };
+  }
+  if (endpoint === 'service/configure-authentication') {
+    if (!fields(payload, ['enabled', 'api_key'], ['enabled']) || typeof payload.enabled !== 'boolean'
+      || (Object.hasOwn(payload, 'api_key') && (!payload.enabled || typeof payload.api_key !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(payload.api_key)))) return null;
+    return { kind: 'write', path: '/api/v1/auth/policy', method: 'PUT', body: body(payload), format: 'value', maintenance: true,
+      authChange: payload, validResult: value => object(value) && value.enabled === payload.enabled && typeof value.has_key === 'boolean' };
+  }
+  if (endpoint === 'service/remote-nodes') {
+    if (!fields(payload, ['refresh'], ['refresh']) || typeof payload.refresh !== 'boolean') return null;
+    return { kind: 'read', path: '/api/v1/cluster/nodes', query: query(payload), maintenance: payload.refresh,
+      validResult: value => object(value) && Array.isArray(value.data) && value.data.every(remoteNode) };
+  }
+  if (endpoint === 'service/add-remote-node') {
+    if (!fields(payload, ['name', 'url', 'api_key_env', 'enabled'], ['name', 'url', 'enabled'])
+      || !text(payload.name, 1, 64) || !/^[A-Za-z_][\w.-]*$/.test(payload.name) || !nodeUrl(payload.url) || typeof payload.enabled !== 'boolean'
+      || (payload.api_key_env != null && (!text(payload.api_key_env, 1, 255) || !/^[A-Za-z_]\w*$/.test(payload.api_key_env)))) return null;
+    return { kind: 'write', path: '/api/v1/cluster/nodes', method: 'POST', body: body(payload),
+      format: 'value', status: 201, validResult: remoteNode, maintenance: true };
+  }
+  if (endpoint === 'service/delete-remote-node') {
+    if (!fields(payload, ['id'], ['id']) || !uuid(payload.id)) return null;
+    return { kind: 'write', path: '/api/v1/cluster/nodes/' + payload.id, method: 'DELETE', format: 'empty' };
+  }
   if (endpoint === 'hub/search') {
     if (!fields(payload, ['provider', 'query', 'formats', 'sort', 'direction', 'cursor', 'limit'], ['provider', 'query'])
       || !provider(payload.provider) || !text(payload.query, 0, 255)
@@ -64,10 +101,23 @@ export function resolvePageAction(endpoint, payload) {
     if (!fields(payload, ['refresh']) || (Object.hasOwn(payload, 'refresh') && typeof payload.refresh !== 'boolean')) return null;
     return { kind: 'read', path: '/api/v1/hub/official', query: query(payload) };
   }
-  if (endpoint === 'models/register') {
+  if (endpoint === 'models/browse-directory') {
+    if (!fields(payload, ['path'], ['path']) || !text(payload.path, 1, 4096)
+      || !/^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(payload.path)) return null;
+    return { kind: 'read', path: '/api/v1/models/directories', query: query(payload),
+      validResult: value => object(value) && directoryId(value.current_id) && Array.isArray(value.data) };
+  }
+  if (endpoint === 'models/open-directory') {
     if (!fields(payload, ['directory_id'], ['directory_id']) || !directoryId(payload.directory_id)) return null;
-    return { kind: 'write', path: '/api/v1/models/directories/register', body: body(payload), method: 'POST', format: 'value',
-      validResult: value => object(value) && Array.isArray(value.data) };
+    return { kind: 'write', path: '/api/v1/models/directories/open', method: 'POST', body: body(payload),
+      format: 'value', validResult: value => object(value) && value.opened === true };
+  }
+  if (endpoint === 'models/register') {
+    if (!fields(payload, ['directory_id', 'file_name'], ['directory_id']) || !directoryId(payload.directory_id)) return null;
+    if (Object.hasOwn(payload, 'file_name') && (!text(payload.file_name, 1, 512)
+      || /[\\/:]/.test(payload.file_name) || ['.', '..'].includes(payload.file_name))) return null;
+    return { kind: 'write', path: '/api/v1/models/directories/register', query: 'allow_empty=true', body: body(payload), method: 'POST', format: 'value',
+      maintenance: true, validResult: value => object(value) && Array.isArray(value.data) };
   }
   if (endpoint === 'downloads/create') {
     if (!fields(payload, ['provider', 'request'], ['provider', 'request']) || !provider(payload.provider)) return null;

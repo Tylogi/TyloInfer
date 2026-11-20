@@ -2,24 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { defaultLoadOptions, nativeLoadRequest, normalizeLoadOptions, loadModelDrafts, saveModelDrafts } from '../src/model-load-options.js';
 
-test('leaves core defaults alone until the user changes next-load options', () => {
-  assert.deepEqual(nativeLoadRequest({ id: 'a'.repeat(32) }, defaultLoadOptions()), { model: 'a'.repeat(32), pin: false });
+test('asks the core to choose context and precision using the default reserve', () => {
+  assert.deepEqual(nativeLoadRequest({ id: 'a'.repeat(32) }, defaultLoadOptions()), {
+    model: 'a'.repeat(32), pin: false, context_management: { reserve_percent: 10, precision: null, vram_preallocated: true },
+  });
 });
-test('uses original context, KV, device and residency fields without a second load path', () => {
+test('passes explicit context, reserve, KV, device and residency fields', () => {
   const options = defaultLoadOptions();
-  options.contextChanged = true;
   options.context.context_size = 65536;
-  options.context.automatic = false;
-  options.context.ssd_kv = true;
-  options.context.kv_quantization = { algorithm: 'turboquant', enabled: true, bits: 4 };
-  options.devices = ['0']; options.ttl = 900; options.chunk = '2048';
+  options.context.reserve_percent = 20;
+  options.context.precision = 4;
+  options.context.vram_preallocated = false;
+  options.devices = ['0']; options.ttl = 900;
   const request = nativeLoadRequest({ id: 'a'.repeat(32) }, options);
   assert.equal(request.context_size, 65536);
-  assert.equal(request.context_management.ssd_kv, true);
-  assert.equal(request.context_management.kv_quantization.bits, 4);
+  assert.deepEqual(request.context_management, { reserve_percent: 20, precision: 4, vram_preallocated: false });
   assert.deepEqual(request.device_ids, ['0']);
   assert.equal(request.idle_ttl_seconds, 900);
-  assert.equal(request.prefill_chunk_size, 2048);
   assert.ok(!('jev_weights' in request));
   options.pin = true;
   assert.ok(!('idle_ttl_seconds' in nativeLoadRequest({ id: 'a'.repeat(32) }, options)));

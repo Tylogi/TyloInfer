@@ -380,7 +380,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
         max_instances=args.max_runtime_instances,
-        max_requests_per_instance=args.max_requests_per_runtime or (8 if selected_backend == "metal" else 1),
+        max_requests_per_instance=args.max_requests_per_runtime or (8 if selected_backend in {"cuda", "metal"} else 1),
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
         max_runtime_memory_bytes=args.max_runtime_memory or None,
         automatic_memory_budget=(

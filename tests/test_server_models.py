@@ -426,6 +426,7 @@ def _fake_stdio_runtime(path: Path) -> None:
             #!/usr/bin/env python3
             import argparse
             import json
+            import os
             import sys
 
             parser = argparse.ArgumentParser()
@@ -460,7 +461,8 @@ def _fake_stdio_runtime(path: Path) -> None:
                         'max_context': args.ctx_size,
                     }
                 elif op == 'status':
-                    data = {'status': 'ok', 'model': args.model_name}
+                    data = {'status': 'ok', 'model': args.model_name, 'kv_quantization_supported': 1,
+                            'kv_quantization_bits': float(os.getenv('TYLOINFER_KV_TURBOQUANT_BITS', '0'))}
                 elif op == 'models':
                     data = {'models': [{'name': args.model_name, 'type': 'qwen35'}]}
                 else:
@@ -490,6 +492,7 @@ def _fake_runtime(path: Path) -> None:
             #!/usr/bin/env python3
             import argparse
             import json
+            import os
             from http.server import BaseHTTPRequestHandler, HTTPServer
 
             parser = argparse.ArgumentParser()
@@ -520,7 +523,8 @@ def _fake_runtime(path: Path) -> None:
                             'max_context': args.ctx_size,
                         }
                     elif self.path == '/runtime/status':
-                        payload = {'status': 'ok', 'model': args.model_name}
+                        payload = {'status': 'ok', 'model': args.model_name, 'kv_quantization_supported': 1,
+                                   'kv_quantization_bits': float(os.getenv('TYLOINFER_KV_TURBOQUANT_BITS', '0'))}
                     elif self.path == '/runtime/models':
                         payload = {'models': [{'name': args.model_name, 'type': 'qwen35'}]}
                     else:
@@ -1052,6 +1056,29 @@ def test_catalog_expands_registered_external_shard_set(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_directory_locations_separate_shortcuts_and_roots(tmp_path: Path, monkeypatch) -> None:
+    first_drive, second_drive = tmp_path / "drive-one", tmp_path / "drive-two"
+    first_drive.mkdir()
+    second_drive.mkdir()
+    models = first_drive / "models"
+    models.mkdir()
+    monkeypatch.setattr(ModelCatalog, "_system_browse_roots", staticmethod(lambda: [first_drive, second_drive]))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: models))
+    catalog = ModelCatalog([models])
+
+    locations = asyncio.run(catalog.browse_directories())
+    assert locations.current_id is None
+    assert [entry.name for entry in locations.shortcuts] == ["models"]
+    assert [entry.name for entry in locations.data] == ["drive-one", "drive-two"]
+    first = asyncio.run(catalog.browse_directories(locations.data[0].id))
+    child = asyncio.run(catalog.browse_directories(first.data[0].id))
+    assert child.current_id == locations.shortcuts[0].id
+    assert child.parent_id == first.current_id
+    second = asyncio.run(catalog.browse_directories(locations.data[1].id))
+    assert second.current_path == str(second_drive.resolve())
+    assert not second.shortcuts
+
+
 def test_common_server_browses_and_registers_external_model_directories(
     tmp_path: Path,
 ) -> None:
@@ -1064,6 +1091,7 @@ def test_common_server_browses_and_registers_external_model_directories(
         native_picker_dir = tmp_path / "native-picker-model"
         native_picker_dir.mkdir()
         _model(native_picker_dir / "desktop.tq", architecture="minicpmo45")
+        _model(native_picker_dir / "other.tq", architecture="qwen35")
         catalog = ModelCatalog(
             [model_dir],
             cache_seconds=0,
@@ -1118,12 +1146,17 @@ def test_common_server_browses_and_registers_external_model_directories(
 
                 native_registered = await client.post(
                     "/api/v1/models/directories/register",
-                    json={"path": str(native_picker_dir)},
+                    json={"directory_id": jumped.json()["current_id"], "file_name": "desktop.tq"},
                 )
                 assert native_registered.status_code == 200
                 assert [
                     artifact["name"] for artifact in native_registered.json()["data"]
                 ] == ["desktop"]
+                outside = await client.post(
+                    "/api/v1/models/directories/register",
+                    json={"directory_id": jumped.json()["current_id"], "file_name": "../external-model/portable.tq"},
+                )
+                assert outside.status_code == 400
                 models = await client.get("/api/v1/models", params={"refresh": True})
                 assert [artifact["name"] for artifact in models.json()["data"]] == [
                     "desktop",
@@ -1340,6 +1373,13 @@ def test_common_server_rejects_directories_without_mfq_models(tmp_path: Path) ->
                 )
                 assert response.status_code == 400
                 assert response.json()["error"]["code"] == "model_registration_failed"
+                selection = await client.post(
+                    "/api/v1/models/directories/register",
+                    params={"allow_empty": True},
+                    json={"directory_id": directory_id},
+                )
+                assert selection.status_code == 200
+                assert selection.json() == {"data": []}
                 assert not (model_dir / ".tq-files.json").exists()
         finally:
             await service.aclose()
@@ -1887,8 +1927,17 @@ def test_managed_native_runtime_leaves_default_prefill_chunk_to_model_autotune(
 
 @pytest.mark.parametrize("backend", ["cuda", "metal"])
 def test_managed_native_runtime_leaves_continuous_batching_validation_to_worker(
-    tmp_path: Path, backend: str,
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "tyloinfer.server.runtime.runtime_pool.host_memory_capacity",
+        lambda: (32 << 30, 24 << 30),
+    )
+    monkeypatch.setattr(
+        "tyloinfer.server.runtime.runtime_pool.host_commit_capacity",
+        lambda: (None, None),
+    )
+
     async def run() -> None:
         model = tmp_path / "tiny.tq"
         _model(model, architecture="qwen4_exp")

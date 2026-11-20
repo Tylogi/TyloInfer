@@ -77,5 +77,23 @@ void kv_quantization_case() {
             }
         }
     }
-    std::cout<<"TurboQuant 7 levels, 6 widths: size, reconstruction, dense/sparse CPU oracle and paged KV PASS\n";
+    int device=0,major=0;
+    TYLOINFER_CUDA_CHECK(cudaGetDevice(&device));
+    TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device));
+    if(major>=7) {
+        constexpr int d=256,kv_heads=2;
+        for(const int ratio:{4,6,8})for(const int prefix:{0,163,384}) {
+            constexpr int tokens=128;
+            const int length=prefix+tokens,heads=kv_heads*ratio;
+            const auto q=data({1,heads,tokens,d},23,.5f).to(tb::kFloat32);
+            const auto k=cuda_kv_encode(data({1,kv_heads,length,d},27,.5f),8,false);
+            const auto v=cuda_kv_encode(data({1,kv_heads,length,d},33,.5f),8,true);
+            const auto fast=mfq_attention_mma256_prefix_cuda(q,cuda_kv_decode(k,d,8,false),
+                cuda_kv_decode(v,d,8,true),1.0/std::sqrt(double(d)));
+            if(!fast.defined())continue;
+            const auto reference=cuda_kv_attention(q,k,v,KvQuantization{8},{},{},prefix,{},length);
+            equal(fast,reference,"TurboQuant MMA causal prefill and append");
+        }
+    }
+    std::cout<<"TurboQuant 7 levels, 6 widths: size, reconstruction, dense/sparse CPU oracle, paged KV and MMA prefill PASS\n";
 }

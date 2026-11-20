@@ -29,6 +29,16 @@ test('keeps partial read failures visible rather than fabricating empty data', a
   assert.equal(value.metrics.value, undefined);
   assert.deepEqual(value.logs.value, { data: [] });
 });
+test('passes a typed directory to the folder browser with cancellation', async () => {
+  const controller = new AbortController();
+  const path = '/example/empty folder';
+  const listing = { current_path: path, current_id: 'a'.repeat(32), model_file_count: 0, data: [] };
+  const api = createPageApi({ rpc: { call: async (...args) => {
+    assert.deepEqual(args, ['/tyloinfer', 'models/browse-directory', { path }, controller.signal]);
+    return ok(listing);
+  } } });
+  assert.deepEqual(await api.browseDirectory(path, controller.signal), listing);
+});
 test('forwards only named page actions and native download tickets without reshaping acceptance', async () => {
   const calls = [];
   const ticket = { id: '11111111-1111-4111-8111-111111111111', kind: 'download.huggingface', status: 'queued', cancel_requested: false };
@@ -40,6 +50,8 @@ test('forwards only named page actions and native download tickets without resha
   assert.deepEqual(calls[1].slice(0, 3), ['/tyloinfer', 'models/register', { directory_id: 'a'.repeat(32) }]);
   await api.configure('inference_policy', { mtp_enabled: false });
   assert.deepEqual(calls[2][2], { resource: 'inference_policy', request: { mtp_enabled: false } });
+  await api.register('a'.repeat(32), undefined, 'selected.gguf');
+  assert.deepEqual(calls[3][2], { directory_id: 'a'.repeat(32), file_name: 'selected.gguf' });
 });
 test('does not retry page writes on transport failures or malformed response envelopes', async () => {
   for (const response of [null, { ok: false }, { ok: true }]) {

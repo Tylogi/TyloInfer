@@ -190,7 +190,7 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_disk_max_bytes", static_cast<double>(paged_disk_budget_)},
                 {"prefix_cache_hot_blocks", static_cast<double>(native_hot_snapshots_ ? native.snapshots : value.hot_blocks)},
                 {"prefix_cache_hot_bytes", static_cast<double>(native_hot_snapshots_ ? native.bytes : value.hot_bytes)},
-                {"prefix_cache_native_hot", native_hot_snapshots_ ? 1.0 : 0.0},
+                {"prefix_cache_native_hot", native_hot_snapshots_ && snapshots_.enabled() ? 1.0 : 0.0},
                 {"prefix_cache_ram_bytes", static_cast<double>(native_hot_snapshots_ ? value.resident_bytes : value.hot_bytes)},
                 {"prefix_cache_ram_max_bytes", static_cast<double>(paged_ram_budget_)},
                 {"prefix_cache_ram_blocks", static_cast<double>(native_hot_snapshots_ ? value.hot_blocks : 0)},
@@ -219,7 +219,7 @@ template <class Backend> class SessionCache {
         }
         const auto value = snapshots_.metrics();
         std::vector<std::pair<std::string, double>> result{
-            {"prefix_cache_supported", supported_ ? 1.0 : 0.0},
+            {"prefix_cache_supported", supported_ && (!native_hot_snapshots_ || snapshots_.enabled()) ? 1.0 : 0.0},
             {"prefix_cache_disabled_reason", static_cast<double>(disabled_reason_)},
             {"prefix_cache_queries", static_cast<double>(value.queries)},
             {"prefix_cache_hits", static_cast<double>(value.hits)},
@@ -234,7 +234,7 @@ template <class Backend> class SessionCache {
             {"prefix_cache_max_bytes", static_cast<double>(snapshots_.max_bytes())},
         };
         if (native_hot_snapshots_) {
-            result.insert(result.end(), {{"prefix_cache_native_hot", 1.0}, {"prefix_cache_dynamic_budget", 1.0},
+            result.insert(result.end(), {{"prefix_cache_native_hot", snapshots_.enabled() ? 1.0 : 0.0}, {"prefix_cache_dynamic_budget", 1.0},
                 {"prefix_cache_hot_bytes", static_cast<double>(value.bytes)},
                 {"prefix_cache_hot_blocks", static_cast<double>(value.snapshots)},
                 {"prefix_cache_resident_sessions", static_cast<double>(value.sessions)},
@@ -283,6 +283,13 @@ template <class Backend> class SessionCache {
         if (!paged_cache_ || !native_hot_snapshots_) return 0;
         paged_ram_budget_ = max_bytes;
         const auto released = paged_cache_->set_hot_limit(max_bytes);
+        if (released) Backend::release_host_cache();
+        return released;
+    }
+
+    uint64_t trim_ram(uint64_t target_bytes) {
+        if (!paged_cache_) return 0;
+        const auto released = paged_cache_->trim_hot(target_bytes);
         if (released) Backend::release_host_cache();
         return released;
     }

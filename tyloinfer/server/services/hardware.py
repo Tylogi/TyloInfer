@@ -84,7 +84,7 @@ def memory_topology() -> dict[str, Any]:
         "gpu_devices": [{"id": item.device_id or str(index), "name": item.name,
             "memory_total_bytes": item.capacity_bytes, "unified_memory": item.unified or _unified_gpu_name(item.name)}
             for index, item in enumerate(hardware.gpu_memory)],
-        "prefix_cache_hot_tier": "vram" if architecture == "discrete" else "ram" if architecture == "unified" else None,
+        "prefix_cache_hot_tier": "ram" if architecture in {"discrete", "unified"} else None,
         "prefix_cache_cold_tier": "ssd",
     }
 

@@ -110,7 +110,7 @@ function CacheInventory() {
     const message = namespace
       ? tr(`清理此缓存组（${formatBytes(group?.bytes ?? 0)}）？模型文件和聊天记录不会删除。`,
           `Clear this cache group (${formatBytes(group?.bytes ?? 0)})? Model files and chat history will be kept.`)
-      : hasSeparateVram(runtime) ? tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存、RAM 前缀缓存与显存热缓存？模型文件和聊天记录不会删除。`,
+      : hasSeparateVram(runtime) && runtime?.prefix_cache_hot_tier !== 'ram' ? tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存、RAM 前缀缓存与显存热缓存？模型文件和聊天记录不会删除。`,
           `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches, RAM prefixes and VRAM hot caches? Model files and chat history will be kept.`) : tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与 RAM 热缓存？模型文件和聊天记录不会删除。`,
           `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches and RAM hot caches? Model files and chat history will be kept.`);
     clearing.current = true;

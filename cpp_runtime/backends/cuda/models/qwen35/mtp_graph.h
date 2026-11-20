@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_process_memory.h"
 #include "runtime/graph_pool_lease.h"
 #include "runtime/routed_cache_resources.h"
 #include "runtime/gdn_recorded_replay_batch.h"
@@ -21,6 +22,10 @@
 #include <vector>
 
 namespace mfq::cuda::qwen35 {
+
+inline int64_t mtp_attention_capacity(int64_t tokens, int64_t context_capacity) {
+    return decode_graph_bucket(tokens,context_capacity);
+}
 
 // Verification retains projected inputs, the initial convolution history,
 // and a separate recurrent result. Committed recurrence stays at a stable
@@ -48,6 +53,7 @@ class MtpTargetGraphs {
     uint64_t captures_ = 0, replays_ = 0;
     Cell* active_ = nullptr;
     int64_t active_start_ = -1, active_confirmed_ = 0, active_tokens_ = 0;
+    int64_t planned_length_ = 0;
     uint64_t rollback_captures_ = 0, rollback_replays_ = 0;
     std::vector<const void*> addresses_;
     std::vector<Tensor> replay_workspace_;
@@ -80,6 +86,9 @@ public:
     bool compatible(const Qwen35CausalLm& model) const noexcept {
         return &model_==&model && stream_==mfq_current_cuda_stream();
     }
+    bool holds_other_plan(int64_t length) const noexcept {
+        return planned_length_!=0 && planned_length_!=length;
+    }
 
     static bool eligible(const Qwen35CausalLm& model, const Tensor& ids) {
         if(!ids.is_cuda() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 ||
@@ -100,7 +109,8 @@ public:
 
     std::optional<Tensor> run(const Tensor& ids, int64_t confirmed, Tensor* raw,
                               Tensor* logits, bool* initialized, int64_t planned_length=0,
-                              Tensor* greedy_packet=nullptr) {
+                              Tensor* greedy_packet=nullptr, bool* resource_limited=nullptr,
+                              std::size_t* shortfall=nullptr) {
         if(!eligible(model_,ids))return {};
         const auto addresses=state_addresses();
         if(addresses!=addresses_) {
@@ -112,11 +122,18 @@ public:
             start+tokens<=planned_length && planned_length<=model_.max_position_embeddings(),
             "invalid Dense MTP graph window");
         const auto stream=mfq_get_current_cuda_stream(ids.get_device());
-        // KV partitioning is captured too. Match ordinary decode's request
-        // plan and retain separate graphs when that plan changes.
+        // KV partitioning is captured. Retain windows for the current plan.
+        if(holds_other_plan(planned_length)) {
+            cells_.clear();
+            active_=nullptr;
+            context_->reclaim_idle_memory();
+        }
+        planned_length_=planned_length;
         auto& owner=cells_[{tokens,confirmed,planned_length,greedy_packet!=nullptr}];
         if(!owner)owner=std::make_unique<Cell>(stream.stream());
         auto& cell=*owner;
+        Tensor raw_result;
+        const auto prepare=[&] {
         if(!cell.ids.defined()) {
             cell.ids=ids.clone();
             cell.positions=mfq_tensor_backend::arange(start,start+tokens,ids.options());
@@ -196,6 +213,18 @@ public:
                 <<" planned_len="<<planned_length<<" greedy_packet="<<(greedy_packet!=nullptr)
                 <<" nodes="<<cell.graph.nodes()<<" count="<<captures_<<'\n';
         }
+        if(raw)raw_result=mfq_tensor_backend::empty_like(cell.raw);
+        };
+        try {
+            prepare();
+        } catch(const MfqResourceExhausted& error) {
+            if(!resource_limited)throw;
+            *resource_limited=true;
+            if(shortfall)
+                if(const auto* limit=dynamic_cast<const CudaMemoryLimitExceeded*>(&error))
+                    *shortfall=limit->shortfall();
+            return {};
+        }
         // Sampling and state resolution use this same ordered stream. Let
         // them queue behind verification instead of waiting on the host.
         if(!cell.graph.enqueue_if_device_only())cell.graph.run();
@@ -212,7 +241,10 @@ public:
             active_=&cell;active_start_=start;active_confirmed_=confirmed;active_tokens_=tokens;
         }
         model_.cache_pos+=tokens;
-        if(raw)*raw=cell.raw.clone();
+        if(raw) {
+            raw_result.copy_(cell.raw);
+            *raw=std::move(raw_result);
+        }
         if(logits)*logits=cell.logits;
         if(greedy_packet)*greedy_packet=cell.greedy_packet;
         return cell.hidden;

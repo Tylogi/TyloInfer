@@ -35,6 +35,16 @@ it('shows separate VRAM, RAM and SSD prefix totals', () => {
   expect(screen.getByText('Total SSD prefix cache')).toBeInTheDocument();
 });
 
+it('shows only RAM and SSD prefix totals when the worker uses a RAM hot tier', () => {
+  state.runtime = { memory_architecture: 'discrete', prefix_cache_hot_tier: 'ram',
+    prefix_cache_total_ram_bytes: 200, prefix_cache_total_ram_max_bytes: 2000,
+    prefix_cache_total_disk_bytes: 300, prefix_cache_total_disk_max_bytes: 3000 };
+  render(<CachePage />);
+  expect(screen.queryByText('Total VRAM hot cache')).not.toBeInTheDocument();
+  expect(screen.getByText('Total RAM prefix cache')).toBeInTheDocument();
+  expect(screen.getByText('Total SSD prefix cache')).toBeInTheDocument();
+});
+
 it('resources contains monitoring and cache but no service configuration', () => {
   state.runtime = null;
   render(<CachePage />);

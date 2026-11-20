@@ -268,6 +268,7 @@ size_t TextSessionCache::clear() { return impl_->clear(); }
 uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) { return impl_->trim_hot(target_bytes); }
 uint64_t TextSessionCache::set_hot_limit(uint64_t max_bytes) { return impl_->set_hot_limit(max_bytes); }
 uint64_t TextSessionCache::set_ram_limit(uint64_t max_bytes) { return impl_->set_ram_limit(max_bytes); }
+uint64_t TextSessionCache::trim_ram(uint64_t target_bytes) { return impl_->trim_ram(target_bytes); }
 void TextSessionCache::reserve_ram(uint64_t bytes) { impl_->reserve_ram(bytes); }
 std::function<uint64_t(uint64_t)> TextSessionCache::ram_reclaimer() const { return impl_->ram_reclaimer(); }
 uint64_t TextSessionCache::set_disk_limit(uint64_t max_bytes) { return impl_->set_disk_limit(max_bytes); }

@@ -9,12 +9,12 @@ test('load context defaults reach the model load request and remain readable in 
     architecture: 'qwen3_5', format: 'mfq', shard_count: 1, total_bytes: 40 * 2 ** 30,
     estimated_resident_weight_bytes: 8 * 2 ** 30, context_capacity: 131072, tensor_count: 1,
     record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '2026-10-14T00:00:00Z' }] } }));
-  await page.route('**/api/v1/models/local/cache-profile?include_recurrent=true', route => route.fulfill({ json: {
-    max_context: 131072, fixed_bytes: 2 ** 30,
-    fixed_components: [{ group: 'GDN', name: 'recurrent_state', bytes: 2 ** 30 }],
-    components: [{ group: 'GQA', name: 'raw_kv', layers: 2, kv_heads: 16, head_dimension: 256,
-      bytes_per_row: 32768, tokens_per_row: 1, allocation: 'exact', minimum_rows: 16 }],
-  } }));
+  await page.route('**/api/v1/models/local/load-plan?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const maximum = query.get('preallocate') === 'false' ? 131072 : (30 - Number(query.get('reserve'))) * 2048;
+    return route.fulfill({ json: { max_context: maximum, context_size: Number(query.get('context_size')) || maximum,
+      precision: Number(query.get('precision')) || 8, precisions: [8, 4], usable: true, reason: null } });
+  });
   await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
     runtime_state: 'ready', model: 'Studio Test Model', model_type: 'Test', max_context: 8192,
     total_requests: 0, active_requests: 0, sampling_defaults: {}, memory_architecture: 'discrete',
@@ -26,21 +26,17 @@ test('load context defaults reach the model load request and remain readable in 
     return route.fulfill({ json: { operation_id: 'load', status: 'accepted' } });
   });
   await openModelSettings(page, 'Qwen3.5', 'zh-CN');
-  const panel = page.getByRole('region', { name: '上下文管理' });
-  await expect(panel.getByRole('spinbutton')).toHaveAttribute('placeholder', '自动');
-  await expect(panel.getByRole('combobox', { name: '估算模型' })).toHaveCount(0);
-  await expect(panel.getByText(/当前剩余/)).toContainText('15 GiB');
-  await expect(panel.getByLabel('预计总占用', { exact: true })).toHaveText('13 GiB');
+  const panel = page.getByRole('region', { name: '加载选项' });
+  await expect(panel.getByRole('spinbutton')).toHaveValue('40960');
+  await expect(panel.getByRole('radio', { name: /普通/ })).toBeChecked();
+  await expect(panel.getByRole('combobox', { name: 'KV 精度' })).toContainText('自动 · INT8');
   expect(writes).toHaveLength(0);
-  await expect(panel.getByRole('button', { name: '高级' })).toHaveAttribute('aria-expanded', 'false');
-  await panel.getByRole('checkbox', { name: '自动' }).uncheck();
-  await expect(panel.getByRole('checkbox', { name: 'RAM 预分配', exact: true })).toHaveCount(0);
-  await expect(panel.getByRole('checkbox', { name: 'SSD KV' })).toHaveCount(0);
-  await expect(panel).not.toContainText('SSD KV');
-  await panel.getByRole('checkbox', { name: 'VRAM 预分配' }).uncheck();
-  await panel.getByRole('combobox', { name: '默认 KV 量化档位' }).selectOption('4');
+  await panel.getByRole('radio', { name: /安全/ }).check();
+  await expect(panel.getByRole('spinbutton')).toHaveValue('20480');
+  await panel.getByRole('combobox', { name: 'KV 分配' }).selectOption('dynamic');
+  await expect(panel.getByRole('spinbutton')).toHaveValue('131072');
+  await panel.getByRole('combobox', { name: 'KV 精度' }).selectOption('4');
   await panel.getByRole('spinbutton').fill('65536');
-  await expect(panel.getByLabel('预计总占用', { exact: true })).toHaveText('9.5 GiB');
   for (const theme of ['light', 'dark']) {
     await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
     await panel.scrollIntoViewIfNeeded();
@@ -50,13 +46,11 @@ test('load context defaults reach the model load request and remain readable in 
   await page.reload();
   await openModelSettings(page, 'Qwen3.5', 'zh-CN');
   await expect(panel.getByRole('spinbutton')).toHaveValue('65536');
-  await expect(panel.getByRole('combobox', { name: '估算模型' })).toHaveCount(0);
   await page.keyboard.press('Escape');
   await page.getByRole('button', { name: '加载', exact: true }).click();
   await expect.poll(() => writes.length).toBe(1);
   expect(writes[0]).toMatchObject({ context_size: 65536, context_management: {
-    automatic: false, ssd_kv: false, ram_preallocated: true, vram_preallocated: false,
-    kv_quantization: { enabled: true, bits: 4, algorithm: 'turboquant' },
+    reserve_percent: 20, precision: 4, vram_preallocated: false,
   } });
   expect(writes[0].context_management).not.toHaveProperty('context_size');
 });

@@ -133,6 +133,7 @@ Strata
 MFQ's CUDA multi-row warp reduction in `mfq/kernels/cuda/warp_multi_sum.cuh`
 is adapted from Strata's s26_tsum.cuh, with MFQ-specific dispatch and packed
 weight integration.
+The Flash-Next expert ranking is derived from Strata's `data/expert-profile.bin`.
 The CUDA runtime uses Strata's direct SSD reader for streamed PLE rows.
 Copyright (c) 2026 Niko1221 and the Strata contributors
 License: MIT (`LICENSES/Strata-MIT.txt`)

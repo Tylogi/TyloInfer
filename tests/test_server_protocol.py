@@ -161,6 +161,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/models/{model_id}/delete",
         "/api/v1/models/{model_id}/analysis",
         "/api/v1/models/{model_id}/cache-profile",
+        "/api/v1/models/{model_id}/load-plan",
         "/api/v1/models/load",
         "/api/v1/models/unload",
         "/api/v1/hub/models",

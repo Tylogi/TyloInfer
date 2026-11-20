@@ -14,6 +14,8 @@
 .model-library-panel .model-files-action { grid-column: 2; grid-row: 1; }
 .model-library-panel .model-load-action { grid-column: 3; grid-row: 1; white-space: nowrap; }
 .model-library-panel .model-load-action:disabled, .model-library-panel .model-load-action:disabled:hover { border-color: var(--line-soft); color: var(--muted); background: var(--surface-control); }
+.model-library-panel .model-row-actions .model-start-action:not(:disabled) { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.model-library-panel .model-row-actions .model-start-action:hover:not(:disabled) { border-color: var(--accent); color: var(--on-accent); background: var(--accent); }
 .model-library-panel .model-delete-action { grid-column: 4; grid-row: 1; }
 .model-row .local-checkpoint-memory { gap: 7px; }
 .model-row .variant-memory-pressure { grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; }
@@ -27,6 +29,15 @@
 .model-folder-location > code { min-width: 0; overflow: hidden; color: var(--ink-soft); font-family: inherit; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-folder-location > button { min-height: 30px; border: 1px solid var(--line-soft); border-radius: 7px; padding: 5px 12px; color: var(--ink-soft); background: var(--surface-control); font-size: 11.5px; white-space: nowrap; }
 .model-folder-location > button:hover:not(:disabled) { background: var(--surface-hover); }
+.studio-dialog.model-unload-dialog { width: min(440px, calc(100vw - 24px)); padding: 0; }
+.model-unload-content { display: grid; gap: 14px; padding: 0 22px 20px; }
+.model-unload-identity, .model-unload-force { display: flex; align-items: center; gap: 12px; }
+.model-unload-identity { border: 1px solid var(--line-soft); border-radius: 10px; padding: 12px; background: var(--surface); }
+.model-unload-force { justify-content: space-between; padding: 0 2px; }
+.model-unload-identity > div, .model-unload-force > div { min-width: 0; }
+.model-unload-content strong, .model-unload-content small { display: block; overflow-wrap: anywhere; }
+.model-unload-content strong { color: var(--ink-strong); font-size: 13px; font-weight: 600; }
+.model-unload-content small { margin-top: 4px; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
 @media (max-width: 560px) { .model-folder-location { grid-template-columns: 16px minmax(0, 1fr) auto; gap: 8px 10px; padding: 10px 12px; } .model-folder-location > code { grid-column: 2 / -1; grid-row: 2; } .model-folder-location > button { grid-column: 3; grid-row: 1; } }
 .model-workbench-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 30px; }
 .model-workbench-summary > div { display: grid; min-width: 0; gap: 8px; border: 1px solid var(--panel-line); border-radius: 12px; padding: 20px; background: var(--panel-surface); }

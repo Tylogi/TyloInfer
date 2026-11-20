@@ -153,9 +153,9 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
 
 @pytest.mark.parametrize("gpus,architecture,capacity,hot", [
     ((hardware.GpuMemory("NVIDIA GB10", 128 << 30, unified=True),), "unified", None, "ram"),
-    ((hardware.GpuMemory("RTX 3090 Ti", 24 << 30),), "discrete", 24 << 30, "vram"),
+    ((hardware.GpuMemory("discrete CUDA GPU", 24 << 30),), "discrete", 24 << 30, "ram"),
     ((hardware.GpuMemory("integrated CUDA GPU", 64 << 30, unified=True),), "unified", None, "ram"),
-    ((hardware.GpuMemory("unknown discrete GPU"),), "discrete", None, "vram"),
+    ((hardware.GpuMemory("unknown discrete GPU"),), "discrete", None, "ram"),
     ((), "unknown", None, None),
 ])
 def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, gpus, architecture, capacity, hot):

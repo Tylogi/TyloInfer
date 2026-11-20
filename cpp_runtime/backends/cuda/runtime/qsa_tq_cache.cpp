@@ -427,6 +427,8 @@ struct QsaTqCache::Impl {
     }
     void ensure_descriptors() {
         if(views.defined())return;
+        // These tables remain live throughout decode, after prefill returns its workspace.
+        const ResidentAllocationScope resident;
         auto table=qsa_descriptor_table(capacity,sizeof(tq::TqBlockView),options,host_metadata);
         auto new_hits=tb::zeros({capacity},options.dtype(tb::kFloat32));
         ram->bind_descriptors(table);

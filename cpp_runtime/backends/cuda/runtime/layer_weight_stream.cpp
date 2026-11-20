@@ -54,6 +54,89 @@ void append(std::vector<LayerWeightBinding>& result,FFN& ffn){
     append(result,ffn.gate_up);append(result,ffn.down);
     if(ffn.important_neurons)append(result,*ffn.important_neurons);
 }
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+std::shared_ptr<tb::TensorStorage> whole_prefill_weight(const tb::Tensor& weight) {
+    auto storage=std::static_pointer_cast<tb::TensorStorage>(weight.weak_storage_owner().lock());
+    // Borrowing changes device addresses. Only move a complete, unshared image.
+    if(!storage || storage.use_count()!=2 || weight.byte_offset() || storage->bytes!=weight.nbytes())return {};
+    return storage;
+}
+void rebind_prefill_weight(tb::Tensor& weight,const std::shared_ptr<tb::TensorStorage>& storage,
+        void* address,std::shared_ptr<void> owner,
+        std::function<void(std::uintptr_t,std::shared_ptr<void>)> record_stream,bool mapped) {
+    storage->base=address;
+    storage->mapped_host=mapped;
+    storage->record_stream=std::move(record_stream);
+    storage->owner=std::move(owner);
+    weight=tb::Tensor(storage,weight.view_descriptor());
+}
+#endif
+}
+
+tb::Tensor* dense_prefill_gguf_image(QuantLinear& projection,int device) {
+    if(!projection.is_gguf() || projection.tensor_parallel())return nullptr;
+    auto& weight=projection.gguf;
+    if(weight.rotation || weight.correction || weight.projection_correction || !weight.packed.is_cuda() ||
+            weight.packed.get_device()!=device || weight.packed.is_mapped_host() || !weight.packed.is_contiguous())return nullptr;
+    return &weight.packed;
+}
+
+std::size_t whole_prefill_weight_bytes(const tb::Tensor& weight) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    const auto storage=whole_prefill_weight(weight);
+    return storage?storage->bytes:0;
+#else
+    (void)weight;return 0;
+#endif
+}
+
+std::size_t borrow_prefill_weight(tb::Tensor& weight) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    const auto storage=whole_prefill_weight(weight);
+    if(!storage)return 0;
+    auto host=std::make_shared<tb::Tensor>(tb::empty({int64_t(storage->bytes)},
+        tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true)));
+    void* alias=nullptr;
+    const auto status=cudaHostGetDevicePointer(&alias,host->data_ptr(),0);
+    if(status==cudaErrorNotSupported || status==cudaErrorInvalidValue) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    TYLOINFER_CUDA_CHECK(status);
+    const auto stream=mfq_current_cuda_stream();
+    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(host->data_ptr(),storage->base,storage->bytes,cudaMemcpyDeviceToHost,stream));
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+    rebind_prefill_weight(weight,storage,alias,std::move(host),{},true);
+    return storage->bytes;
+#else
+    (void)weight;return 0;
+#endif
+}
+
+std::size_t restore_prefill_weight(tb::Tensor& weight,Context& context,std::size_t floor) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    const auto storage=whole_prefill_weight(weight);
+    const auto available=context.available_memory();
+    const auto headroom=available>floor?available-floor:0;
+    if(!storage || (storage->bytes>headroom && storage->bytes-headroom>context.reusable_dense_weight_bytes()))return 0;
+    const DenseWeightAllocationScope residency;
+    auto image=tb::empty({int64_t(storage->bytes)},weight.options().dtype(tb::kUInt8));
+    const auto host=std::static_pointer_cast<tb::Tensor>(storage->owner);
+    const auto stream=mfq_current_cuda_stream();
+    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(image.data_ptr(),host->data_ptr(),storage->bytes,cudaMemcpyHostToDevice,stream));
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+    context.check_memory_limit();
+    if(context.available_memory()<std::min(available,floor)) {
+        image={};
+        context.reclaim_idle_memory();
+        return 0;
+    }
+    const auto device_storage=std::static_pointer_cast<tb::TensorStorage>(image.weak_storage_owner().lock());
+    rebind_prefill_weight(weight,storage,device_storage->base,device_storage->owner,device_storage->record_stream,false);
+    return storage->bytes;
+#else
+    (void)weight;(void)context;(void)floor;return 0;
+#endif
 }
 struct LayerWeightStream::Impl {
     struct Field{LayerWeightBinding binding;tb::Tensor host;std::size_t offset;};

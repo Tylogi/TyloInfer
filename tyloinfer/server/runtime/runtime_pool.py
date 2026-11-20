@@ -620,9 +620,30 @@ class RuntimePool:
                     request.gguf_companions)
         except (NativeRuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
             raise _job_error("invalid_gguf_companion", str(error)) from error
+        defaults = request.context_management
+        fixed_qsa = False
+        planned_vram_limit = None
+        if defaults is not None and defaults.reserve_percent is not None:
+            plan = await self.model_load_plan(
+                artifact, requested=request.context_size, reserve=defaults.reserve_percent,
+                precision=defaults.precision, preallocate=defaults.vram_preallocated,
+                device_ids=request.device_ids, streamed_jev=request.jev_weights == 'stream',
+                yarn_enabled=request.yarn_enabled,
+            )
+            if not plan.usable:
+                reason = plan.reason or "memory_limit"
+                message = {
+                    "memory_unavailable": "Could not measure the available memory or model KV geometry",
+                    "precision_unsupported": "The selected KV precision is unavailable for this model",
+                }.get(reason, f"With these load settings, the maximum context is {plan.max_context:,} tokens")
+                raise _job_error("model_load_" + reason, message)
+            fixed_qsa = plan.precisions == [8, 4]
+            planned_vram_limit = plan.gpu_budget_bytes
+            request = request.model_copy(update={"context_size": plan.context_size,
+                "context_management": defaults.model_copy(update={"precision": plan.precision})})
         from tyloinfer.server.runtime.load_context import apply_load_context
         try:
-            request = apply_load_context(request, artifact.resource.architecture, self.backend)
+            request = apply_load_context(request, artifact.resource.architecture, self.backend, fixed_qsa=fixed_qsa)
         except ValueError as error:
             raise _job_error("kv_ssd_required", "Disabling RAM preallocation requires SSD KV") from error
         if 'qsa_kv_offload' not in request.model_fields_set:
@@ -642,6 +663,9 @@ class RuntimePool:
             saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
             if saved_quantization is not None:
                 request = request.model_copy(update={"kv_quantization": saved_quantization})
+            elif not cuda_qsa and self.backend in {"cuda", "metal"} and artifact.resource.architecture.casefold().startswith(
+                    ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35")):
+                request = request.model_copy(update={"kv_quantization": KvQuantizationSettings(enabled=True, bits=8)})
         if request.kv_quantization.enabled and (self.backend not in {"cuda", "metal"} or not artifact.resource.architecture.casefold().startswith(
             ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35"))):
             raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
@@ -921,6 +945,8 @@ class RuntimePool:
                 request,
                 port=port,
             )
+            if planned_vram_limit is not None:
+                process_environment["TYLOINFER_CUDA_VRAM_LIMIT_GIB"] = str(planned_vram_limit / (1 << 30))
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -1428,7 +1454,7 @@ class RuntimePool:
         experts = [min(total, item.routed_expert_bytes) for item, total in zip(artifacts, totals)]
         dense = [total - expert for total, expert in zip(totals, experts)]
         ceiling = self._resident_total_limit(policy)
-        prefixes = policy.prefix_limit_bytes if policy.prefix_limit_bytes is not None else 2 << 30
+        prefixes = self._prefix_total_limit(policy)
         limit = policy.model_limit_bytes
         if ceiling is not None:
             available = max(0, ceiling - prefixes - (2 << 30))
@@ -1455,8 +1481,11 @@ class RuntimePool:
         hot = {item.resource.name: share + (index < remainder) for index, item in enumerate(artifacts)}
         return limits, hot
 
-    def _prefix_total_limit(self) -> int:
-        return self.memory_policy.prefix_limit_bytes if self.memory_policy.prefix_limit_bytes is not None else 2 << 30
+    def _prefix_total_limit(self, policy: RuntimeMemoryPolicy | None = None) -> int:
+        if self.backend == "cuda" and memory_topology()["memory_architecture"] == "discrete":
+            return 0
+        limit = (policy if policy is not None else self.memory_policy).prefix_limit_bytes
+        return limit if limit is not None else 2 << 30
 
     def _prefix_ram_total_limit(self) -> int:
         if self.backend != "cuda" or memory_topology()["memory_architecture"] != "discrete":
@@ -2600,6 +2629,27 @@ class RuntimePool:
         finally:
             assert instance is not None
             await self._release_control_lease(instance)
+
+    async def model_load_plan(self, artifact: DiscoveredModel, *, requested: int | None, reserve: int,
+            precision: float | None, preallocate: bool, device_ids: list[str], streamed_jev: bool,
+            yarn_enabled: bool | None = None):
+        from tyloinfer.server.runtime.load_plan import plan_model_load
+        maximum = self._context_limit(artifact, yarn_enabled) or self.context_policy.fallback_context_size
+        if self.context_policy.max_context_size is not None and requested is None:
+            maximum = min(maximum, self.context_policy.max_context_size)
+        selection_request = ModelLoadRequest(model=artifact.resource.name, device_ids=device_ids)
+        selected = self._cuda_device_ids(selection_request)
+        status = await self.runtime_status()
+        if self.backend == "cuda":
+            # Use physical availability even when an active worker reports its own allocator budget.
+            gpu_devices = await asyncio.to_thread(gpu_memory_status)
+            if gpu_devices:
+                status["gpu_devices"] = gpu_devices
+            if self.runtime_environment.get("TYLOINFER_CUDA_VRAM_LIMIT_GIB", os.environ.get("TYLOINFER_CUDA_VRAM_LIMIT_GIB")):
+                status["load_plan_vram_ceiling"] = self._cuda_device_vram_limit(selection_request)
+        return await asyncio.to_thread(plan_model_load, artifact, status, maximum=maximum,
+            requested=requested, reserve=reserve, precision=precision, preallocate=preallocate,
+            device_id=selected[0] if selected else "0", streamed_jev=streamed_jev)
 
     def resolve_context_size(self, artifact: DiscoveredModel, explicit: int | None = None,
         *, ignore_override: bool = False, yarn_enabled: bool | None = None) -> int:
@@ -4182,6 +4232,11 @@ class RuntimePool:
         stream = process.stderr if self.transport == "stdio" else process.stdout
         if stream is None:
             return
+        config = instance.artifact.source_config or {}
+        text_config = config.get("text_config")
+        layer_count = config.get("num_hidden_layers")
+        if layer_count is None and isinstance(text_config, dict):
+            layer_count = text_config.get("num_hidden_layers")
         async for line in self._log_lines(stream):
             job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
@@ -4210,7 +4265,15 @@ class RuntimePool:
                 elif message == "mfq_load_progress stage=finalizing":
                     value = 0.94
                     data = {"phase": "finalizing"}
-                else:
+                elif self.backend in {"cuda", "hip"} and type(layer_count) is int and layer_count > 0:
+                    layer = re.fullmatch(r"loading layer (\d{1,6}) \S+ (?:CUDA(?:-streamed)?|CPU)", message)
+                    if layer and (completed := int(layer[1])) < layer_count:
+                        value = 0.02 + 0.90 * completed / layer_count
+                        data = {"phase": "weights", "completed": completed, "total": layer_count}
+                    elif message.startswith("runtime_sampling_prepare "):
+                        value = 0.94
+                        data = {"phase": "finalizing"}
+                if value is None:
                     compile_match = re.fullmatch(r"mfq_load_progress stage=(compiling|warming) completed=(\d{1,10}) total=(\d{1,10})", message)
                     if compile_match:
                         phase = compile_match.group(1)
@@ -4471,6 +4534,9 @@ class RuntimePool:
                     for field in ("resident_bytes", "resident_weight_bytes", "resident_buffer_bytes", "kv_bytes",
                         "prefix_cache_bytes", "memory_total_bytes", "memory_available_bytes")
                     if measured(status.get(f"gpu_{index}_{field}"))}
+                physical_free = status.get(f"gpu_{index}_physical_memory_available_bytes")
+                if measured(physical_free):
+                    fields["memory_available_bytes"] = int(physical_free)
                 devices.append({"device_id": device_ids[index] if index < len(device_ids) else str(index), **fields})
             values["devices"] = devices
         return RuntimeMemoryResources(**values)
@@ -4886,7 +4952,8 @@ class RuntimePool:
         process_environment["TYLOINFER_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
         if self.backend == "cuda" and request.context_management is not None:
             defaults = request.context_management
-            process_environment["TYLOINFER_KV_VRAM_PREALLOCATED"] = "1" if defaults.automatic or defaults.vram_preallocated else "0"
+            preallocated = defaults.vram_preallocated or (defaults.reserve_percent is None and defaults.automatic)
+            process_environment["TYLOINFER_KV_VRAM_PREALLOCATED"] = "1" if preallocated else "0"
         if self.backend == "cuda":
             process_environment["TYLOINFER_KV_PLACEMENT"] = request.kv_memory.placement
             process_environment["TYLOINFER_KV_ALLOCATION"] = request.kv_memory.allocation

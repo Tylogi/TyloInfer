@@ -1,4 +1,4 @@
-import { validCompanionIds } from './companion-options.js';
+import { validCompanionIds, validCompanionPaths } from './companion-options.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const terminalStates = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
 const states = new Set(['queued', 'running', 'cancelling', ...terminalStates]);
@@ -23,9 +23,17 @@ export function createModelApi(connection) {
     if (!value || value.id !== id || !['model.load', 'model.unload'].includes(value.kind) || !states.has(value.status) || typeof value.cancel_requested !== 'boolean') throw write ? unknown(id) : invalid();
     return value;
   };
-  const submit = async (method, request, signal, companionIds) => {
-    if (method === 'models/load' && (!request || Object.hasOwn(request, 'gguf_companions') || companionIds !== undefined && !validCompanionIds(companionIds))) throw new ModelBridgeError('tyloinfer/bad-request', 'Select registered companion identities; filesystem paths are not accepted');
-    const value = await call(method, { request, ...(method === 'models/load' && companionIds?.length ? { companion_ids: [...companionIds] } : {}) }, signal, true);
+  const submit = async (method, request, signal, companions) => {
+    let companionFields = {};
+    if (method === 'models/load') {
+      if (!request || Object.hasOwn(request, 'gguf_companions')) throw new ModelBridgeError('tyloinfer/bad-request', 'Use the Engram companion picker');
+      if (companions !== undefined) {
+        if (validCompanionPaths(companions)) companionFields = { companion_paths: [...companions] };
+        else if (validCompanionIds(companions)) companionFields = companions.length ? { companion_ids: [...companions] } : {};
+        else throw new ModelBridgeError('tyloinfer/bad-request', 'Choose registered companions or enter full server paths');
+      }
+    }
+    const value = await call(method, { request, ...companionFields }, signal, true);
     if (!isOperationId(value?.operation_id) || value.status !== 'accepted') throw unknown();
     return value;
   };

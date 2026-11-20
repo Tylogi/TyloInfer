@@ -1,8 +1,9 @@
 # Flash-Next CUDA continuous batching
 
-Enable an explicit request capacity with `tyloinfer serve --max-requests-per-runtime N`
-or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
-from 1 to 32 on one CUDA device. The managed server's default remains one request.
+The managed CUDA server accepts eight requests per worker by default. Set a
+different limit with `tyloinfer serve --max-requests-per-runtime N`. The native
+runtime exposes `mfq-runtime --continuous-batching N`. Flash-Next supports
+capacities from 1 to 32 on one CUDA device.
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded

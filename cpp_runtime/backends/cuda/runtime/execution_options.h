@@ -26,6 +26,7 @@ bool skip_fixed_gpu_timing();
 bool window_input_views();
 bool decode_host_pin();
 bool kv_vram_preallocated();
+bool kv_vram_request_sized();
 bool vision_resident();
 bool dma_graph_batch();
 bool ram_field_packing();

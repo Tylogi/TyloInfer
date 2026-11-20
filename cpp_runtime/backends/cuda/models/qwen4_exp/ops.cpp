@@ -15,6 +15,7 @@
 #include "storage/moe_ffn_pipeline.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/routed_cache_resources.h"
+#include "runtime/layer_weight_stream.h"
 #include "runtime/routed_graph_pools.h"
 #include "prefill_budget.h"
 #include "runtime/nint_row_pipeline.h"
@@ -2550,28 +2551,6 @@ void qwen4_release_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp) {
     }
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-namespace {
-namespace tb=mfq_tensor_backend;
-std::shared_ptr<tb::TensorStorage> whole_prefill_weight(const tb::Tensor& weight) {
-    auto storage=std::static_pointer_cast<tb::TensorStorage>(weight.weak_storage_owner().lock());
-    // A replacement invalidates raw device addresses. Only move complete
-    // allocations with one tensor view, after retiring every graph reader.
-    if(!storage || storage.use_count()!=2 || weight.byte_offset() || storage->bytes!=weight.nbytes())return {};
-    return storage;
-}
-void rebind_prefill_weight(tb::Tensor& weight,const std::shared_ptr<tb::TensorStorage>& storage,
-        void* address,std::shared_ptr<void> owner,
-        std::function<void(std::uintptr_t,std::shared_ptr<void>)> record_stream,bool mapped) {
-    storage->base=address;
-    storage->mapped_host=mapped;
-    storage->record_stream=std::move(record_stream);
-    storage->owner=std::move(owner);
-    weight=tb::Tensor(storage,weight.view_descriptor());
-}
-}
-#endif
-
 std::size_t qwen4_borrow_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* mtp,std::size_t bytes,
         const std::function<void(std::size_t)>& reserve_host,std::size_t reserved_ram,bool reserve_live_state) {
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
@@ -2583,19 +2562,13 @@ std::size_t qwen4_borrow_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* m
     int mapped=0;
     TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&mapped,cudaDevAttrCanMapHostMemory,device));
     if(!mapped)return 0;
-    const auto candidate=[&](QuantLinear& projection) -> tb::Tensor* {
-        if(!projection.is_gguf() || projection.tensor_parallel())return nullptr;
-        auto& weight=projection.gguf;
-        if(weight.rotation || weight.correction || weight.projection_correction || !weight.packed.is_cuda() ||
-                weight.packed.get_device()!=device || weight.packed.is_mapped_host() || !weight.packed.is_contiguous())return nullptr;
-        return &weight.packed;
-    };
-    std::vector<tb::Tensor*> candidates;
+    std::vector<mfq_tensor_backend::Tensor*> candidates;
     for(auto block=model.blocks.rbegin();block!=model.blocks.rend();++block) {
         const auto& dense=static_cast<qwen4_exp::Qwen4Block&>(**block).dense_ffn_weights;
         if(!dense)continue;
-        if(auto* weight=candidate(dense->down))candidates.push_back(weight);
-        for(auto& projection:dense->gate_up.layers)if(auto* weight=candidate(projection))candidates.push_back(weight);
+        if(auto* weight=dense_prefill_gguf_image(dense->down,device))candidates.push_back(weight);
+        for(auto& projection:dense->gate_up.layers)
+            if(auto* weight=dense_prefill_gguf_image(projection,device))candidates.push_back(weight);
     }
     if(candidates.empty())return 0;
     model.borrowed_dense_weights.reserve(model.borrowed_dense_weights.size()+candidates.size());
@@ -2627,34 +2600,24 @@ std::size_t qwen4_borrow_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* m
             headroom=available;
         }
     }
-    const auto stream=mfq_current_cuda_stream();
     const auto target=mfq::engine::prefill_budget_add(headroom,bytes);
     auto next_check=bytes;
     std::size_t released=0,reclaimed_at=0;
     for(auto* weight:candidates) {
-        const auto storage=whole_prefill_weight(*weight);
-        if(!storage)continue;
+        const auto image_bytes=whole_prefill_weight_bytes(*weight);
+        if(!image_bytes)continue;
         try {
-            const auto required=mfq::engine::prefill_budget_add(reserved_ram,storage->bytes);
+            const auto required=mfq::engine::prefill_budget_add(reserved_ram,image_bytes);
             if(reserve_host)reserve_host(required);
             if(required>mfq::sample_host_memory().available_host_bytes())continue;
-            auto host=std::make_shared<tb::Tensor>(tb::empty({int64_t(storage->bytes)},
-                tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true)));
-            void* alias=nullptr;
-            const auto status=cudaHostGetDevicePointer(&alias,host->data_ptr(),0);
-            if(status==cudaErrorNotSupported || status==cudaErrorInvalidValue) {
-                (void)cudaGetLastError();break;
-            }
-            TYLOINFER_CUDA_CHECK(status);
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(host->data_ptr(),storage->base,storage->bytes,cudaMemcpyDeviceToHost,stream));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-            rebind_prefill_weight(*weight,storage,alias,std::move(host),{},true);
+            const auto moved=borrow_prefill_weight(*weight);
+            if(!moved)continue;
             if(model.borrowed_dense_weights.empty()) {
                 model.dense_prefill_restore_headroom=headroom;
                 model.dense_prefill_initial_state_growth=qwen4_prefill_state_growth_bytes(model,1);
             }
             model.borrowed_dense_weights.push_back(weight);
-            released+=storage->bytes;
+            released+=moved;
             if(released>=next_check) {
                 context->reclaim_idle_memory();
                 reclaimed_at=released;
@@ -2722,7 +2685,6 @@ void qwen4_restore_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* mtp,std
         return;
     }
     qwen4_release_decode_graphs(model,mtp);
-    const auto stream=mfq_current_cuda_stream();
     if(target==SIZE_MAX && model.positions.defined()) {
         // The final position tensor survives prefill. Move its small payload
         // before trimming so its original allocation cannot pin scratch pages.
@@ -2754,28 +2716,10 @@ void qwen4_restore_dense_prefill_weights(Qwen4CausalLm& model,MtpModule* mtp,std
         context->available_memory(),context->reusable_dense_weight_bytes(),floor,qwen4_borrowed_dense_weight_bytes(model));
     const auto restore_available=[&] {
         for(auto it=borrowed.begin();it!=borrowed.end() && restored<target;) {
-            auto& weight=**it;
-            const auto storage=whole_prefill_weight(weight);
-            const auto available=context->available_memory();
-            const auto headroom=available>floor?available-floor:0;
-            if(!storage || (storage->bytes>headroom && storage->bytes-headroom>context->reusable_dense_weight_bytes())) {
-                ++it;continue;
-            }
             try {
-                const DenseWeightAllocationScope residency;
-                auto image=tb::empty({int64_t(storage->bytes)},weight.options().dtype(tb::kUInt8));
-                const auto host=std::static_pointer_cast<tb::Tensor>(storage->owner);
-                TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(image.data_ptr(),host->data_ptr(),storage->bytes,cudaMemcpyHostToDevice,stream));
-                TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-                context->check_memory_limit();
-                if(context->available_memory()<std::min(available,floor)) {
-                    image={};
-                    context->reclaim_idle_memory();
-                    ++it;continue;
-                }
-                const auto device_storage=std::static_pointer_cast<tb::TensorStorage>(image.weak_storage_owner().lock());
-                rebind_prefill_weight(weight,storage,device_storage->base,device_storage->owner,device_storage->record_stream,false);
-                restored+=storage->bytes;
+                const auto moved=restore_prefill_weight(**it,*context,floor);
+                if(!moved){++it;continue;}
+                restored+=moved;
                 it=borrowed.erase(it);
             } catch(const MfqResourceExhausted&) {
                 (void)cudaGetLastError();

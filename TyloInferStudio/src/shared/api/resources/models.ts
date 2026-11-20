@@ -17,11 +17,31 @@ import { request } from '../client';
 import type { KvQuantizationSettings } from './runtime';
 
 export interface ModelLoadContextSettings {
-  automatic: boolean;
-  ssd_kv: boolean;
-  ram_preallocated: boolean;
+  reserve_percent?: 5 | 10 | 20;
+  precision?: number | null;
+  automatic?: boolean;
+  ssd_kv?: boolean;
+  ram_preallocated?: boolean;
   vram_preallocated: boolean;
-  kv_quantization: KvQuantizationSettings;
+  kv_quantization?: KvQuantizationSettings;
+}
+
+export interface ModelLoadPlan {
+  max_context: number;
+  context_size: number | null;
+  precision: number;
+  precisions: number[];
+  usable: boolean;
+  reason: 'model_limit' | 'memory_limit' | 'memory_unavailable' | 'precision_unsupported' | null;
+}
+
+export interface ModelLoadPlanQuery {
+  reserve: 5 | 10 | 20;
+  context_size?: number;
+  precision?: number;
+  preallocate: boolean;
+  device?: string;
+  streamed_jev: boolean;
 }
 
 export interface DownloadDirectoryStatus {
@@ -133,6 +153,7 @@ export const modelsApi = {
         pin: policy.pin ?? false,
         ...(policy.jev_weights ? { jev_weights: policy.jev_weights } : {}),
         ...(policy.context_management ? { context_management: {
+          reserve_percent: policy.context_management.reserve_percent, precision: policy.context_management.precision,
           automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,
           ram_preallocated: policy.context_management.ram_preallocated, vram_preallocated: policy.context_management.vram_preallocated,
           kv_quantization: policy.context_management.kv_quantization,
@@ -142,6 +163,11 @@ export const modelsApi = {
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });
+  },
+
+  modelLoadPlan(id: string, params: ModelLoadPlanQuery, signal?: AbortSignal): Promise<ModelLoadPlan> {
+    const query = new URLSearchParams(Object.entries(params).map(([key, value]) => [key, String(value)]));
+    return request('/api/v1/models/' + encodeURIComponent(id) + '/load-plan?' + query, { signal });
   },
 
 

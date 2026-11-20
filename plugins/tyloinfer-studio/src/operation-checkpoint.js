@@ -1,6 +1,6 @@
 import { isOperationId } from './model-api.js';
 
-const kinds = new Set(['model.load', 'model.unload', 'memory', 'download', 'context']);
+const kinds = new Set(['model.load', 'model.unload', 'memory', 'download', 'context', 'sync']);
 export function createOperationCheckpoint(storage, key) {
   const source = () => typeof storage === 'function' ? storage() : storage;
   return {

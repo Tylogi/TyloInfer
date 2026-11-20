@@ -114,25 +114,27 @@ class RuntimeServer(uvicorn.Server):
                 raise RuntimeError("server listener is not running")
             if protocol not in {"openai", "anthropic"}:
                 raise ValueError("unsupported API protocol")
-            index = 1 if protocol == "anthropic" else 0
-            if index == 1 and self.anthropic_port is None:
-                raise RuntimeError("Anthropic listener is not enabled")
-            previous_port = self.anthropic_port if index else self.config.port
+            anthropic = protocol == "anthropic"
+            previous_port = self.anthropic_port if anthropic else self.config.port
             if port == previous_port:
                 return self.listener_status()
             listener = await self._new_listener(port)
             try:
                 await listener.start_serving()
-                await asyncio.to_thread(self._save_port, port if not index else self.config.port, port if index else self.anthropic_port)
+                await asyncio.to_thread(self._save_port, self.config.port if anthropic else port, port if anthropic else self.anthropic_port)
             except BaseException:
                 listener.close()
                 await listener.wait_closed()
                 raise
-            previous = self.servers[index]
-            self.servers[index] = listener
-            if index:
+            if previous_port is None:
+                self.servers.append(listener)
+            else:
+                index = -1 if anthropic else 0
+                previous = self.servers[index]
+                self.servers[index] = listener
+                previous.close()
+            if anthropic:
                 self.anthropic_port = port
             else:
                 self.config.port = port
-            previous.close()
             return self.listener_status()

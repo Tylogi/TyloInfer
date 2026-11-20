@@ -417,7 +417,7 @@ For API loading, omit `jev_weights` to use d1 residency automatically, or select
 | `--work-dir PATH` | Workspace boundary for tool jobs. | Current directory |
 | `--api-key-env NAME` | Environment variable containing the administrator API key. | `TYLOINFER_SERVER_API_KEY` |
 | `--max-runtime-instances N` | Maximum managed native workers. | `2` |
-| `--max-requests-per-runtime N` | Concurrent requests per worker. | CUDA/HIP: `1`; Metal: `8` |
+| `--max-requests-per-runtime N` | Concurrent requests per worker. | CUDA and Metal `8`, HIP `1` |
 | `--max-queued-requests-per-runtime N` | Waiting requests per worker. | `max(32, 4 × concurrency)` |
 | `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
 | `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic where supported |

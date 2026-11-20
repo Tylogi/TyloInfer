@@ -197,7 +197,7 @@ export function useModelCatalog() {
         pin: options.pinned,
         device_ids: options.deviceIds,
         idle_ttl_seconds: options.idleTtl,
-        ...(!options.context.automatic ? { context_management: options.context } : {}),
+        context_management: options.context,
         ...(companions?.length ? { gguf_companions: companions } : {}),
       });
       if (!current()) return;
@@ -240,9 +240,7 @@ export function useModelCatalog() {
             ),
         );
       }
-      const loaded =
-        instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
-        runtime?.model === artifact.name;
+      const loaded = instances.some((item) => item.model === artifact.name && item.state !== 'failed');
       if (!loaded && !artifact.gguf_companion_required) {
         const options = loadPreferences[artifact.name] ?? defaultPreferences(artifact.name);
         await modelsApi.loadModel(artifact.name, options.context.context_size, 'auto', {
@@ -250,7 +248,7 @@ export function useModelCatalog() {
           pin: options.pinned,
           device_ids: options.deviceIds,
           idle_ttl_seconds: options.idleTtl,
-          ...(!options.context.automatic ? { context_management: options.context } : {}),
+          context_management: options.context,
         });
         if (!current()) return;
       }

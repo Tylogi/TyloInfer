@@ -30,7 +30,7 @@ const acceptedUnload = await ctx.connection.rpc.call('/tyloinfer', 'models/unloa
 
 桥分别调用固定的 `POST /api/v1/models/load` 和 `POST /api/v1/models/unload`。`request` 使用核心现有 `ModelLoadRequest`／`ModelUnloadRequest` 字段；桥不补写默认值、不改 Auto／固定精度、SSD 或内存策略。请求必须为JSON对象，大小上限64 KiB；完整原生字段校验仍由核心执行。
 
-加载时选择配套工件的规则见[产品边界](agent-product-boundaries.md)：禁止Client在request中传 `gguf_companions`，改用顶层 `companion_ids`（0–16个唯一的32位小写hex已登记GGUF工件ID）。Host逐一向核心固定companion-reference路由核实当前路径，全部成功后才发送一次load；不从Host本机文件系统猜路径，也不对旧核心退回任意Client路径。缺失工件在加载前返回 404。
+配套资产使用顶层 `companion_ids` 或 `companion_paths`。前者由 Host 向核心解析已登记 GGUF 工件，后者接收用户明确选择的核心所在设备的绝对路径。原生加载器验证文件和兼容性。见[产品边界](agent-product-boundaries.md)。
 
 成功仅表示核心返回 HTTP 202 和真实 `{operation_id, status:'accepted'}`。这不是完成、不是模型 ready，也不能据此显示加载成功。加载／卸载只能由明确用户动作触发；页面挂载、刷新、重连和状态恢复不得触发写操作。强制卸载必须是明确选择，不得把 `force` 默认为 true。
 

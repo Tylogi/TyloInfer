@@ -7,7 +7,7 @@
 | RPC | 精确payload | 返回与边界 |
 |---|---|---|
 | `connection/info` | `{}` | 固定读取已配置TyloInfer核心的health和listener；返回 `{base_url,openai_base_url,anthropic_base_url,anthropic_port,protocol_version}`。地址来自核心provider，不使用Agent origin；拒绝userinfo、query、fragment及包含已解析凭据值的地址。Anthropic未监听时两个相关字段为null，不猜默认端口。不回传密钥或凭据引用。核心不兼容／不可达时失败，不伪造可用地址。 |
-| `models/load` | `{request,companion_ids?}` | request保持原生ModelLoadRequest，但禁止Client传 `gguf_companions` 路径。companion_ids为0–16个唯一的32位小写hex工件ID。Host固定GET每个 `/api/v1/models/{id}/companion-reference`，核对ID、GGUF格式和路径后，才将解析出的路径写入原生gguf_companions并POST固定load。全部解析成功才发一次load；不查Host本机文件，不退回Client路径。返回原生OperationAccepted。 |
+| `models/load` | `{request,companion_ids?,companion_paths?}` | 配套输入二选一。`companion_ids` 由核心 `/api/v1/models/{id}/companion-reference` 解析。`companion_paths` 接收 0–16 个唯一的服务端绝对路径。Host 将选定的配套文件填入原生 `gguf_companions` 并提交加载。核心验证文件和兼容性。 |
 | `jobs/delete` | `{job_id,confirmed:true}` | 先固定GET作业并核对身份及终态，再DELETE同ID。允许任意kind的succeeded/failed/cancelled/interrupted记录；活动态不取消、不强制。原生204映射 `{ok:true,value:null}`。只归档记录，不删除模型或下载文件。 |
 | `jobs/clear-completed` | `{scope:'all-completed',confirmed:true}` | 固定DELETE `/api/v1/jobs/completed`，由原生数据库原子筛选终态；原生204映射null，不编造清理数量。不接受省略scope或泛化all，不清理活动队列，不运行／重试／取消任何作业。确认须明确包含非下载作业的全部终态记录。 |
 | `cache/configure-directory` | `{directory_id,scope:'all-loaded-models',confirmed:true}` | 目录ID必须为核心已提供的32位小写hex。Host固定GET `/api/v1/models/directories?directory_id=...`，核对current_id与current_path后，仅PUT `/api/v1/runtime/memory-policy` 的 `{prefix_directory:<核心路径>}`。返回原生202 OperationAccepted，通过既有service/get和service/cancel跟踪原生memory作业。不能直接传路径；此入口不支持null恢复默认。 |
@@ -16,7 +16,7 @@ companion-reference由核心根据其当前catalog解析，仅返回完整且实
 
 缓存目录变更不是无害的路径保存：原生全局内存规划可能先卸载再重载所有已加载实例，清除活动KV；忙时返回真实作业失败，不替用户取消请求。确认必须显示全局范围与重载影响，不能隐藏在自动保存、轮询或草稿恢复里。PUT保留核心对现有预算的部分更新合并，不由Host写默认容量。目录存在、可写性及模型恢复最终由核心验证；失败不能声称原子完成或完全无副作用。
 
-远程路由、监听／认证修改以及apply_global_cap批量重载不在本批开放；现有provider配置不能宣称等价恢复它们。
+远程路由、监听和鉴权修改、全局上下文重载见[推理页面接口](agent-inference-pages.md)。
 
 ## 独立产品与遗留门面
 
