@@ -11,7 +11,7 @@ import zipfile
 
 
 def payload(project: Path, executable: Path) -> dict[str, Path]:
-    tauri = project / "TyloInferStudio/src-tauri"
+    tauri = project / "studio/web/src-tauri"
     bundle = json.loads((tauri / "tauri.release-windows.conf.json").read_text())["bundle"]
     files: dict[str, Path] = {}
     names: set[str] = set()
@@ -48,7 +48,7 @@ def payload(project: Path, executable: Path) -> dict[str, Path]:
 
 def build_archive(project: Path, executable: Path, output: Path) -> Path:
     files = payload(project, executable)
-    config = json.loads((project / "TyloInferStudio/src-tauri/tauri.conf.json").read_text())
+    config = json.loads((project / "studio/web/src-tauri/tauri.conf.json").read_text())
     output.mkdir(parents=True, exist_ok=True)
     archive = output / f"TyloInfer_{config['version']}_x64-portable.zip"
     partial = archive.with_suffix(".zip.partial")
@@ -80,7 +80,7 @@ def nsis_string(value: str) -> str:
 
 def build_executable(project: Path, executable: Path, output: Path, makensis: Path) -> Path:
     files = payload(project, executable)
-    version = json.loads((project / "TyloInferStudio/src-tauri/tauri.conf.json").read_text())["version"]
+    version = json.loads((project / "studio/web/src-tauri/tauri.conf.json").read_text())["version"]
     digest = hashlib.sha256()
     instructions = []
     directory = None
@@ -103,7 +103,7 @@ def build_executable(project: Path, executable: Path, output: Path, makensis: Pa
     template = (project / "packaging/windows_standalone.nsi").read_text(encoding="utf-8")
     for key, value in {
         "OUTPUT": nsis_string(str(partial.resolve())), "VERSION": version,
-        "ICON": nsis_string(str(project / "TyloInferStudio/src-tauri/icons/icon.ico")),
+        "ICON": nsis_string(str(project / "studio/web/src-tauri/icons/icon.ico")),
         "PAYLOAD_ID": f"{version}-{digest.hexdigest()[:16]}",
         "PAYLOAD_FILES": "\n".join(instructions),
     }.items():

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="TyloInferStudio/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
+  <img src="studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
 </p>
 
 <h1 align="center">TyloInfer</h1>
@@ -79,24 +79,24 @@ git clone https://github.com/Tylogi/TyloInfer.git
 cd TyloInfer
 
 # Apple Silicon
-uv sync --extra metal
-uv run tyloinfer build --backend metal
+uv sync --project studio/server --extra metal
+uv run --project studio/server tyloinfer build --backend metal
 
 # Start the server and discover models in this directory
-uv run tyloinfer serve --model-dir ./models
+uv run --project studio/server tyloinfer serve --model-dir ./models
 ```
 
 For NVIDIA, replace the two build steps with:
 
 ```sh
-uv sync
-uv run tyloinfer build --backend cuda
+uv sync --project studio/server
+uv run --project studio/server tyloinfer build --backend cuda
 ```
 
 Open **http://127.0.0.1:8090/**, download a model, and load it from **Models**. To load an existing model at startup:
 
 ```sh
-uv run tyloinfer serve --model /models/model.gguf
+uv run --project studio/server tyloinfer serve --model /models/model.gguf
 ```
 
 The same command accepts `.tq` checkpoints. For sharded models, select the first shard and keep the complete set in one directory.

@@ -2,7 +2,7 @@ Unicode true
 RequestExecutionLevel user
 SilentInstall silent
 AutoCloseWindow true
-InstallDir "$TEMP\TyloInferStudio"
+InstallDir "$TEMP\studio/web"
 SetCompressor /SOLID zlib
 Name "TyloInfer"
 Caption "TyloInfer"
@@ -37,7 +37,7 @@ Section
   StrCpy $CachePath "$CacheRoot\@PAYLOAD_ID@"
   StrCpy $Stage "$CachePath.partial"
 
-  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\TyloInferStudio-@PAYLOAD_ID@") p .r0'
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\studio/web-@PAYLOAD_ID@") p .r0'
   StrCpy $Mutex $0
   ${If} $Mutex == 0
     Goto failed

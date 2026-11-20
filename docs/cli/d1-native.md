@@ -17,7 +17,7 @@ executable rejects unsupported devices. No driver or toolkit is installed by
 this command.
 
 ```sh
-cmake -S cpp_runtime/backends/cuda/d1 -B build/d1 -DCMAKE_BUILD_TYPE=Release
+cmake -S csrc/backends/cuda/d1 -B build/d1 -DCMAKE_BUILD_TYPE=Release
 cmake --build build/d1 --target tyloinfer-d1-native --config Release
 ```
 
@@ -155,7 +155,7 @@ only the measured iteration count. These metrics are not end-to-end TTFT.
 ## Validation and licensing
 
 ```sh
-python -m pytest tests/test_d1_native.py tests/test_d1_native_gpu.py tests/test_d1_native_quantized.py tests/test_d1_native_real.py -q
+python -m pytest studio/server/tests/test_d1_native.py studio/server/tests/test_d1_native_gpu.py studio/server/tests/test_d1_native_quantized.py studio/server/tests/test_d1_native_real.py -q
 ```
 
 Protocol tests use a fake executable and do not prove CUDA correctness. The

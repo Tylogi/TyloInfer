@@ -14,7 +14,7 @@ mfq_spec_dir="${mfq_build_root}/spec"
 mfq_sidecar_dir="${mfq_script_dir}/sidecars"
 mfq_framework_dir="${mfq_script_dir}/Frameworks"
 mfq_resource_dir="${mfq_script_dir}/Resources"
-tyloinfer_dir="${mfq_project_dir}/TyloInferStudio"
+tyloinfer_dir="${mfq_project_dir}/studio/web"
 mfq_tauri_target="aarch64-apple-darwin"
 mfq_output_dir="${TYLOINFER_RELEASE_OUTPUT_DIR:-${mfq_script_dir}/dist}"
 mfq_cli_name="tyloinfer-cli"
@@ -59,7 +59,8 @@ else
 fi
 source "${mfq_venv_dir}/bin/activate"
 if [[ "${TYLOINFER_RELEASE_REUSE_VENV:-0}" != "1" ]]; then
-  uv sync \
+  uv sync --project studio/server \
+    --project "${mfq_project_dir}/studio/server" \
     --locked \
     --active \
     --no-default-groups \
@@ -83,7 +84,7 @@ for mfq_mlx_file in \
   [[ -f "${mfq_mlx_file}" ]] || fail "missing MLX runtime file: ${mfq_mlx_file}"
 done
 
-cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja \
+cmake -S "${mfq_project_dir}/csrc" -B "${mfq_native_build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_FLAGS="${CFLAGS}" \
   -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
@@ -148,7 +149,7 @@ mfq_pyinstaller_args=(
   --target-architecture arm64
   --paths "${mfq_project_dir}"
   --additional-hooks-dir "${mfq_script_dir}/hooks"
-  --collect-data tyloinfer
+  --collect-data server
   --collect-all av
   --collect-all fastapi
   --collect-all httpx
@@ -191,7 +192,7 @@ mfq_pyinstaller_args=(
 if [[ "${mfq_signing_identity}" != "-" ]]; then
   mfq_pyinstaller_args+=(--codesign-identity "${mfq_signing_identity}")
 fi
-mfq_pyinstaller_args+=("${mfq_project_dir}/tyloinfer/cli.py")
+mfq_pyinstaller_args+=("${mfq_project_dir}/studio/server/cli.py")
 "${mfq_venv_dir}/bin/pyinstaller" "${mfq_pyinstaller_args[@]}"
 
 mfq_cli_path="${mfq_resource_dir}/${mfq_cli_name}/${mfq_cli_name}"

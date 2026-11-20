@@ -20,7 +20,7 @@ companion-reference由核心根据其当前catalog解析，仅返回完整且实
 
 ## 独立产品与遗留门面
 
-- 官方完整DSH源码和实际运行包已分别归位vendor/dsh/upstream与vendor/dsh/runtime，既有证据为同一0.2.2-rc.2发行版；未宣称源码逐位重现二进制。
+- 官方完整DSH源码和实际运行包已分别归位dsh/upstream与dsh/runtime，既有证据为同一0.2.2-rc.2发行版；未宣称源码逐位重现二进制。
 - 核心不再默认导入、挂载或关闭旧Python Agent任务／设置门面；相关源码迁到Host插件下非分发的legacy-python兼容测试目录，未删除任何旧数据库、配置或凭据。
 - 核心Python包移除旧SDK extra；已离线更新锁文件并重生成公开OpenAPI，协议回归通过。旧门面测试显式加载兼容工厂，不把它重新挂回正式核心。核心隔离测试明确阻断DSH／旧门面导入，默认应用无旧Agent state与路由。
 - Studio显示设置与纯推理入口由前端独立保留，Agent版使用原生DSH设置，不要求Studio依赖DSH。

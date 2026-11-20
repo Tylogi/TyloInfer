@@ -5,7 +5,7 @@ detects Metal, CUDA or the early HIP backend, invokes CMake, and records the res
 that [`tyloinfer serve`](serve.md) can find it without a binary path.
 
 The `tyloinfer` command must come from a TyloInfer source checkout containing
-`cpp_runtime/CMakeLists.txt`. TyloInfer derives the repository root from the installed
+`csrc/CMakeLists.txt`. TyloInfer derives the repository root from the installed
 Python package, not from the current working directory. In an editable
 development environment, run the CLI through uv from that checkout.
 
@@ -15,19 +15,19 @@ Sync the dependency set for the current host once:
 
 ```shell
 cd /path/to/TyloInfer
-uv sync --extra metal
+uv sync --project studio/server --extra metal
 ```
 
 On a CUDA host, the native build itself needs no Python accelerator package:
 
 ```shell
-uv sync
+uv sync --project studio/server
 ```
 
 Build with automatic backend detection:
 
 ```shell
-uv run tyloinfer build
+uv run --project studio/server tyloinfer build
 ```
 
 Automatic backend selection uses:
@@ -43,8 +43,8 @@ Backend detection does not check every compiler dependency. Requirements are
 listed below. Pass the backend explicitly when debugging a build:
 
 ```shell
-uv run tyloinfer build --backend metal
-uv run tyloinfer build --backend cuda
+uv run --project studio/server tyloinfer build --backend metal
+uv run --project studio/server tyloinfer build --backend cuda
 ```
 
 ## Native format profiles
@@ -55,7 +55,7 @@ excluded from the ordinary build. Use a separate build directory for a
 compatibility runtime:
 
 ```shell
-uv run tyloinfer build --build-dir build/native-compat -- -DTYLOINFER_ENABLE_MFQ_COMPAT=ON
+uv run --project studio/server tyloinfer build --build-dir build/native-compat -- -DTYLOINFER_ENABLE_MFQ_COMPAT=ON
 ```
 
 Compatibility adds legacy NINT/NVQ/MFE/SQ inference; it does not add offline
@@ -66,14 +66,14 @@ TQ HIP implementation.
 
 ## Output and build manifest
 
-The default CMake build directory is `<repo>/build/cpp_runtime`. Executable
+The default CMake build directory is `<repo>/build/csrc`. Executable
 paths:
 
 | Backend | Executable |
 | --- | --- |
-| Metal | `<repo>/build/cpp_runtime/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/cpp_runtime/mfq-runtime` |
-| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
+| Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
+| CUDA | `<repo>/build/csrc/mfq-runtime` |
+| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
 
 `mfq-runtime` runs inference and service mode.
 
@@ -91,7 +91,7 @@ To inspect a generator-dependent path, read the `executable` field for the
 selected backend in the manifest:
 
 ```shell
-uv run -m json.tool build/mfq-runtime.json
+uv run --project studio/server -m json.tool build/mfq-runtime.json
 ```
 
 `tyloinfer serve` reads this manifest automatically. If the executable exists, it is
@@ -104,14 +104,14 @@ Use `--build-dir` when the build tree belongs on another disk:
 
 ```shell
 cd /path/to/TyloInfer
-uv run tyloinfer build --build-dir /mnt/fast-build/tyloinfer
+uv run --project studio/server tyloinfer build --build-dir /mnt/fast-build/tyloinfer
 ```
 
 The manifest records the absolute build directory and executable path. A later
 `tyloinfer serve` command finds this custom build without another option:
 
 ```shell
-uv run tyloinfer serve --model /models/model.tq
+uv run --project studio/server tyloinfer serve --model /models/model.tq
 ```
 
 Both commands must use the `tyloinfer` installation associated with the same source
@@ -123,7 +123,7 @@ Arguments after `--` are passed to the CMake configure command. The separator
 is required so the arguments are not parsed as `tyloinfer build` options.
 
 ```shell
-uv run tyloinfer build --backend cuda -- \
+uv run --project studio/server tyloinfer build --backend cuda -- \
   -DCMAKE_CUDA_ARCHITECTURES=90 \
   -DGGML_CCACHE=OFF
 ```
@@ -136,7 +136,7 @@ missing executable.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--backend {auto,cuda,hip,metal}` | Select or detect the accelerator backend. | `auto` |
-| `--build-dir PATH` | Set the CMake build directory. | `<repo>/build/cpp_runtime` |
+| `--build-dir PATH` | Set the CMake build directory. | `<repo>/build/csrc` |
 | `--build-type TYPE` | Set `CMAKE_BUILD_TYPE` and the build configuration. | `Release` |
 | `-j N`, `--jobs N` | Set parallel build jobs. | Host CPU count |
 | `--generator NAME` | Select a CMake generator. | Ninja when available, otherwise CMake default |
@@ -161,8 +161,8 @@ retained internal names; do not rename them when following these instructions.
 For a source checkout managed by uv:
 
 ```shell
-uv sync --extra metal
-uv run tyloinfer build
+uv sync --project studio/server --extra metal
+uv run --project studio/server tyloinfer build
 ```
 
 ### HIP (experimental)
@@ -170,7 +170,7 @@ uv run tyloinfer build
 - Linux with a ROCm/HIP toolchain and `hipcc`;
 - CMake 3.26 or newer and a C++ toolchain.
 
-Use `uv run tyloinfer build --backend hip`. This is not a claim of CUDA feature
+Use `uv run --project studio/server tyloinfer build --backend hip`. This is not a claim of CUDA feature
 parity; consult the [known gaps](../runtime/support.md#amd-gpus-and-rocm-hip)
 before choosing a model.
 
@@ -205,7 +205,7 @@ produced.
 ### Inspect the exact commands
 
 ```shell
-uv run tyloinfer build --dry-run --backend cuda -- \
+uv run --project studio/server tyloinfer build --dry-run --backend cuda -- \
   -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 

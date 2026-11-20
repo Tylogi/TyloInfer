@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 DSH_VERSION = "0.2.2-rc.2"
 PROFILE = "tyloinfer-web"
 OFFICIAL = ("@deepseek-ai/dsh", "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app")
-PRODUCTS = {"@tyloinfer/dsh-host": "tyloinfer-host", "@tyloinfer/dsh-studio": "tyloinfer-studio"}
+PRODUCTS = {"@tyloinfer/dsh-host": "host", "@tyloinfer/dsh-studio": "studio"}
 BUNDLES = [*OFFICIAL[1:], *PRODUCTS]
 
 
@@ -198,7 +198,7 @@ def open_existing(state_root: Path, port: int, opener=None) -> None:
 def main(argv: list[str] | None = None) -> int:
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime-root", type=Path, default=repo / "vendor" / "dsh" / "runtime")
+    parser.add_argument("--runtime-root", type=Path, default=repo / "dsh" / "runtime")
     parser.add_argument("--plugins-root", type=Path, default=repo / "plugins")
     parser.add_argument("--state-root", type=Path, required=True, help="Private profile and workspace directory")
     parser.add_argument("--core-url", default="http://127.0.0.1:8090/v1", help="Initial endpoint for a new profile only")

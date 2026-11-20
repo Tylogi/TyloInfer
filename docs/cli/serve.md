@@ -12,23 +12,23 @@ Sync the server and backend dependencies once:
 
 ```shell
 cd /path/to/TyloInfer
-uv sync --extra metal
+uv sync --project studio/server --extra metal
 ```
 
-On a CUDA host, use `uv sync` instead. Native CUDA inference
+On a CUDA host, use `uv sync --project studio/server` instead. Native CUDA inference
 does not require PyTorch or LibTorch.
 
 Start an idle server:
 
 ```shell
-uv run tyloinfer serve
+uv run --project studio/server tyloinfer serve
 ```
 
 Open the model catalog in TyloInfer or the Web UI to load a discovered model.
 To load one model before the server becomes available, pass its existing path:
 
 ```shell
-uv run tyloinfer serve --model /models/model.gguf
+uv run --project studio/server tyloinfer serve --model /models/model.gguf
 ```
 
 The server listens on `http://127.0.0.1:8090` by default. `Ctrl-C` stops the
@@ -112,7 +112,7 @@ architecture, and backend. Mismatched manifests are ignored.
 
 The manifest is always read from `<repo>/build/mfq-runtime.json`, where
 `<repo>` is the checkout supplying the running `tyloinfer` command. A default build
-uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
+uses `<repo>/csrc` as its source and `<repo>/build/csrc` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 
@@ -125,7 +125,7 @@ Source installations use the managed build automatically, including a custom
 `--host` and `--port` control only the user-facing FastAPI/Uvicorn listener:
 
 ```shell
-uv run tyloinfer serve \
+uv run --project studio/server tyloinfer serve \
   --model /models/model.gguf \
   --host 0.0.0.0 \
   --port 9000
@@ -143,7 +143,7 @@ starting the listener:
 
 ```shell
 TYLOINFER_SERVER_API_KEY='replace-with-a-secret' \
-  uv run tyloinfer serve --model /models/model.gguf --host 0.0.0.0
+  uv run --project studio/server tyloinfer serve --model /models/model.gguf --host 0.0.0.0
 ```
 
 `--api-key-env` changes the name of the environment variable read by the
@@ -169,11 +169,11 @@ To use another variable name:
 
 ```shell
 TYLOINFER_PRODUCTION_KEY='replace-with-a-secret' \
-  uv run tyloinfer serve --model /models/model.gguf --api-key-env TYLOINFER_PRODUCTION_KEY
+  uv run --project studio/server tyloinfer serve --model /models/model.gguf --api-key-env TYLOINFER_PRODUCTION_KEY
 ```
 
 In PowerShell, set `$env:TYLOINFER_SERVER_API_KEY = 'replace-with-a-secret'` before
-running `uv run tyloinfer serve`. The current browser UI and Studio show an
+running `uv run --project studio/server tyloinfer serve`. The current browser UI and Studio show an
 **API Key** sign-in page when authentication is required. Browser credentials
 are held in memory; reloading the page may require signing in again. Studio
 can persist credentials through the system credential store. Use a key with
@@ -191,7 +191,7 @@ root, such as `http://127.0.0.1:8090/`. Asset selection follows this order:
 3. `TYLOINFER_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
 4. Packaged Studio servers use their bundled `web-ui` assets without Node.js/npm.
-5. Otherwise, TyloInfer looks for `TyloInferStudio` in the source checkout.
+5. Otherwise, TyloInfer looks for `studio/web` in the source checkout.
 
 Studio starts both the API and Web UI on the same listener; it does not open a
 browser automatically. The desktop client and browsers share that server.
@@ -215,10 +215,10 @@ Explicit Web UI modes:
 
 ```shell
 # Serve an existing Web UI build.
-uv run tyloinfer serve --model /models/model.gguf --web-root /srv/tyloinfer-web
+uv run --project studio/server tyloinfer serve --model /models/model.gguf --web-root /srv/tyloinfer-web
 
 # Start only the API.
-uv run tyloinfer serve --model /models/model.gguf --no-web-ui
+uv run --project studio/server tyloinfer serve --model /models/model.gguf --no-web-ui
 ```
 
 `--web-root` and `--no-web-ui` are mutually exclusive. When neither is given,
@@ -231,7 +231,7 @@ Without it, the server stays idle until Studio, the Web UI, or the model API
 loads a model. Repeat `--model-dir` to add discovery roots:
 
 ```shell
-uv run tyloinfer serve \
+uv run --project studio/server tyloinfer serve \
   --model /models/default.tq \
   --model-dir /models/team-a \
   --model-dir /models/team-b
@@ -272,7 +272,7 @@ files. User-selected tool-job paths remain restricted to the current working
 directory.
 
 ```shell
-uv run tyloinfer serve \
+uv run --project studio/server tyloinfer serve \
   --model /models/model.gguf \
   --data-dir /var/lib/tyloinfer \
   --work-dir /srv/tyloinfer-work
@@ -284,7 +284,7 @@ persistent paths. TyloInfer resolves data, work, and model paths before startup.
 ## Runtime controls
 
 ```shell
-uv run tyloinfer serve \
+uv run --project studio/server tyloinfer serve \
   --model /models/model.gguf \
   --context-size 32768 \
   --prefill-chunk-size auto \
@@ -327,11 +327,11 @@ checkpoint. The current CLI exposes these explicit companion controls for CUDA:
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
-uv run tyloinfer serve --backend cuda --model /models/target.gguf \
+uv run --project studio/server tyloinfer serve --backend cuda --model /models/target.gguf \
   --mtp-native-draft /models/matching-mtp.gguf --no-web-ui
 
 # DFlash2 checkpoint directory (the CLI describes the CUDA Flash-Next path).
-uv run tyloinfer serve --backend cuda --model /models/target.gguf \
+uv run --project studio/server tyloinfer serve --backend cuda --model /models/target.gguf \
   --dflash2-draft /models/matching-dflash2 --no-web-ui
 ```
 
@@ -380,7 +380,7 @@ streaming transfers. Neither mode guarantees that a model fits: execution
 workspaces and other allocations also require memory.
 
 ```shell
-uv run tyloinfer serve --backend cuda --model ./models/decision.tq --jev-weights stream --no-web-ui
+uv run --project studio/server tyloinfer serve --backend cuda --model ./models/decision.tq --jev-weights stream --no-web-ui
 ```
 
 Replace the example artifact with a supported decision checkpoint. The setting
@@ -455,5 +455,5 @@ does not need configuration.
 
 ### Web UI assets are missing
 
-Install Node.js/npm so TyloInfer can build `TyloInferStudio`, pass a valid
+Install Node.js/npm so TyloInfer can build `studio/web`, pass a valid
 `--web-root`, or use `--no-web-ui` for an API-only process.

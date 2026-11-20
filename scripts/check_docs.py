@@ -10,8 +10,8 @@ from urllib.parse import unquote, urlsplit
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from tyloinfer.cli import _build_parser  # noqa: E402
+sys.path.insert(0, str(ROOT / "studio"))
+from server.cli import _build_parser  # noqa: E402
 
 
 def check() -> None:
@@ -51,7 +51,7 @@ def check() -> None:
                 if unquote(url.fragment) not in anchors:
                     errors.append(f"{relative}: missing Markdown anchor {raw}")
 
-    schema = json.loads((ROOT / "tyloinfer/server/protocol/openapi.json").read_text())
+    schema = json.loads((ROOT / "studio/server/server/protocol/openapi.json").read_text())
     methods = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
     operations = {(m.upper(), p): op for p, item in schema["paths"].items() for m, op in item.items() if m in methods}
     api = (ROOT / "docs/api/http.md").read_text()

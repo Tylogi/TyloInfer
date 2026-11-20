@@ -38,7 +38,7 @@ names and the `MFQTNSR1` envelope are internal interfaces, not old public CLI
 aliases.
 
 ```python
-from tyloinfer.runtime import load_minicpmo45
+from server.runtime import load_minicpmo45
 
 runtime = load_minicpmo45(
     "/models/OpenBMB/MiniCPM-o-4_5",

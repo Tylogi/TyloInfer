@@ -25,7 +25,7 @@ cd packaging
 ./build_release_mac.sh
 ```
 
-The script builds from the canonical `cpp_runtime` source tree, validates the
+The script builds from the canonical `csrc` source tree, validates the
 native runtime, CLI subcommands, Rust desktop app, Web UI, architectures, and
 code signatures, then copies the DMG to `packaging/dist/`.
 

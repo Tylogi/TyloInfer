@@ -10,7 +10,7 @@ settings for every engine. Set input lengths using token counts, not characters.
 Start a single-model, single-request server:
 
 ```sh
-uv run tyloinfer serve --model /models/model.gguf \
+uv run --project studio/server tyloinfer serve --model /models/model.gguf \
   --context-size 32768 --max-runtime-instances 1 \
   --max-requests-per-runtime 1 --no-prefix-cache --no-web-ui
 ```

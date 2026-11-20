@@ -42,7 +42,7 @@ checkpoint's global/per-question-bucket temperatures.
 Optional dependencies (no Transformers package or remote custom code required):
 
 ```sh
-uv sync --extra d1-reference
+uv sync --project studio/server --extra d1-reference
 ```
 
 The checkpoint must already exist locally, with `config.json`, `tokenizer.json`,
@@ -53,11 +53,11 @@ applies to its weights and use.
 
 ```sh
 # Configuration validation only; no tensor allocation or weight loading
-uv run tyloinfer d1-reference --model ./models/d1-2B --check-config
+uv run --project studio/server tyloinfer d1-reference --model ./models/d1-2B --check-config
 
 # CPU FP32 reference. --device cuda:0 --dtype bfloat16 is an explicit alternative;
 # availability of that option is not proof it has been validated on your GPU.
-uv run tyloinfer d1-reference --model ./models/d1-2B --request request.json
+uv run --project studio/server tyloinfer d1-reference --model ./models/d1-2B --request request.json
 ```
 
 `request.json`:
@@ -93,7 +93,7 @@ mocked model. They test loading, slots, padding, grouping, repeat-call isolation
 malformed contracts and the CLI. They are not real d1-2B quality evidence.
 
 ```sh
-python -m pytest tests/test_d1_reference.py tests/test_lfm3_reference.py tests/test_d1_reference_edges.py -q
+python -m pytest studio/server/tests/test_d1_reference.py studio/server/tests/test_lfm3_reference.py studio/server/tests/test_d1_reference_edges.py -q
 ```
 
 For optional fixed-source comparisons, prepare the official small source and
@@ -105,7 +105,7 @@ Prompt/readout tests use the actual official prompt/calibration/API modules and
 tokenizer. FP32 and BF16 tolerance checks are numerical tests, not speed tests.
 
 ```sh
-python -m pytest tests/test_lfm3_reference.py tests/test_d1_official_parity.py -q
+python -m pytest studio/server/tests/test_lfm3_reference.py studio/server/tests/test_d1_official_parity.py -q
 ```
 
 `TYLOINFER_D1_MODEL` opts into loading a real local checkpoint for the smoke test.

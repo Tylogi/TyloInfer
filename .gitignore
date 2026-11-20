@@ -83,4 +83,6 @@ data/*
 *.pth
 docs/benchmarks/
 *.jsonl
-/vendor/dsh/runtime/node_modules/
+/dsh/runtime/node_modules/
+
+

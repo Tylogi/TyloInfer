@@ -238,7 +238,7 @@ function New-BuildContext {
         ScriptDirectory = $scriptDirectory
         PathChecker = Join-Path $scriptDirectory "check_release_paths.py"
         ProjectDirectory = $projectDirectory
-        StudioDirectory = Join-Path $projectDirectory "TyloInferStudio"
+        StudioDirectory = Join-Path $projectDirectory "studio/web"
         PyInstallerBuildDirectory = Join-Path $scriptDirectory "build\pyinstaller"
         SpecDirectory = Join-Path $scriptDirectory "build\spec"
         NativeBuildDirectory = Join-Path $scriptDirectory "build\runtime"
@@ -439,7 +439,8 @@ function Initialize-PythonEnvironment {
     Add-ToPath (Join-Path $Context.VenvDirectory "Scripts")
 
     $syncArguments = @(
-        "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
+        "sync", "--project", (Join-Path $Context.ProjectDirectory "studio/server"),
+        "--locked", "--active", "--no-default-groups", "--no-editable",
         "--group", "release"
     )
     Invoke-Checked $Context.Tools.Uv $syncArguments
@@ -467,7 +468,7 @@ function Build-NativeSidecar {
     $nativeFlags = @(Get-ReleaseNativeFlags $Context)
     $cudaFlags = ($nativeFlags | ForEach-Object { "--compiler-options=$_" }) -join ' '
     Invoke-Checked $Context.Tools.CMake @(
-        "-S", (Join-Path $Context.ProjectDirectory "cpp_runtime"),
+        "-S", (Join-Path $Context.ProjectDirectory "csrc"),
         "-B", $Context.NativeBuildDirectory,
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
@@ -526,7 +527,7 @@ function Build-PythonCli {
         "--noconfirm", "--clean", "--onedir",
         "--name", $Context.CliName,
         "--paths", $Context.ProjectDirectory,
-        "--collect-data", "tyloinfer"
+        "--collect-data", "server"
     )
     foreach ($package in @(
             "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
@@ -537,8 +538,8 @@ function Build-PythonCli {
     foreach ($module in @(
             "torch", "transformers", "safetensors",
             "scipy", "tiktoken",
-            "tyloinfer.runtime",
-            "tyloinfer.runtime.minicpmo45", "tyloinfer.runtime.minicpmo45_realtime",
+            "server.runtime",
+            "server.runtime.minicpmo45", "server.runtime.minicpmo45_realtime",
             "minicpmo_utils", "stepaudio2_minicpmo", "torchaudio", "onnxruntime",
             "s3tokenizer", "hyperpyyaml", "librosa")) {
         $arguments += @("--exclude-module", $module)
@@ -551,7 +552,7 @@ function Build-PythonCli {
         "--distpath", $Context.ResourceDirectory,
         "--workpath", $Context.PyInstallerBuildDirectory,
         "--specpath", $Context.SpecDirectory,
-        (Join-Path $Context.ProjectDirectory "tyloinfer\cli.py")
+        (Join-Path $Context.ProjectDirectory "studio\server\cli.py")
     )
     Invoke-Checked $Context.PyInstaller $arguments
 

@@ -4,9 +4,9 @@ TyloInfer 推理服务与完整 DSH Host 分别启动。产品启动器位于 `s
 
 ## 两种独立产品形态
 
-TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。Studio使用自己的 `TyloInferStudio/package.json` 构建入口：`npm run build` 只执行TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
+TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。Studio使用自己的 `studio/web/package.json` 构建入口：`npm run build` 只执行TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
 
-Agent产品使用完整DSH Host及外部插件；`plugins/tyloinfer-studio/` 是Agent中的推理Client插件，不是独立Studio的替代安装。其 `node build.mjs` 单独生成插件产物，允许单向复用Studio的纯展示组件与样式，但不能让Studio反向导入DSH服务、插件运行时或Agent页面。当前插件构建还复用了Studio的Vite工具安装；共享构建工具和源码不等于Studio必须构建Agent。
+Agent产品使用完整DSH Host及外部插件；`plugins/studio/` 是Agent中的推理Client插件，不是独立Studio的替代安装。其 `node build.mjs` 单独生成插件产物，允许单向复用Studio的纯展示组件与样式，但不能让Studio反向导入DSH服务、插件运行时或Agent页面。当前插件构建还复用了Studio的Vite工具安装；共享构建工具和源码不等于Studio必须构建Agent。
 
 两种入口的功能与测试分别报告。当前独立Studio无模型预览的特定设置／执行能力限制，不代表整个Studio是待淘汰的过渡产品；旧Python Agent任务／设置门面的迁出也不包括删除Studio或推理核心API。
 
@@ -14,10 +14,10 @@ Agent产品使用完整DSH Host及外部插件；`plugins/tyloinfer-studio/` 是
 
 ## 安装布局与版本
 
-- `vendor/dsh/upstream/`：完整官方参考源码。
-- `vendor/dsh/runtime/`：独立官方运行包、固定版本依赖清单与锁文件；当前开发安装已归入此处，尚未发布最终安装包。
-- `plugins/tyloinfer-host/`：推理适配、协议握手和默认组合。
-- `plugins/tyloinfer-studio/`：产品 Client 及构建产物。
+- `dsh/upstream/`：完整官方参考源码。
+- `dsh/runtime/`：独立官方运行包、固定版本依赖清单与锁文件；当前开发安装已归入此处，尚未发布最终安装包。
+- `plugins/host/`：推理适配、协议握手和默认组合。
+- `plugins/studio/`：产品 Client 及构建产物。
 - `--state-root`：使用者显式指定的私有 profile、工作区和临时目录，不属于源码或发布资源。
 
 启动器读取所选CLI的实际发行版，要求CLI、base、Web版本一致，并与两个产品插件明确的engines声明匹配；不再将Python脚本中的固定版本当成独立选择runtime的限制。当前插件仍仅声明已验证的DSH `0.2.2-rc.2`；模拟未来版本元数据只验证预检机制，不能当作真实新发行版的兼容证据。完整源码固定到官方同版本标签 `dsh-v0.2.2-rc.2`，无本地 Core 补丁；运行包仍来自官方发布产物，未验证从源码逐位重现二进制。运行包缺失、版本不匹配或 Client 未构建时会明确退出，不回退读取其他安装或当前 DS Bot 的 profile。

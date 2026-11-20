@@ -12,8 +12,8 @@ Linux 使用 GCC / Clang。详细要求见[构建说明](cli/build.md#backend-re
 ```shell
 git clone https://github.com/Tylogi/TyloInfer.git
 cd TyloInfer
-uv sync
-uv run tyloinfer build --backend cuda --build-type Release -j 8
+uv sync --project studio/server
+uv run --project studio/server tyloinfer build --backend cuda --build-type Release -j 8
 ```
 
 原生 CUDA 推理无需安装 PyTorch。**更新源码后重新执行构建命令**；已有的托管二进制
@@ -24,13 +24,13 @@ uv run tyloinfer build --backend cuda --build-type Release -j 8
 Linux：
 
 ```shell
-uv run tyloinfer serve --backend cuda --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio/server tyloinfer serve --backend cuda --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 Windows PowerShell：
 
 ```powershell
-uv run tyloinfer serve --backend cuda --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio/server tyloinfer serve --backend cuda --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 替换为实际 GGUF / TQ 模型路径；`.mfq` 容器后缀仍可识别，但不代表所有旧量化格式默认可用。
