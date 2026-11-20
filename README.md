@@ -83,7 +83,7 @@ uv sync --project studio/server --extra metal
 uv run --project studio/server tyloinfer build --backend metal
 
 # Start the server and discover models in this directory
-uv run --project studio/server tyloinfer serve --model-dir ./models
+uv run --project studio/server python -m server.serve --model-dir ./models
 ```
 
 For NVIDIA, replace the two build steps with:
@@ -96,7 +96,7 @@ uv run --project studio/server tyloinfer build --backend cuda
 Open **http://127.0.0.1:8090/**, download a model, and load it from **Models**. To load an existing model at startup:
 
 ```sh
-uv run --project studio/server tyloinfer serve --model /models/model.gguf
+uv run --project studio/server python -m server.serve --model /models/model.gguf
 ```
 
 The same command accepts `.tq` checkpoints. For sharded models, select the first shard and keep the complete set in one directory.

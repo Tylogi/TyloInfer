@@ -1,4 +1,4 @@
-"""Implementation of the public ``tyloinfer serve`` command."""
+"""Start the TyloInfer inference server process."""
 
 from __future__ import annotations
 
@@ -12,7 +12,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from server.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
+from server._version import __version__
+from server.server.runtime.native_build import (
+    BuildError,
+    detect_backend,
+    load_managed_build,
+)
 
 
 def _positive_int(value: str) -> int:
@@ -194,22 +199,12 @@ def _resolve_runtime_executable(
         print(f"Using configured native runtime: {executable}", flush=True)
         return executable
     managed = load_managed_build(backend)
-    if managed is not None and managed.executable.is_file():
+    if managed is not None:
         print(f"Using managed native runtime: {managed.executable}", flush=True)
         return managed.executable
-    if managed is not None:
-        print(
-            f"Managed native runtime is missing; rebuilding in {managed.build_dir}",
-            flush=True,
-        )
-        return build_runtime(
-            backend=backend,
-            build_dir=managed.build_dir,
-            build_type=managed.build_type,
-            generator=managed.generator,
-            cmake_args=managed.cmake_args,
-        )
-    return build_runtime(backend=backend)
+    raise BuildError(
+        f"no native {backend} runtime was found; build it with CMake or pass --running-executable"
+    )
 
 
 def _select_backend(requested: str, running_executable: Path | None) -> str:
@@ -221,7 +216,7 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
         if system == "Darwin" and machine in {"arm64", "aarch64"}:
             return "metal"
         if system == "Linux":
-            from server.commands.build import _cuda_compiler, _hip_compiler
+            from server.server.runtime.native_build import _cuda_compiler, _hip_compiler
 
             if _cuda_compiler() is not None:
                 return "cuda"
@@ -446,15 +441,15 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
     return 0
 
 
-def add_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "serve",
-        help="start the TyloInfer inference server and optionally load a model",
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tyloinfer-server",
         description=(
             "Resolve the native runtime for this machine and expose the TyloInfer API and Web UI. "
             "An initial TyloInfer model is optional; additional models can be loaded through the API."
         ),
     )
+    parser.add_argument("-V", "--version", action="version", version=f"tyloinfer-server {__version__}")
     parser.add_argument("--model", type=Path, help="optional TyloInfer model to load at startup")
     draft = parser.add_mutually_exclusive_group()
     draft.add_argument("--dflash2-draft", type=Path, help="DFlash2 checkpoint directory for CUDA Flash-Next generation")
@@ -600,4 +595,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="stdio",
         help="Python-to-native-runtime transport (default: stdio)",
     )
-    parser.set_defaults(_impl=_run)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _run(_parser().parse_args(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

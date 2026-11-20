@@ -106,4 +106,4 @@ MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).
 
 Build requirements and backend selection: [`tyloinfer build`](../cli/build.md).
-Serving and model-pool configuration: [`tyloinfer serve`](../cli/serve.md).
+Serving and model-pool configuration: [`python -m server.serve`](../cli/serve.md).

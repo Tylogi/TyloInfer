@@ -703,10 +703,10 @@ if(TYLOINFER_BUILD_PRECOMPILED_METAL)
     set(_TYLOINFER_AOT_ROOT "${_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR}/mfq-metal")
     add_custom_command(OUTPUT "${_TYLOINFER_AOT_ROOT}/manifest.json"
         COMMAND $<TARGET_FILE:mfq-metal-source-export> "${CMAKE_CURRENT_BINARY_DIR}/metal-sources"
-        COMMAND "${Python3_EXECUTABLE}" "${TYLOINFER_REPOSITORY_ROOT}/packaging/compile_metal_libraries.py"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/compile_metal_libraries.py"
             "${CMAKE_CURRENT_BINARY_DIR}/metal-sources" "${_TYLOINFER_AOT_ROOT}"
             --metal "${_TYLOINFER_METAL_COMPILER}" --metallib "${_TYLOINFER_METALLIB_COMPILER}" --sdk "${_TYLOINFER_METAL_SDK}"
-        DEPENDS mfq-metal-source-export "${TYLOINFER_REPOSITORY_ROOT}/packaging/compile_metal_libraries.py"
+        DEPENDS mfq-metal-source-export "${CMAKE_CURRENT_LIST_DIR}/compile_metal_libraries.py"
         VERBATIM)
     add_custom_target(mfq-metal-precompiled DEPENDS "${_TYLOINFER_AOT_ROOT}/manifest.json")
     add_dependencies(mfq-decode-metal mfq-metal-precompiled)

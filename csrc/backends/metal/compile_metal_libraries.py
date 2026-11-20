@@ -1,3 +1,10 @@
+"""Compile exported Metal sources into precompiled libraries for the runtime.
+
+CMake invokes this during the native build (see the mfq-metal-precompiled target
+next to this file), so it stays with the Metal backend instead of the release
+scripts that only consume the result.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -19,7 +26,7 @@ def worker_count(jobs: int) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sources", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--metal", required=True)
@@ -33,7 +40,8 @@ def main() -> None:
 
     def compile_one(job: tuple[Path, str, int, str]) -> dict:
         source, standard, language, minimum = job
-        key = fingerprint(source.read_bytes(), 2, language)
+        source_bytes = source.read_bytes()
+        key = fingerprint(source_bytes, 2, language)
         target = args.output / (key + ".metallib")
         with tempfile.TemporaryDirectory(prefix="mfq-metal-") as temporary:
             air = Path(temporary) / "kernel.air"
@@ -43,7 +51,7 @@ def main() -> None:
                 "-c", str(source), "-o", str(air)], check=True)
             subprocess.run([args.metallib, str(air), "-o", str(library)], check=True)
             target.write_bytes(library.read_bytes())
-        return {"name": source.stem, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        return {"name": source.stem, "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
             "math_mode": 2, "language": language, "file": target.name,
             "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
 

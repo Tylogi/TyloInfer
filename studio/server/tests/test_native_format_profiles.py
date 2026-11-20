@@ -68,7 +68,6 @@ def test_ordinary_build_is_explicit_and_compatibility_is_opt_in():
         assert 'if(TYLOINFER_ENABLE_MFQ_COMPAT)' in source
         assert 'ops/common/' in source
         assert 'ops/mfq/' in source
-    assert '-DTYLOINFER_ENABLE_MFQ_COMPAT=OFF' in (ROOT / 'studio/server/commands/build.py').read_text()
 
 
 def test_moved_native_operators_keep_resolvable_relative_includes():

@@ -2,7 +2,7 @@
 
 `tyloinfer build` compiles the native inference runtime for the current machine. It
 detects Metal, CUDA or the early HIP backend, invokes CMake, and records the resulting executable so
-that [`tyloinfer serve`](serve.md) can find it without a binary path.
+that [`python -m server.serve`](serve.md) can find it without a binary path.
 
 The `tyloinfer` command must come from a TyloInfer source checkout containing
 `csrc/CMakeLists.txt`. TyloInfer derives the repository root from the installed
@@ -94,7 +94,7 @@ selected backend in the manifest:
 uv run --project studio/server -m json.tool build/mfq-runtime.json
 ```
 
-`tyloinfer serve` reads this manifest automatically. If the executable exists, it is
+`python -m server.serve` reads this manifest automatically. If the executable exists, it is
 used directly. If it was deleted, TyloInfer rebuilds it in the recorded directory with
 the recorded configuration.
 
@@ -108,10 +108,10 @@ uv run --project studio/server tyloinfer build --build-dir /mnt/fast-build/tyloi
 ```
 
 The manifest records the absolute build directory and executable path. A later
-`tyloinfer serve` command finds this custom build without another option:
+`python -m server.serve` command finds this custom build without another option:
 
 ```shell
-uv run --project studio/server tyloinfer serve --model /models/model.tq
+uv run --project studio/server python -m server.serve --model /models/model.tq
 ```
 
 Both commands must use the `tyloinfer` installation associated with the same source
@@ -209,4 +209,4 @@ uv run --project studio/server tyloinfer build --dry-run --backend cuda -- \
   -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 
-Next: [`tyloinfer serve`](serve.md).
+Next: [`python -m server.serve`](serve.md).

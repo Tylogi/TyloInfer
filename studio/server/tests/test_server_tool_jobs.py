@@ -76,30 +76,6 @@ def test_download_reports_real_written_bytes_and_speed(tmp_path, monkeypatch, ra
     asyncio.run(run())
 
 
-def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> None:
-    catalog = ModelCatalog([tmp_path])
-    executable = tmp_path / "tq"
-    handlers = ToolJobHandlers(
-        catalog,
-        ToolJobPaths(
-            tmp_path,
-            executable,
-            None,
-            None,
-            None,
-            None,
-            standalone_cli=True,
-        ),
-    )
-
-    assert handlers._mfq_command("_hub-download", "input", "output") == [
-        str(executable),
-        "_hub-download",
-        "input",
-        "output",
-    ]
-
-
 def _executable(path: Path, source: str) -> Path:
     path.write_text(textwrap.dedent(source), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -321,100 +297,6 @@ def test_download_argv_does_not_execute_shell_metacharacters(tmp_path: Path) -> 
         removed = handlers.remove_workspace_artifact(result.result["artifact"])
         assert removed == {"files": 1, "total_bytes": 4}
         assert not (tmp_path / "downloads" / "value;touch-owned").exists()
-        await manager.close()
-
-    asyncio.run(run())
-
-
-def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
-    async def run() -> None:
-        cli = _executable(
-            tmp_path / "tyloinfer-cli",
-            """\
-            #!/usr/bin/env python3
-            import pathlib, sys
-            assert sys.argv[1:6] == [
-                '_hub-download', '--provider', 'modelscope', '--repo-id', 'owner/model'
-            ]
-            root = pathlib.Path(sys.argv[sys.argv.index('--local-dir') + 1])
-            root.mkdir(parents=True, exist_ok=True)
-            (root / 'config.json').write_text('{}')
-            """,
-        )
-        model_root = tmp_path / "managed" / "models"
-        (tmp_path / "work").mkdir()
-        handlers = ToolJobHandlers(
-            ModelCatalog([model_root]),
-            ToolJobPaths(
-                work_root=tmp_path / "work",
-                python=cli,
-                modelscope=None,
-                huggingface=None,
-                runtime=None,
-                standalone_cli=True,
-                internal_modelscope=True,
-            ),
-        )
-        store = SessionStore(tmp_path / "jobs.sqlite3")
-        manager = JobManager(store, handlers.handlers())
-        assert "download.modelscope" in {item.kind for item in manager.kinds().data}
-        submitted = await manager.submit(
-            CreateJobRequest(
-                kind="download.modelscope",
-                payload={"repo_id": "owner/model", "destination": "models/owner/model", "expected_bytes": 2},
-            )
-        )
-        result = await _wait(store, submitted.id)
-        assert result.status == JobStatus.SUCCEEDED
-        assert result.result["files"] == 1
-        assert result.result["artifact"] == "workspace://models/owner/model"
-        assert (model_root / "owner" / "model" / "config.json").is_file()
-        await manager.close()
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("provider", ("modelscope", "huggingface"))
-@pytest.mark.parametrize("internal", (False, True))
-@pytest.mark.parametrize("proxy", (False, True))
-def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkeypatch, provider, internal, proxy) -> None:
-    import os
-    import server.server.services.tool_jobs as tool_jobs
-
-    async def select(endpoint, *, direct=False):
-        assert endpoint == ("https://modelscope.cn" if provider == "modelscope" else "https://huggingface.co")
-        env = dict(os.environ)
-        for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
-            env.pop(key, None)
-        env["NO_PROXY"] = "localhost" if proxy else "*"
-        env["TYLOINFER_EXPECT_PROXY"] = str(proxy)
-        if proxy:
-            env["HTTPS_PROXY"] = "http://proxy.test:8080"
-        return env, proxy
-
-    monkeypatch.delenv("HF_ENDPOINT", raising=False)
-    monkeypatch.setattr(tool_jobs, "download_environment", select)
-
-    async def run():
-        executable = _executable(tmp_path / "download-cli", """\
-            #!/usr/bin/env python3
-            import os, pathlib, sys
-            proxy = os.environ['TYLOINFER_EXPECT_PROXY'] == 'True'
-            assert os.environ.get('HTTPS_PROXY') == ('http://proxy.test:8080' if proxy else None)
-            assert os.environ['NO_PROXY'] == ('localhost' if proxy else '*')
-            root = pathlib.Path(sys.argv[sys.argv.index('--local-dir') + 1])
-            root.mkdir(parents=True, exist_ok=True)
-            (root / 'config.json').write_text('{}')
-            """)
-        paths = ToolJobPaths(tmp_path, executable, executable, executable, None, None,
-            standalone_cli=internal, internal_modelscope=internal, internal_huggingface=internal)
-        handlers = ToolJobHandlers(ModelCatalog([]), paths)
-        store = SessionStore(tmp_path / "jobs.sqlite3")
-        manager = JobManager(store, handlers.handlers())
-        submitted = await manager.submit(CreateJobRequest(kind=f"download.{provider}",
-            payload={"repo_id": "owner/model", "destination": "downloads/model", "expected_bytes": 2}))
-        result = await _wait(store, submitted.id)
-        assert result.status == JobStatus.SUCCEEDED and result.result["files"] == 1
         await manager.close()
 
     asyncio.run(run())

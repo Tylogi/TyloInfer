@@ -83,7 +83,7 @@ uv sync --project studio/server --extra metal
 uv run --project studio/server tyloinfer build --backend metal
 
 # 启动服务，从此目录发现模型
-uv run --project studio/server tyloinfer serve --model-dir ./models
+uv run --project studio/server python -m server.serve --model-dir ./models
 ```
 
 NVIDIA 设备将上面两条构建命令替换为：
@@ -96,7 +96,7 @@ uv run --project studio/server tyloinfer build --backend cuda
 打开 **http://127.0.0.1:8090/**，下载模型后在「模型」中加载。也可启动时直接加载已有模型：
 
 ```sh
-uv run --project studio/server tyloinfer serve --model /models/model.gguf
+uv run --project studio/server python -m server.serve --model /models/model.gguf
 ```
 
 `.tq` 模型同样使用此命令。分片模型选择首个分片，并将完整分片放在同一目录。

@@ -1,7 +1,7 @@
 # 服务部署与性能设置
 
 以下以 **Windows / Linux、单张 NVIDIA GPU、GGUF / TQ 权重**为例，配置说明针对
-Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`tyloinfer serve`](cli/serve.md)。
+Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`python -m server.serve`](cli/serve.md)。
 
 ## 1. 构建当前版本
 
@@ -24,13 +24,13 @@ uv run --project studio/server tyloinfer build --backend cuda --build-type Relea
 Linux：
 
 ```shell
-uv run --project studio/server tyloinfer serve --backend cuda --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio/server python -m server.serve --backend cuda --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 Windows PowerShell：
 
 ```powershell
-uv run --project studio/server tyloinfer serve --backend cuda --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio/server python -m server.serve --backend cuda --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 替换为实际 GGUF / TQ 模型路径；`.mfq` 容器后缀仍可识别，但不代表所有旧量化格式默认可用。
@@ -82,12 +82,12 @@ PowerShell 使用 `curl.exe`。加载返回 `202` 和操作 ID，通过
 
 ## 4. 快路径是否需要手工开启？
 
-**通过 `tyloinfer serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
+**通过 `python -m server.serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
 服务会选择专家缓存、RAM 锁页、两阶段 FFN、传输复用、整层 prefill 和异步上传；
 CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环境变量。
 
 直接执行 `mfq-runtime` 不会经过 Python 服务的缓存和内存规划，部分原生默认值不同。
-部署应使用 `tyloinfer serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
+部署应使用 `python -m server.serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
 时指定，避免误用另一份旧二进制。
 
 旧的实验环境变量会覆盖服务默认配置。速度异常时，检查启动环境中是否遗留
@@ -143,7 +143,7 @@ CUDA 决策模型默认 `--jev-weights stream`，使用 RAM 权重和两个 GPU 
 d1 文本模型也使用同一接口，但当前仅支持 CUDA 全显存驻留：CLI 启动时指定
 `--jev-weights vram`；API 加载时省略 `jev_weights` 自动选驻留，或显式设为 `"vram"`，
 显式 `"stream"` 会被拒绝。需配套 HF 配置、tokenizer、calibration 与原生 companion，
-详见 [d1 接入与限制](cli/d1-native.md#managed-serving)。Score 由模型定义：D3 保留均值，
+详见 [服务部署指南](cli/serve.md)。Score 由模型定义：D3 保留均值，
 d1 保留官方中位数；通用接口不强制某一种读出。
 
 上面的短请求用于确认服务可用。比较 PP 时使用 **4K / 8K 的真实输入**，保持模型、上下文、

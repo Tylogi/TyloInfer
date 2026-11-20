@@ -1,6 +1,6 @@
 # Native runtime transport
 
-`tyloinfer serve` owns the public API. Each managed C++ inference runtime only exposes
+`python -m server.serve` owns the public API. Each managed C++ inference runtime only exposes
 its private runtime control surface through one selected communication module:
 
 ```text
@@ -46,8 +46,8 @@ the engine unhealthy, including errors encountered during explicit shutdown.
 Select it with:
 
 ```bash
-tyloinfer serve --transport stdio   # default
-tyloinfer serve --transport http
+python -m server.serve --transport stdio   # default
+python -m server.serve --transport http
 ```
 
 CUDA runtime tuning uses `TYLOINFER_RUNTIME_*` environment variables.

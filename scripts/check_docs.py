@@ -1,7 +1,6 @@
-"""Check documentation links, examples and CLI/API contracts without modifying files."""
+"""Check documentation links, examples and API contracts without modifying files."""
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 import re
@@ -10,8 +9,6 @@ from urllib.parse import unquote, urlsplit
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "studio"))
-from server.cli import _build_parser  # noqa: E402
 
 
 def check() -> None:
@@ -68,26 +65,10 @@ def check() -> None:
             if name not in schema["components"]["schemas"] or f"/schemas/{name}" not in json.dumps(operation):
                 errors.append(f"API {method} {path}: schema {name} differs from contract")
 
-    parser = _build_parser()
-    subcommands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
-    if "mfq" in subcommands.choices or parser.prog != "tyloinfer":
-        errors.append("Unexpected public CLI identity")
-    serve = subcommands.choices["serve"]
-    options = {flag for action in serve._actions for flag in action.option_strings}
-    guide = (ROOT / "docs/cli/serve.md").read_text()
-    for flag in ("--dflash2-draft", "--mtp-native-draft", "--spec-min-p", "--mtp-min-probability", "--draft-conf", "--dflash2-draft-confidence", "--mtp-cost-aware", "--no-mtp-cost-aware"):
-        if flag not in options or flag not in guide:
-            errors.append(f"Speculation CLI/doc mismatch: {flag}")
-    if f"`./{serve.get_default('data_dir')}`" not in guide:
-        errors.append("Documented data directory differs from CLI default")
-    if "must point to an existing `.mfq`" in guide:
-        errors.append("Obsolete model-format restriction")
-
     if errors:
         raise SystemExit("FAIL:\n" + "\n".join(errors))
     print(f"PASS: {len(files)} Markdown files; {json_count} JSON examples; {link_count} local links/anchors")
     print(f"PASS: API table matches {len(schema['paths'])} paths / {len(operations)} operations and named schemas")
-    print("PASS: public CLI identity, data-dir default and speculative decoding options")
 
 
 if __name__ == "__main__":

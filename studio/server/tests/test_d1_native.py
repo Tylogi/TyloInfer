@@ -80,18 +80,6 @@ def test_native_rejects_protocol_and_error_frames():
             runtime._receive()
 
 
-def test_native_cli_registration():
-    import argparse
-
-    from server.commands.d1_reference import add_parser
-
-    parser = argparse.ArgumentParser()
-    add_parser(parser.add_subparsers())
-    args = parser.parse_args(["d1-native", "--model", ".", "--executable", "native"])
-    assert args.iterations == 1 and args.warmup == 0 and not args.unfused
-    assert args.weights_placement == 'vram'
-
-
 @pytest.mark.parametrize('placement', ['stream', 'vram'])
 def test_native_placement_is_forwarded_without_optional_frameworks(tmp_path, monkeypatch, placement):
     root = tmp_path / 'assets'

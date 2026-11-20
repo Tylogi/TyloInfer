@@ -284,21 +284,6 @@ def test_actual_small_hf_load_forward_slots_and_grouping(tiny_checkpoint):
     assert runtime.decide_batch([payload, payload]) == [out, out]
 
 
-def test_cli_explicit_reference_and_config_only(tiny_checkpoint, tmp_path, capsys):
-    from server.cli import main
-
-    directory, _ = tiny_checkpoint
-    assert main(["d1-reference", "--model", str(directory), "--check-config"]) == 0
-    checked = json.loads(capsys.readouterr().out)
-    assert checked["native_runtime"] is False and checked["result"]["weights_loaded"] is False
-    req = tmp_path / "request.json"
-    req.write_text(json.dumps(request()), encoding="utf-8")
-    assert main(["d1-reference", "--model", str(directory), "--request", str(req)]) == 0
-    done = json.loads(capsys.readouterr().out)
-    assert done["backend"] == "pytorch-lfm3-text-reference" and done["native_runtime"] is False
-    assert done["result"]["usage"]["output_tokens"] == 0
-
-
 def test_real_checkpoint_opt_in_only():
     import os
 

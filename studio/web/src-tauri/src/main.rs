@@ -401,11 +401,11 @@ fn mfq_program(app: &AppHandle) -> Result<(PathBuf, bool), String> {
     let bundled_names = ["tyloinfer"];
     if let Ok(resource_dir) = app.path().resource_dir() {
         #[cfg(windows)]
-        let bundled_cli = resource_dir.join("tyloinfer-cli").join("tyloinfer-cli.exe");
+        let bundled_server = resource_dir.join("tyloinfer-server").join("tyloinfer-server.exe");
         #[cfg(not(windows))]
-        let bundled_cli = resource_dir.join("tyloinfer-cli").join("tyloinfer-cli");
-        if usable_program(&bundled_cli) {
-            return Ok((bundled_cli, false));
+        let bundled_server = resource_dir.join("tyloinfer-server").join("tyloinfer-server");
+        if usable_program(&bundled_server) {
+            return Ok((bundled_server, false));
         }
     }
     if let Some(path) = packaged_executable(app, &bundled_names) {
@@ -500,10 +500,9 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     let mut command = Command::new(program);
     let instance_id = uuid::Uuid::new_v4().to_string();
     if python_module {
-        command.arg("-m").arg("server.cli");
+        command.arg("-m").arg("server.serve");
     }
     command
-        .arg("serve")
         .arg("--exit-on-stdin-close")
         .arg("--studio-instance-id")
         .arg(&instance_id)
@@ -834,7 +833,7 @@ mod tests {
         assert!(!usable_program(&current));
         let directory = std::env::temp_dir().join(format!("tyloinfer-program-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        let cli = directory.join("tyloinfer-cli");
+        let cli = directory.join("tyloinfer-server");
         fs::write(&cli, b"test CLI fixture").unwrap();
         assert!(usable_program(&cli));
         assert!(!usable_program(&directory));

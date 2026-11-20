@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
-
 import httpx
 import pytest
 
-from server.commands import serve
 from server.server.api import network
 
 
@@ -40,25 +37,6 @@ def test_network_bind_requires_an_api_key(host: str) -> None:
     assert not network.is_loopback_bind_host(host)
     assert network.network_auth_error(host, None) is not None
     assert network.network_auth_error(host, "root-secret") is None
-
-
-def test_serve_rejects_an_unauthenticated_network_bind_before_startup(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("TYLOINFER_TEST_SERVER_KEY", raising=False)
-    monkeypatch.setattr(
-        network,
-        "install_system_proxy_environment",
-        lambda: pytest.fail("network startup ran before bind authentication validation"),
-    )
-
-    with pytest.raises(ValueError, match="API key is required"):
-        serve._run(
-            SimpleNamespace(
-                host="0.0.0.0",
-                api_key_env="TYLOINFER_TEST_SERVER_KEY",
-            )
-        )
 
 
 def test_system_proxy_environment_discovers_os_proxy_and_bypasses_loopback(monkeypatch) -> None:

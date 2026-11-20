@@ -9,7 +9,7 @@ description = "TQ inference and serving on CUDA and Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "MFQ contributors" }]
+authors = [{ name = "Tylogi AI Lab contributors" }]
 keywords = ["inference", "llm", "cuda", "metal", "mlx", "tq", "serving"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -81,7 +81,6 @@ minicpmo45-realtime = [
 ]
 
 [project.scripts]
-tyloinfer = "server.cli:main"
 tyloinfer-minicpmo-realtime = "server.runtime.minicpmo45_realtime:main"
 
 [dependency-groups]

@@ -129,13 +129,6 @@ class ToolJobHandlers:
             )
         return status
 
-    def _mfq_command(self, *arguments: str) -> list[str]:
-        command = [str(self.paths.python)]
-        if not self.paths.standalone_cli:
-            command.extend(["-m", "server.cli"])
-        command.extend(arguments)
-        return command
-
     def handlers(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if self.voice_component is not None:
@@ -172,17 +165,8 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = ModelScopeDownloadPayload.model_validate(payload)
         destination = self._download_output(request.destination, request.download_directory)
-        if self.paths.internal_modelscope:
-            argv = self._mfq_command(
-                "_hub-download",
-                "--provider",
-                "modelscope",
-                "--repo-id",
-                request.repo_id,
-            )
-        else:
-            executable = self._required_executable(self.paths.modelscope, "ModelScope")
-            argv = [str(executable), "download", request.repo_id]
+        executable = self._required_executable(self.paths.modelscope, "ModelScope")
+        argv = [str(executable), "download", request.repo_id]
         argv.extend(
             [
                 "--repo-type",
@@ -196,17 +180,9 @@ class ToolJobHandlers:
             ]
         )
         if request.include:
-            if self.paths.internal_modelscope:
-                for pattern in request.include:
-                    argv.extend(["--include", pattern])
-            else:
-                argv.extend(["--include", *request.include])
+            argv.extend(["--include", *request.include])
         if request.exclude:
-            if self.paths.internal_modelscope:
-                for pattern in request.exclude:
-                    argv.extend(["--exclude", pattern])
-            else:
-                argv.extend(["--exclude", *request.exclude])
+            argv.extend(["--exclude", *request.exclude])
         env, proxy = await self._download_environment("modelscope", request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
@@ -219,17 +195,8 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = HuggingFaceDownloadPayload.model_validate(payload)
         destination = self._download_output(request.destination, request.download_directory)
-        if self.paths.internal_huggingface:
-            argv = self._mfq_command(
-                "_hub-download",
-                "--provider",
-                "huggingface",
-                "--repo-id",
-                request.repo_id,
-            )
-        else:
-            executable = self._required_executable(self.paths.huggingface, "Hugging Face")
-            argv = [str(executable), "download", request.repo_id]
+        executable = self._required_executable(self.paths.huggingface, "Hugging Face")
+        argv = [str(executable), "download", request.repo_id]
         argv.extend(
             [
                 "--repo-type",

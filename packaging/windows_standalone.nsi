@@ -12,7 +12,7 @@ VIProductVersion "@VERSION@.0"
 VIAddVersionKey /LANG=1033 "ProductName" "TyloInfer"
 VIAddVersionKey /LANG=1033 "FileDescription" "TyloInfer"
 VIAddVersionKey /LANG=1033 "FileVersion" "@VERSION@"
-VIAddVersionKey /LANG=1033 "LegalCopyright" "MFQ contributors"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "Tylogi AI Lab contributors"
 
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
@@ -51,7 +51,7 @@ Section
   IfFileExists "$CachePath\.ready" 0 extract
   IfFileExists "$CachePath\tyloinfer.exe" 0 extract
   IfFileExists "$CachePath\mfq-runtime.exe" 0 extract
-  IfFileExists "$CachePath\tyloinfer-cli\tyloinfer-cli.exe" 0 extract
+  IfFileExists "$CachePath\tyloinfer-server\tyloinfer-server.exe" 0 extract
   IfFileExists "$CachePath\web-ui\index.html" cached extract
 
 extract:

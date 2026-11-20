@@ -720,7 +720,7 @@ compatible weights, backend support and scheduling are still required.
 SSE stream. It requires a model with a supported native decision implementation.
 A model appearing in `/v1/models`, or this route being present, does not by itself
 establish decision capability. The CUDA d1 text adapter uses this same route and
-the existing managed model lifecycle; see [d1 setup and limitations](../cli/d1-native.md#managed-serving).
+the existing managed model lifecycle; see [the serving guide](../cli/serve.md).
 
 The managed runtime must be ready and idle. Readiness is checked first: a runtime
 in `BUSY` state (including an active chat request) or otherwise not `READY`

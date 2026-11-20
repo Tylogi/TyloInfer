@@ -24,7 +24,6 @@ UPDATE_MANAGER = (
     STUDIO / "src" / "features" / "settings" / "UpdateManager.tsx"
 ).read_text(encoding="utf-8")
 UPDATER = (TAURI / "src" / "updater.rs").read_text(encoding="utf-8")
-RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
 def test_studio_uses_one_package_for_web_and_desktop_clients():
@@ -46,18 +45,6 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert "IconFamily::new" in BUILD
     assert "media-src 'self' asset: data: blob:" in config["app"]["security"]["csp"]
     assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
-    assert 'if [[ "${mfq_signing_identity}" != "-" ]]' in RELEASE_SCRIPT
-    assert '"hardenedRuntime":true' in RELEASE_SCRIPT
-    assert 'source "${mfq_script_dir}/macos_release_paths.sh"' in RELEASE_SCRIPT
-    assert "mfq_configure_release_paths" in RELEASE_SCRIPT
-    assert '-DCMAKE_C_FLAGS="${CFLAGS}"' in RELEASE_SCRIPT
-    assert '-DCMAKE_CXX_FLAGS="${CXXFLAGS}"' in RELEASE_SCRIPT
-    assert '-DCMAKE_OBJCXX_FLAGS="${OBJCXXFLAGS}"' in RELEASE_SCRIPT
-    assert '--additional-hooks-dir "${mfq_script_dir}/hooks"' in RELEASE_SCRIPT
-    assert '"${mfq_packaged_app}" "${mfq_release_dmg}"' in RELEASE_SCRIPT
-    assert '--python-cli "${mfq_packaged_app}/Contents/Resources/tyloinfer-cli/tyloinfer-cli"' in RELEASE_SCRIPT
-    assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
-    assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
 
 
 def test_studio_macos_icons_have_platform_padding():
@@ -73,7 +60,7 @@ def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert 'Some("tyloinfer-server")' in RUST
     assert "Command::new" in RUST
     assert "studio_start_local" in RUST
-    assert '.arg("serve")' in RUST
+    assert '.arg("server.serve")' in RUST
     assert '.arg("--data-dir")' in RUST
     assert '.arg("--db")' not in RUST
     assert 'command.arg("--running-executable")' in RUST

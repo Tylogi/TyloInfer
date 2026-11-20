@@ -1,6 +1,6 @@
-# `tyloinfer serve`
+# `python -m server.serve`
 
-`tyloinfer serve` starts the API and Web UI, with or without an initial model. It
+`python -m server.serve` starts the API and Web UI, with or without an initial model. It
 selects the C++ executable and manages workers on private loopback ports.
 
 For copyable CUDA deployment commands and performance settings, see the
@@ -21,14 +21,14 @@ does not require PyTorch or LibTorch.
 Start an idle server:
 
 ```shell
-uv run --project studio/server tyloinfer serve
+uv run --project studio/server python -m server.serve
 ```
 
 Open the model catalog in TyloInfer or the Web UI to load a discovered model.
 To load one model before the server becomes available, pass its existing path:
 
 ```shell
-uv run --project studio/server tyloinfer serve --model /models/model.gguf
+uv run --project studio/server python -m server.serve --model /models/model.gguf
 ```
 
 The server listens on `http://127.0.0.1:8090` by default. `Ctrl-C` stops the
@@ -96,7 +96,7 @@ worker startup/load logs and runtime state.
 
 ## How the native runtime is selected
 
-`tyloinfer serve` detects the host backend and selects the runtime in this order:
+`python -m server.serve` detects the host backend and selects the runtime in this order:
 
 1. `--running-executable` uses a prebuilt binary and skips managed-build
    lookup, compiler detection, and compilation.
@@ -125,7 +125,7 @@ Source installations use the managed build automatically, including a custom
 `--host` and `--port` control only the user-facing FastAPI/Uvicorn listener:
 
 ```shell
-uv run --project studio/server tyloinfer serve \
+uv run --project studio/server python -m server.serve \
   --model /models/model.gguf \
   --host 0.0.0.0 \
   --port 9000
@@ -143,7 +143,7 @@ starting the listener:
 
 ```shell
 TYLOINFER_SERVER_API_KEY='replace-with-a-secret' \
-  uv run --project studio/server tyloinfer serve --model /models/model.gguf --host 0.0.0.0
+  uv run --project studio/server python -m server.serve --model /models/model.gguf --host 0.0.0.0
 ```
 
 `--api-key-env` changes the name of the environment variable read by the
@@ -169,11 +169,11 @@ To use another variable name:
 
 ```shell
 TYLOINFER_PRODUCTION_KEY='replace-with-a-secret' \
-  uv run --project studio/server tyloinfer serve --model /models/model.gguf --api-key-env TYLOINFER_PRODUCTION_KEY
+  uv run --project studio/server python -m server.serve --model /models/model.gguf --api-key-env TYLOINFER_PRODUCTION_KEY
 ```
 
 In PowerShell, set `$env:TYLOINFER_SERVER_API_KEY = 'replace-with-a-secret'` before
-running `uv run --project studio/server tyloinfer serve`. The current browser UI and Studio show an
+running `uv run --project studio/server python -m server.serve`. The current browser UI and Studio show an
 **API Key** sign-in page when authentication is required. Browser credentials
 are held in memory; reloading the page may require signing in again. Studio
 can persist credentials through the system credential store. Use a key with
@@ -215,10 +215,10 @@ Explicit Web UI modes:
 
 ```shell
 # Serve an existing Web UI build.
-uv run --project studio/server tyloinfer serve --model /models/model.gguf --web-root /srv/tyloinfer-web
+uv run --project studio/server python -m server.serve --model /models/model.gguf --web-root /srv/tyloinfer-web
 
 # Start only the API.
-uv run --project studio/server tyloinfer serve --model /models/model.gguf --no-web-ui
+uv run --project studio/server python -m server.serve --model /models/model.gguf --no-web-ui
 ```
 
 `--web-root` and `--no-web-ui` are mutually exclusive. When neither is given,
@@ -231,7 +231,7 @@ Without it, the server stays idle until Studio, the Web UI, or the model API
 loads a model. Repeat `--model-dir` to add discovery roots:
 
 ```shell
-uv run --project studio/server tyloinfer serve \
+uv run --project studio/server python -m server.serve \
   --model /models/default.tq \
   --model-dir /models/team-a \
   --model-dir /models/team-b
@@ -272,7 +272,7 @@ files. User-selected tool-job paths remain restricted to the current working
 directory.
 
 ```shell
-uv run --project studio/server tyloinfer serve \
+uv run --project studio/server python -m server.serve \
   --model /models/model.gguf \
   --data-dir /var/lib/tyloinfer \
   --work-dir /srv/tyloinfer-work
@@ -284,7 +284,7 @@ persistent paths. TyloInfer resolves data, work, and model paths before startup.
 ## Runtime controls
 
 ```shell
-uv run --project studio/server tyloinfer serve \
+uv run --project studio/server python -m server.serve \
   --model /models/model.gguf \
   --context-size 32768 \
   --prefill-chunk-size auto \
@@ -327,11 +327,11 @@ checkpoint. The current CLI exposes these explicit companion controls for CUDA:
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
-uv run --project studio/server tyloinfer serve --backend cuda --model /models/target.gguf \
+uv run --project studio/server python -m server.serve --backend cuda --model /models/target.gguf \
   --mtp-native-draft /models/matching-mtp.gguf --no-web-ui
 
 # DFlash2 checkpoint directory (the CLI describes the CUDA Flash-Next path).
-uv run --project studio/server tyloinfer serve --backend cuda --model /models/target.gguf \
+uv run --project studio/server python -m server.serve --backend cuda --model /models/target.gguf \
   --dflash2-draft /models/matching-dflash2 --no-web-ui
 ```
 
@@ -380,7 +380,7 @@ streaming transfers. Neither mode guarantees that a model fits: execution
 workspaces and other allocations also require memory.
 
 ```shell
-uv run --project studio/server tyloinfer serve --backend cuda --model ./models/decision.tq --jev-weights stream --no-web-ui
+uv run --project studio/server python -m server.serve --backend cuda --model ./models/decision.tq --jev-weights stream --no-web-ui
 ```
 
 Replace the example artifact with a supported decision checkpoint. The setting
@@ -392,7 +392,7 @@ fields and exclusive-runtime limits. The CUDA d1 text adapter uses this same API
 but requires resident weights: use `--jev-weights vram` for CLI startup loading.
 For API loading, omit `jev_weights` to use d1 residency automatically, or select
 `"vram"` explicitly; explicit `"stream"` is rejected. See
-[d1 serving setup](d1-native.md#managed-serving).
+the managed model lifecycle described above.
 
 ## Command options
 
@@ -446,7 +446,7 @@ debugging runtime or server startup.
 
 Model loading is included in the startup deadline. Increase
 `--runtime-startup-timeout` for large models or slower storage, then inspect the
-native worker output printed by `tyloinfer serve`.
+native worker output printed by `python -m server.serve`.
 
 ### The public port is already in use
 
