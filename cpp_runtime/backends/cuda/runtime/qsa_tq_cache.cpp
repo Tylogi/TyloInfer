@@ -284,7 +284,6 @@ struct QsaTqCache::Impl {
     std::vector<std::shared_ptr<ImageBatch>> owners;
     std::vector<Retired> retired;
     std::vector<Upload> uploads;
-    tq::TqBlockView pending_view;
     std::mutex queue_mutex;std::vector<tq::BlockReplacement> queued;
     std::size_t resident_append_begin=0,resident_append_end=0;
     struct ResidentAppendScope {
@@ -872,8 +871,8 @@ struct QsaTqCache::Impl {
     }
     void publish_pending(const tb::Tensor& k,const tb::Tensor& v,int64_t id) {
         pending_k=k;pending_v=v;
-        pending_view={k.data_ptr<std::uint8_t>(),v.data_ptr<std::uint8_t>(),0,0};
-        check(cudaMemcpyAsync(views.data_ptr<std::uint8_t>()+id*sizeof(pending_view),&pending_view,sizeof(pending_view),cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
+        check(tq::tq_publish_contiguous_views({k.data_ptr<std::uint8_t>(),v.data_ptr<std::uint8_t>(),0,0},
+            views.data_ptr<tq::TqBlockView>()+id,int(k.nbytes()),1,mfq_current_cuda_stream()));
     }
     bool graph_host_boundary=false,graph_ssd_task=false;
     tb::Tensor stage_pending(const tb::Tensor& selected,int queries,int count,const tb::Tensor& positions) {
@@ -1541,24 +1540,26 @@ struct QsaTqCache::Impl {
         cancel_batch_warmup();
         if(keep<0 || keep>tokens)throw std::invalid_argument("invalid adaptive QSA truncation");
         if(keep==tokens)return;
+        const auto complete=keep/4,remainder=keep%4;
+        const bool local_tail=keep && ram && !ssd_cache && pending_graph && complete==tokens/4 &&
+            (!remainder || tail_k.defined());
         if(!keep && host_index_calls) {
             std::fprintf(stderr,"native_qsa_cpu_indexer calls=%llu score_ms=%.3f transfer_ms=%.3f\n",
                 static_cast<unsigned long long>(host_index_calls),host_index_ms,host_index_transfer_ms);
             host_index_calls=0;host_index_ms=host_index_transfer_ms=0;
         }
-        if(keep || !ram) {
+        if(!local_tail && (keep || !ram)) {
             finish_history();
             if(ram)ram->wait();else cache->wait();
             drain();
-        } else if(history_transfer.pending) {
+        } else if(!keep && history_transfer.pending) {
             // Retire the transfer without scheduling work on discarded KV.
             check(cudaEventSynchronize(history_transfer.done));
             history_transfer.pending=false;
         }
-        // Empty reset only retires owners and enqueues zeroes on this stream.
-        // Reconstruction retains the existing completion barrier.
-        if(keep)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
-        const auto complete=keep/4,remainder=keep%4;
+        // Trimming within the pending block touches only stream-ordered
+        // buffers and leaves the published archive and its readers intact.
+        if(keep && !local_tail)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
         if(remainder && keep==append_input_position && append_k.defined() && append_v.defined() && append_index.defined()) {
             // The input stage retains the original partial block even if the
             // append failed before writing its completed archive entry.
@@ -1586,16 +1587,22 @@ struct QsaTqCache::Impl {
             if(index->size()!=index_archive_bytes())throw std::runtime_error("QSA raw index archive length changed");
             std::memcpy(host.data_ptr(),index->data(),8*index_width);tail_index=host.to(options.dtype(tb::kFloat32)).narrow(1,0,remainder).contiguous();
         }else {tail_k={};tail_v={};tail_index={};}
-        if(ram)ram->truncate(complete);else cache->truncate(complete);
-        index_archive.resize(complete);
-        {std::lock_guard<std::mutex> lock(queue_mutex);queued.clear();resident_append_begin=resident_append_end=0;}
-        for(std::size_t i=std::size_t(complete);i<owners.size();++i)owners[i].reset();
+        if(!local_tail) {
+            if(ram)ram->truncate(complete);else cache->truncate(complete);
+            index_archive.resize(complete);
+            {std::lock_guard<std::mutex> lock(queue_mutex);queued.clear();resident_append_begin=resident_append_end=0;}
+            for(std::size_t i=std::size_t(complete);i<owners.size();++i)owners[i].reset();
+        }
         tokens=keep;append_input_position=-1;hits.zero_();if(mass.defined())mass.zero_();
         if(!keep){canonical_slab={};graph_image.reset();}
         if(remainder) {
             check(tq::tq_prepare_modes(tail_k.data_ptr(),tail_v.data_ptr(),false,ks.data_ptr<float>(),vs.data_ptr<float>(),pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),
                 pending_k.data_ptr<std::uint16_t>(),pending_v.data_ptr<std::uint16_t>(),int(remainder),kv_heads,width,padded,mfq_current_cuda_stream(),
                 rotated_tail_k.data_ptr<float>(),rotated_tail_v.data_ptr<float>()));publish_pending(pending_k,pending_v,complete);
+        }
+        if(const auto* trace=local_tail?std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH"):nullptr;trace && trace[0]=='1') {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true))std::fprintf(stderr,"native_qsa_ram_rollback actual_match=1 pending_block_only=1\n");
         }
     }
 };

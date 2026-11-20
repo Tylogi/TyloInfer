@@ -451,6 +451,8 @@ void check_batch_graph(int heads,int width,int bits,bool int32_positions=false) 
     };
     append(3,0,false);
     for(int i=0;i<48;++i) {
+        // Trim a partial block to a shorter tail and then to a block boundary.
+        if(i==2 || i==5){--position;cache.truncate(position);reference.truncate(position);}
         if(i==17){position-=5;cache.truncate(position);reference.truncate(position);}
         if(i==32){position=0;cache.reset();reference.reset();}
         append(i%8+1,i+1,true);
