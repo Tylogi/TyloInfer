@@ -263,16 +263,6 @@ through the target model a second time. Eager execution keeps its existing
 rollback/replay behavior. Additional recurrent checkpoints are included in the
 runtime's cache memory accounting; packed expert weights retain their layout.
 
-For conversational measurements, `bench/cuda_mtp_conversation_sampling.py`
-uses open-ended Chinese questions and stochastic target/draft sampling
-(temperature 0.7, top-p 0.8, top-k 20 by default). It refuses temperature zero,
-saves the generated text, per-delta timestamps, acceptance/depth/parking metrics,
-and the sampling parameters. Load the model afresh before measuring a cold first
-turn. `--rounds 2` includes the continuation in the same conversation.
-The default background is synthetic repeated English text of roughly 8K tokens;
-`--background` selects a document instead. Counting and near-100% acceptance
-measurements do not represent this conversational workload.
-
 CUDA Flash-Next completes its one-token target bootstrap before publishing the
 initial two-token batch. It preserves the prompt-only prefix snapshot before
 bootstrap and previews the first token's EOS/stop behavior without changing the

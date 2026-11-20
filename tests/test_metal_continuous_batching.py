@@ -20,7 +20,7 @@ def batch_model(tmp_path_factory, request):
     if not os.environ.get("TYLOINFER_METAL_BATCHING_TEST"):
         pytest.skip("TYLOINFER_METAL_BATCHING_TEST required")
     from tyloinfer.formats.io import Float8E4M3Array
-    from bench.tq_smoke_fixture import matrix
+    from tests.tq_smoke_fixture import matrix
 
     config, weights = mtp_fixture("qwen", layers=1)
     config["text_config"].update(

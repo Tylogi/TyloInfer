@@ -598,10 +598,6 @@ target_link_libraries(mfq-metal-tq-test PRIVATE mfq-metal-runtime)
 target_include_directories(mfq-metal-tq-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_features(mfq-metal-tq-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-tq-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
-add_executable(tyloinfer-metal-tq-benchmark tests/mlx_tq_benchmark.cpp)
-target_link_libraries(tyloinfer-metal-tq-benchmark PRIVATE mfq-metal-runtime)
-target_compile_features(tyloinfer-metal-tq-benchmark PRIVATE cxx_std_20)
-set_target_properties(tyloinfer-metal-tq-benchmark PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 if(BUILD_TESTING)
     add_test(NAME tyloinfer-metal-tq-nemotron-test COMMAND mfq-metal-tq-test --nemotron)
     add_test(NAME tyloinfer-metal-tq-container-test COMMAND mfq-metal-tq-test unused --expert-containers)
@@ -622,10 +618,6 @@ if(BUILD_TESTING)
 endif()
 
 if(TARGET mfq-paged-prefix-cache)
-    add_executable(mfq-metal-tq-model-benchmark tests/mlx_tq_model_benchmark.cpp)
-    target_link_libraries(mfq-metal-tq-model-benchmark PRIVATE mfq-metal-runtime mfq-paged-prefix-cache)
-    target_compile_features(mfq-metal-tq-model-benchmark PRIVATE cxx_std_20)
-    set_target_properties(mfq-metal-tq-model-benchmark PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 endif()
 
 add_library(mfq-metal-engine STATIC
@@ -882,16 +874,6 @@ add_test(
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-mxfp4-sq2-benchmark
-    benchmarks/mlx_mxfp4_sq2_benchmark.cpp
-)
-target_link_libraries(mfq-metal-mxfp4-sq2-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-mxfp4-sq2-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mxfp4-sq2-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
@@ -914,122 +896,36 @@ add_test(
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-mxfp4-sq3-benchmark
-    benchmarks/mlx_mxfp4_sq3_benchmark.cpp
-)
-target_link_libraries(mfq-metal-mxfp4-sq3-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-mxfp4-sq3-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mxfp4-sq3-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
-add_executable(mfq-metal-mx-benchmark
-    benchmarks/mlx_mx_benchmark.cpp
-)
-target_link_libraries(mfq-metal-mx-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-mx-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mx-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-nint-benchmark
-    benchmarks/mlx_nint_benchmark.cpp
-)
-target_link_libraries(mfq-metal-nint-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-nint-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-nint-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
-add_executable(mfq-metal-dense-smallm-benchmark
-    benchmarks/mlx_dense_smallm_benchmark.cpp
-)
-target_link_libraries(mfq-metal-dense-smallm-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_include_directories(mfq-metal-dense-smallm-benchmark PRIVATE
-    ${TYLOINFER_REPOSITORY_ROOT}/bench
-)
 target_compile_features(
     mfq-metal-dense-smallm-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-dense-smallm-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-mfe-smallm-benchmark
-    benchmarks/mlx_mfe_smallm_benchmark.cpp
-)
-target_link_libraries(mfq-metal-mfe-smallm-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-mfe-smallm-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mfe-smallm-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-vq-smallm-benchmark
-    benchmarks/mlx_vq_smallm_benchmark.cpp
-)
-target_link_libraries(mfq-metal-vq-smallm-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-vq-smallm-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-vq-smallm-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-mfe-prefill-benchmark
-    benchmarks/mlx_mfe_prefill_benchmark.cpp
-)
-target_link_libraries(mfq-metal-mfe-prefill-benchmark PRIVATE mfq-metal-runtime)
-target_compile_features(mfq-metal-mfe-prefill-benchmark PRIVATE cxx_std_20)
 
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-vq-benchmark
-    benchmarks/mlx_vq_benchmark.cpp
-)
-target_link_libraries(mfq-metal-vq-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(mfq-metal-vq-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-vq-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-grouped-linear-benchmark
-    benchmarks/mlx_grouped_linear_benchmark.cpp
-)
-target_link_libraries(mfq-metal-grouped-linear-benchmark PRIVATE
-    mfq-metal-runtime
-)
 target_compile_features(
     mfq-metal-grouped-linear-benchmark PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-grouped-linear-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
 
 endif()
 
@@ -1185,9 +1081,6 @@ add_test(
 )
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-ssd-expert-benchmark
-    benchmarks/ssd_expert_benchmark.cpp
-)
 target_link_libraries(
     mfq-metal-ssd-expert-benchmark PRIVATE
     mfq-metal-runtime
@@ -1202,9 +1095,6 @@ set_target_properties(
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-deepseek-v4-moe-smallm-benchmark
-    benchmarks/mlx_deepseek_v4_moe_smallm_benchmark.cpp
-)
 target_link_libraries(
     mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE
     mfq-metal-runtime
@@ -1784,3 +1674,4 @@ set_target_properties(
     mfq-metal-qwen35-grouped-parity PROPERTIES
     BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
 )
+

@@ -222,7 +222,7 @@ async def _wait(store: SessionStore, job_id) -> object:
     return store.get_job(job_id)
 
 
-def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> None:
+def test_workspace_path_boundary(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
@@ -233,15 +233,6 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
             #!/usr/bin/env python3
             import sys
             print('MFQ container OK version=2 architecture=test shards=1 records=1')
-            """,
-        )
-        diagnostics = _executable(
-            tmp_path / "mfq-diagnostics",
-            """\
-            #!/usr/bin/env python3
-            import sys
-            assert '--check-mfq-container' in sys.argv
-            print('MFQ container OK via diagnostics')
             """,
         )
         python = _executable(
@@ -264,7 +255,6 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
                 modelscope=None,
                 huggingface=None,
                 runtime=runtime,
-                diagnostics=diagnostics,
             ),
         )
         store = SessionStore(tmp_path / "jobs.sqlite3")
@@ -272,13 +262,6 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
         kinds = {item.kind: item for item in manager.kinds().data}
         assert not {'model.quantize', 'calibrate.imatrix', 'artifact.import'} & kinds.keys()
         artifact = (await catalog.list()).data[0]
-
-        checked = await manager.submit(
-            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
-        )
-        result = await _wait(store, checked.id)
-        assert result.status == JobStatus.SUCCEEDED
-        assert result.result["summary"] == "MFQ container OK via diagnostics"
 
         with pytest.raises(Exception, match='workspace-relative'):
             handlers._input(str(tmp_path))

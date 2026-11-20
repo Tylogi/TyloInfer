@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from bench.tq_random import layout, random_tensor, row_bits
+from tests.tq_random import layout, random_tensor, row_bits
 from tyloinfer.formats.header import FileHeader
 from tyloinfer.formats.io import open_mmap, pack_tensor_payload, save, unpack_tensor_payload
 from tyloinfer.formats.tq import TQTensor

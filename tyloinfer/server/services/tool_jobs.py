@@ -30,7 +30,6 @@ from tyloinfer.server.services.jobs import JobContext, JobExecutionError, TypedJ
 from tyloinfer.server.services.download_directory import DownloadDirectorySettings
 from tyloinfer.server.runtime.disk_budget import DiskBudget, volume
 from tyloinfer.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
-from tyloinfer.server.state.storage import StorageError
 
 _TOOL_OUTPUT_TAIL_LINES = 4096
 _TOOL_TERMINATE_TIMEOUT_SECONDS = 10.0
@@ -71,10 +70,6 @@ class HuggingFaceDownloadPayload(_Payload):
     expected_bytes: int | None = Field(default=None, ge=0)
 
 
-class ContainerValidationPayload(_Payload):
-    model: str = Field(min_length=1, max_length=255)
-
-
 @dataclass(frozen=True)
 class ToolJobPaths:
     work_root: Path
@@ -82,7 +77,6 @@ class ToolJobPaths:
     modelscope: Path | None
     huggingface: Path | None
     runtime: Path | None
-    diagnostics: Path | None = None
     standalone_cli: bool = False
     internal_modelscope: bool = False
     internal_huggingface: bool = False
@@ -143,9 +137,7 @@ class ToolJobHandlers:
         return command
 
     def handlers(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "model.validate": TypedJobHandler(self.validate_container, ContainerValidationPayload),
-        }
+        result: dict[str, Any] = {}
         if self.voice_component is not None:
             result["component.voice_output.install"] = TypedJobHandler(
                 self.install_voice_output, VoiceOutputInstallPayload
@@ -470,26 +462,6 @@ class ToolJobHandlers:
                 await asyncio.to_thread(reservation.close)
                 if self.runtime_manager is not None:
                     self.runtime_manager._prefix_disk_checked_at = 0.0
-
-    async def validate_container(
-        self, context: JobContext, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        request = ContainerValidationPayload.model_validate(payload)
-        artifact = await self._model(request.model)
-        diagnostics = self._required_executable(
-            self.paths.diagnostics or self.paths.runtime, "TyloInfer diagnostics"
-        )
-        output = await self._run(
-            context,
-            [str(diagnostics), "--model", str(artifact.path), "--check-mfq-container"],
-        )
-        with suppress(ValueError, StorageError):
-            await context.validate_artifact(self._artifact_uri(artifact.path))
-        return {
-            "model_id": artifact.resource.name,
-            "artifact_id": artifact.resource.id,
-            "summary": output[-1] if output else "ok",
-        }
 
     async def _run(
         self,

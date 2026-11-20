@@ -5,7 +5,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from bench.tq_random import random_tensor
+from tests.tq_random import random_tensor
 from tyloinfer.formats.companions import with_engram_shards
 from tyloinfer.formats.header import FileHeader
 from tyloinfer.formats.io import open_mmap, save

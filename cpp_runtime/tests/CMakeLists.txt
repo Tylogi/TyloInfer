@@ -5,12 +5,6 @@ else()
     add_compile_options(-UNDEBUG)
 endif()
 
-add_executable(mfq-benchmark-validation-test benchmark_validation_test.cpp)
-target_include_directories(mfq-benchmark-validation-test PRIVATE
-    ${TYLOINFER_REPOSITORY_ROOT}/bench
-)
-target_compile_features(mfq-benchmark-validation-test PRIVATE cxx_std_17)
-add_test(NAME mfq-benchmark-validation-test COMMAND mfq-benchmark-validation-test)
 
 add_executable(tyloinfer-expert-route-usage-test expert_route_usage_test.cpp)
 target_compile_features(tyloinfer-expert-route-usage-test PRIVATE cxx_std_20)
@@ -127,18 +121,11 @@ target_link_libraries(tyloinfer-gguf-model-source-test PRIVATE mfq-ggml)
 mfq_add_core_test(mfq-file-range-reader-test file_range_reader_test.cpp)
 mfq_add_core_test(mfq-mirrored-file-reader-test mirrored_file_reader_test.cpp)
 mfq_add_core_test(mfq-moe-dispatch-plan-test moe_dispatch_plan_test.cpp)
-add_executable(mfq-moe-residency-bench ${PROJECT_SOURCE_DIR}/../bench/moe_residency_bench.cpp)
-target_link_libraries(mfq-moe-residency-bench PRIVATE mfq-core)
-target_compile_features(mfq-moe-residency-bench PRIVATE cxx_std_17)
 mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-quant-expert-range-test quant_expert_range_test.cpp)
 mfq_add_core_test(mfq-host-parallel-test host_parallel_test.cpp)
 mfq_add_core_test(mfq-cpu-expert-pool-test cpu_expert_pool_test.cpp)
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-mfq_add_core_test(mfq-packed-nint-cpu-test packed_nint_cpu_test.cpp)
-target_link_libraries(mfq-packed-nint-cpu-test PRIVATE mfq-cpu-ops)
-mfq_add_core_test(mfq-nvq-group-cpu-test nvq_group_cpu_test.cpp)
-target_link_libraries(mfq-nvq-group-cpu-test PRIVATE mfq-cpu-ops)
 endif()
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 
@@ -279,3 +266,5 @@ find_package(Threads REQUIRED)
 target_link_libraries(mfq-gguf-cpu-balance-test PRIVATE Threads::Threads)
 target_compile_features(mfq-gguf-cpu-balance-test PRIVATE cxx_std_20)
 add_test(NAME mfq-gguf-cpu-balance-test COMMAND mfq-gguf-cpu-balance-test)
+
+

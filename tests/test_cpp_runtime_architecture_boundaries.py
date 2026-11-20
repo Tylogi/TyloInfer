@@ -430,7 +430,7 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
 
 def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     apps = ROOT / "cpp_runtime" / "backends" / "cuda" / "apps"
-    for name in ("runtime", "diagnostics"):
+    for name in ("runtime",):
         source = (apps / f"{name}_main.cpp").read_text(encoding="utf-8")
         assert f"mfq::cuda::commands::run_{name}(argc, argv)" in source
         assert "argv[" not in source
@@ -453,7 +453,6 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "${TYLOINFER_CUDA_ROOT}/models/minicpmo45/components.cpp" in instances
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${TYLOINFER_CUDA_ROOT}/commands/runtime.cpp" in cmake
-    assert "${TYLOINFER_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
     assert "${TYLOINFER_CUDA_ROOT}/commands/eval.cpp" not in cmake
     assert ("mfq-" + "decode") not in cmake
     assert "execute_runtime" in CUDA_RUNTIME_COMMAND
@@ -499,9 +498,6 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert not (
         CUDA_RUNTIME.parent / "commands" / "token_generation.cpp"
     ).exists()
-    assert "generate_diagnostic_tokens" in (
-        CUDA_RUNTIME.parent / "diagnostics" / "token_generation.h"
-    ).read_text(encoding="utf-8")
     assert '"--ids"' not in CUDA_RUNTIME_COMMAND
     assert '"--ids-file"' not in CUDA_RUNTIME_COMMAND
     assert '"--gen"' not in CUDA_RUNTIME_COMMAND
@@ -535,15 +531,11 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     )
     assert "static CudaExecutionContext context" not in execution_source
     assert "thread_local bool g_decode_graph" not in CUDA_BACKEND_SOURCE
-    command_and_diagnostic_sources = "\n".join(
+    command_sources = "\n".join(
         path.read_text(encoding="utf-8")
-        for directory in (
-            CUDA_RUNTIME.parent / "commands",
-            CUDA_RUNTIME.parent / "diagnostics",
-        )
-        for path in directory.glob("*.cpp")
+        for path in (CUDA_RUNTIME.parent / "commands").glob("*.cpp")
     )
-    assert "cuda_execution_context()" not in command_and_diagnostic_sources
+    assert "cuda_execution_context()" not in command_sources
     for alias in (
         "g_tensor_parallel",
         "g_expert_parallel",
@@ -1334,11 +1326,6 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "storage/model_loader.cpp",
         "engine/cuda_batching.cpp",
         "models/qwen35/batch_state.cpp",
-        "diagnostics/attention_checks.cpp",
-        "diagnostics/backend_checks.cpp",
-        "diagnostics/linear_checks.cpp",
-        "diagnostics/moe_checks.cpp",
-        "diagnostics/session_checks.cpp",
     )
     for relative in required:
         assert (cuda / relative).is_file()
@@ -1401,7 +1388,6 @@ def test_cuda_qwen_speculation_is_model_owned() -> None:
     assert "forward_speculative(" not in CUDA_TRANSFORMER_HEADER
     assert "struct LinearBlock" not in CUDA_TRANSFORMER_HEADER
     assert "TYLOINFER_QWEN_MTP_BATCH" not in CUDA_TRANSFORMER_HEADER
-    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_BACKEND_SOURCE
 
 
 def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:

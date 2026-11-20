@@ -8,12 +8,8 @@ CUDA_RUNTIME = "\n".join(
     for path in (
         CUDA_ROOT / "engine" / "generation.cpp",
         CUDA_ROOT / "engine" / "generation.h",
-        CUDA_ROOT / "diagnostics" / "token_generation.h",
     )
 )
-BACKEND_CHECKS = (
-    CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
-).read_text(encoding="utf-8")
 MODEL_METADATA_SOURCE = "\n".join(
     (ROOT / "cpp_runtime/models" / model / "causal_lm.h").read_text(
         encoding="utf-8"
@@ -41,9 +37,7 @@ SOURCE = "\n".join(
         CUDA_ROOT / "ops" / "common" / "cuda_execution.cpp",
         CUDA_ROOT / "core" / "decode_graph.h",
     )
-) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
-    CUDA_ROOT / "commands" / "diagnostics.cpp"
-).read_text(encoding="utf-8")
+) + "\n" + CUDA_RUNTIME + "\n"
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "tyloinfer" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
@@ -118,60 +112,12 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
     ) == 2
     assert "model.metadata.decode_graph_double_warmup" in SOURCE
     assert "graph.ensure_captured(" in CUDA_RUNTIME
-    assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
-
-
-def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
-    graph_path = CUDA_RUNTIME.rsplit(
-        "MfqCudaGraph graph;", 1
-    )[1].split(
-        "graph.capture_end();", 1
-    )[0]
-    warmup = graph_path.index("model.next_token_static(")
-    profiler_reset = graph_path.index("profiler.reset();")
-    external_events = graph_path.index(
-        "profiler.graph_events = profile_cuda_graph;"
-    )
-    capture = graph_path.index("graph.capture_begin();")
-    assert warmup < profiler_reset < external_events < capture
-
-
-def test_graph_profile_covers_model_and_commit_boundaries() -> None:
-    graph_path = CUDA_RUNTIME.rsplit(
-        "MfqCudaGraph graph;", 1
-    )[1].split(
-        "graph.capture_end();", 1
-    )[0]
-    assert 'profiler.measure("decode.model_total"' in graph_path
-    assert 'profiler.measure("decode.commit"' in graph_path
-    assert graph_path.index('profiler.measure("decode.model_total"') < graph_path.index(
-        'profiler.measure("decode.commit"'
-    )
 
 
 def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
     assert 'std::getenv("TYLOINFER_TORCH_CUDA_GRAPH_DUMP")' in BACKEND_SOURCE
     assert "graph.enable_debug_mode();" in BACKEND_SOURCE
     assert "graph.debug_dump(debug_path);" in BACKEND_SOURCE
-    assert "mfq_debug_dump_cuda_graph(graph);" in SOURCE
-
-
-def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
-    assert "run_backend_bf16_add_check" in SOURCE
-    assert '{"--check-backend-bf16-add", &DiagnosticsCommandOptions::check_backend_bf16_add}' in SOURCE
-    check = BACKEND_CHECKS.split("int run_backend_bf16_add_check", 1)[1].split(
-        "int run_backend_argmax_check", 1
-    )[0]
-    assert "eager = (left + right).contiguous();" in check
-    assert "graph.capture_begin();" in check
-    assert "graph.replay();" in check
-    assert '<< " max_abs=" << maximum' in check
-    assert "constexpr int chain_nodes = 512;" in check
-    assert "chain_graph.capture_begin();" in check
-    assert '<< " chain_node_us="' in check
-    assert "shared_result = silu_mul_cuda(left, right);" in check
-    assert "shared_graph.capture_begin();" in check
-    assert '<< " shared_chain_node_us="' in check
 
 
 def test_native_argmax_uses_bounded_contiguous_last_dimension_path() -> None:
@@ -292,11 +238,6 @@ def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> N
     assert '"TYLOINFER_PROFILE_CUDA_FILTER"' in SOURCE
     assert "profiler.filter = config.profile_filter" in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
-    eager_path = (CUDA_ROOT / 'diagnostics/token_generation.h').read_text().split("} else if (!hit_eos) {", 1)[1].split(
-        "produced = i + 1;", 1
-    )[0]
-    assert 'profiler.measure("decode.eager_model"' in eager_path
-    assert 'profiler.measure("decode.eager_commit"' in eager_path
 
 
 def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:

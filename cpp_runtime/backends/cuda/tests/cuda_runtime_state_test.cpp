@@ -2,7 +2,7 @@
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
-#include "diagnostics/generation_result.h"
+#include "generation_result.h"
 #include "storage/text_session_cache.h"
 #include "mfq_paged_prefix_cache.h"
 #include "models/gemma4/causal_lm.h"

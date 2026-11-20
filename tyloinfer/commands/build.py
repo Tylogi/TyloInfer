@@ -339,7 +339,6 @@ def create_build_plan(
         build_type,
         "--target",
         target,
-        *([] if selected == "metal" else ["mfq-diagnostics"]),
         "-j",
         str(parallelism),
     ]

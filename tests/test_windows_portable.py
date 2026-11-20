@@ -45,14 +45,13 @@ def project(tmp_path):
             "../dist": "web-ui", "../../packaging/Resources/tyloinfer-cli": "tyloinfer-cli",
             "../../packaging/windows-runtime": "", "../../packaging/Resources/licenses": "licenses",
         },
-        "externalBin": ["../../packaging/sidecars/mfq-runtime", "../../packaging/sidecars/mfq-diagnostics"],
+        "externalBin": ["../../packaging/sidecars/mfq-runtime"],
     }}))
     for path in (
         "build/tyloinfer.exe", "TyloInferStudio/dist/index.html",
         "packaging/Resources/tyloinfer-cli/tyloinfer-cli.exe", "packaging/Resources/tyloinfer-cli/_internal/python.dll",
         "packaging/windows-runtime/cudart64_12.dll", "packaging/Resources/licenses/NOTICE",
         "packaging/sidecars/mfq-runtime-x86_64-pc-windows-msvc.exe",
-        "packaging/sidecars/mfq-diagnostics-x86_64-pc-windows-msvc.exe",
         "build/private-server.log", "packaging/.venv/private.txt",
     ):
         file = root / path
@@ -67,7 +66,7 @@ def test_zip_contains_the_installer_resources_without_build_files(tmp_path):
     with zipfile.ZipFile(archive) as package:
         assert package.testzip() is None
         assert set(package.namelist()) == {
-            "TyloInfer/tyloinfer.exe", "TyloInfer/mfq-runtime.exe", "TyloInfer/mfq-diagnostics.exe",
+            "TyloInfer/tyloinfer.exe", "TyloInfer/mfq-runtime.exe",
             "TyloInfer/tyloinfer-cli/tyloinfer-cli.exe", "TyloInfer/tyloinfer-cli/_internal/python.dll",
             "TyloInfer/cudart64_12.dll", "TyloInfer/web-ui/index.html", "TyloInfer/licenses/NOTICE",
         }

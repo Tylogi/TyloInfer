@@ -45,18 +45,7 @@ Batched requests do not use MTP. Explicit session IDs and multimodal requests
 remain exclusive. The default single-request path retains MTP and prefix caching.
 Configured QSA KV offload uses the eager batch path.
 
-Run the state check with the native diagnostics executable:
-
-```shell
-mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching
-mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching --continuous-batching-check-requests 32
-```
-
-The check compares outputs against serial generation, exercises paused rows,
-decode cancellation, partial-prefill cancellation and subsequent request reuse.
-The larger check holds all requests until their prefills finish, then decodes
-them together across the 256-token cache-capacity boundary. Small native model
-fixtures include QSA, GDN, PLE and routed experts. The shared execution test also
+The shared execution test also
 injects prefill and decode-capacity failures to verify surviving requests, and
 checks staggered request scheduling. The stdio chat-client integration test
 compares simultaneous generations with serial output and verifies that the

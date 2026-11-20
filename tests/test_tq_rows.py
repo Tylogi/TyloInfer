@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 
-from bench.tq_random import random_tensor
+from tests.tq_random import random_tensor
 from tyloinfer.formats.tq import TQTensor
 from tyloinfer.formats.tq_rows import TQRows
 

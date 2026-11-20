@@ -16,8 +16,7 @@
       }
     },
     "externalBin": [
-      "../../packaging/sidecars/mfq-runtime",
-      "../../packaging/sidecars/mfq-diagnostics"
+      "../../packaging/sidecars/mfq-runtime"
     ],
     "resources": {
       "../dist": "web-ui",

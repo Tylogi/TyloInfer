@@ -336,19 +336,6 @@ set_target_properties(mfq-hip-runtime PROPERTIES
 
 
 
-add_library(mfq-hip-diagnostics STATIC
-    ${TYLOINFER_HIP_ROOT}/diagnostics/attention_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/backend_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/linear_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/moe_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/runtime_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/session_checks.cpp
-)
-mfq_configure_hip_runtime_target(mfq-hip-diagnostics)
-target_include_directories(mfq-hip-diagnostics PRIVATE ${TYLOINFER_HIP_ROOT}/storage)
-target_compile_definitions(mfq-hip-diagnostics PRIVATE
-    TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
-target_link_libraries(mfq-hip-diagnostics PUBLIC mfq-hip-runtime)
 
 add_executable(mfq-runtime
     ${TYLOINFER_HIP_ROOT}/apps/runtime_main.cpp
@@ -366,18 +353,6 @@ set_target_properties(mfq-runtime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
-add_executable(mfq-diagnostics
-    ${TYLOINFER_HIP_ROOT}/apps/diagnostics_main.cpp
-    ${TYLOINFER_HIP_ROOT}/commands/diagnostics.cpp
-)
-mfq_configure_hip_runtime_target(mfq-diagnostics)
-target_include_directories(mfq-diagnostics PRIVATE ${TYLOINFER_HIP_ROOT}/storage)
-target_compile_definitions(mfq-diagnostics PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
-target_link_libraries(mfq-diagnostics PRIVATE mfq-hip-diagnostics)
-target_compile_features(mfq-diagnostics PRIVATE cxx_std_20)
-set_target_properties(mfq-diagnostics PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-)
 
 
 if(BUILD_TESTING)
@@ -467,13 +442,6 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-hip-nint-q8-test PRIVATE
         mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
         mfq-hip-runtime mfq-runtime-communication mfq-model-graph)
-    add_executable(mfq-hip-nint-bench ${TYLOINFER_REPOSITORY_ROOT}/bench/hip_nint_bench.cpp)
-    target_include_directories(mfq-hip-nint-bench PRIVATE ${TYLOINFER_HIP_TEST_INCLUDES})
-    target_compile_definitions(mfq-hip-nint-bench PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1)
-    target_link_libraries(mfq-hip-nint-bench PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
-        mfq-hip-runtime mfq-runtime-communication mfq-model-graph)
-    target_compile_features(mfq-hip-nint-bench PRIVATE cxx_std_20)
     mfq_add_hip_test(mfq-hip-nint-rows-test
         ${TYLOINFER_HIP_ROOT}/tests/mfq_nint_rows_test.cu)
     target_link_libraries(mfq-hip-nint-rows-test PRIVATE
@@ -523,3 +491,4 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-recurrent-mixer-test ${TYLOINFER_HIP_ROOT}/tests/recurrent_mixer_ops_test.hip)
     target_link_libraries(mfq-hip-recurrent-mixer-test PRIVATE mfq-hip-core mfq-hip-native-kernels)
 endif()
+

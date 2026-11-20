@@ -4,7 +4,7 @@ import numpy as np
 
 
 def synthetic_tq_experts(weights, *, experts=None, intermediate=None, prefix='', seed=2342):
-    from bench.tq_smoke_fixture import matrix
+    from tests.tq_smoke_fixture import matrix
     from tyloinfer.formats.tq import TQExpertTensor
     result = dict(weights)
     rng = np.random.default_rng(seed)

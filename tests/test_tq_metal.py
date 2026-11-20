@@ -86,7 +86,7 @@ def test_fixed_book_all_states():
 @pytest.mark.parametrize("columns,gs", [(False, 16), (False, 32), (False, 512), (True, 512)])
 @pytest.mark.parametrize("bits", range(1, 9))
 def test_decode_eight_ring_wrap(columns, gs, bits):
-    from bench.tq_decode import random_tensor
+    from tests.tq_decode import random_tensor
     tensor = random_tensor(9, 768, seed=341, bits=(bits, bits), gs=gs, columns=columns)
     kernel = mx.fast.metal_kernel(name="tq_decode_eight_reference", input_names=["words", "desc", "scales", "relative"],
         output_names=["y"], header=(Path(__file__).resolve().parents[1] / "tyloinfer/kernels/metal/tq_decode.h").read_text(),
@@ -106,7 +106,7 @@ TqDecoded8 value = tq_decode8<COLUMNS, 768, GS>(words, desc[row], scales, relati
 
 @pytest.mark.parametrize("mean", [1.1, 2.3, 4.5, 7.9])
 def test_fake_tensor_byte_budget(mean):
-    from bench.tq_decode import random_tensor
+    from tests.tq_decode import random_tensor
     rows, width = 128, 768
     overhead = 64 + rows * 8 + (rows * 2 + 1) // 2
     target = round(overhead + rows * width * mean / 8)
@@ -120,7 +120,7 @@ def test_fake_tensor_byte_budget(mean):
 @pytest.mark.parametrize("bits", range(1, 9))
 @pytest.mark.parametrize("width,columns,gs", [(640, False, 512), (1025, False, 16), (513, True, 512)])
 def test_each_precision_ring_wrap(bits, width, columns, gs):
-    from bench.tq_decode import random_tensor
+    from tests.tq_decode import random_tensor
     tensor = random_tensor(11, width, seed=132, bits=(bits, bits), gs=gs, columns=columns)
     op = Projection(tensor, input_columns=width)
     x = np.random.default_rng(19).normal(size=(2, width)).astype(np.float32)
