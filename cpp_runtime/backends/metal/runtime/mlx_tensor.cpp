@@ -528,8 +528,9 @@ MlxLinear MlxLinear::load(
 #endif
     if (record.dtype == "TQ") return finish(MlxLinear(MlxTqWeight::load(model, name)));
     if (is_gguf_dtype(record.dtype)) {
+        const bool can_drop_rows = record.dtype == "GGUF_Q8_0" || record.dtype == "GGUF_Q4_1";
         const bool retain_rows = gguf_access != GgufAccess::projection_only ||
-            record.dtype != "GGUF_Q8_0" || mlx_predequantize_fp16_enabled();
+            !can_drop_rows || mlx_predequantize_fp16_enabled();
         const bool native_projection = gguf_access != GgufAccess::row_lookup;
         return finish(MlxLinear(MlxGgufWeight::load(model, name, native_projection, retain_rows)));
     }

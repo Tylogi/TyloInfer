@@ -1595,8 +1595,10 @@ void check_normalized_projections() {
         auto* context = ggml_init({2 << 20, nullptr, false});
         auto* file = gguf_init_empty();
         gguf_set_val_str(file, "general.architecture", "test");
-        for (int i = 0; i < 5; ++i) {
-            const auto type = i == 4 ? GGML_TYPE_Q8_0 : (i % 2 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_S);
+        const std::array types{GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S,
+            GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, GGML_TYPE_Q4_1};
+        for (std::size_t i = 0; i < types.size(); ++i) {
+            const auto type = types[i];
             auto* tensor = ggml_new_tensor_2d(context, type, K, N);
             ggml_set_name(tensor, ("matrix." + std::to_string(i) + ".weight").c_str());
             const auto bytes = packed(type, K, N);
@@ -1607,21 +1609,24 @@ void check_normalized_projections() {
         gguf_free(file); ggml_free(context);
         if (!written) throw std::runtime_error("cannot write normalized GGUF fixture");
         const MfqContainer model(cleanup.file);
-        const auto full_q8 = MlxLinear::load(model, "matrix.4.weight");
-        const auto compact_q8 = MlxLinear::load(model, "matrix.4.weight", MlxLinear::GgufAccess::projection_only);
-        const auto lookup_q8 = MlxLinear::load(model, "matrix.4.weight", MlxLinear::GgufAccess::row_lookup);
-        const auto ids = array({0, N - 1}, int32);
-        const auto* lookup = lookup_q8.gguf_weight_ref();
-        if (lookup->native_weight_ref() ||
-            !all(full_q8.gguf_weight_ref()->embedding(ids, float32) == lookup->embedding(ids, float32)).item<bool>())
-            throw std::runtime_error("row-only Q8 changed lookup or retained native storage");
-        if (full_q8.gguf_weight_ref()->packed_nbytes() !=
-            compact_q8.gguf_weight_ref()->packed_nbytes() + ggml_row_size(GGML_TYPE_Q8_0, K) * N)
-            throw std::runtime_error("projection-only Q8 still holds a row-major copy");
-        for (const int rows : {1, 65}) {
-            const auto input = astype(reshape(sin(arange(rows * K, float32) * .013f), {rows, K}), bfloat16);
-            if (!all(view(full_q8(input), uint16) == view(compact_q8(input), uint16)).item<bool>())
-                throw std::runtime_error("projection-only Q8 changed output bits");
+        for (std::size_t i = 4; i < types.size(); ++i) {
+            const auto name = "matrix." + std::to_string(i) + ".weight";
+            const auto full = MlxLinear::load(model, name);
+            const auto compact = MlxLinear::load(model, name, MlxLinear::GgufAccess::projection_only);
+            const auto row_lookup = MlxLinear::load(model, name, MlxLinear::GgufAccess::row_lookup);
+            const auto ids = array({0, N - 1}, int32);
+            const auto* lookup = row_lookup.gguf_weight_ref();
+            if (lookup->native_weight_ref() ||
+                !all(full.gguf_weight_ref()->embedding(ids, float32) == lookup->embedding(ids, float32)).item<bool>())
+                throw std::runtime_error("row-only GGUF changed lookup or retained native storage");
+            if (full.gguf_weight_ref()->packed_nbytes() !=
+                compact.gguf_weight_ref()->packed_nbytes() + ggml_row_size(types[i], K) * N)
+                throw std::runtime_error("projection-only GGUF still holds a row-major copy");
+            for (const int rows : {1, 65}) {
+                const auto input = astype(reshape(sin(arange(rows * K, float32) * .013f), {rows, K}), bfloat16);
+                if (!all(view(full(input), uint16) == view(compact(input), uint16)).item<bool>())
+                    throw std::runtime_error("projection-only GGUF changed output bits");
+            }
         }
 
         std::vector<MlxLinear> weights;
