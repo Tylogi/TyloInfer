@@ -3335,7 +3335,9 @@ private:
                         const int key_heads = static_cast<int>(config_.linear_num_key_heads);
                         const int value_heads = static_cast<int>(config_.linear_num_value_heads);
                         // Dispatch signatures differ as a cohort drains and its metadata fits in constant memory.
-                        for (int count : {1, 2}) for (int rows : {1, 8}) {
+                        constexpr std::array<std::pair<int, int>, 5> layouts{{
+                            {1, 1}, {1, 3}, {1, 8}, {2, 1}, {2, 8}}};
+                        for (const auto& [count, rows] : layouts) {
                             auto lanes = full_lanes;
                             for (auto& lane : lanes) lane.parents = lane.parents.first(rows);
                             const auto packed = mlx::core::zeros(
@@ -3350,7 +3352,7 @@ private:
                                 return mlx::core::slice(value, {0, 0, 0}, {1, rows, value.shape(2)});
                             };
                             const auto& tape = result.tapes.front();
-                            const auto retained = rows == 1 ? array({0}) : array({0, 1, 2, 3, 4, 5, 6, 7});
+                            const auto retained = rows == 8 ? array({0, 1, 2, 3, 4, 5, 6, 7}) : array({0});
                             auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
                                 tape.keys, tape.values, tape.decay, tape.beta, retained, config_.linear_tiled_heads);
                             preparation->add(folded.recurrent);
@@ -6422,8 +6424,14 @@ void MlxQwen4CausalLm::set_hidden_capture_layers(std::vector<int> layers) {
     impl_->auxiliary_hidden.reset();
     if (!impl_->auxiliary_layers.empty()) if (auto* preparation = MlxKernelPreparation::current())
         preparation->collect([&] {
-            const auto streams = mlx::core::zeros({1, 1, int(impl_->config.hc_count * impl_->config.hidden_size)}, mlx::core::float32);
-            preparation->add(qwen4_stream_mean(streams, int(impl_->config.hidden_size), int(impl_->config.hc_count)));
+            const Shape shape{1, 1, int(impl_->config.hc_count * impl_->config.hidden_size)};
+            const auto add = [&](mlx::core::Dtype dtype) {
+                preparation->add(qwen4_stream_mean(mlx::core::zeros(shape, dtype),
+                    int(impl_->config.hidden_size), int(impl_->config.hc_count)));
+            };
+            add(mlx::core::float32);
+            if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false))
+                add(mlx::core::bfloat16);
         });
 }
 
