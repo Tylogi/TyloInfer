@@ -473,6 +473,7 @@ std::string gdn_step_source(
         "constant uint& tokens [[buffer(15)]], "
         "device float* gate_out [[buffer(16)]], "
         "device float* beta_out [[buffer(17)]], ";
+    if (lanes > 1) source += "constant uint* projection_strides [[buffer(27)]], ";
     source +=
         "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
         "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
@@ -480,11 +481,11 @@ std::string gdn_step_source(
     if (lanes > 1) {
         source += R"METAL(
 const uint row = threadgroup_position_in_grid.y;
-qk += row * uint(2 * HK * D);
-value += row * uint(HV * D);
-output_gate += row * uint(HV * D);
-alpha += row * uint(HV);
-beta += row * uint(HV);
+qk += ulong(row) * projection_strides[0];
+value += ulong(row) * projection_strides[1];
+output_gate += ulong(row) * projection_strides[2];
+alpha += ulong(row) * projection_strides[3];
+beta += ulong(row) * projection_strides[4];
 output += row * uint(HV * D);
 )METAL";
         for (const auto* name : {"convolution_state", "recurrent_state", "convolution_out", "recurrent_out"}) {
@@ -630,8 +631,14 @@ private:
             for (int index = 0; index < 4; ++index)
                 encoder.set_input_array(inputs[index], index + 7);
             encoder.set_bytes(config_.eps, 11);
-            for (int index = 0; index < 5; ++index)
-                encoder.set_input_array(inputs[4 + index], index, first * row_bytes(inputs[4 + index]));
+            std::array<uint32_t, 5> projection_strides{};
+            for (int index = 0; index < 5; ++index) {
+                const auto& projection = inputs[4 + index];
+                const auto stride = projection.strides()[1];
+                projection_strides[index] = static_cast<uint32_t>(stride);
+                encoder.set_input_array(projection, index, first * stride * projection.itemsize());
+            }
+            encoder.set_bytes(projection_strides, 27);
             encoder.set_output_array(outputs[0], 12, first * row_bytes(outputs[0]));
             for (int row = 0; row < lanes; ++row) {
                 const int in = 9 + 2 * (first + row), out = 1 + 2 * (first + row);
@@ -649,6 +656,30 @@ private:
 
     GdnStepConfig config_;
     std::string kernel_name_;
+};
+
+// Grouped input projections often share a buffer with padded rows. Resolve
+// their strides after MLX has materialized the lazy projection views.
+class GdnProjectionRows final : public mlx::core::Primitive {
+public:
+    GdnProjectionRows(const array& input, mlx::core::Stream stream)
+        : Primitive(stream), copy_(mlx::core::contiguous(input, false, stream).primitive_ptr()) {}
+    const char* name() const override { return "GdnProjectionRows"; }
+    void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        if (has_feature_rows(inputs.front())) outputs.front().copy_shared_buffer(inputs.front());
+        else copy_->eval_cpu(inputs, outputs);
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        if (has_feature_rows(inputs.front())) outputs.front().copy_shared_buffer(inputs.front());
+        else copy_->eval_gpu(inputs, outputs);
+    }
+private:
+    static bool has_feature_rows(const array& input) {
+        const auto& strides = input.strides();
+        return strides[2] == 1 && strides[1] >= 0 &&
+            strides[1] <= std::numeric_limits<uint32_t>::max();
+    }
+    std::shared_ptr<mlx::core::Primitive> copy_;
 };
 
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
@@ -1655,12 +1686,14 @@ MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
     std::vector<array> inputs{weight.values, std::move(bias), std::move(decay), std::move(norm)};
     inputs.reserve(9 + 2 * rows);
     const std::array widths{qk_width, value_width, value_width, value_heads, value_heads};
+    const auto stream = mlx::core::default_stream(mlx::core::default_device());
     for (int index = 0; index < 5; ++index) {
-        auto value = real_contiguous(projections[index]);
+        auto value = floating_strided(projections[index]);
         if (value.shape() != Shape{1, rows, widths[index]})
             throw std::invalid_argument("invalid Gated DeltaNet decode batch projection");
         config.projection_types[index] = value.dtype();
-        inputs.push_back(std::move(value));
+        inputs.emplace_back(value.shape(), value.dtype(), std::make_shared<GdnProjectionRows>(value, stream),
+            std::vector<array>{value});
     }
     const Shape convolution{1, 3, channels}, recurrent{1, value_heads, dimension, dimension};
     std::vector<Shape> shapes{{1, rows, value_width}};
@@ -1675,7 +1708,7 @@ MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
     std::vector<Dtype> dtypes(shapes.size(), mlx::core::float32);
     dtypes.front() = output_dtype;
     auto outputs = array::make_arrays(shapes, dtypes,
-        std::make_shared<GdnStepPrimitive>(mlx::core::default_stream(mlx::core::default_device()), config), std::move(inputs));
+        std::make_shared<GdnStepPrimitive>(stream, config), std::move(inputs));
     MlxGatedDeltaBatchDecodeResult result{std::move(outputs[0]), {}};
     result.states.reserve(rows);
     for (int row = 0; row < rows; ++row)

@@ -551,6 +551,14 @@ void test_gdn_decode_step(
         }
         std::vector<array> packed;
         for (const auto& projection : projections) packed.push_back(concatenate(projection, 1));
+        const int value_width = packed[1].shape(-1);
+        const auto padding = zeros({1, batch, 1}, packed[1].dtype());
+        packed[1] = slice(concatenate({padding, packed[1], padding}, -1),
+            {0, 0, 1}, {1, batch, value_width + 1});
+        const int gate_width = packed[3].shape(-1);
+        const auto gate = expand_dims(packed[3], -1);
+        packed[3] = slice(reshape(concatenate({zeros_like(gate), gate}, -1), {1, batch, 2 * gate_width}),
+            {0, 0, 1}, {1, batch, 2 * gate_width}, {1, 1, 2});
         auto actual = mfq::metal::gated_delta_decode_batch(packed, states, convolution_weight, bias, decay, norm,
             key_heads, value_heads, 1e-6f, 1e-6f, true, false, float32);
         for (int row = 0; row < batch; ++row) {
