@@ -1,4 +1,5 @@
 #include "mlx_tensor.h"
+#include "tyloinfer/channel_fp8.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "mlx_reference.h"
@@ -493,6 +494,73 @@ array load_dense_array(
     return result;
 }
 
+MlxChannelFp8Weight MlxChannelFp8Weight::from_blob(std::span<const std::uint8_t> blob) {
+    namespace mx = mlx::core;
+    const auto layout = channel_fp8::parse(reinterpret_cast<const std::byte*>(blob.data()), blob.size());
+    const auto outputs = static_cast<int>(layout.outputs);
+    const auto width = static_cast<int>(layout.width);
+    if (width % 32)
+        throw std::invalid_argument("Metal channel FP8 requires a weight width divisible by 32");
+
+    auto values = array(mx::allocator::malloc(layout.scales - channel_fp8::header_bytes),
+        {outputs, width / 4}, mx::uint32);
+    std::memcpy(values.data<std::uint32_t>(), blob.data() + channel_fp8::header_bytes, values.nbytes());
+    const auto dtype = layout.scale_kind == channel_fp8::ScaleKind::Bf16 ? mx::bfloat16
+        : layout.scale_kind == channel_fp8::ScaleKind::F16 ? mx::float16 : mx::float32;
+    auto scales = array(mx::allocator::malloc(layout.bytes - layout.scales), {outputs}, dtype);
+    std::memcpy(scales.data<std::uint8_t>(), blob.data() + layout.scales, scales.nbytes());
+
+    // E8M0 byte 127 contributes a factor of one. Apply the checkpoint's
+    // actual per-channel scales after the product.
+    auto units = mx::full(Shape{outputs, width / 32}, array(127, mx::uint8));
+    units.eval();
+    MlxWeightResidency::track(values);
+    MlxWeightResidency::track(scales);
+    MlxWeightResidency::track(units);
+    return MlxChannelFp8Weight(std::move(values), std::move(units), std::move(scales), layout.dynamic_activations);
+}
+
+MlxChannelFp8Weight::MlxChannelFp8Weight(array values, array unit_scales,
+    array channel_scales, bool dynamic_activations)
+    : values_(std::move(values)), unit_scales_(std::move(unit_scales)),
+      channel_scales_(std::move(channel_scales)), dynamic_activations_(dynamic_activations) {}
+
+array MlxChannelFp8Weight::matmul(const array& input) const {
+    namespace mx = mlx::core;
+    if (input.ndim() == 0 || input.shape(-1) != input_size())
+        throw std::invalid_argument("Metal channel FP8 input width mismatch");
+    auto output_shape = input.shape();
+    output_shape.back() = output_size();
+    if (input.size() == 0) return mx::zeros(output_shape, input.dtype());
+
+    const auto x = mx::astype(mx::reshape(input, {-1, input_size()}), mx::float32);
+    const auto scales = mx::astype(channel_scales_, mx::float32);
+    // BF16 represents every finite E4M3 value and keeps the dot product in
+    // range before its token and channel scales are applied.
+    const auto compute_dtype = input.dtype() == mx::float32 ? mx::float32 : mx::bfloat16;
+    const auto project = [&](const array& source) {
+        return mx::astype(mx::quantized_matmul(source, values_, unit_scales_,
+            std::nullopt, true, 32, 8, "mxfp8"), mx::float32);
+    };
+    const auto product = [&] {
+        if (!dynamic_activations_) return project(mx::astype(x, compute_dtype)) * scales;
+
+        // Match compressed-tensors' symmetric E4M3 scale per input token.
+        const auto token_scales = mx::maximum(mx::max(mx::abs(x), -1, true), array(1e-12f)) / array(448.f);
+        const auto q = mx::from_fp8(
+            mx::to_fp8(mx::clip(x / token_scales, array(-448.f), array(448.f))), compute_dtype);
+        return project(q) * token_scales * scales;
+    }();
+    return mx::reshape(mx::astype(product, input.dtype()), output_shape);
+}
+
+array MlxChannelFp8Weight::embedding(const array& rows, Dtype dtype) const {
+    namespace mx = mlx::core;
+    const auto values = mx::from_fp8(mx::view(mx::take(values_, rows, 0), mx::uint8), mx::float32);
+    const auto scales = mx::expand_dims(mx::astype(mx::take(channel_scales_, rows, 0), mx::float32), -1);
+    return mx::astype(values * scales, dtype);
+}
+
 MlxLinear MlxLinear::load(
     const MfqContainer& model,
     const std::string& name,
@@ -519,6 +587,11 @@ MlxLinear MlxLinear::load(
         return result;
     };
     const auto& record = model.record(name);
+    if (record.dtype == channel_fp8::dtype) {
+        auto weight = MlxChannelFp8Weight::from_blob(model.read(name));
+        model.record_prepared(name);
+        return finish(MlxLinear(std::move(weight)));
+    }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (is_nint8_zero_dtype(record.dtype)) return finish(MlxLinear(MlxNint8ZeroWeight::from_blob(model.map_record(name).view())));
     if (is_nint_dtype(record.dtype)) return finish(MlxLinear(MlxNintWeight::from_blob(model.map_record(name).view())));
@@ -572,6 +645,9 @@ MlxLinear::MlxLinear(MlxMxWeight weight)
       weight_(std::move(weight)) {}
 
 
+MlxLinear::MlxLinear(MlxChannelFp8Weight weight)
+    : weight_(weight), input_size_(weight.input_size()), output_size_(weight.output_size()) {}
+
 MlxLinear::MlxLinear(array weight)
     : weight_(std::move(weight)) {
     const auto& dense = std::get<array>(weight_);
@@ -604,6 +680,7 @@ array MlxLinear::operator()(const array& input) const {
     if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->matmul(input);
     if (const auto* gguf = std::get_if<MlxGgufWeight>(&weight_)) return gguf->matmul(input);
     if (const auto* affine = std::get_if<MlxAffineWeight>(&weight_)) return affine->matmul(input);
+    if (const auto* fp8 = std::get_if<MlxChannelFp8Weight>(&weight_)) return fp8->matmul(input);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, output_size_)) {
@@ -912,6 +989,7 @@ const array* MlxLinear::dense_weight_ref() const noexcept {
 }
 
 void MlxLinear::materialize_fp16() {
+    if (std::holds_alternative<MlxChannelFp8Weight>(weight_)) return;
     if (std::holds_alternative<MlxAffineWeight>(weight_)) return;
     if (std::holds_alternative<MlxGgufWeight>(weight_)) return;
     if (std::holds_alternative<MlxTqWeight>(weight_)) return;

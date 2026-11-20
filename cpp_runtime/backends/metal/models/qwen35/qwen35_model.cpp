@@ -1,5 +1,6 @@
 #include "qwen35_model.h"
 
+#include "tyloinfer/channel_fp8.h"
 #include "tyloinfer/nint_blob.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "mlx_nint.h"
@@ -378,7 +379,8 @@ bool is_dense_float_dtype(const std::string& dtype) {
 }
 
 bool is_supported_linear_dtype(const std::string& dtype) {
-    return is_dense_float_dtype(dtype) || dtype == "TQ" || is_mx_dtype(dtype) || is_gguf_dtype(dtype)
+    return is_dense_float_dtype(dtype) || dtype == "TQ" || is_mx_dtype(dtype) || is_gguf_dtype(dtype) ||
+        dtype == channel_fp8::dtype
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         || is_nint_dtype(dtype) || is_nint8_zero_dtype(dtype) || is_vq_dtype(dtype)
 #endif
@@ -731,7 +733,7 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
     Qwen35TensorMetadata metadata;
     metadata.dtype = record.dtype;
 
-    if (is_gguf_dtype(record.dtype)) {
+    if (is_gguf_dtype(record.dtype) || record.dtype == channel_fp8::dtype) {
         metadata.shape = model.tensor_shape(name);
         metadata.packed = true;
         metadata.axis = 0;
