@@ -42,6 +42,23 @@ MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& 
     const mlx::core::array& norm_weight, int key_heads, int value_heads,
     float norm_eps, bool silu_gate, bool tiled_heads, mlx::core::Dtype output_dtype);
 
+struct MlxGatedDeltaTreeLane {
+    std::span<const int> parents;
+    mlx::core::array convolution, recurrent;
+};
+
+struct MlxGatedDeltaPackedTreeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaTreeResult> tapes;
+};
+
+MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
+    const std::vector<mlx::core::array>& projections, std::span<const MlxGatedDeltaTreeLane> lanes,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float norm_eps, bool silu_gate, bool tiled_heads,
+    mlx::core::Dtype output_dtype);
+
 struct MlxGatedDeltaDecodeState {
     mlx::core::array convolution, recurrent;
 };

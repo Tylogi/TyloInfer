@@ -2849,6 +2849,32 @@ public:
             return Qwen4Attention::forward_packed_requests(grouped, caches, positions, offsets, confirmed, tree);
         auto projected = project_inputs(grouped);
         detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        if (tree && tree->lanes.size() == 2) {
+            // Submit both request trees together while binding each cache's state directly.
+            std::vector<MlxGatedDeltaTreeLane> lanes;
+            lanes.reserve(tree->lanes.size());
+            for (const auto& lane : tree->lanes) {
+                const auto& cache = *lane.cache;
+                if (!cache.convolution || !cache.recurrent || cache.gdn_rollback)
+                    throw std::logic_error("invalid GDN verification tree cache");
+                lanes.push_back({lane.parents, *cache.convolution, *cache.recurrent});
+            }
+            auto result = gated_delta_decode_packed_trees(projected, lanes, convolution_weight_, dt_bias_, decay_scale_,
+                output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
+                static_cast<int>(config_.linear_num_value_heads), output_norm_.eps(),
+                config_.output_gate_silu, config_.linear_tiled_heads, grouped.dtype());
+            for (std::size_t i = 0; i < lanes.size(); ++i) {
+                const auto& lane = tree->lanes[i];
+                auto& tape = result.tapes[i];
+                const int end = lane.begin + static_cast<int>(lane.parents.size());
+                const auto part = [&](const array& value) {
+                    return mlx::core::slice(value, {0, lane.begin, 0}, {1, end, value.shape(2)});
+                };
+                lane.gdn->emplace(Qwen4TreeGdnTape{part(projected[0]), part(projected[1]),
+                    std::move(tape.keys), std::move(tape.values), std::move(tape.decay), std::move(tape.beta)});
+            }
+            return output_(result.output);
+        }
         if (tree) {
             std::vector<array> rows;
             for (const auto& lane : tree->lanes) {

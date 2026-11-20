@@ -1017,6 +1017,61 @@ void test_bfloat16_gdn_tree() {
         throw std::runtime_error("GDN tree output rounding disagrees");
 }
 
+void test_packed_gdn_trees() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    constexpr int heads = 2, key_heads = 1, width = 128, channels = 4 * width;
+    const std::array first_parents{-1, 0, 0};
+    const std::array second_parents{-1, 0, 1, 0, 3};
+    const auto weight = full({channels, 4}, .25f, float32);
+    const auto bias = full({heads}, .2f, float32);
+    const auto scale = full({heads}, -.6f, float32);
+    const auto norm = ones({width}, float32);
+    const auto lane_input = [](int rows, float offset) {
+        auto make = [&](int columns, float multiplier) {
+            auto base = reshape(arange(rows * columns, float32), {1, rows, columns});
+            return astype(sin(base * array(multiplier) + array(offset)), bfloat16);
+        };
+        return MlxGatedDeltaDecodeInput{make(2 * width, .91f), make(heads * width, 1.07f),
+            make(heads * width, 1.13f), make(heads, .63f), make(heads, .44f),
+            full({1, 3, channels}, offset, float32),
+            full({1, heads, width, width}, offset * .005f, float32)};
+    };
+    const auto first = lane_input(first_parents.size(), .1f);
+    const auto second = lane_input(second_parents.size(), -.2f);
+    const auto pack = [](const array& a, const array& b) { return concatenate({a, b}, 1); };
+    const std::array<MlxGatedDeltaTreeLane, 2> lanes{{
+        {first_parents, first.convolution_state, first.recurrent_state},
+        {second_parents, second.convolution_state, second.recurrent_state},
+    }};
+    const auto packed = gated_delta_decode_packed_trees(
+        {pack(first.qk, second.qk), pack(first.value, second.value), pack(first.output_gate, second.output_gate),
+         pack(first.alpha, second.alpha), pack(first.beta, second.beta)},
+        lanes, weight, bias, scale, norm, key_heads, heads, 1.e-6f, true, false, bfloat16);
+    const auto first_ref = gated_delta_decode_tree(first, first_parents, weight, bias, scale, norm,
+        key_heads, heads, 1.e-6f, true, false, bfloat16);
+    const auto second_ref = gated_delta_decode_tree(second, second_parents, weight, bias, scale, norm,
+        key_heads, heads, 1.e-6f, true, false, bfloat16);
+    require_bit_exact(packed.output, pack(first_ref.output, second_ref.output), "packed GDN verify output");
+    for (int i = 0; i < 2; ++i) {
+        const auto& state = i == 0 ? first : second;
+        const auto& expected = i == 0 ? first_ref : second_ref;
+        const auto retained = i == 0 ? array({0, 2}) : array({0, 3, 4});
+        const auto fold = [&](const auto& tape) {
+            return fold_gated_delta_tree({state.convolution_state, state.recurrent_state}, state.qk, state.value,
+                tape.keys, tape.values, tape.decay, tape.beta, retained, false);
+        };
+        require_bit_exact(packed.tapes[i].keys, expected.keys, "packed GDN keys");
+        require_bit_exact(packed.tapes[i].values, expected.values, "packed GDN values");
+        require_bit_exact(packed.tapes[i].decay, expected.decay, "packed GDN decay");
+        require_bit_exact(packed.tapes[i].beta, expected.beta, "packed GDN beta");
+        const auto actual_fold = fold(packed.tapes[i]);
+        const auto expected_fold = fold(expected);
+        require_bit_exact(actual_fold.convolution, expected_fold.convolution, "packed GDN committed convolution");
+        require_bit_exact(actual_fold.recurrent, expected_fold.recurrent, "packed GDN committed recurrence");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace mlx::core;
@@ -1033,6 +1088,7 @@ int main(int argc, char** argv) {
         test_runtime_token_kernel_reuse();
         test_gdn_output_norm();
         test_bfloat16_gdn_tree();
+        test_packed_gdn_trees();
         test_mixed_gdn_projection_types();
         test_linear_conv_prefill();
         test_linear_conv_prefill(48);

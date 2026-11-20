@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1571,49 +1572,106 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
         convolution_eps, norm_eps, output_gate_silu, tiled_heads, output_dtype, transposed_state, round_fp16).front();
 }
 
-MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& input,
-    std::span<const int> parents, const array& convolution_weight, const array& dt_bias,
-    const array& decay_scale, const array& norm_weight, int key_heads, int value_heads,
+MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
+    const std::vector<array>& projections, std::span<const MlxGatedDeltaTreeLane> lanes,
+    const array& convolution_weight, const array& dt_bias, const array& decay_scale,
+    const array& norm_weight, int key_heads, int value_heads,
     float norm_eps, bool silu_gate, bool tiled_heads, Dtype output_dtype) {
-    const int rows = static_cast<int>(parents.size());
     constexpr int dimension = 128;
+    if (lanes.empty() || lanes.size() > 2 || projections.size() != 5 ||
+        key_heads < 1 || value_heads < 1 || value_heads % key_heads)
+        throw std::invalid_argument("invalid GDN verification tree geometry");
     const int key_width = key_heads * dimension, value_width = value_heads * dimension;
     const int channels = 2 * key_width + value_width;
-    if (rows < 1 || rows > 16 || parents.front() != -1 || key_heads < 1 || value_heads < 1 || value_heads % key_heads ||
-        input.qk.shape() != Shape{1, rows, 2 * key_width} || input.value.shape() != Shape{1, rows, value_width} ||
-        input.convolution_state.shape() != Shape{1, 3, channels} ||
-        input.recurrent_state.shape() != Shape{1, value_heads, dimension, dimension})
-        throw std::invalid_argument("invalid GDN verification tree geometry");
     const auto weight = normalize_conv_weight(convolution_weight, channels);
     if (weight.kernel != 4) throw std::invalid_argument("GDN verification tree requires four convolution taps");
 
-    std::vector<std::uint32_t> paths(rows, 1);
-    std::vector<int> taps(rows * 4);
-    for (int node = 0; node < rows; ++node) {
-        if (node && (parents[node] < 0 || parents[node] >= node))
-            throw std::invalid_argument("invalid GDN verification tree parent");
-        if (node) paths[node] = paths[parents[node]] | (1u << node);
-        int parent = node;
-        int history = 2;
-        for (int tap = 3; tap >= 0; --tap) {
-            taps[4 * node + tap] = parent >= 0 ? 3 + parent : history--;
-            if (parent >= 0) parent = parents[parent];
+    std::vector<std::uint32_t> paths, layout;
+    std::vector<int> taps;
+    paths.reserve(16 * lanes.size());
+    taps.reserve(64 * lanes.size());
+    layout.reserve(2 * lanes.size() + 1);
+    int longest = 0;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size());
+        if (rows < 1 || rows > 16 || lane.parents.front() != -1 ||
+            lane.convolution.shape() != Shape{1, 3, channels} ||
+            lane.recurrent.shape() != Shape{1, value_heads, dimension, dimension})
+            throw std::invalid_argument("invalid GDN verification tree geometry");
+        const auto begin = paths.size();
+        layout.push_back(static_cast<std::uint32_t>(begin));
+        layout.push_back(static_cast<std::uint32_t>(rows));
+        longest = std::max(longest, rows);
+        paths.push_back(1);
+        taps.resize(4 * (begin + rows));
+        for (int node = 0; node < rows; ++node) {
+            if (node) {
+                const int parent = lane.parents[node];
+                if (parent < 0 || parent >= node)
+                    throw std::invalid_argument("invalid GDN verification tree parent");
+                paths.push_back(paths[begin + parent] | (1u << node));
+            }
+            int parent = node;
+            int history = 2;
+            for (int tap = 3; tap >= 0; --tap) {
+                taps[4 * (begin + node) + tap] = parent >= 0 ? 3 + parent : history--;
+                if (parent >= 0) parent = lane.parents[parent];
+            }
         }
     }
-    auto gates = gated_delta_gates(input.alpha, input.beta, dt_bias, decay_scale);
-    auto decay = mlx::core::exp(gates.gate);
-    // Splash's decode prologue, ancestor transform, scan and output gate share
-    // one group per value head. Keep the projected key/value tape for folding.
+    const int total_rows = static_cast<int>(paths.size());
+    layout.push_back(static_cast<std::uint32_t>(total_rows));
+    if (projections[0].shape() != Shape{1, total_rows, 2 * key_width} ||
+        projections[1].shape() != Shape{1, total_rows, value_width} ||
+        projections[2].shape() != projections[1].shape() ||
+        projections[3].shape() != Shape{1, total_rows, value_heads} ||
+        projections[4].shape() != projections[3].shape())
+        throw std::invalid_argument("invalid GDN verification tree projections");
+    const char* gates_setting = std::getenv("TYLOINFER_METAL_GDN_GATES");
+    const bool fuse_gates = lanes.size() == 2 && (!gates_setting || std::string_view(gates_setting) != "0");
+    auto gates = fuse_gates
+        ? MlxGatedDeltaGates{real_contiguous(projections[3]), real_contiguous(projections[4])}
+        : gated_delta_gates(projections[3], projections[4], dt_bias, decay_scale);
+    auto decay = fuse_gates ? gates.gate : mlx::core::exp(gates.gate);
+    // As in Splash, a threadgroup verifies one value head of one request.
+    // Keep its projected key/value and gate rows for the accepted-path fold.
     static const auto decode = cached_metal_kernel("tyloinfer_gdn_tree_decode",
-        {"qk", "value", "history", "state", "weight", "taps", "paths", "decay", "beta", "gate", "norm", "eps", "width"},
-        {"output", "keys", "values"}, R"METAL(
+        {"qk", "value", "history0", "state0", "history1", "state1", "weight", "taps", "paths",
+         "alpha", "beta", "gate", "norm", "eps", "layout", "bias", "scale"},
+        {"output", "keys", "values", "decays", "betas"}, R"METAL(
 const uint lane = thread_index_in_simdgroup, group = simdgroup_index_in_threadgroup;
-const uint rows = width[0], head = threadgroup_position_in_grid.x;
+const uint request = threadgroup_position_in_grid.y;
+const uint begin = layout[2u * request], rows = layout[2u * request + 1u];
+const uint head = threadgroup_position_in_grid.x, total = layout[2u * LANES];
+const device float* history = request == 0u ? history0 : history1;
+const device float* state = request == 0u ? state0 : state1;
 const uint kh = TILED ? head % uint(HK) : head / uint(HV / HK);
 const bool key_writer = TILED ? head < uint(HK) : head % uint(HV / HK) == 0u;
 constexpr uint QK = uint(2 * HK * 128), V = uint(HV * 128), C = QK + V;
 threadgroup float query[CAP * 128], key[CAP * 128], val[CAP * 128], coef[CAP * CAP];
+threadgroup float decay_cache[CAP], beta_cache[CAP];
 for (uint row = group; row < rows; row += 8u) {
+    if (lane == 0u) {
+        if (FUSE_GATES) {
+            // Match gated_delta_gates' FP32 softplus and sigmoid.
+            const uint src = (begin + row) * uint(HV) + head;
+            const float x = float(alpha[src]) + bias[head];
+            const float exp_term = metal::precise::exp(-abs(x));
+            const float plus_one = 1.f + exp_term;
+            const float log_term = plus_one == 1.f ? exp_term :
+                exp_term * (metal::precise::log(plus_one) / (plus_one - 1.f));
+            const float log_decay = scale[head] * (max(x, 0.f) + log_term);
+            const float b = float(beta[src]), tail = 1.f / (1.f + metal::precise::exp(abs(b)));
+            decay_cache[row] = metal::precise::exp(log_decay);
+            beta_cache[row] = b < 0.f ? tail : 1.f - tail;
+            const uint dst = begin * uint(HV) + head * rows + row;
+            decays[dst] = decay_cache[row];
+            betas[dst] = beta_cache[row];
+        } else {
+            decay_cache[row] = float(alpha[head * total + begin + row]);
+            beta_cache[row] = float(beta[head * total + begin + row]);
+        }
+    }
     float vector[3][4], square[2] = {0.f, 0.f};
     for (uint component = 0; component < 3; ++component) {
         const uint base = component == 0u ? kh * 128u : component == 1u ? (uint(HK) + kh) * 128u : QK + head * 128u;
@@ -1621,9 +1679,9 @@ for (uint row = group; row < rows; row += 8u) {
             const uint c = base + lane + i * 32u;
             float sum = 0.f;
             for (uint tap = 0; tap < 4; ++tap) {
-                const uint src = uint(taps[row * 4u + tap]);
+                const uint src = uint(taps[(begin + row) * 4u + tap]);
                 const float x = src < 3u ? history[src * C + c] : c < QK ?
-                    float(qk[(src - 3u) * QK + c]) : float(value[(src - 3u) * V + c - QK]);
+                    float(qk[(begin + src - 3u) * QK + c]) : float(value[(begin + src - 3u) * V + c - QK]);
                 sum += x * weight[c * 4u + tap];
             }
             vector[component][i] = sum / (1.f + exp(-sum));
@@ -1637,8 +1695,8 @@ for (uint row = group; row < rows; row += 8u) {
         query[at] = vector[0][i] * q_norm;
         key[at] = vector[1][i] * k_norm;
         val[at] = vector[2][i];
-        if (key_writer) keys[(kh * rows + row) * 128u + dim] = key[at];
-        values[(head * rows + row) * 128u + dim] = val[at];
+        if (key_writer) keys[(begin * uint(HK) + kh * rows + row) * 128u + dim] = key[at];
+        values[(begin * uint(HV) + head * rows + row) * 128u + dim] = val[at];
     }
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1646,14 +1704,14 @@ for (uint row = group; row < rows; row += 8u) {
     const uint at = row * 128u + lane * 4u;
     float z[4], a = 0.f;
     for (uint i = 0; i < 4; ++i) z[i] = query[at + i];
-    for (uint up = paths[row]; up;) {
+    for (uint up = paths[begin + row]; up;) {
         const uint parent = 31 - clz(up);
         up &= ~(1u << parent);
         const uint from = parent * 128u + lane * 4u;
         float sum = 0.f;
         for (uint i = 0; i < 4; ++i) sum += key[from + i] * z[i];
-        const float c = beta[head * rows + parent] * simd_sum(sum);
-        const float d = decay[head * rows + parent];
+        const float c = beta_cache[parent] * simd_sum(sum);
+        const float d = decay_cache[parent];
         for (uint i = 0; i < 4; ++i) z[i] = d * (z[i] - c * key[from + i]);
         if (lane == parent) a = c;
     }
@@ -1685,24 +1743,66 @@ for (uint row = group; row < rows; row += 8u) {
     }
     const float inv = metal::precise::rsqrt(simd_sum(square) / 128.f + eps[0]);
     for (uint i = 0; i < 4; ++i) {
-        const uint c = lane + i * 32u, out = row * V + head * 128u + c;
+        const uint c = lane + i * 32u, out = (begin + row) * V + head * 128u + c;
         const float z = float(gate[out]), tail = 1.f / (1.f + metal::precise::exp(abs(z)));
         const float sigmoid = z < 0.f ? tail : 1.f - tail;
         output[out] = T(normalized[i] * inv * norm[c] * (SILU ? z * sigmoid : sigmoid));
     }
 }
 )METAL");
-    auto result = decode({real_contiguous(input.qk), real_contiguous(input.value),
-        float32_contiguous(input.convolution_state), float32_contiguous(input.recurrent_state), weight.values,
-        array(taps.begin(), {rows, 4}, mlx::core::int32), array(paths.begin(), {rows}, mlx::core::uint32),
-        decay, gates.beta, real_contiguous(input.output_gate), float32_contiguous(norm_weight), array({norm_eps}),
-        array({static_cast<std::uint32_t>(rows)})},
-        {input.output_gate.shape(), {1, key_heads, rows, dimension}, {1, value_heads, rows, dimension}},
-        {output_dtype, mlx::core::float32, mlx::core::float32}, {value_heads * 256, 1, 1}, {256, 1, 1},
+    const auto& first = lanes.front();
+    const auto& last = lanes.back();
+    const Shape gate_tape{fuse_gates ? total_rows * value_heads : 1};
+    auto result = decode({real_contiguous(projections[0]), real_contiguous(projections[1]),
+        float32_contiguous(first.convolution), float32_contiguous(first.recurrent),
+        float32_contiguous(last.convolution), float32_contiguous(last.recurrent), weight.values,
+        array(taps.begin(), {total_rows, 4}, mlx::core::int32),
+        array(paths.begin(), {total_rows}, mlx::core::uint32), decay, gates.beta,
+        real_contiguous(projections[2]), float32_contiguous(norm_weight), array({norm_eps}),
+        array(layout.begin(), {static_cast<int>(layout.size())}, mlx::core::uint32),
+        float32_contiguous(dt_bias), float32_contiguous(decay_scale)},
+        {projections[2].shape(), {total_rows * key_width}, {total_rows * value_width}, gate_tape, gate_tape},
+        {output_dtype, mlx::core::float32, mlx::core::float32, mlx::core::float32, mlx::core::float32},
+        {value_heads * 256, static_cast<int>(lanes.size()), 1}, {256, 1, 1},
         {{"HK", key_heads}, {"HV", value_heads}, {"TILED", static_cast<int>(tiled_heads)},
-         {"CAP", rows <= 8 ? 8 : 16}, {"SILU", static_cast<int>(silu_gate)}, {"T", output_dtype}},
+         {"CAP", longest <= 8 ? 8 : 16}, {"SILU", static_cast<int>(silu_gate)}, {"LANES", static_cast<int>(lanes.size())},
+         {"FUSE_GATES", static_cast<int>(fuse_gates)}, {"T", output_dtype}},
         std::nullopt, false, {});
-    return {std::move(result[0]), std::move(result[1]), std::move(result[2]), std::move(decay), std::move(gates.beta)};
+    std::vector<MlxGatedDeltaTreeResult> tapes;
+    tapes.reserve(lanes.size());
+    int begin = 0;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size()), end = begin + rows;
+        const auto kv = [&](const array& tape, int heads, int width) {
+            return mlx::core::reshape(mlx::core::slice(tape, {begin * width}, {end * width}),
+                {1, heads, rows, dimension});
+        };
+        const auto gate = [&](const array& tape) {
+            return projection_contiguous(mlx::core::slice(tape, {0, 0, begin}, {1, value_heads, end}));
+        };
+        const auto gate_rows = [&](const array& fused, const array& separate) {
+            return fuse_gates
+                ? mlx::core::reshape(mlx::core::slice(fused, {begin * value_heads}, {end * value_heads}),
+                    {1, value_heads, rows})
+                : gate(separate);
+        };
+        tapes.push_back({mlx::core::slice(result[0], {0, begin, 0}, {1, end, value_width}),
+            kv(result[1], key_heads, key_width), kv(result[2], value_heads, value_width),
+            gate_rows(result[3], decay), gate_rows(result[4], gates.beta)});
+        begin = end;
+    }
+    return {std::move(result[0]), std::move(tapes)};
+}
+
+MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& input,
+    std::span<const int> parents, const array& convolution_weight, const array& dt_bias,
+    const array& decay_scale, const array& norm_weight, int key_heads, int value_heads,
+    float norm_eps, bool silu_gate, bool tiled_heads, Dtype output_dtype) {
+    const MlxGatedDeltaTreeLane lane{parents, input.convolution_state, input.recurrent_state};
+    return std::move(gated_delta_decode_packed_trees(
+        {input.qk, input.value, input.output_gate, input.alpha, input.beta}, std::span(&lane, 1),
+        convolution_weight, dt_bias, decay_scale, norm_weight, key_heads, value_heads,
+        norm_eps, silu_gate, tiled_heads, output_dtype).tapes.front());
 }
 
 MlxGatedDeltaDecodeState fold_gated_delta_tree(const MlxGatedDeltaDecodeState& state,
