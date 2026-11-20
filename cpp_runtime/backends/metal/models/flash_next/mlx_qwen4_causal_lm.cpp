@@ -6430,8 +6430,12 @@ void MlxQwen4CausalLm::set_hidden_capture_layers(std::vector<int> layers) {
                     int(impl_->config.hidden_size), int(impl_->config.hc_count)));
             };
             add(mlx::core::float32);
-            if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false))
+            if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
                 add(mlx::core::bfloat16);
+                const mlx::core::array retained({0, 1}, mlx::core::int32);
+                for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16, mlx::core::float32})
+                    preparation->add(mlx::core::take(mlx::core::zeros({1, 2, 4}, dtype), retained, 1));
+            }
         });
 }
 

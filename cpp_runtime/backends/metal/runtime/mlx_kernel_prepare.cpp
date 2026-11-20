@@ -1,3 +1,4 @@
+#include "runtime_config.h"
 #include "mlx_kernel_prepare.h"
 #include "mfq_mlx_utils_embedded.h"
 
@@ -83,6 +84,14 @@ MlxKernelPreparation::MlxKernelPreparation(int context, int chunk_size)
         const int rows = std::min(context, requested);
         if (std::find(rows_.begin(), rows_.end(), rows) == rows_.end()) rows_.push_back(rows);
     }
+    if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
+        // Compact verification trees can choose any of these short row counts.
+        // The dense projection groups specialize on the exact count.
+        for (const int rows : {9, 10, 11, 13, 14, 15})
+            if (rows < context) rows_.push_back(rows);
+        std::sort(rows_.begin(), rows_.end());
+        rows_.erase(std::unique(rows_.begin(), rows_.end()), rows_.end());
+    }
     active_ = this;
 }
 
@@ -143,6 +152,17 @@ void MlxKernelPreparation::add(const mlx::core::array& output) {
             std::string key = compiled ? "compiled:" + compiled->lib_name() : primitive->name();
             if (!compiled)
                 for (const auto& input : inputs) key += ':' + std::to_string(static_cast<int>(input.dtype().val()));
+            if (!compiled && std::string_view(primitive->name()) == "Gather" && inputs.size() > 1) {
+                const auto [axes, slices] = static_cast<const mlx::core::Gather*>(primitive.get())->state();
+                const auto& source = input_shapes.front();
+                const bool front = axes.size() == 1 && axes.front() == 0 && slices.front() == 1 &&
+                    std::equal(slices.begin() + 1, slices.end(), source.begin() + 1, source.end());
+                key += ':' + std::to_string(inputs[1].ndim());
+                if (front) {
+                    const auto columns = outputs.front().size() / std::max<std::size_t>(inputs[1].size(), 1);
+                    key += columns > 8 && input_dtypes.front().size() < 4 ? ":front-wide" : ":front";
+                }
+            }
             std::vector<mlx::core::array> view_inputs;
             if (compiled && bounded(input_shapes, input_dtypes))
                 for (const auto& input : inputs) view_inputs.push_back(preparation_view_input(input, key));
