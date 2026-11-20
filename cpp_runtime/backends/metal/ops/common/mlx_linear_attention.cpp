@@ -1610,15 +1610,11 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     std::vector<array> inputs{packed_weight.values, bias_values, decay_values, norm_values};
     inputs.reserve(4 + requests.size() * 7);
     std::vector<Shape> shapes;
-    const int tokens = requests.front().qk.ndim() == 3 ? requests.front().qk.shape(1) : 0;
-    if (tokens < 1 || tokens > 8)
-        throw std::invalid_argument("Gated DeltaNet fused decode requires one to eight tokens");
-    const bool sequence = tokens > 1;
+    const bool sequence = std::any_of(requests.begin(), requests.end(), [](const auto& request) {
+        return request.qk.ndim() == 3 && request.qk.shape(1) > 1;
+    });
     const int fields = sequence ? 5 : 3;
     shapes.reserve(requests.size() * fields);
-    const std::array<Shape, 7> expected{Shape{1, tokens, qk_width}, Shape{1, tokens, value_width},
-        Shape{1, tokens, value_width}, Shape{1, tokens, value_heads}, Shape{1, tokens, value_heads},
-        Shape{1, 3, channels}, Shape{1, value_heads, dimension, dimension}};
     GdnStepConfig config{{mlx::core::float32, mlx::core::float32, mlx::core::float32,
         mlx::core::float32, mlx::core::float32}, key_heads, value_heads, output_gate_silu,
         {convolution_eps, norm_eps}, sequence, tiled_heads, output_dtype, transposed_state};
@@ -1627,6 +1623,12 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     if (sequence && !transposed_state && cores > 0 && value_heads < cores * 2) config.head_splits = 4;
     for (std::size_t row = 0; row < requests.size(); ++row) {
         const auto& request = requests[row];
+        const int tokens = request.qk.ndim() == 3 ? request.qk.shape(1) : 0;
+        if (tokens < 1 || tokens > 8)
+            throw std::invalid_argument("Gated DeltaNet fused decode requires one to eight tokens per request");
+        const std::array<Shape, 7> expected{Shape{1, tokens, qk_width}, Shape{1, tokens, value_width},
+            Shape{1, tokens, value_width}, Shape{1, tokens, value_heads}, Shape{1, tokens, value_heads},
+            Shape{1, 3, channels}, Shape{1, value_heads, dimension, dimension}};
         std::array<array, 7> values{real_contiguous(request.qk), real_contiguous(request.value),
             real_contiguous(request.output_gate), real_contiguous(request.alpha),
             real_contiguous(request.beta), float32_contiguous(request.convolution_state),

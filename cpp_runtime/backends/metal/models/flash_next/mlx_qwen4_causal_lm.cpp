@@ -2627,7 +2627,7 @@ public:
         auto output = forward_packed_requests(grouped, caches, positions, offsets, confirmed);
         return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
     }
-    array forward_packed_requests(const array& grouped,
+    virtual array forward_packed_requests(const array& grouped,
         const std::vector<Qwen4RequestLayerCache*>& caches,
         const std::vector<int>& positions, const std::vector<int>& offsets, int confirmed = 0) {
         const int batch = static_cast<int>(caches.size());
@@ -2688,8 +2688,7 @@ public:
         const std::vector<Qwen4RequestLayerCache*>& caches,
         const std::vector<int>& positions, int confirmed = 0) override {
         const int tokens = hidden.shape(1);
-        if (tokens < 1 || tokens > 2 || !gdn_decode_step_enabled() || config_.linear_key_head_dim != 128 ||
-            config_.linear_value_head_dim != 128 || config_.linear_conv_kernel_dim != 4)
+        if (tokens < 1 || tokens > 2 || !supports_fused_decode())
             return Qwen4Attention::forward_requests(hidden, caches, positions, confirmed);
         if (confirmed < 0 || confirmed >= tokens)
             throw std::logic_error("invalid batched GDN speculative boundary");
@@ -2720,6 +2719,30 @@ public:
             detail::profile_eval("qwen4.batch.attention.output", output);
             return mlx::core::reshape(output, {batch, 1, output.shape(2)});
         }
+        std::vector<int> offsets(batch + 1);
+        for (int row = 0; row <= batch; ++row) offsets[row] = row * tokens;
+        auto output = decode_packed_requests(grouped, projected, caches, offsets, confirmed);
+        return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
+    }
+    array forward_packed_requests(const array& grouped,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, const std::vector<int>& offsets, int confirmed) override {
+        if (!supports_fused_decode() || !confirmed)
+            return Qwen4Attention::forward_packed_requests(grouped, caches, positions, offsets, confirmed);
+        auto projected = project_inputs(grouped);
+        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        return decode_packed_requests(grouped, projected, caches, offsets, confirmed);
+    }
+
+private:
+    bool supports_fused_decode() const {
+        return gdn_decode_step_enabled() && config_.linear_key_head_dim == 128 &&
+            config_.linear_value_head_dim == 128 && config_.linear_conv_kernel_dim == 4;
+    }
+
+    array decode_packed_requests(const array& grouped, const std::vector<array>& projected,
+        const std::vector<Qwen4RequestLayerCache*>& caches, const std::vector<int>& offsets, int confirmed) {
+        const int batch = static_cast<int>(caches.size());
         std::vector<MlxGatedDeltaDecodeInput> inputs;
         inputs.reserve(batch);
         for (int row = 0; row < batch; ++row) {
@@ -2728,20 +2751,21 @@ public:
                 throw std::logic_error("cannot batch uninitialized GDN state");
             std::vector<array> values;
             for (const auto& value : projected)
-                values.push_back(mlx::core::slice(value, {0, row * tokens, 0},
-                    {1, (row + 1) * tokens, value.shape(2)}));
+                values.push_back(mlx::core::slice(value, {0, offsets[row], 0},
+                    {1, offsets[row + 1], value.shape(2)}));
             inputs.push_back({std::move(values[0]), std::move(values[1]), std::move(values[2]),
                 std::move(values[3]), std::move(values[4]), *cache.convolution, *cache.recurrent});
         }
         auto decoded = gated_delta_decode_steps(inputs, convolution_weight_, dt_bias_, decay_scale_,
             output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
             static_cast<int>(config_.linear_num_value_heads), 128,
-            1e-6f, output_norm_.eps(), config_.output_gate_silu, config_.linear_tiled_heads, hidden.dtype());
+            1e-6f, output_norm_.eps(), config_.output_gate_silu, config_.linear_tiled_heads, grouped.dtype());
         std::vector<array> outputs;
         outputs.reserve(batch);
         for (int row = 0; row < batch; ++row) {
             auto& cache = *caches[row];
-            if (confirmed) cache.gdn_rollback.emplace(MlxGatedDeltaSpeculativeState{
+            const int tokens = offsets[row + 1] - offsets[row];
+            if (confirmed && tokens > 1) cache.gdn_rollback.emplace(MlxGatedDeltaSpeculativeState{
                 *cache.convolution, *cache.recurrent, inputs[row].qk, inputs[row].value,
                 decoded[row].gate, decoded[row].beta, cache.position, cache.batch, confirmed, tokens});
             cache.convolution = std::move(decoded[row].convolution_state);
@@ -2750,10 +2774,12 @@ public:
             outputs.push_back(std::move(decoded[row].output));
         }
         detail::profile_eval("qwen4.batch.attention.core", outputs);
-        auto output = output_(mlx::core::astype(mlx::core::concatenate(outputs, 1), hidden.dtype()));
+        auto output = output_(mlx::core::astype(mlx::core::concatenate(outputs, 1), grouped.dtype()));
         detail::profile_eval("qwen4.batch.attention.output", output);
-        return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
+        return output;
     }
+
+public:
     std::vector<array> decode_input_projections(const array& hidden) override {
         return project_inputs(hidden);
     }

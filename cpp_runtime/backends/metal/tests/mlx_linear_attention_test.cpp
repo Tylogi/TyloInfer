@@ -602,6 +602,19 @@ void test_gdn_decode_step(
             const bool split_heads = !transposed_state && cores > 0 && value_heads < cores * 2;
             if (!prepared || (prepared->preparation_key().find("_split4") != std::string::npos) != split_heads)
                 throw std::runtime_error("GDN sequence head partition dispatch mismatch");
+            if (transposed_state && tokens == 8 && !tiled_heads && !silu_gate) {
+                const auto& second = requests[1];
+                const mfq::metal::MlxGatedDeltaDecodeInput short_request{
+                    qs[0], vs[0], zs[0], as[0], bs[0], second.convolution_state, second.recurrent_state};
+                const auto ragged = mfq::metal::gated_delta_decode_steps({requests[0], short_request},
+                    convolution_weight, bias, decay, norm, key_heads, value_heads, dimension,
+                    1e-6f, 1e-6f);
+                const auto single = mfq::metal::gated_delta_decode_steps({short_request}, convolution_weight,
+                    bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f).front();
+                require_bit_exact(ragged[0].output, actual[0].output, "GDN long window in mixed batch");
+                require_bit_exact(ragged[1].output, single.output, "GDN anchor-only window in mixed batch");
+                require_bit_exact(ragged[1].recurrent_state, single.recurrent_state, "GDN mixed anchor recurrent state");
+            }
             for (const auto output_dtype : {float16, bfloat16}) {
                 auto rounded = mfq::metal::gated_delta_decode_steps(requests, convolution_weight,
                     bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f, silu_gate, tiled_heads, output_dtype, transposed_state);
