@@ -1,7 +1,9 @@
 import { build } from '../../studio/web/node_modules/vite/dist/node/index.js';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('.', import.meta.url));
+const dsbot = process.argv.includes('--dsbot');
+const output = new URL(dsbot ? './dist/dsbot/' : './', import.meta.url);
 const versionSource = await readFile(new URL('../../studio/_version.py', import.meta.url), 'utf8');
 const productVersion = versionSource.match(/^__version__\s*=\s*["']([^"']+)["']/m)?.[1];
 if (!productVersion) throw new Error('TyloInfer product version is missing');
@@ -40,13 +42,37 @@ const result = await build({ configFile: false, root, logLevel: 'error', plugins
     const path = id.replaceAll('\\', '/');
     if (path.startsWith(studioRoot) && /\.tsx$/.test(path) && !/import\s+React\b/.test(code)) return `import React from 'react';\n${code}`;
   },
-}], define: { __TYLOINFER_PRODUCT_VERSION__: JSON.stringify(productVersion) }, oxc: { jsx: { runtime: 'classic' } },
+}], define: { __TYLOINFER_PRODUCT_VERSION__: JSON.stringify(productVersion), __TYLOINFER_DSBOT__: JSON.stringify(dsbot) }, oxc: { jsx: { runtime: 'classic' } },
   build: { write: false, minify: false, lib: { entry: 'src/client.jsx', name: 'TyloInferStudioClient', formats: ['iife'] },
     rollupOptions: { external: ['react'], output: { globals: { react: 'React' } } } } });
 const outputs = Array.isArray(result) ? result : [result];
 const chunks = outputs.flatMap((item) => item.output).filter((item) => item.type === 'chunk');
 if (chunks.length !== 1) throw new Error('Expected one self-contained Client factory');
-await mkdir(new URL('./lib/', import.meta.url), { recursive: true });
-await writeFile(new URL('./lib/client.js', import.meta.url), `window.__ModuleLoader__.load({ id: '@tyloinfer/dsh-studio', factory(require) {\nconst React = require('react');\n${chunks[0].code}\nreturn TyloInferStudioClient;\n} });\n`);
-await writeFile(new URL('./lib/index.js', import.meta.url), await readFile(new URL('./src/index.js', import.meta.url), 'utf8'));
+await mkdir(new URL('lib/', output), { recursive: true });
+const portal = dsbot ? "const createDSBotPortal = require('react-dom').createPortal;\n" : '';
+await writeFile(new URL('lib/client.js', output), `window.__ModuleLoader__.load({ id: '@tyloinfer/dsh-studio', factory(require) {\nconst React = require('react');\n${portal}${chunks[0].code}\nreturn TyloInferStudioClient;\n} });\n`);
+await copyFile(new URL('./src/index.js', import.meta.url), new URL('lib/index.js', output));
+
+if (dsbot) {
+  const manifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
+  const host = new URL('../host/', import.meta.url);
+  const hostManifest = JSON.parse(await readFile(new URL('package.json', host), 'utf8'));
+  if (manifest.engines.dsh !== hostManifest.engines.dsh) throw new Error('DSBot plugin components require different DSH versions');
+  const hostOutput = new URL('lib/host/', output);
+  await mkdir(hostOutput, { recursive: true });
+  for (const filename of ['package.json', ...hostManifest.files.filter(filename => filename.endsWith('.js'))]) {
+    await copyFile(new URL(filename, host), new URL(filename, hostOutput));
+  }
+  const { name, version, type, engines, exports, dsh, peerDependencies } = manifest;
+  const packageManifest = {
+    name, version, type, engines, dsh,
+    description: 'TyloInfer inference controls for DSBot',
+    license: hostManifest.license,
+    exports: { ...exports, './bridge': './lib/host/index.js' },
+    peerDependencies: { ...peerDependencies, ...hostManifest.peerDependencies, 'react-dom': peerDependencies.react },
+    files: ['lib', 'cordis.patch.yml'],
+  };
+  await copyFile(new URL('dsbot.patch.yml', import.meta.url), new URL('cordis.patch.yml', output));
+  await writeFile(new URL('package.json', output), JSON.stringify(packageManifest, null, 2) + '\n');
+}
 console.log('CLIENT_BUILD_OK external_react=true factory_count=1');

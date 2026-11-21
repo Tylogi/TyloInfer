@@ -7,7 +7,7 @@ const require = createRequire(new URL('../../../studio/web/package.json', import
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 const artifact = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
-function harness(sessionStorage) {
+function harness(sessionStorage, source = artifact) {
   let definition;
   const imports = [];
   const styles = new Set();
@@ -15,8 +15,12 @@ function harness(sessionStorage) {
   const icons = new Set();
   const document = { querySelectorAll: () => [], createElement: tag => ({ dataset: {}, remove() { styles.delete(this); icons.delete(this); }, tag }), head: { append: item => item.tag === 'link' ? icons.add(item) : styles.add(item) },
     body: { classList: { add: value => classes.add(value), remove: value => classes.delete(value) } } };
-  vm.runInNewContext(artifact, { document, AbortController, setTimeout, clearTimeout, window: { sessionStorage, __ModuleLoader__: { load: value => { definition = value; } } } });
-  const plugin = definition.factory((name) => { imports.push(name); assert.equal(name, 'react'); return React; });
+  vm.runInNewContext(source, { document, AbortController, setTimeout, clearTimeout, window: { sessionStorage, __ModuleLoader__: { load: value => { definition = value; } } } });
+  const plugin = definition.factory((name) => {
+    imports.push(name);
+    assert.ok(name === 'react' || name === 'react-dom');
+    return name === 'react' ? React : require(name);
+  });
   const registrations = [];
   const disposers = [];
   const selected = [];
@@ -36,6 +40,33 @@ function harness(sessionStorage) {
   plugin.apply(ctx);
   return { definition, imports, registrations, selected, styles, classes, icons, tokens: () => tokens, dispose() { for (const dispose of disposers.reverse()) dispose();  } };
 }
+test('DSBot build adds a native panel without replacing the existing shell', { skip: process.env.TYLOINFER_TEST_DSBOT !== '1' }, async () => {
+  const output = new URL('../dist/dsbot/', import.meta.url);
+  const manifest = JSON.parse(await readFile(new URL('package.json', output), 'utf8'));
+  const patch = await readFile(new URL(manifest.dsh.bundle.patch, output), 'utf8');
+  assert.match(patch, /name: '@tyloinfer\/dsh-studio\/bridge'/);
+  assert.doesNotMatch(patch, /agent-default-model|connectionFile/);
+  await readFile(new URL(manifest.exports['./bridge'], output), 'utf8');
+  const source = await readFile(new URL(manifest.exports['./client'], output), 'utf8');
+  const scope = harness(undefined, source);
+  try {
+    assert.equal(scope.definition.id, manifest.name);
+    assert.deepEqual(scope.imports, ['react', 'react-dom']);
+    assert.deepEqual(scope.registrations.map(row => row.options.name), ['sidebar.footer.action', 'main']);
+    const [access, panel] = scope.registrations;
+    assert.equal(access.options.id, panel.options.key);
+    const content = renderToStaticMarkup(React.createElement(access.Component, {
+      wide: true, t: key => key, useNavSelection: select => select('overview'),
+      usePanelInfo: select => select({ activePanelId: null }), ...access.options.inject(),
+    }));
+    assert.match(content, /tylo-studio-engine/);
+    assert.match(content, /overview.*models.*service.*resources.*downloads.*analysis.*logs/);
+    assert.doesNotMatch(content, /tylo-studio-settings/);
+    assert.equal(scope.classes.size, 0);
+    assert.equal(scope.icons.size, 0);
+    assert.equal(scope.tokens(), false);
+  } finally { scope.dispose(); }
+});
 test('uses a lazy Host factory with external React and preserves the native root and conversation', () => {
   const scope = harness();
   try {

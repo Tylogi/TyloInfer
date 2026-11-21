@@ -53,4 +53,16 @@ node --test tests/plugin.test.mjs tests/core-runtime.test.mjs tests/model-manage
 
 The build uses the monorepo's Vite toolchain and emits a single lazy `window.__ModuleLoader__.load` factory. React is provided by the Host's `require('react')`; no React runtime or ReactDOM root is bundled. The source uses APIs present in React 18.2. The current Node contract smoke uses Studio's development React and verifies factory loading, slot registration, default markup, navigation callbacks and disposal. The isolated official Host browser check also covers native rendering, settings persistence, same-session draft retention during inference navigation, refresh recovery and narrow-screen settings. These checks validate the currently exposed bounded workflows, not every standalone Studio control, real-weight inference, real downloads or final visual acceptance by the user.
 
-The bare package row in `cordis.patch.yml` carries both Host and Client halves. The Host export deliberately has no business implementation. Compatibility is currently limited to the pinned `0.2.2-rc.2` DSH release; broader compatibility is not claimed. Publication or installation in the user's running DS Bot profile is not part of this work.
+The bare package row in `cordis.patch.yml` carries both Host and Client halves. The Host export deliberately has no business implementation. Compatibility is currently limited to the pinned `0.2.2-rc.2` DSH release; broader compatibility is not claimed.
+
+## DSBot
+
+Build the installable bundle from the repository root:
+
+```sh
+node plugins/studio/build.mjs --dsbot
+```
+
+Install `plugins/studio/dist/dsbot` into the chosen DSBot profile using DSH's `dsh plugin --profile <profile> add file:<bundle-directory>` command. The bundle includes the Host bridge and adds the usual **Inference engine** controls above Settings at the bottom of the sidebar. Select the TyloInfer provider in DSBot's model settings to use a loaded model. The provider initially points to `http://127.0.0.1:8090/v1` and can be edited in those settings.
+
+Verified with DS Bot `0.3.8` on DSH `0.2.2-rc.2` Web. DS Bot's theme, settings and default model stay under the host profile's control.
