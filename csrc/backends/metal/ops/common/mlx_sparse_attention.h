@@ -54,15 +54,20 @@ mlx::core::array mlx_sparse_block_gqa_attention(
     std::optional<float> scale = std::nullopt);
 
 // Common selected-token sparse-MLA seam.  The adapter owns index selection,
-// masks, and cache updates; the backend owns the fused indexed softmax/value
-// reduction for the 64-head, 512-dimensional latent-attention geometry.
+// masks, and cache updates. The value may use only the latent prefix of the
+// cached key. The remaining key coordinates can carry rotary features.
 mlx::core::array mlx_sparse_selected_mla_attention(
     const mlx::core::array& query,
     const mlx::core::array& kv_cache,
     const mlx::core::array& selected_indices,
     const mlx::core::array& selected_mask,
     const mlx::core::array& sinks,
-    std::optional<float> scale = std::nullopt);
+    std::optional<float> scale = std::nullopt, int value_dimension = 0);
+
+// The same latent attention over rows already gathered from paged storage.
+mlx::core::array mlx_gathered_mla_attention(const mlx::core::array& query,
+    const mlx::core::array& gathered, const mlx::core::array& mask,
+    const mlx::core::array& sinks, float scale, int value_dimension);
 
 // Multi-query sparse MLA over an already chronological local window and a
 // capacity-backed compressed pool. This is the oMLX-style M>1 path: causal

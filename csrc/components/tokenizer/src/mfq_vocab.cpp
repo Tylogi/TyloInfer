@@ -2274,6 +2274,10 @@ void mfq_text_vocab::impl::load(mfq_gguf_loader & ml, const mfq_gguf_keys & kv) 
                 tokenizer_pre == "talkie") {
                 pre_type = TYLOINFER_TEXT_VOCAB_PRE_TYPE_GPT4O;
                 clean_spaces = false;
+            } else if (tokenizer_pre == "inkling2") {
+                pre_type = TYLOINFER_TEXT_VOCAB_PRE_TYPE_GPT4O;
+                special_bos_id = TYLOINFER_TEXT_TOKEN_NULL;
+                clean_spaces = false;
             } else if (
                 tokenizer_pre == "granite-embed-multi-97m") {
                 pre_type = TYLOINFER_TEXT_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI;
@@ -2311,7 +2315,8 @@ void mfq_text_vocab::impl::load(mfq_gguf_loader & ml, const mfq_gguf_keys & kv) 
                 pre_type = TYLOINFER_TEXT_VOCAB_PRE_TYPE_HUNYUAN;
                 clean_spaces = false;
             } else if (
-                tokenizer_pre == "hunyuan-dense") {
+                    tokenizer_pre == "hunyuan-dense" ||
+                    tokenizer_pre == "hy_v4") {
                 pre_type = TYLOINFER_TEXT_VOCAB_PRE_TYPE_HUNYUAN_DENSE;
                 clean_spaces = false;
             } else if (

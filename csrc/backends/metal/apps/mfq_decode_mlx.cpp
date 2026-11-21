@@ -9,6 +9,8 @@
 #include "mlx_memory_residency.h"
 #include "mlx_resident_budget.h"
 #include "mlx_qwen4_causal_lm.h"
+#include "mlx_inkling2.h"
+#include "mlx_hy4.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_stream_sync.h"
 #include "mlx_tensor.h"
@@ -1674,6 +1676,26 @@ std::int32_t generate_with_prefill_metrics(
         prefix_cache);
 }
 
+template <class Model>
+std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxTextBackboneRuntime<Model>& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
+    return runtime.generate(prompt, sampling, max_tokens, callback,
+        [on_prefill](std::size_t tokens, double ms) {
+            if (on_prefill) on_prefill(MfqPrefillTiming{tokens, ms, 0.0, ms});
+        }, token_constraint, cache_plan.stable_prefix_tokens > 0 ?
+            std::optional<std::size_t>(cache_plan.stable_prefix_tokens) : std::nullopt,
+        prefill_chunk_size, prefix_cache);
+}
+
 std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxNemotronHCausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
@@ -2051,7 +2073,8 @@ public:
                 std::size_t last_checkpoint = 0;
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
                     std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                    std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                    std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm> ||
+                    requires { Runtime::prefix_checkpoints; }) {
                     if (cache_enabled) {
                         prefix_hooks.block_size = session_cache->block_size_tokens();
                         prefix_hooks.input_tokens = stable_prefix_tokens;
@@ -2063,7 +2086,8 @@ public:
                                     loaded_runtime.capture_text_session_state(
                                         std::vector<std::int64_t>(cache_tokens.begin(),
                                             cache_tokens.begin() + static_cast<std::ptrdiff_t>(position)),
-                                        std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm> &&
+                                        (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm> ||
+                                            requires { Runtime::prefix_checkpoints; }) &&
                                             !session_cache->persistent_prefix_enabled()), media_key);
                                 last_checkpoint = position;
                             } catch (const std::exception& error) {
@@ -3258,6 +3282,24 @@ int run_native_runtime(
             config.max_position_embeddings,
             config.vocab,
             runtime_stream);
+    }
+
+    if (backbone == "inkling2_loop" || backbone == "hy_v4_flash") {
+        const auto config = nlohmann::json::parse(container.read_text("__mfq_asset__/model_config.json"));
+        const auto context = config.at("max_position_embeddings").get<int>();
+        const auto run = [&]<class Runtime>() {
+            auto load = [&container, context](std::int64_t requested) {
+                if (requested < 1) throw std::invalid_argument("invalid Metal text context");
+                return Runtime::load(container, static_cast<int>(std::min<std::int64_t>(requested, context)));
+            };
+            auto runtime = load(arguments.context_size);
+            const int vocab = runtime.vocabulary();
+            release_model_load_staging_memory(runtime_stream);
+            return run_loaded_runtime(arguments, container, std::move(runtime), load,
+                backbone, context, vocab, runtime_stream);
+        };
+        if (backbone == "inkling2_loop") return run.template operator()<mfq::metal::MlxInkling2Runtime>();
+        return run.template operator()<mfq::metal::MlxHy4Runtime>();
     }
 
     if (backbone == "nemotron_h") {

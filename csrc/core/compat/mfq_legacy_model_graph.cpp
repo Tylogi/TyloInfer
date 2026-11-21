@@ -69,7 +69,8 @@ MfqModelGraph synthesize_legacy_model_graph(
 
     std::string family;
     std::string backbone;
-    if (config_family == "sensenova_loop" && stored_family == "sensenova_loop") {
+    if ((config_family == "sensenova_loop" || config_family == "inkling2_loop" || config_family == "hy_v4_flash") &&
+        config_family == stored_family) {
         family = backbone = stored_family;
     } else if (starts_with(text_family, "qwen3_5") ||
         starts_with(stored_family, "qwen3_5") ||
@@ -127,7 +128,8 @@ MfqModelGraph synthesize_legacy_model_graph(
     graph.tensor_namespace = std::string(kMfqCanonicalTensorNamespace);
     graph.tensor_naming_version = 1;
     graph.topology.text_layers = std::max<std::int64_t>(
-        1, integer_value(text, family == "sensenova_loop" ? "num_hidden_visits" : "num_hidden_layers", 1));
+        1, integer_value(text, family == "sensenova_loop" || family == "inkling2_loop" ?
+            "num_hidden_visits" : "num_hidden_layers", 1));
     graph.component_roots.push_back("model");
     graph.components.push_back({
         "text", "model", backbone, "decoder", {}, {}, {}});

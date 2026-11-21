@@ -182,6 +182,13 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     cache.append(keys);
     require(budget > 32768 ? store->stats().disk_bytes == 0 : store->stats().disk_bytes > 0,
         "indexer residency does not match its byte budget");
+    const array gathered_ids({101, 102, 103, -1, 302, 16, 15, 16}, Shape{1, 2, 4}, int32);
+    const auto gathered = cache.gather(gathered_ids);
+    const auto gathered_reference = take(keys, maximum(gathered_ids, array(0, int32)), 1);
+    const auto visible_rows = expand_dims(gathered_ids >= array(0, int32), -1);
+    require(all(gathered == where(visible_rows,
+        reshape(gathered_reference, gathered.shape()), array(0.0f))).item<bool>(),
+        "offloaded row gather differs from resident rows or exposes masked rows");
     auto selected = cache.select(query, 4090, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});

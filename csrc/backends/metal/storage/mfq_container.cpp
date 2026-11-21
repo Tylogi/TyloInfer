@@ -258,7 +258,9 @@ MfqContainer::MfqContainer(std::filesystem::path path, std::string hf_source_pre
             records_.emplace(name, MfqRecord{name, "BLOB", "BLOB", path, 0,
                 gguf_source_->read_asset(name).size()});
         header_.record_count = static_cast<std::uint32_t>(records_.size());
-        legacy_tensor_layout_.qwen_gdn_gguf_layout = header_.architecture == "qwen35" || header_.architecture == "qwen35moe";
+        legacy_tensor_layout_.qwen_gdn_gguf_layout =
+            gguf_source_->legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout ||
+            header_.architecture == "qwen35moe";
         return;
     }
     mfq::MfqModelSource source(std::move(path));

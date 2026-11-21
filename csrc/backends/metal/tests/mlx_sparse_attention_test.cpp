@@ -556,9 +556,26 @@ void test_small_indexer_scores() {
     }
 }
 
+
+void test_latent_value_prefix() {
+    using namespace mlx::core;
+    constexpr int queries = 2, keys = 4;
+    const auto latent = mfq::metal::mlx_sparse_selected_mla_attention(
+        zeros({1, 32, queries, 576}), ones({1, keys, 576}, float16),
+        zeros({1, queries, 32}, int32),
+        broadcast_to(where(arange(32) == array(0), array(0.0f), array(-std::numeric_limits<float>::infinity())),
+            {1, queries, 32}), zeros({32}), 0.0625f, 512);
+    if (latent.shape() != Shape{1, queries, 32, 512} ||
+        !all(abs(latent - array(0.5f)) < array(1e-5f)).item<bool>()) {
+        throw std::runtime_error("sparse MLA value prefix disagrees with the masked attention reference");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
+        test_latent_value_prefix();
+        if (argc == 2 && std::string(argv[1]) == "--latent-only") return 0;
         if (argc == 2 && std::string(argv[1]) == "--small-m-only") {
             test_block_gqa_small_m(4, 1);
             test_block_gqa_small_m(4, 2);

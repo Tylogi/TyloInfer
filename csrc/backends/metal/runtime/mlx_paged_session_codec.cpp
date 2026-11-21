@@ -31,6 +31,8 @@ constexpr std::uint32_t kMiniRuntime = 1;
 constexpr std::uint32_t kQwen35Runtime = 2;
 constexpr std::uint32_t kQwen4Runtime = 3;
 constexpr std::uint32_t kDeepseekV41Runtime = 4;
+constexpr std::uint32_t kInkling2Runtime = 5;
+constexpr std::uint32_t kHy4Runtime = 6;
 constexpr std::uint8_t kQsaLayer = 4;
 constexpr std::uint8_t kGdnLayer = 5;
 constexpr std::uint8_t kGdnUnavailableLayer = 6;
@@ -1173,6 +1175,361 @@ MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::decode(
         auto layer = rebuild_kv(blocks, index, tokens.size());
         state.bytes += layer.nbytes();
         state.layers.push_back(std::move(layer));
+    }
+    return state;
+}
+
+MlxPagedPayload
+MlxPagedSessionCodec<MlxInkling2TextSessionState>::encode_block(
+    const MlxInkling2TextSessionState& state, std::size_t block_size, std::size_t index) {
+    const auto position = state.tokens.size();
+    if (!position || position > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !block_size || index > (position - 1) / block_size || state.window <= 0 ||
+        state.visits.empty() || state.visits.size() > 4096 || !state.last_logits)
+        throw std::runtime_error("invalid Inkling prefix checkpoint");
+
+    const auto start = index * block_size;
+    const auto count = std::min(block_size, position - start);
+    const auto end = start + count;
+    const bool exact = end == position;
+    Writer writer;
+    write_header(writer, kInkling2Runtime, static_cast<std::uint32_t>(start),
+        static_cast<std::uint32_t>(count), state.visits.size());
+    writer.scalar<std::int32_t>(state.window);
+    writer.scalar<std::uint8_t>(exact ? 1 : 0);
+    for (const auto& layer : state.visits) {
+        if (layer.global.has_value() == layer.window.has_value())
+            throw std::runtime_error("Inkling prefix visit needs exactly one KV store");
+        writer.scalar<std::uint8_t>(layer.global ? 1 : 0);
+        if (layer.global) {
+            write_kv_layer(writer, *layer.global, static_cast<int>(start), static_cast<int>(count));
+        } else {
+            const auto& window = *layer.window;
+            const auto length = std::min(position, static_cast<std::size_t>(state.window));
+            if (window.ndim() != 3 || window.shape(0) != 1 ||
+                window.shape(1) != static_cast<int>(length))
+                throw std::runtime_error("invalid Inkling prefix window");
+            const auto origin = position - length;
+            const auto row_start = std::max(origin, start);
+            const bool visible = row_start < end;
+            writer.scalar<std::uint8_t>(visible ? 1 : 0);
+            if (visible) {
+                writer.scalar<std::uint32_t>(static_cast<std::uint32_t>(row_start));
+                writer.tensor(mlx::core::slice(window,
+                    {0, static_cast<int>(row_start - origin), 0},
+                    {1, static_cast<int>(end - origin), window.shape(2)}));
+            }
+        }
+        if (exact) for (const auto& history : layer.convolution) writer.tensor(history);
+    }
+    if (exact) writer.tensor(*state.last_logits);
+    return std::move(writer).finish();
+}
+
+MlxInkling2TextSessionState
+MlxPagedSessionCodec<MlxInkling2TextSessionState>::decode(
+    const std::vector<MlxPagedPayload>& payloads, const std::vector<std::int64_t>& tokens,
+    std::size_t block_size) {
+    if (tokens.empty() || tokens.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !block_size || (tokens.size() - 1) / block_size + 1 != payloads.size())
+        throw std::runtime_error("invalid Inkling prefix chain length");
+    MlxInkling2TextSessionState state;
+    state.tokens = tokens;
+    std::vector<DecodedBlock> blocks;
+    std::vector<std::vector<array>> local;
+    std::vector<std::size_t> local_next;
+    for (std::size_t index = 0; index < payloads.size(); ++index) {
+        if (!payloads[index]) throw std::runtime_error("missing Inkling prefix block");
+        Reader reader(*payloads[index]);
+        std::array<std::uint8_t, 8> magic{};
+        reader.raw(magic.data(), magic.size(), "magic");
+        if (magic != kMagic || reader.scalar<std::uint32_t>("version") != kVersion ||
+            reader.scalar<std::uint32_t>("runtime") != kInkling2Runtime)
+            throw std::runtime_error("invalid Inkling prefix format");
+        DecodedBlock block;
+        block.start = reader.scalar<std::uint32_t>("start");
+        block.count = reader.scalar<std::uint32_t>("count");
+        const auto layers = reader.scalar<std::uint32_t>("visits");
+        const auto window = reader.scalar<std::int32_t>("window");
+        const bool exact = reader.scalar<std::uint8_t>("checkpoint") != 0;
+        const auto start = index * block_size;
+        const auto end = start + std::min(block_size, tokens.size() - start);
+        if (block.start != start || block.count != end - start || !layers || layers > 4096 ||
+            window <= 0 || (index && (window != state.window || layers != local.size())) ||
+            (end == tokens.size() && !exact))
+            throw std::runtime_error("inconsistent Inkling prefix geometry");
+        const auto need = tokens.size() - std::min(tokens.size(), static_cast<std::size_t>(window));
+        if (!index) {
+            state.window = window;
+            local.resize(layers);
+            local_next.assign(layers, need);
+        }
+        block.layers.resize(layers);
+        for (std::uint32_t visit = 0; visit < layers; ++visit) {
+            const bool global = reader.scalar<std::uint8_t>("KV kind") != 0;
+            if (index && (blocks.front().layers[visit].kind == kKvLayer) != global)
+                throw std::runtime_error("Inkling KV kind changed across the prefix");
+            if (global) {
+                block.layers[visit] = read_layer(reader);
+                if (block.layers[visit].kind != kKvLayer || block.layers[visit].position != static_cast<int>(end))
+                    throw std::runtime_error("invalid Inkling global KV block");
+            } else if (reader.scalar<std::uint8_t>("window rows present")) {
+                const auto row_start = reader.scalar<std::uint32_t>("window start");
+                auto slice = reader.tensor();
+                if (row_start < start || row_start >= end || slice.shape.size() != 3 ||
+                    slice.shape[0] != 1 || slice.shape[1] != static_cast<int>(end - row_start))
+                    throw std::runtime_error("invalid Inkling window page rows");
+                if (end > need) {
+                    const auto taken = std::max<std::size_t>(row_start, need);
+                    if (taken != local_next[visit]) throw std::runtime_error("Inkling window page gap");
+                    auto data = copy_tensor(slice);
+                    if (taken != row_start)
+                        data = mlx::core::slice(data, {0, static_cast<int>(taken - row_start), 0}, data.shape());
+                    local[visit].push_back(std::move(data));
+                    local_next[visit] = end;
+                }
+            }
+            if (exact) {
+                if (end == tokens.size()) {
+                    std::array<array, 4> conv{
+                        copy_tensor(reader.tensor()), copy_tensor(reader.tensor()),
+                        copy_tensor(reader.tensor()), copy_tensor(reader.tensor())};
+                    for (const auto& item : conv) state.bytes += item.nbytes();
+                    state.visits.push_back({std::nullopt, std::nullopt, std::move(conv)});
+                } else {
+                    for (int tap = 0; tap < 4; ++tap) (void)reader.tensor();
+                }
+            }
+        }
+        if (exact) {
+            const auto logits = reader.tensor();
+            if (end == tokens.size()) {
+                state.last_logits = copy_tensor(logits);
+                state.bytes += state.last_logits->nbytes();
+            }
+        }
+        reader.expect_end();
+        blocks.push_back(std::move(block));
+    }
+    for (std::size_t i = 0; i < state.visits.size(); ++i) {
+        auto& visit = state.visits[i];
+        if (blocks.front().layers[i].kind == kKvLayer) {
+            visit.global = rebuild_kv(blocks, i, tokens.size());
+            state.bytes += visit.global->nbytes();
+        } else {
+            if (local[i].empty() || local_next[i] != tokens.size())
+                throw std::runtime_error("Inkling prefix window is incomplete");
+            visit.window = local[i].size() == 1 ? local[i].front() : mlx::core::concatenate(local[i], 1);
+            state.bytes += visit.window->nbytes();
+        }
+    }
+    return state;
+}
+
+namespace {
+void write_hy4_rows(Writer& writer, const MlxHy4RowSnapshot& snapshot, int start, int count) {
+    if (snapshot.offloaded) {
+        writer.offloaded_index_tensor(*snapshot.offloaded, start, count);
+    } else if (snapshot.resident) {
+        const auto& rows = *snapshot.resident;
+        writer.tensor(mlx::core::slice(rows, {0, start, 0}, {1, start + count, rows.shape(-1)}));
+    } else {
+        throw std::runtime_error("Hy4 prefix page is missing rows");
+    }
+}
+
+struct Hy4PrefixRows {
+    std::size_t position = 0;
+    int width = 0;
+    std::optional<array> resident;
+    std::optional<QsaKvSequence> offloaded;
+
+    void append(const SerializedTensor& tensor, std::size_t offset, std::size_t skip,
+        std::size_t count, std::size_t total, Dtype dtype, int priority,
+        const std::shared_ptr<QsaKvStore>& store) {
+        if (tensor.shape.size() != 3 || tensor.shape[0] != 1 || tensor.dtype != dtype ||
+            static_cast<std::size_t>(tensor.shape[1]) != skip + count ||
+            position != offset || count > total - offset || (width && width != tensor.shape[2]))
+            throw std::runtime_error("Hy4 prefix row chain geometry mismatch");
+        width = tensor.shape[2];
+        const auto stride = static_cast<std::size_t>(width) * dtype.size();
+        const auto* data = tensor.data + skip * stride;
+        if (store) {
+            if (!offloaded) offloaded.emplace(store, stride, 16, priority);
+            offloaded->append(data, count);
+        } else {
+            if (!resident) resident.emplace(mlx::core::allocator::malloc(total * stride),
+                Shape{1, static_cast<int>(total), width}, dtype);
+            std::memcpy(resident->data<std::uint8_t>() + offset * stride, data, count * stride);
+        }
+        position += count;
+    }
+
+    MlxHy4RowSnapshot finish(std::size_t total, Dtype dtype, std::size_t& bytes) {
+        if (position != total) throw std::runtime_error("incomplete Hy4 prefix row chain");
+        if (offloaded) {
+            offloaded->seal_tail();
+            auto snapshot = offloaded->snapshot();
+            bytes += snapshot.tail.size() + snapshot.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            return {std::nullopt, MlxQsaIndexSnapshot{std::move(snapshot), width, dtype}};
+        }
+        if (resident) bytes += resident->nbytes();
+        return {std::move(resident), std::nullopt};
+    }
+};
+}  // namespace
+
+MlxPagedPayload MlxPagedSessionCodec<MlxHy4TextSessionState>::encode_block(
+    const MlxHy4TextSessionState& state, std::size_t block_size, std::size_t index) {
+    const auto position = state.tokens.size();
+    if (!position || position > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !block_size || index > (position - 1) / block_size || state.window <= 0 || state.group_size <= 1 ||
+        state.layers.empty() || state.layers.size() > 4096 || !state.last_hidden || !state.last_logits)
+        throw std::runtime_error("invalid Hy4 prefix checkpoint");
+    const auto start = index * block_size;
+    const auto count = std::min(block_size, position - start);
+    const auto end = start + count;
+    const bool exact = end == position;
+    Writer writer;
+    write_header(writer, kHy4Runtime, static_cast<std::uint32_t>(start),
+        static_cast<std::uint32_t>(count), state.layers.size());
+    writer.scalar<std::int32_t>(state.window);
+    writer.scalar<std::int32_t>(state.group_size);
+    writer.scalar<std::uint8_t>(exact);
+    for (const auto& layer : state.layers) {
+        writer.scalar<std::uint8_t>(layer.window.has_value());
+        if (layer.window) {
+            const auto length = std::min(position, static_cast<std::size_t>(state.window));
+            const auto first = position - length;
+            const auto visible = std::max(start, first);
+            writer.scalar<std::uint8_t>(visible < end);
+            if (visible < end) {
+                writer.scalar<std::uint32_t>(static_cast<std::uint32_t>(visible));
+                writer.tensor(mlx::core::slice(*layer.window,
+                    {0, static_cast<int>(visible - first), 0},
+                    {1, static_cast<int>(end - first), layer.window->shape(-1)}));
+            }
+            continue;
+        }
+        write_hy4_rows(writer, layer.latent, static_cast<int>(start), static_cast<int>(count));
+        const auto first = start / state.group_size;
+        const auto complete = end / state.group_size - first;
+        if (complete) write_hy4_rows(writer, layer.groups, static_cast<int>(first), static_cast<int>(complete));
+        if (exact) {
+            if (bool(layer.index_tail) != bool(end % state.group_size) || !layer.last_indices)
+                throw std::runtime_error("invalid Hy4 prefix selection checkpoint");
+            if (layer.index_tail) writer.tensor(*layer.index_tail);
+            writer.tensor(*layer.last_indices);
+        }
+    }
+    if (exact) {
+        writer.tensor(*state.last_hidden);
+        writer.tensor(*state.last_logits);
+    }
+    return std::move(writer).finish();
+}
+
+MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
+    const std::vector<MlxPagedPayload>& payloads, const std::vector<std::int64_t>& tokens, std::size_t block_size) {
+    const auto position = tokens.size();
+    if (!position || position > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !block_size || (position - 1) / block_size + 1 != payloads.size())
+        throw std::runtime_error("invalid Hy4 prefix chain length");
+
+    MlxHy4TextSessionState state;
+    state.tokens = tokens;
+    state.bytes = position * sizeof(tokens.front());
+    const auto store = mlx_qsa_kv_offload_store();
+    struct LayerRows {
+        bool sliding = false;
+        Hy4PrefixRows latent, groups;
+    };
+    std::vector<LayerRows> rows;
+    for (std::size_t index = 0; index < payloads.size(); ++index) {
+        if (!payloads[index]) throw std::runtime_error("missing Hy4 prefix block");
+        Reader reader(*payloads[index]);
+        std::array<std::uint8_t, 8> magic{};
+        reader.raw(magic.data(), magic.size(), "magic");
+        if (magic != kMagic || reader.scalar<std::uint32_t>("version") != kVersion ||
+            reader.scalar<std::uint32_t>("runtime") != kHy4Runtime)
+            throw std::runtime_error("invalid Hy4 prefix format");
+        const auto start = index * block_size, end = start + std::min(block_size, position - start);
+        const auto page_start = reader.scalar<std::uint32_t>("start");
+        const auto page_count = reader.scalar<std::uint32_t>("count");
+        const auto layers = reader.scalar<std::uint32_t>("layers");
+        const auto window = reader.scalar<std::int32_t>("window");
+        const auto ratio = reader.scalar<std::int32_t>("group size");
+        const bool exact = reader.scalar<std::uint8_t>("checkpoint");
+        if (page_start != start || page_count != end - start || !layers || layers > 4096 ||
+            window <= 0 || ratio <= 1 || (end == position && !exact) ||
+            (index && (layers != rows.size() || window != state.window || ratio != state.group_size)))
+            throw std::runtime_error("inconsistent Hy4 prefix geometry");
+
+        if (!index) {
+            state.window = window;
+            state.group_size = ratio;
+            state.layers.resize(layers);
+            rows.resize(layers);
+        }
+        const auto length = std::min(position, static_cast<std::size_t>(window));
+        const auto first_window = position - length;
+        for (std::uint32_t i = 0; i < layers; ++i) {
+            auto& output = state.layers[i];
+            auto& layer = rows[i];
+            const bool sliding = reader.scalar<std::uint8_t>("KV kind");
+            if (!index) layer.sliding = sliding;
+            else if (layer.sliding != sliding) throw std::runtime_error("Hy4 prefix KV kind changed");
+            if (sliding) {
+                if (reader.scalar<std::uint8_t>("window rows present")) {
+                    const auto from = reader.scalar<std::uint32_t>("window row start");
+                    const auto tensor = reader.tensor();
+                    if (from < start || from >= end)
+                        throw std::runtime_error("Hy4 prefix window outside its page");
+                    if (end > first_window) {
+                        const auto visible = std::max<std::size_t>(first_window, from);
+                        layer.latent.append(tensor, visible - first_window, visible - from, end - visible,
+                            length, mlx::core::float16, 0, {});
+                    }
+                }
+                continue;
+            }
+            layer.latent.append(reader.tensor(), start, 0, end - start, position,
+                mlx::core::float16, 1, store);
+            const auto first_group = start / ratio, groups = end / ratio - first_group;
+            if (groups) layer.groups.append(reader.tensor(), first_group, 0, groups, position / ratio,
+                mlx::core::float32, 0, store);
+            if (exact) {
+                std::optional<SerializedTensor> tail;
+                if (end % ratio) tail = reader.tensor();
+                const auto indices = reader.tensor();
+                if (end == position) {
+                    if (tail) output.index_tail = copy_tensor(*tail);
+                    output.last_indices = copy_tensor(indices);
+                    state.bytes += indices.bytes + (tail ? tail->bytes : 0);
+                }
+            }
+        }
+        if (exact) {
+            const auto hidden = reader.tensor();
+            const auto logits = reader.tensor();
+            if (end == position) {
+                state.last_hidden = copy_tensor(hidden);
+                state.last_logits = copy_tensor(logits);
+                state.bytes += hidden.bytes + logits.bytes;
+            }
+        }
+        reader.expect_end();
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        auto& layer = rows[i];
+        auto& output = state.layers[i];
+        if (layer.sliding) {
+            output.window = layer.latent.finish(std::min(position, static_cast<std::size_t>(state.window)),
+                mlx::core::float16, state.bytes).resident;
+        } else {
+            output.latent = layer.latent.finish(position, mlx::core::float16, state.bytes);
+            output.groups = layer.groups.finish(position / state.group_size, mlx::core::float32, state.bytes);
+        }
     }
     return state;
 }

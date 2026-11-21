@@ -351,6 +351,39 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     return keys;
 }
 
+array MlxQsaIndexOffload::gather(const array& indices) const {
+    if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
+        indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)
+        throw std::invalid_argument("offloaded indexed rows require int32 [1, query, selection]");
+    auto ids = mlx::core::contiguous(indices);
+    ids.eval();
+    const auto& state = rows_.view();
+    if (ids.size() > std::numeric_limits<std::size_t>::max() / state.row_bytes)
+        throw std::invalid_argument("offloaded indexed row allocation is too large");
+    const auto max_read = std::max<std::size_t>(1, state.store->config().buffer_bytes / 2 / state.row_bytes);
+    const auto size = ids.size() * state.row_bytes;
+    auto result = array(mlx::core::allocator::malloc(size),
+        Shape{1, ids.shape(1), ids.shape(2), width_}, dtype_);
+    auto* output = result.data<std::uint8_t>();
+    const auto* values = ids.data<std::int32_t>();
+    for (std::size_t begin = 0; begin < ids.size();) {
+        const auto row = values[begin];
+        if (row < 0) {
+            std::memset(output + begin * state.row_bytes, 0, state.row_bytes);
+            ++begin;
+            continue;
+        }
+        if (row >= position()) throw std::invalid_argument("selected offloaded row is outside the cache");
+        std::size_t count = 1;
+        while (count < max_read && count < ids.size() - begin &&
+            count < static_cast<std::size_t>(position() - row) && values[begin + count] == row + static_cast<int>(count))
+            ++count;
+        state.read_rows(row, count, output + begin * state.row_bytes);
+        begin += count;
+    }
+    return result;
+}
+
 array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int budget,
     const std::optional<array>& head_weights, bool reserve_current_group) const {
     if (ratio <= 0 || budget < ratio || offset < 0 || query.ndim() != 4 || query.shape(0) != 1 ||
