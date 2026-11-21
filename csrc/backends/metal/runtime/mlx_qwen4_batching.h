@@ -273,7 +273,7 @@ public:
         request->mtp = request->dflash_context || (request->sampling.enable_mtp && runtime_.supports_mtp());
         runtime_.clear_cache();
         request->cache = runtime_.make_request_cache();
-        const auto restored = hooks_.restore && !request->dflash_context ? hooks_.restore(*request) : 0;
+        const auto restored = hooks_.restore ? hooks_.restore(*request) : 0;
         if (restored) runtime_.adopt_request_cache(*request->cache);
         if (request->sampler.params().has_penalties()) {
             request->counts = sample_token_counts_add(mlx::core::zeros(
@@ -1237,7 +1237,13 @@ private:
                 (!hooks_.block_size || position % hooks_.block_size))) return;
         try {
             std::vector<std::int64_t> tokens(request.history.begin(), request.history.begin() + position);
-            hooks_.store(request, runtime_.capture_request_cache(*request.cache, tokens));
+            if (request.dflash_context && request.dflash_context->position != static_cast<int>(position)) return;
+            auto state = runtime_.capture_request_cache(*request.cache, tokens);
+            if (request.dflash_context) {
+                state.dflash = request.dflash_context;
+                state.bytes += state.dflash->bytes();
+            }
+            hooks_.store(request, std::move(state));
             request.checkpoint = position;
         } catch (const std::exception& error) {
             std::cerr << "server_session_cache backend=metal action=skip error=" << error.what() << '\n';

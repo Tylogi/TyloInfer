@@ -552,6 +552,11 @@ target_link_libraries(mfq-metal-runtime PUBLIC
     ${TYLOINFER_IOKIT_FRAMEWORK}
 )
 target_link_libraries(mfq-metal-runtime PRIVATE mfq-json)
+if(TARGET mfq-paged-prefix-cache)
+    target_link_libraries(mfq-metal-runtime PRIVATE mfq-paged-prefix-cache)
+    set_property(SOURCE models/dflash2/mlx_dflash2.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS TYLOINFER_METAL_PAGED_PREFIX_CACHE=1)
+endif()
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
 target_compile_definitions(mfq-metal-runtime PUBLIC
     TYLOINFER_NATIVE_MLX_RUNTIME=1

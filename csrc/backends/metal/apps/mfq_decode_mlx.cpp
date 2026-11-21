@@ -904,14 +904,15 @@ public:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens,
-        bool require_mtp = false, std::string_view media_key = {}) {
+        bool require_mtp = false, std::string_view media_key = {},
+        const std::function<bool(const SessionState&)>& accept = {}) {
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 return restore_paged(
                     runtime,
                     requested_session,
                     prompt,
-                    maximum_prefix_tokens, require_mtp, media_key);
+                    maximum_prefix_tokens, require_mtp, media_key, accept);
             }
         }
         if (requested_session.empty() || max_sessions_ == 0 ||
@@ -947,6 +948,7 @@ public:
         if (selected_session.empty()) return 0;
         auto& selected = states_.at(selected_session)[selected_snapshot];
         try {
+            if (accept && !accept(selected.state)) return 0;
             runtime.restore_text_session_state(selected.state);
             selected.last_used = ++clock_;
             ++hits_;
@@ -1262,7 +1264,8 @@ private:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens,
-        bool require_mtp, std::string_view media_key) {
+        bool require_mtp, std::string_view media_key,
+        const std::function<bool(const SessionState&)>& accept) {
         if (max_sessions_ == 0 || !runtime.supports_text_session_state() ||
             prompt.size() < 2) {
             return 0;
@@ -1337,6 +1340,10 @@ private:
             return 0;
         }
         try {
+            if (accept && !accept(*decoded)) {
+                paged_cache_->record_match(0);
+                return 0;
+            }
             runtime.restore_text_session_state(std::move(*decoded));
             if (!requested_session.empty()) {
                 bind_paged_session(
@@ -1862,11 +1869,26 @@ public:
                         request.prefix = 0;
                         return std::size_t{0};
                     }
-                    return session_cache->restore_best(runtime_holder->value(), request.cache_plan.session_id,
-                        request.prompt, std::min(request.prefix, request.prompt.size() - 1), request.mtp);
+                    const auto limit = std::min(request.prefix, request.prompt.size() - 1);
+                    if (!request.dflash_context) {
+                        return session_cache->restore_best(runtime_holder->value(), request.cache_plan.session_id,
+                            request.prompt, limit, request.mtp);
+                    }
+                    const auto& draft = *runtime_components.dflash2;
+                    mfq::metal::MlxDFlash2Context restored_draft;
+                    const auto restored = session_cache->restore_best(runtime_holder->value(),
+                        request.cache_plan.session_id, request.prompt, limit, false, draft.prefix_cache_key(),
+                        [&](const auto& state) {
+                            if (!state.dflash || state.dflash->position != state.cache_position) return false;
+                            draft.restore_context(restored_draft, *state.dflash);
+                            return true;
+                        });
+                    if (restored) request.dflash_context = std::move(restored_draft);
+                    return restored;
                 };
                 hooks.store = [this](auto& request, auto state) {
-                    session_cache->store(request.cache_plan.session_id, std::move(state));
+                    const std::string_view key = state.dflash ? runtime_components.dflash2->prefix_cache_key() : std::string_view{};
+                    session_cache->store(request.cache_plan.session_id, std::move(state), key);
                 };
                 batching = std::make_unique<MetalBatch>(prefill_chunk_size, prefill_chunk_size,
                     runtime_holder->value(), std::move(hooks));

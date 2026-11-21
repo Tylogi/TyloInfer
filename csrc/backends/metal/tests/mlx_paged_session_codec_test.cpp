@@ -373,6 +373,23 @@ int main() {
         flash_restored.layers[1].ple_context == gdn.ple_context &&
         flash_restored.mtp_layers.size() == 1 && flash_restored.mtp_layers[0].position == 5,
         "Flash-Next QSA/GDN/PLE/MTP checkpoint did not round trip");
+    require(!flash_restored.dflash, "ordinary Flash-Next checkpoints must not require a draft ring");
+    auto flash_with_draft = flash;
+    auto& draft = flash_with_draft.dflash.emplace();
+    draft.position = flash.cache_position;
+    draft.layers.push_back({
+        mlx::core::astype(fp16_values(16), mlx::core::bfloat16),
+        mlx::core::astype(fp16_values(16, 64), mlx::core::bfloat16)
+    });
+    const auto dflash_last = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(flash_with_draft, 4, 1);
+    const auto dflash_restored = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
+        {flash_first, dflash_last}, flash.tokens, 4);
+    require(dflash_restored.dflash && dflash_restored.dflash->position == draft.position &&
+        dflash_restored.dflash->layers.size() == 1 &&
+        byte_equal(*dflash_restored.dflash->layers[0].keys, *draft.layers[0].keys) &&
+        byte_equal(*dflash_restored.dflash->layers[0].values, *draft.layers[0].values) &&
+        dflash_restored.bytes == flash_restored.bytes + draft.bytes(),
+        "Flash-Next DFlash2 cache ring did not round trip with the target checkpoint");
     QsaKvStoreConfig offload_config;
     offload_config.budget_bytes = 16384;
     offload_config.buffer_bytes = 8192;

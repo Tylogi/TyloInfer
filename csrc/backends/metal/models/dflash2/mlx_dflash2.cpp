@@ -1,5 +1,8 @@
 #include "mlx_dflash2.h"
 #include "hf_safetensors_store.h"
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+#include "mfq_paged_prefix_cache.h"
+#endif
 #include "mlx_cached_kernel.h"
 #include "mlx_tensor.h"
 #include "mlx_weight_residency.h"
@@ -14,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <queue>
 #include <stdexcept>
@@ -300,13 +304,23 @@ struct Loader {
     HfSafetensorStore store;
     std::size_t bytes = 0;
     std::vector<array> allocations;
-    explicit Loader(const std::filesystem::path& directory) : store(directory, false) {}
+    std::string fingerprint;
+    explicit Loader(const std::filesystem::path& directory) : store(directory, false) {
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        std::ifstream config(directory / "config.json", std::ios::binary);
+        const std::string bytes{std::istreambuf_iterator<char>{config}, std::istreambuf_iterator<char>{}};
+        fingerprint = mfq::cache::block_hash_hex(mfq::cache::sha256(bytes));
+#endif
+    }
     array dense(const std::string& name, const Shape& shape, bool retain = true) {
         const auto& record = store.tensor(name);
         if (record.dtype != "BF16" || std::vector<std::int64_t>(shape.begin(), shape.end()) != record.shape)
             throw std::invalid_argument("DFlash2 tensor shape or precision differs: " + name);
         auto value = array(allocator::malloc(record.nbytes), shape, bfloat16);
         store.read_tensor(record, {reinterpret_cast<std::byte*>(value.data<std::uint8_t>()), std::size_t(record.nbytes)});
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        fingerprint += mfq::cache::block_hash_hex(mfq::cache::sha256(value.data<std::uint8_t>(), record.nbytes));
+#endif
         if (retain) { bytes += value.nbytes(); MlxWeightResidency::track(value); allocations.push_back(value); }
         return value;
     }
@@ -389,6 +403,7 @@ struct MlxDFlash2::Impl {
     std::optional<array> mask_embedding;
     std::vector<array> allocations;
     std::size_t bytes = 0;
+    std::string prefix_key;
     Impl(Loader& loader, MlxDFlash2Config c)
         : config(std::move(c)),
           context_projection(loader.linear("fc", config.hidden, config.hidden * int(config.target_layers.size()))),
@@ -401,6 +416,9 @@ struct MlxDFlash2::Impl {
         if (loader.store.tensors().contains("mask_embedding")) mask_embedding = loader.dense("mask_embedding", {config.hidden});
         bytes = loader.bytes;
         allocations = std::move(loader.allocations);
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        prefix_key = "dflash2-ring-v1:" + mfq::cache::block_hash_hex(mfq::cache::sha256(loader.fingerprint));
+#endif
     }
     void validate_context(const MlxDFlash2Context& context) const {
         if (context.owner != this || context.position < 0 ||
@@ -421,6 +439,7 @@ MlxDFlash2 MlxDFlash2::load(const std::filesystem::path& directory) {
 }
 const MlxDFlash2Config& MlxDFlash2::config() const noexcept { return impl_->config; }
 std::size_t MlxDFlash2::weight_bytes() const noexcept { return impl_->bytes; }
+const std::string& MlxDFlash2::prefix_cache_key() const noexcept { return impl_->prefix_key; }
 void MlxDFlash2::track_weights() const {
     for (const auto& value : impl_->allocations) MlxWeightResidency::track(value);
 }
@@ -441,6 +460,13 @@ void MlxDFlash2::reset(MlxDFlash2Context& context) const {
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16),
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16)});
     context = std::move(next);
+}
+
+void MlxDFlash2::restore_context(MlxDFlash2Context& context, const MlxDFlash2Context& snapshot) const {
+    auto restored = snapshot;
+    restored.owner = impl_.get();
+    impl_->validate_context(restored);
+    context = std::move(restored);
 }
 
 void MlxDFlash2::append_context(MlxDFlash2Context& context, const array& target_hidden, int start_position) const {

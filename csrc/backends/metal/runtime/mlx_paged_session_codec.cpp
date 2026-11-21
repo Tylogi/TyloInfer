@@ -23,6 +23,7 @@ using mlx::core::array;
 constexpr std::array<std::uint8_t, 8> kMagic{
     'M', 'F', 'Q', 'M', 'L', 'X', '1', 0};
 constexpr std::uint32_t kVersion = 4;
+constexpr std::uint32_t kDFlashVersion = 5;
 constexpr std::uint8_t kKvLayer = 1;
 constexpr std::uint8_t kRecurrentLayer = 2;
 constexpr std::uint8_t kRecurrentUnavailableLayer = 3;
@@ -270,6 +271,7 @@ struct DecodedBlock {
     std::vector<DecodedLayer> layers;
     std::vector<DecodedLayer> mtp_layers;
     std::optional<SerializedTensor> last_hidden;
+    std::vector<std::pair<SerializedTensor, SerializedTensor>> dflash;
 };
 
 void write_header(
@@ -277,9 +279,10 @@ void write_header(
     std::uint32_t runtime,
     std::uint32_t start,
     std::uint32_t count,
-    std::size_t layers) {
+    std::size_t layers,
+    std::uint32_t version = kVersion) {
     writer.raw(kMagic.data(), kMagic.size());
-    writer.scalar<std::uint32_t>(kVersion);
+    writer.scalar<std::uint32_t>(version);
     writer.scalar<std::uint32_t>(runtime);
     writer.scalar<std::uint32_t>(start);
     writer.scalar<std::uint32_t>(count);
@@ -470,7 +473,7 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
     std::array<std::uint8_t, 8> magic{};
     reader.raw(magic.data(), magic.size(), "magic");
     const auto version = reader.scalar<std::uint32_t>("version");
-    if (magic != kMagic || version < 1 || version > kVersion) {
+    if (magic != kMagic || version < 1 || version > kDFlashVersion) {
         throw std::runtime_error("unsupported MLX cache payload");
     }
     DecodedBlock block;
@@ -493,6 +496,19 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
         if (count > 4096 || (count > 0 && !block.last_hidden))
             throw std::runtime_error("invalid MTP checkpoint");
         for (std::uint32_t i = 0; i < count; ++i) block.mtp_layers.push_back(read_layer(reader));
+    }
+    if (version == kDFlashVersion) {
+        const auto count = reader.scalar<std::uint32_t>("DFlash2 ring layer count");
+        if (block.runtime != kQwen4Runtime || count == 0 || count > 64)
+            throw std::runtime_error("invalid DFlash2 cache checkpoint");
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto key = reader.tensor();
+            auto value = reader.tensor();
+            if (key.dtype != mlx::core::bfloat16 || value.dtype != key.dtype ||
+                key.shape.size() != 4 || key.shape[0] != 1 || value.shape != key.shape)
+                throw std::runtime_error("invalid DFlash2 cache ring");
+            block.dflash.emplace_back(std::move(key), std::move(value));
+        }
     }
     reader.expect_end();
     return block;
@@ -898,13 +914,18 @@ std::vector<MlxPagedPayload> encode_state(
         const auto start = block * block_size;
         const auto count = std::min(block_size, state.tokens.size() - start);
         const bool exact_boundary = start + count == state.tokens.size();
+        const bool dflash = [&] {
+            if constexpr (requires { state.dflash; }) return exact_boundary && state.dflash.has_value();
+            else return false;
+        }();
         Writer writer;
         write_header(
             writer,
             runtime,
             static_cast<std::uint32_t>(start),
             static_cast<std::uint32_t>(count),
-            state.layers.size());
+            state.layers.size(),
+            dflash ? kDFlashVersion : kVersion);
         for (const auto& layer : state.layers) {
             write_layer(
                 writer,
@@ -925,6 +946,19 @@ std::vector<MlxPagedPayload> encode_state(
         } else {
             writer.scalar<std::uint8_t>(0);
             writer.scalar<std::uint32_t>(0);
+        }
+        if constexpr (requires { state.dflash; }) {
+            if (dflash) {
+                const auto& snapshot = *state.dflash;
+                if (snapshot.position != state.cache_position || snapshot.layers.empty() || snapshot.layers.size() > 64)
+                    throw std::runtime_error("invalid DFlash2 cache boundary");
+                writer.scalar<std::uint32_t>(static_cast<std::uint32_t>(snapshot.layers.size()));
+                for (const auto& layer : snapshot.layers) {
+                    if (!layer.keys || !layer.values) throw std::runtime_error("missing DFlash2 cache ring");
+                    writer.tensor(*layer.keys);
+                    writer.tensor(*layer.values);
+                }
+            }
         }
         result.push_back(std::move(writer).finish());
     }
@@ -1327,6 +1361,13 @@ MlxQwen4TextSessionState MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
     for (const auto& layer : state.layers) bytes(layer);
     for (const auto& layer : state.mtp_layers) bytes(layer);
     if (state.last_hidden) state.bytes += state.last_hidden->nbytes();
+    if (!final.dflash.empty()) {
+        auto& snapshot = state.dflash.emplace();
+        snapshot.position = state.cache_position;
+        for (const auto& [key, value] : final.dflash)
+            snapshot.layers.push_back({copy_tensor(key), copy_tensor(value)});
+        state.bytes += snapshot.bytes();
+    }
     return state;
 }
 

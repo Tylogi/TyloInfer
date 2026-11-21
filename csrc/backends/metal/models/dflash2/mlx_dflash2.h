@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <mlx/mlx.h>
@@ -70,10 +71,12 @@ public:
     static MlxDFlash2 load(const std::filesystem::path& directory);
     const MlxDFlash2Config& config() const noexcept;
     std::size_t weight_bytes() const noexcept;
+    const std::string& prefix_cache_key() const noexcept;
     void track_weights() const;
     void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
         bool tree_batch = false) const;
     void reset(MlxDFlash2Context& context) const;
+    void restore_context(MlxDFlash2Context& context, const MlxDFlash2Context& snapshot) const;
     void append_context(MlxDFlash2Context& context, const mlx::core::array& target_hidden,
         int start_position) const;
     struct ContextCommit {
