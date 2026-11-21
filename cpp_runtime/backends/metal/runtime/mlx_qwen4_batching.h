@@ -134,6 +134,7 @@ private:
         // Splash's measured step costs on resident Flash-Next
         // and M5 Max. Use the cost of the padded row group, including jumps
         // at tile boundaries.
+        if (lanes == 3 && rows > 32) return rows == 33 ? 54.22 : 63.67;
         const std::array last_rows{lanes, 8, 9, 15, 16, 17, 24, 25, 32};
         constexpr std::array three_lane_ms{25.75, 27.58, 30.00, 32.93, 33.39, 37.07, 40.95, 43.12, 45.76};
         constexpr std::array four_lane_ms{26.86, 28.39, 30.75, 34.37, 34.50, 38.33, 41.92, 46.62, 50.07};
@@ -828,18 +829,19 @@ private:
                 else hooks_.dflash2->append_context(context, features, position);
             }
 
-            stats.selected_depth = depth;
-            ++stats.depth_cycles[depth];
+            const int reported_depth = tree ? request->round_depth : depth;
+            stats.selected_depth = reported_depth;
+            ++stats.depth_cycles[reported_depth];
             if (!depth) ++stats.standard_tokens;
             else {
                 stats.used = true;
                 ++stats.cycles;
                 stats.drafted_tokens += depth;
                 stats.accepted_tokens += retained;
-                for (int i = 0; i < depth; ++i) ++stats.position_drafted[i];
+                for (int i = 0; i < reported_depth; ++i) ++stats.position_drafted[i];
                 for (int i = 0; i < retained; ++i) ++stats.position_accepted[i];
             }
-            stats.measured_depth_ms[depth] += std::chrono::duration<double, std::milli>(
+            stats.measured_depth_ms[reported_depth] += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - request->draft_started).count();
             finish_round(*request, retained);
         }
@@ -887,6 +889,12 @@ private:
         std::vector<std::size_t> draft_lanes;
         std::vector<MlxDFlash2Tree> trees;
         const auto width = cohort.active.size();
+        const auto& target = runtime_.config();
+        const bool flash_next_on_m5_max = target.hidden_size == 2560 && target.hc_count == 4 &&
+            !target.ple_layer_ids.empty() && mlx_apple_chip_is("Apple M5 Max");
+        const bool wider_three_lane_trees = width == 3 && flash_next_on_m5_max &&
+            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", true) &&
+            std::ranges::all_of(cohort.active, [](const auto& request) { return request->dflash_max_verify_width <= 3; });
         bool two_way = true, three_way = true, four_way = true;
         for (const auto& request : cohort.active) {
             request->dflash_max_verify_width = std::max(request->dflash_max_verify_width, width);
@@ -903,7 +911,9 @@ private:
             draft_lanes.push_back(plans.size() - 1);
             contexts.push_back(&*request->dflash_context);
             anchors.push_back(anchor);
-            inputs.push_back(request->dflash_lookup->propose(depth, depth + 1));
+            // As in Splash, a branch can use spare rows without increasing the path depth.
+            const int candidate_rows = wider_three_lane_trees ? 2 * MlxQwen4CausalLm::maximum_verification_rows : depth + 1;
+            inputs.push_back(request->dflash_lookup->propose(depth, candidate_rows));
             embeddings.push_back(anchor);
             embeddings.insert(embeddings.end(), config.block_size - 1, config.mask_token);
         }
@@ -921,9 +931,6 @@ private:
         // budget at two active lanes adds work to the end of a wider batch.
         const bool adaptive = trees.size() == plans.size() &&
             mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
-        const auto& target = runtime_.config();
-        const bool flash_next_on_m5_max = target.hidden_size == 2560 && target.hc_count == 4 &&
-            !target.ple_layer_ids.empty() && mlx_apple_chip_is("Apple M5 Max");
         const bool calibrated = three_way && flash_next_on_m5_max;
         const bool four_way_buckets = four_way && width >= 3 && flash_next_on_m5_max;
         // Use full trees once a calibrated three-request group drains.
@@ -965,9 +972,19 @@ private:
             const int end = start + rows;
             request->target_work->draft_count = depth;
             request->round_depth = depth;
+            if (depth > mfq::engine::mtp::kMaximumReportedDraftDepth) {
+                // The tree can have more proposal nodes than positions on any path.
+                const auto& parents = request->dflash_tree->parents;
+                std::array<int, 2 * MlxQwen4CausalLm::maximum_verification_rows> distances{};
+                request->round_depth = 0;
+                for (int node = 1; node < rows; ++node) {
+                    distances[node] = distances[parents[node]] + 1;
+                    request->round_depth = std::max(request->round_depth, distances[node]);
+                }
+            }
             request->round = round;
             round->started = std::min(round->started, request->draft_started);
-            round->maximum_drafts = std::max(round->maximum_drafts, depth);
+            round->maximum_drafts = std::max(round->maximum_drafts, request->round_depth);
             auto chosen = mlx::core::slice(predictions, {start}, {end});
             selected.push_back(chosen);
             request->target_result.emplace(MlxMtpTargetBatch{

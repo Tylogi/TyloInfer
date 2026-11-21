@@ -550,7 +550,7 @@ static void check_ragged_speculative(MlxQwen4CausalLm& runtime) {
 }
 static void check_tree_speculative(MlxQwen4CausalLm& runtime, bool short_context) {
     const std::vector<MlxQwen4RequestTree> trees{
-        {{1, 5, 9, 3, 7, 11}, {-1, 0, 0, 2, 1, 3}},
+        {{1, 5, 9, 3, 7, 11, 13, 15, 21, 27, 29}, {-1, 0, 0, 2, 1, 3, 3, 6, 7, 8, 9}},
         {{4, runtime.config().eos_token_id, 12, 16}, {-1, 0, 0, 1}},
         {{6}, {-1}}};
     const std::array kept{2, 3, -1};
