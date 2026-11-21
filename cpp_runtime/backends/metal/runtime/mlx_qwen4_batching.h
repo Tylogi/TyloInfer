@@ -82,7 +82,7 @@ public:
         const auto& cost = costs_[lanes - 1];
         if (!calibrated && (cost.samples < 4 || cost.samples % 16 == 15)) return;
         const auto step_cost = [&](int rows) {
-            return calibrated ? three_lane_price(rows) : price(cost, lanes, rows);
+            return calibrated ? row_bucket_price(lanes, rows) : price(cost, lanes, rows);
         };
         // Splash StepCosts pools the next row of every lane by path reach,
         // then chooses the prefix with the most expected tokens per cost.
@@ -130,14 +130,15 @@ private:
         double weight = 0.0, rows = 0.0, rows_squared = 0.0, wall = 0.0, rows_wall = 0.0;
     };
 
-    static double three_lane_price(int rows) {
-        // Splash's measured three-lane step costs on resident Flash-Next
+    static double row_bucket_price(int lanes, int rows) {
+        // Splash's measured step costs on resident Flash-Next
         // and M5 Max. Use the cost of the padded row group, including jumps
         // at tile boundaries.
-        constexpr std::array last_rows{3, 8, 9, 15, 16, 17, 24};
-        constexpr std::array cycle_ms{25.75, 27.58, 30.00, 32.93, 33.39, 37.07, 40.95};
+        const std::array last_rows{lanes, 8, 9, 15, 16, 17, 24, 25, 32};
+        constexpr std::array three_lane_ms{25.75, 27.58, 30.00, 32.93, 33.39, 37.07, 40.95, 43.12, 45.76};
+        constexpr std::array four_lane_ms{26.86, 28.39, 30.75, 34.37, 34.50, 38.33, 41.92, 46.62, 50.07};
         const auto bucket = std::lower_bound(last_rows.begin(), last_rows.end() - 1, rows);
-        return cycle_ms[static_cast<std::size_t>(bucket - last_rows.begin())];
+        return (lanes == 3 ? three_lane_ms : four_lane_ms)[static_cast<std::size_t>(bucket - last_rows.begin())];
     }
 
     static double price(const Cost& c, int lanes, int rows) {
@@ -886,11 +887,12 @@ private:
         std::vector<std::size_t> draft_lanes;
         std::vector<MlxDFlash2Tree> trees;
         const auto width = cohort.active.size();
-        bool two_way = true, three_way = true;
+        bool two_way = true, three_way = true, four_way = true;
         for (const auto& request : cohort.active) {
             request->dflash_max_verify_width = std::max(request->dflash_max_verify_width, width);
             two_way = two_way && request->dflash_max_verify_width == 2;
             three_way = three_way && request->dflash_max_verify_width == 3;
+            four_way = four_way && request->dflash_max_verify_width == 4;
             const auto anchor = request->target_work->pending_token;
             const int position = runtime_.request_cache_position(*request->cache);
             const int depth = std::min({draft_cap(*request), request->generation_limit - request->produced - 1,
@@ -923,8 +925,10 @@ private:
         const bool flash_next_on_m5_max = target.hidden_size == 2560 && target.hc_count == 4 &&
             !target.ple_layer_ids.empty() && mlx_apple_chip_is("Apple M5 Max");
         const bool calibrated = three_way && flash_next_on_m5_max;
+        const bool four_way_buckets = four_way && width >= 3 && flash_next_on_m5_max;
         // Use full trees once a calibrated three-request group drains.
-        if (adaptive && (!calibrated || width == 3)) dflash_tree_budget_.choose(trees, calibrated);
+        if (adaptive && (!calibrated || width == 3))
+            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets);
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
         const auto verification = std::chrono::steady_clock::now();
