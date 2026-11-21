@@ -5,6 +5,7 @@
 #include "mlx_tensor.h"
 
 #include <optional>
+#include <utility>
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
@@ -139,6 +140,10 @@ mlx::core::array qwen4_dense_gqa_decode_batch(
     const std::vector<mlx::core::array>& keys,
     const std::vector<mlx::core::array>& values,
     const mlx::core::array* gate = nullptr);
+
+std::pair<mlx::core::array, mlx::core::array> qwen4_qsa_join_half_history(
+    const mlx::core::array& history_key, const mlx::core::array& history_value,
+    const mlx::core::array& proposal_key, const mlx::core::array& proposal_value);
 
 mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& query,

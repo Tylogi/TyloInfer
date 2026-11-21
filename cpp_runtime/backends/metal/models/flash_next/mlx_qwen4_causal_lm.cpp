@@ -3620,9 +3620,22 @@ public:
                 }
                 lane.dense_mask.emplace(visible.begin(), Shape{1, 1, rows, columns}, mlx::core::bool_);
             }
-            auto attended = scaled_dot_product_attention(slice_rows(prologue.query),
-                mlx::core::concatenate({history_keys, mlx::core::astype(keys, history_keys.dtype())}, 2),
-                mlx::core::concatenate({history_values, mlx::core::astype(values, history_values.dtype())}, 2),
+            auto query = slice_rows(prologue.query);
+            const auto [joined_keys, joined_values] = [&] {
+                const auto supported = [](const array& value) {
+                    return value.dtype() == mlx::core::float16 && value.shape(2) > 0 &&
+                        value.strides(1) >= 0 && value.strides(2) >= 0 && value.strides(3) == 1;
+                };
+                if (query.dtype() == mlx::core::bfloat16 && config_.num_key_value_heads == 2 &&
+                    config_.head_dim == 256 && supported(history_keys) && supported(history_values) &&
+                    supported(keys) && supported(values)) {
+                    return qwen4_qsa_join_half_history(history_keys, history_values, keys, values);
+                }
+                return std::pair{
+                    mlx::core::concatenate({history_keys, mlx::core::astype(keys, history_keys.dtype())}, 2),
+                    mlx::core::concatenate({history_values, mlx::core::astype(values, history_values.dtype())}, 2)};
+            }();
+            auto attended = scaled_dot_product_attention(query, joined_keys, joined_values,
                 false, 1.f / std::sqrt(static_cast<float>(config_.head_dim)), lane.dense_mask);
             outputs.push_back(mlx::core::transpose(attended, {0, 2, 1, 3}));
             lane.tape->emplace(Qwen4TreeQsaTape{std::move(keys), std::move(values), std::move(index_keys)});
@@ -4368,6 +4381,7 @@ private:
                     const auto query = mlx::core::zeros({1, 24, 2, 256}, mlx::core::bfloat16);
                     const auto kv = mlx::core::zeros({1, 2, 2, 256}, mlx::core::float16);
                     preparation->add(qwen4_dense_gqa_decode_batch(query, {kv, kv}, {kv, kv}));
+                    preparation->add(qwen4_qsa_join_half_history(kv, kv, kv, kv).first);
                 }
                 for (const auto requested : preparation->row_buckets())
                     for (const auto dtype : {preparation->activation_dtype(), mlx::core::float32}) {

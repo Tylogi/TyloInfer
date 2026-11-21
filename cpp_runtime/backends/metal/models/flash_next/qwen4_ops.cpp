@@ -184,6 +184,64 @@ private:
     bool gate_;
 };
 
+class QsaJoinHalfHistory final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    explicit QsaJoinHalfHistory(mlx::core::Stream stream) : Primitive(stream) {}
+    std::string preparation_key() const override { return "mfq_qsa_join_half_history"; }
+    const char* name() const override { return "QsaJoinHalfHistory"; }
+    void prepare_gpu() override { (void)kernel(); }
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA half-history join requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel());
+        std::array<std::uint64_t, 10> params{
+            std::uint64_t(inputs[0].shape(2)), std::uint64_t(output.shape(2))};
+        for (unsigned i = 0; i < inputs.size(); ++i) {
+            encoder.set_input_array(inputs[i], i);
+            params[2 + i * 2] = inputs[i].strides(1);
+            params[3 + i * 2] = inputs[i].strides(2);
+        }
+        encoder.set_output_array(output, 4);
+        encoder.set_bytes(params, 5);
+        encoder.dispatch_threads(MTL::Size(output.size() / 8, 1, 1), MTL::Size(256, 1, 1));
+    }
+private:
+    MTL::ComputePipelineState* kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [] {
+            return std::string(R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void mfq_qsa_join_half_history(
+    device const half* history_key [[buffer(0)]], device const half* history_value [[buffer(1)]],
+    device const half* proposal_key [[buffer(2)]], device const half* proposal_value [[buffer(3)]],
+    device bfloat* output [[buffer(4)]], constant ulong* params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint Chunks = 32;
+    const uint rows = uint(params[1]), prefix = uint(params[0]);
+    const uint column = tid % Chunks * 8, row = tid / Chunks % rows;
+    const uint head = tid / (Chunks * rows) % 2, part = tid / (Chunks * rows * 2);
+    const bool proposal = row >= prefix;
+    const uint field = part + 2 * uint(proposal);
+    device const half* input = part
+        ? (proposal ? proposal_value : history_value)
+        : (proposal ? proposal_key : history_key);
+    const ulong index = head * params[2 + 2 * field] +
+        (proposal ? row - prefix : row) * params[3 + 2 * field] + column;
+#pragma unroll
+    for (uint i = 0; i < 8; ++i) output[ulong(tid) * 8 + i] = bfloat(float(input[index + i]));
+}
+)METAL");
+        });
+        return device.get_kernel(name, library);
+    }
+};
+
 class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     QsaOutputGatePrimitive(mlx::core::Stream stream, std::array<mlx::core::Dtype, 3> types,
@@ -2805,6 +2863,30 @@ array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>&
     return array(shape, mlx::core::bfloat16,
         std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu), gate != nullptr),
         std::move(inputs));
+}
+
+std::pair<mlx::core::array, mlx::core::array> qwen4_qsa_join_half_history(
+    const mlx::core::array& history_key, const mlx::core::array& history_value,
+    const mlx::core::array& proposal_key, const mlx::core::array& proposal_value) {
+    const auto supported = [](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == 2 &&
+            value.shape(2) > 0 && value.shape(3) == 256 && value.dtype() == mlx::core::float16 &&
+            value.strides(1) >= 0 && value.strides(2) >= 0 && value.strides(3) == 1;
+    };
+    if (!supported(history_key) || !supported(history_value) || !supported(proposal_key) ||
+        !supported(proposal_value) || history_key.shape() != history_value.shape() ||
+        proposal_key.shape() != proposal_value.shape())
+        throw std::invalid_argument("invalid QSA half-history join");
+    const auto length = std::int64_t(history_key.shape(2)) + proposal_key.shape(2);
+    if (length > std::numeric_limits<int>::max() / 128)
+        throw std::invalid_argument("QSA history exceeds Metal dispatch size");
+    const int rows = static_cast<int>(length);
+    // The attention kernel consumes two views of the joined BF16 allocation.
+    auto joined = array(Shape{2, 2, rows, 256}, mlx::core::bfloat16,
+        std::make_shared<QsaJoinHalfHistory>(mlx::core::default_stream(mlx::core::Device::gpu)),
+        {history_key, history_value, proposal_key, proposal_value});
+    return {mlx::core::slice(joined, {0, 0, 0, 0}, {1, 2, rows, 256}),
+        mlx::core::slice(joined, {1, 0, 0, 0}, {2, 2, rows, 256})};
 }
 
 array qwen4_dense_gqa_attention(

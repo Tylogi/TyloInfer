@@ -329,6 +329,24 @@ void test_qsa_grouped_decode() {
     }
 }
 
+void test_qsa_half_history_join() {
+    using namespace mlx::core;
+    const auto half_values = [](int rows, float frequency) {
+        auto index = reshape(arange(2 * rows * 256, float32), {1, 2, rows, 256});
+        return astype(sin(index * frequency), float16);
+    };
+    auto history_key = slice(half_values(47, .051f), {0, 0, 3, 0}, {1, 2, 36, 256});
+    auto history_value = slice(half_values(64, .093f), {0, 0, 2, 0}, {1, 2, 35, 256});
+    auto proposal_key = slice(half_values(10, .037f), {0, 0, 1, 0}, {1, 2, 8, 256});
+    auto proposal_value = half_values(7, .023f);
+    const auto [keys, values] = mfq::metal::qwen4_qsa_join_half_history(
+        history_key, history_value, proposal_key, proposal_value);
+    require_close(keys, astype(concatenate({history_key, proposal_key}, 2), bfloat16),
+        0.0f, "QSA half-history join preserves strided keys");
+    require_close(values, astype(concatenate({history_value, proposal_value}, 2), bfloat16),
+        0.0f, "QSA half-history join preserves strided values");
+}
+
 void test_qsa_canonical_prefill_prefix() {
     using namespace mlx::core;
     constexpr int heads = 24, kv_heads = 2, dimension = 256;
@@ -1373,6 +1391,7 @@ int main(int argc, char** argv) {
         test_qsa_prefill_output_gate();
         test_qsa_dense_attention_causal_boundaries();
         test_qsa_grouped_decode();
+        test_qsa_half_history_join();
         test_qsa_canonical_prefill_prefix();
         for (auto dtype : {mlx::core::float16, mlx::core::bfloat16,
                            mlx::core::float32}) {
