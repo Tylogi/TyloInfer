@@ -334,18 +334,18 @@ std::vector<std::byte> dense_prefix(const std::vector<int64_t>& shape) {
     return bytes;
 }
 
-struct Qwen35Nextn {
+struct QwenNextn {
     int64_t backbone=0, layers=0;
-    Qwen35Nextn()=default;
-    explicit Qwen35Nextn(const gguf_context* context) {
-        const auto key=gguf_find_key(context,"qwen35.nextn_predict_layers");
+    QwenNextn()=default;
+    explicit QwenNextn(const gguf_context* context, const std::string& architecture="qwen35") {
+        const auto key=gguf_find_key(context,(architecture+".nextn_predict_layers").c_str());
         if(key<0)return;
         const auto value=scalar(context,key);
         if(!value.is_number_integer())throw std::runtime_error("invalid GGUF NextN layer count: expected an integer");
         layers=value.get<int64_t>();
         if(layers<0)throw std::runtime_error("invalid GGUF NextN layer count: negative value");
         if(!layers)return;
-        const auto count=gguf_find_key(context,"qwen35.block_count");
+        const auto count=gguf_find_key(context,(architecture+".block_count").c_str());
         if(count<0 || !scalar(context,count).is_number_integer())
             throw std::runtime_error("Qwen GGUF nextn requires an integer block count");
         const auto blocks=scalar(context,count).get<int64_t>();
@@ -365,6 +365,9 @@ struct Qwen35Nextn {
             {"nextn.eh_proj.weight","predictor.fusion.weight"},
             {"nextn.enorm.weight","predictor.embedding_norm.weight"},
             {"nextn.hnorm.weight","predictor.hidden_norm.weight"},
+            {"nextn.hc_head_norm.weight","predictor.mhc.pre.norm.weight"},
+            {"nextn.hc_head_down.weight","predictor.mhc.pre.down.weight"},
+            {"nextn.hc_head_up.weight","predictor.mhc.pre.up.weight"},
             {"nextn.shared_head_norm.weight","predictor.output_norm.weight"},
             {"nextn.embed_tokens.weight","predictor.token_embedding.weight"},
             {"nextn.shared_head_head.weight","predictor.output.weight"}};
@@ -727,7 +730,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
     }
 
     json meta = json::object(), shapes = json::object();
-    Qwen35Nextn model_nextn;
+    QwenNextn model_nextn;
     for (std::size_t shard = 0; shard < impl_->paths.size(); ++shard) {
         ggml_context* raw = nullptr;
         auto file = open(impl_->paths[shard]);
@@ -755,7 +758,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             }
             if (!meta.contains("general.architecture")) throw std::runtime_error("GGUF has no architecture");
             impl_->arch = meta["general.architecture"].get<std::string>();
-            if(impl_->arch=="qwen35")model_nextn=Qwen35Nextn(ctx.get());
+            if(impl_->arch=="qwen35")model_nextn=QwenNextn(ctx.get());
             Gguf tokenizer(gguf_init_empty(), gguf_free);
             gguf_set_kv(tokenizer.get(), ctx.get());
             auto& asset = impl_->asset_data[kTokenizerGgufAsset];
@@ -768,8 +771,25 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         // indices still use that model-wide layer count on every shard.
         const bool qwen35_file=shard<model_shards?impl_->arch=="qwen35":
             architecture_key>=0 && scalar(ctx.get(),architecture_key)=="qwen35";
-        const Qwen35Nextn nextn=qwen35_file?(shard<model_shards?model_nextn:Qwen35Nextn(ctx.get())):Qwen35Nextn();
+        const QwenNextn nextn=qwen35_file?(shard<model_shards?model_nextn:QwenNextn(ctx.get())):QwenNextn();
         const bool qwen35_companion=shard>=model_shards && qwen35_file && nextn.layers>0;
+        const bool qwen4_companion=shard>=model_shards && architecture_key>=0 &&
+            scalar(ctx.get(),architecture_key)=="qwen4exp" &&
+            QwenNextn(ctx.get(),"qwen4exp").layers>0;
+        const auto qwen4_nextn=qwen4_companion?QwenNextn(ctx.get(),"qwen4exp"):QwenNextn();
+        if(qwen4_companion) {
+            if(impl_->arch!="qwen4exp" || qwen4_nextn.backbone!=meta.at("qwen4exp.block_count").get<int64_t>())
+                throw std::runtime_error("Qwen4 MTP companion backbone depth differs");
+            for(const auto* suffix:{"embedding_length","attention.head_count","attention.head_count_kv",
+                    "attention.key_length","expert_count","expert_feed_forward_length","hyper_connection.count",
+                    "hyper_connection.low_rank","attention.indexer.head_count","attention.indexer.key_length",
+                    "rope.dimension_count","rope.freq_base","attention.layer_norm_rms_epsilon"}) {
+                const auto name=std::string("qwen4exp.")+suffix;
+                const auto id=gguf_find_key(ctx.get(),name.c_str());
+                if(meta.contains(name) && (id<0 || scalar(ctx.get(),id)!=meta.at(name)))
+                    throw std::runtime_error("Qwen4 MTP companion geometry differs: "+name);
+            }
+        }
         if(qwen35_companion) {
             if(impl_->arch!="qwen35")throw std::runtime_error("Qwen35 MTP companion requires a Qwen35 backbone");
             const auto primary_predictors=meta.value("qwen35.nextn_predict_layers",int64_t{0});
@@ -802,8 +822,9 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx.get()); ++i) {
             const auto* original = gguf_get_tensor_name(ctx.get(), i);
-            const auto qwen35_name=qwen35_file?nextn.name(original):std::optional<std::string>{};
-            if(qwen35_companion && !qwen35_name)continue;
+            const auto predictor_name=qwen4_companion?qwen4_nextn.name(original):
+                qwen35_file?nextn.name(original):std::optional<std::string>{};
+            if((qwen35_companion || qwen4_companion) && !predictor_name)continue;
             const auto* tensor = ggml_get_tensor(tensors.get(), original);
             if (!tensor) throw std::runtime_error("GGUF tensor shape is missing");
             const auto type = gguf_get_tensor_type(ctx.get(), i);
@@ -812,7 +833,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 throw std::runtime_error("Gyro GGUF requires agention.trellis.state_bits=15");
             std::vector<int64_t> shape;
             for (int d = ggml_n_dims(tensor) - 1; d >= 0; --d) shape.push_back(tensor->ne[d]);
-            auto name = raw_predictor ? predictor_names.at(original) : qwen35_name?*qwen35_name:canonical_name(original, &meta);
+            auto name = raw_predictor ? predictor_names.at(original) : predictor_name?*predictor_name:canonical_name(original, &meta);
             if (impl_->arch == "qwen4exp") {
                 if (name == "per_layer_token_embd.weight") {
                     const auto layers = meta.at("qwen4exp.ple.layers").get<std::vector<int64_t>>();
@@ -854,6 +875,30 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) { return std::toupper(c); });
             if (!ggml_is_quantized(type) && !engram) record.prefix = dense_prefix(shape);
             record.tensor = {name, dtype, dtype, shape, size + record.prefix.size()};
+            if(qwen4_companion && name=="predictor.fusion.weight") {
+                const auto hidden=meta.at("qwen4exp.embedding_length").get<int64_t>();
+                if(shape!=std::vector<int64_t>{hidden,2*hidden} || hidden%ggml_blck_size(type))
+                    throw std::runtime_error("Qwen4 MTP fusion layout cannot be split without changing precision");
+                const auto row=ggml_row_size(type,hidden);
+                std::vector<std::byte> packed(size);
+                file->read(record.offset,packed.data(),packed.size());
+                for(int part=0;part<2;++part) {
+                    const std::string split=part?"predictor.fusion.hidden.weight":"predictor.fusion.embedding.weight";
+                    if(impl_->records.count(split))throw std::runtime_error("duplicate GGUF tensor: "+split);
+                    Impl::Record piece;
+                    const std::vector<int64_t> dimensions{hidden,hidden};
+                    if(!ggml_is_quantized(type))piece.prefix=dense_prefix(dimensions);
+                    piece.inline_bytes=piece.prefix;
+                    const auto start=piece.inline_bytes.size();
+                    piece.inline_bytes.resize(start+hidden*row);
+                    for(int64_t r=0;r<hidden;++r)
+                        std::memcpy(piece.inline_bytes.data()+start+r*row,packed.data()+(2*r+part)*row,row);
+                    piece.tensor={split,dtype,dtype,dimensions,piece.inline_bytes.size()};
+                    shapes[split]=dimensions;
+                    impl_->tensors.push_back(piece.tensor);
+                    impl_->records.emplace(split,std::move(piece));
+                }
+            }
             // Canonical GGUF predictors use the backbone's RMS weight
             // convention. Legacy mtp.* companions already store norm deltas.
             const bool canonical_predictor = std::string_view(original).rfind("predictor.", 0) == 0;
@@ -1032,8 +1077,12 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
     }
     if (impl_->arch == "qwen4exp") {
         const auto blocks = meta.at("qwen4exp.block_count").get<int64_t>();
-        for (int64_t block = 0; block < blocks; ++block) {
-            const auto root = "model.block." + std::to_string(block) + ".attention.indexer.";
+        std::vector<std::string> indexer_roots;
+        for(int64_t block=0;block<blocks;++block)
+            indexer_roots.push_back("model.block."+std::to_string(block)+".attention.indexer.");
+        for(int64_t block=0;impl_->records.count("predictor.block."+std::to_string(block)+".attention.query.weight");++block)
+            indexer_roots.push_back("predictor.block."+std::to_string(block)+".attention.indexer.");
+        for (const auto& root : indexer_roots) {
             const auto q = impl_->records.find(root + "query.weight");
             const auto k = impl_->records.find(root + "key.weight");
             if (q == impl_->records.end() && k == impl_->records.end()) continue;

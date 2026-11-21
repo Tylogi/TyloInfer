@@ -606,6 +606,77 @@ void qwen4_source(const std::filesystem::path& directory) {
         require(delta == .25f, "canonical MTP norm no longer uses the backbone convention");
         gguf_free(canonical); ggml_free(canonical_tensors);
     }
+    {
+        auto* nextn_tensors=ggml_init({3<<20,nullptr,false});
+        auto* nextn=gguf_init_empty();
+        auto* backbone=gguf_init_from_file(main_path.string().c_str(),{true,nullptr});
+        require(backbone,"NextN backbone header read failed");
+        gguf_set_kv(nextn,backbone);
+        gguf_free(backbone);
+        gguf_set_val_u32(nextn,"qwen4exp.block_count",5);
+        gguf_set_val_u32(nextn,"qwen4exp.nextn_predict_layers",1);
+        const auto add=[&](const char* name,ggml_type type,std::vector<int64_t> shape) {
+            std::reverse(shape.begin(),shape.end());
+            auto* tensor=ggml_new_tensor(nextn_tensors,type,int(shape.size()),shape.data());
+            ggml_set_name(tensor,name);
+            std::memset(tensor->data,0,ggml_nbytes(tensor));
+            if(type==GGML_TYPE_F32)
+                std::fill_n(static_cast<float*>(tensor->data),ggml_nelements(tensor),1.25f);
+            gguf_add_tensor(nextn,tensor);
+            return tensor;
+        };
+        add("token_embd.weight",GGML_TYPE_Q8_0,{3,256});
+        add("output.weight",GGML_TYPE_Q8_0,{3,256});
+        add("blk.4.nextn.enorm.weight",GGML_TYPE_F32,{256});
+        add("blk.4.nextn.hnorm.weight",GGML_TYPE_F32,{512});
+        add("blk.4.nextn.hc_head_norm.weight",GGML_TYPE_F32,{512});
+        add("blk.4.nextn.hc_head_down.weight",GGML_TYPE_Q8_0,{64,512});
+        add("blk.4.nextn.hc_head_up.weight",GGML_TYPE_Q8_0,{512,64});
+        auto* fusion=add("blk.4.nextn.eh_proj.weight",GGML_TYPE_Q8_0,{256,512});
+        auto* packed=static_cast<std::byte*>(fusion->data);
+        for(std::size_t i=0;i<ggml_nbytes(fusion);++i)packed[i]=std::byte(i%251);
+        add("blk.4.attn_q.weight",GGML_TYPE_Q8_0,{512,256});
+        add("blk.4.ffn_gate_inp.weight",GGML_TYPE_F32,{4,256});
+        add("blk.4.ffn_gate_exps.weight",GGML_TYPE_Q8_0,{4,128,256});
+        add("blk.4.ffn_up_exps.weight",GGML_TYPE_Q8_0,{4,128,256});
+        add("blk.4.ffn_down_exps.weight",GGML_TYPE_Q8_0,{4,256,128});
+        add("blk.4.indexer.q_proj.weight",GGML_TYPE_BF16,{128,256});
+        add("blk.4.indexer.k_proj.weight",GGML_TYPE_BF16,{128,256});
+        const auto nextn_path=directory/"nextn-predictor.gguf";
+        require(gguf_write_to_file(nextn,nextn_path.string().c_str(),false),"NextN predictor write failed");
+        const mfq::GgufModelSource composed(main_path,{table_path,nextn_path});
+        const auto config=nlohmann::json::parse(composed.model_config_json());
+        require(config["num_hidden_layers"]==4 && config["mtp_num_hidden_layers"]==1,
+            "NextN companion changed backbone depth or lost its predictor");
+        require(composed.read("model.token_embedding.weight")==source.read("model.token_embedding.weight"),
+            "NextN companion replaced backbone embeddings");
+        require(!composed.find_tensor("model.block.4.attention.query.weight") &&
+            composed.find_tensor("predictor.block.0.attention.indexer.query_key.weight"),
+            "NextN predictor aliases or indexer composition differ");
+        require(composed.canonical_tensor_name("blk.4.nextn.eh_proj.weight")=="predictor.fusion.weight" &&
+            composed.find_tensor("predictor.fusion.weight"),"NextN fusion source alias was lost");
+        const auto norm=composed.read("predictor.mhc.pre.norm.weight");
+        float delta=0;std::memcpy(&delta,norm.data()+12,4);
+        require(delta==.25f,"NextN head norm did not use the backbone convention");
+        const auto row=ggml_row_size(GGML_TYPE_Q8_0,256);
+        for(int part=0;part<2;++part) {
+            const auto name=part?"predictor.fusion.hidden.weight":"predictor.fusion.embedding.weight";
+            const auto* info=composed.find_tensor(name);
+            require(info && info->dtype=="GGUF_Q8_0" && *info->shape==std::vector<int64_t>{256,256},
+                "NextN fusion split changed shape or precision");
+            const auto bytes=composed.read(name);
+            for(int r=0;r<256;++r)
+                require(std::memcmp(bytes.data()+r*row,packed+(2*r+part)*row,row)==0,
+                    "NextN fusion split changed packed quantization blocks");
+        }
+        gguf_set_val_u32(nextn,"qwen4exp.expert_count",8);
+        require(gguf_write_to_file(nextn,nextn_path.string().c_str(),false),"invalid NextN predictor write failed");
+        bool rejected=false;
+        try { mfq::GgufModelSource invalid(main_path,{table_path,nextn_path}); }
+        catch(const std::runtime_error&) { rejected=true; }
+        require(rejected,"incompatible NextN expert geometry was accepted");
+        gguf_free(nextn);ggml_free(nextn_tensors);
+    }
     add_predictor("mtp.unsupported.weight", GGML_TYPE_F32, {1});
     require(gguf_write_to_file(predictor, predictor_path.string().c_str(), false), "GGUF invalid predictor write failed");
     bool unsupported_predictor = false;
