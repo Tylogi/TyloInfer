@@ -64,7 +64,7 @@ DS Bot 的侧栏会显示「推理引擎」入口。TyloInfer 提供方默认连
 
 Agent 和 DS Bot 启动时会查询 TyloInfer，并定期同步已加载的模型。若有服务端别名，提供方使用别名作为模型 ID。同步保留相同 ID 的已有配置，新 ID 的初始记录只有 `id`。加载权重仍由推理引擎页面的加载操作或 Core API 发起。
 
-- 新登记的模型如果没有匹配的 DSH 目录记录或显式配置，当前 DSH 的 pi-ai 提供方按 `contextWindow: 1000000` 和 `maxTokens: 128000` 估算可用预算。DSH 根据该配置和估算的剩余上下文决定实际发送的 `max_tokens`。
+- 新登记的模型如果没有匹配的 DSH 目录记录或显式配置，当前 DSH 的 pi-ai 提供方按 `contextWindow: 1000000` 和 `maxTokens: 128000` 估算可用预算。对于 TyloInfer 路由，Host 同时传递 pi-ai 裁剪前的输出上限，Core 按实际分词后的剩余空间裁剪。
 - TyloInfer 的 `/v1/chat/completions` 在省略 `max_completion_tokens` 和 `max_tokens` 时，使用实例级采样默认配置或内置默认值 `128000`。原生引擎按实际分词后的剩余上下文限制输出。提示词（含历史和工具定义）本身超过已加载实例的上下文时，请求会返回上下文超限错误。
 
 在 DSH 的模型设置或 profile 中，按已加载实例的 `context_size` 填写 `contextWindow`，再设置合适的 `maxTokens`。例如，实例加载的是 32K 上下文，可用下面的 profile 配置将单次输出预算设为 4096 token。将 `MODEL_ID` 换成 TyloInfer 提供方登记的 ID。

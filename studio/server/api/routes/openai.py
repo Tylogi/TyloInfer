@@ -100,9 +100,19 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
             content=openai_error_body(str(error)),
         )
     try:
-        mtp = request.headers.get('x-tyloinfer-mtp')
-        if isinstance(body, dict) and mtp in {'on', 'off'}:
-            body.setdefault('enable_mtp', mtp == 'on')
+        if isinstance(body, dict):
+            mtp = request.headers.get('x-tyloinfer-mtp')
+            if mtp in {'on', 'off'}:
+                body.setdefault('enable_mtp', mtp == 'on')
+            budget = request.headers.get('x-tyloinfer-output-budget')
+            if budget == 'default':
+                body.pop('max_tokens', None)
+                body.pop('max_completion_tokens', None)
+            elif budget is not None:
+                if not (1 <= len(budget) <= 10 and budget.isascii() and budget.isdecimal()
+                        and 1 <= int(budget) <= 2147483647):
+                    raise OpenAIRequestError('invalid X-TyloInfer-Output-Budget', param='max_completion_tokens')
+                body['max_completion_tokens'] = int(budget)
         parsed = parse_chat_request(body)
     except OpenAIRequestError as error:
         return JSONResponse(

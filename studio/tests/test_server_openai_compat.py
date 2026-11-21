@@ -147,6 +147,26 @@ def test_agent_mtp_header_is_request_local_and_preserves_explicit_body(stream) -
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('stream', [False, True])
+def test_agent_output_budget_preserves_original_limit_before_context_clamping(stream) -> None:
+    async def run() -> None:
+        backend = _Backend()
+        app = create_app(_Service(backend))
+        body = {'model': 'test-model', 'messages': [{'role': 'user', 'content': 'hello'}], 'stream': stream}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            for budget, expected in [(None, 1), ('1', 1), ('4096', 4096), ('default', 128000)]:
+                headers = {} if budget is None else {'X-TyloInfer-Output-Budget': budget}
+                response = await client.post('/v1/chat/completions', json={**body, 'max_tokens': 1}, headers=headers)
+                assert response.status_code == 200
+                sampling = backend.requests[-1]['sampling']
+                assert sampling.max_tokens == expected
+                assert ('max_tokens' in sampling.model_fields_set) is (budget != 'default')
+            rejected = await client.post('/v1/chat/completions', json={**body, 'max_completion_tokens': 1},
+                                         headers={'X-TyloInfer-Output-Budget': '0'})
+            assert rejected.status_code == 400
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_missing_model_returns_not_found_for_both_transports(tmp_path, stream) -> None:
     from server.runtime.runtime_pool import RuntimePool
