@@ -1224,6 +1224,18 @@ void check_grouped_shared() {
     const auto down = make(GGML_TYPE_IQ4_NL, K, N, false);
     const auto sg = make(GGML_TYPE_IQ4_XS, N, K, true), su = make(GGML_TYPE_Q4_K, N, K, true);
     const auto sd = make(GGML_TYPE_IQ4_NL, K, N, true);
+    {
+        // One expert spills a single route into a second 8-row tile.
+        constexpr int rows = 9;
+        const auto iq2 = make(GGML_TYPE_IQ2_XXS, N, K, false);
+        const auto ids = zeros({rows, 1}, int32);
+        const auto row = astype(sin(arange(K, float32) * .023f), bfloat16);
+        const auto input = broadcast_to(row, {rows, K});
+        const auto plan = MlxGgufPrefillPlan::from_topk(input, ids, E, 8);
+        const auto output = plan.restore(plan.gate_up(iq2, up));
+        compare(output, broadcast_to(slice(output, {0, 0, 0}, {1, 1, N}), output.shape()),
+            0.f, "GGUF Gate/Up keeps identical inputs consistent across tiles of one expert");
+    }
     for (bool shared : {false, true}) for (bool broadcast : {false, true}) {
         const array ids({2, 2, -1, E, E + 1, 4}, {1, 6}, int32);
         const auto input = astype(reshape(sin(arange((broadcast ? 1 : 6) * K, float32) * .017f),

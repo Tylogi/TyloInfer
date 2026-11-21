@@ -962,6 +962,9 @@ if (shared) {
 }
 }
 uint live = MAX_ROWS == 1 ? 1u : uint(descriptors[tile * descriptor_stride + 1u]);
+// Routes for an expert are assigned to tiles by atomics. Keep the same
+// accumulation path when one route lands in a trailing tile.
+const bool continuation = MAX_ROWS > 1 && tile > 0u && descriptors[(tile - 1u) * descriptor_stride] == int(e);
 uint row_map = 0u;
 if constexpr (SOURCE_ROWS) for (uint r = 0u; r < live; ++r)
     row_map |= (uint(slots[row0 + r]) / (params[6] & 0x7fffffffu)) << (r * 3u);
@@ -988,11 +991,11 @@ if constexpr (Q8_COLUMNS) if (live <= 2u) {
         }
     };
     if constexpr (MAX_ROWS == 1) run(integral_constant<int, 1>{});
-    else if (live == 1u) run(integral_constant<int, 1>{});
+    else if (live == 1u && !continuation) run(integral_constant<int, 1>{});
     else run(integral_constant<int, 2>{});
     return;
 }
-if (MAX_ROWS <= 8 || (live <= 2u && (tile == 0u || descriptors[(tile - 1u) * descriptor_stride] != int(e)))) {
+if (MAX_ROWS <= 8 || (live <= 2u && !continuation)) {
     auto columns = [&](auto rows) {
     const auto source = [&] {
         if constexpr (SOURCE_ROWS) return GgufColumnInput{input, row_map};
@@ -1006,9 +1009,9 @@ if (MAX_ROWS <= 8 || (live <= 2u && (tile == 0u || descriptors[(tile - 1u) * des
         gate_table, up_table, reinterpret_cast<threadgroup T*>(stages), y + ulong(row0) * n);
     };
     if constexpr (MAX_ROWS == 1) columns(integral_constant<int, 1>{});
-    else if (live == 1u) columns(integral_constant<int, 1>{});
+    else if (live == 1u && !continuation) columns(integral_constant<int, 1>{});
     else if constexpr (MAX_ROWS == 8 && !COLUMN_ONLY) {
-        if (live == 2u) columns(integral_constant<int, 2>{});
+        if (live <= 2u) columns(integral_constant<int, 2>{});
         else columns(integral_constant<int, 8>{});
     } else columns(integral_constant<int, 2>{});
     return;
