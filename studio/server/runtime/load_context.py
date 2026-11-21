@@ -9,7 +9,8 @@ def apply_load_context(request: ModelLoadRequest, architecture: str, backend: st
     if defaults is None:
         return request
     kind = architecture.casefold()
-    qsa = kind.startswith('qwen4_exp') and backend in {'cuda', 'metal'}
+    qsa = (kind.startswith('qwen4_exp') and backend in {'cuda', 'metal'}) or (
+        kind == 'hy_v4_flash' and backend == 'metal')
     quantized = backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35'))
     if defaults.reserve_percent is not None:
         bits = defaults.precision or 16

@@ -178,7 +178,7 @@ MfqModelGraph synthesize_legacy_model_graph(
             std::to_string(graph.topology.text_layers) + ".eh_proj.weight";
         has_predictor = has_predictor || contains_tensor(prefix);
     }
-    if ((qwen_grid || glm_grid) && has_predictor) {
+    if ((qwen_grid || glm_grid || family == "sensenova_loop") && has_predictor) {
         graph.topology.predictor_layers = std::max<std::int64_t>(
             1, predictor_layers);
         add_optional(

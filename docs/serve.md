@@ -402,6 +402,13 @@ curl -fsS http://127.0.0.1:8080/runtime/generate \
   }'
 ```
 
+### SenseNova Loop-9B and Inkling 2 Mini on Metal
+
+Load the text GGUF with `--model`. Prefix cache saves the attention and
+recurrent state for each pass through the repeated layers. SenseNova Loop-9B
+can use the NextN predictor embedded in its GGUF. Use the per-request
+`enable_mtp` setting to control it.
+
 ### Hy4 Flash on Metal
 
 Keep the two numbered GGUF shards in the same directory and pass the first shard

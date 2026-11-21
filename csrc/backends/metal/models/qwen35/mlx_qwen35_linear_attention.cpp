@@ -804,6 +804,21 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
     const array& input,
     int position_offset,
     int confirmed_tokens) {
+    return forward_speculative_impl(input, position_offset, confirmed_tokens, false);
+}
+
+array MlxQwen35LinearAttentionBlock::forward_attention_speculative(
+    const array& input,
+    int position_offset,
+    int confirmed_tokens) {
+    return forward_speculative_impl(input, position_offset, confirmed_tokens, true);
+}
+
+array MlxQwen35LinearAttentionBlock::forward_speculative_impl(
+    const array& input,
+    int position_offset,
+    int confirmed_tokens,
+    bool attention_only) {
     if (input.ndim() != 3 || input.shape(0) <= 0 ||
         input.shape(1) <= confirmed_tokens || confirmed_tokens <= 0 ||
         input.shape(2) != config_.hidden_size) {
@@ -842,7 +857,8 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
             tokens,
         });
     try {
-        return forward(input, position_offset, true);
+        return attention_only ? forward_attention(input, position_offset, true)
+                              : forward(input, position_offset, true);
     } catch (...) {
         convolution_state_ = speculative_rollback_->convolution_state;
         recurrent_state_ = speculative_rollback_->recurrent_state;

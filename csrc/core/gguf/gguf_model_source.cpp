@@ -322,9 +322,9 @@ std::string canonical_name(const std::string& name, const json* meta = nullptr) 
         if (suffix == "hc_ffn_fn.bias") return prefix + "mlp.mhc.pre.bias";
     }
     const auto found = names.find(suffix);
-    if (architecture == "qwen35") {
-        const auto predictors = meta->value("qwen35.nextn_predict_layers", json(0));
-        const auto blocks = meta->value("qwen35.block_count", json(0));
+    if (architecture == "qwen35" || architecture == "sensenova_loop") {
+        const auto predictors = meta->value(architecture + ".nextn_predict_layers", json(0));
+        const auto blocks = meta->value(architecture + ".block_count", json(0));
         if (predictors.is_number_integer() && blocks.is_number_integer() && predictors.get<int64_t>() == 1 &&
             blocks.get<int64_t>() > 1 && name.compare(4, dot - 4, std::to_string(blocks.get<int64_t>() - 1)) == 0) {
             static const std::map<std::string, std::string> predictor_names{
@@ -434,6 +434,23 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
     if (shapes.contains("model.token_embedding.weight"))
         config["vocab_size"] = shapes["model.token_embedding.weight"][0];
     config["tie_word_embeddings"] = !shapes.contains("model.output.weight");
+    if (arch == "hy_v4_flash") {
+        const auto records = number("block_count").get<int64_t>();
+        const auto nextn = number("nextn_predict_layers", 0).get<int64_t>();
+        const auto sliding = number("attention.sliding_window_pattern").get<std::vector<bool>>();
+        if (records <= 0 || nextn < 0 || nextn >= records || sliding.size() < static_cast<std::size_t>(records - nextn))
+            throw std::runtime_error("invalid Hy4 Flash GGUF attention schedule");
+        config["num_hidden_layers"] = records - nextn;
+        config["num_nextn_predict_layers"] = nextn;
+        config["head_dim"] = number("attention.key_length");
+        config["indexer_head_dim"] = number("attention.indexer.key_length");
+        config["indexer_compress_ratio"] = number("attention.indexer.kpool");
+        config["indexer_budget"] = number("attention.indexer.top_k");
+        config["sliding_window"] = number("attention.sliding_window");
+        config["layer_types"] = json::array();
+        for (int64_t i = 0; i < records - nextn; ++i)
+            config["layer_types"].push_back(sliding[i] ? "sliding_attention" : "full_attention");
+    }
     if (arch == "sensenova_loop" || arch == "inkling2_loop") {
         const bool sensenova = arch == "sensenova_loop";
         const auto begin = number("loop.start").get<int64_t>();
@@ -477,6 +494,24 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         }
         if (!sensenova) {
             config["sliding_window"] = number("attention.sliding_window");
+            config["head_dim"] = number("attention.key_length");
+            for (const char* name : {"num_attention_heads", "num_key_value_heads"}) {
+                auto heads = config.value(name, json());
+                if (heads.is_array() && !heads.empty() &&
+                    std::all_of(heads.begin(), heads.end(), [&](const json& count) { return count == heads.front(); }))
+                    config[name] = heads.front();
+            }
+            int64_t convolution_elements = 0;
+            for (const auto& id : config["layer_weight_ids"]) {
+                const auto prefix = "blk." + std::to_string(id.get<int64_t>()) + ".";
+                for (const char* name : {"attn_k_conv.weight", "attn_v_conv.weight",
+                    "attn_post_conv.weight", "ffn_post_conv.weight"}) {
+                    const auto weight = shapes.find(prefix + name);
+                    if (weight != shapes.end() && weight->size() == 2)
+                        convolution_elements += weight->at(0).get<int64_t>() * (weight->at(1).get<int64_t>() - 1);
+                }
+            }
+            config["shortconv_state_elements"] = convolution_elements;
         } else if (meta.contains(key("mhc.streams"))) {
             const auto mhc_start = number("mhc.start").get<int64_t>();
             const auto mhc_end = number("mhc.end").get<int64_t>();
@@ -510,14 +545,14 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         config["linear_value_head_dim"] = number("ssm.state_size", 128);
         config["linear_num_key_heads"] = number("ssm.group_count", 0);
         config["linear_num_value_heads"] = number("ssm.time_step_rank", 0);
-        if (arch == "qwen35") {
+        if (arch == "qwen35" || arch == "sensenova_loop") {
             const auto nextn = number("nextn_predict_layers", 0);
             if (!nextn.is_number_integer()) throw std::runtime_error("invalid GGUF NextN layer count");
             const auto predictors = nextn.get<int64_t>();
-            const auto blocks = config.value("num_hidden_layers", int64_t{0});
+            const auto blocks = number("block_count", 0).get<int64_t>();
             if (predictors < 0 || (predictors > 0 && predictors >= blocks))
                 throw std::runtime_error("invalid GGUF NextN layer count");
-            if (predictors > 0) config["num_hidden_layers"] = blocks - predictors;
+            if (predictors > 0 && arch == "qwen35") config["num_hidden_layers"] = blocks - predictors;
             config["mtp_num_hidden_layers"] = 0;
             config["mtp_use_dedicated_embeddings"] = shapes.contains("predictor.token_embedding.weight");
             int64_t available=0;
@@ -849,7 +884,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             }
             if (!meta.contains("general.architecture")) throw std::runtime_error("GGUF has no architecture");
             impl_->arch = meta["general.architecture"].get<std::string>();
-            if(impl_->arch=="qwen35")model_nextn=QwenNextn(ctx.get());
+            if (impl_->arch == "qwen35" || impl_->arch == "sensenova_loop")
+                model_nextn = QwenNextn(ctx.get(), impl_->arch);
             Gguf tokenizer(gguf_init_empty(), gguf_free);
             gguf_set_kv(tokenizer.get(), ctx.get());
             auto& asset = impl_->asset_data[kTokenizerGgufAsset];
@@ -862,7 +898,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         // indices still use that model-wide layer count on every shard.
         const bool qwen35_file=shard<model_shards?impl_->arch=="qwen35":
             architecture_key>=0 && scalar(ctx.get(),architecture_key)=="qwen35";
-        const QwenNextn nextn=qwen35_file?(shard<model_shards?model_nextn:QwenNextn(ctx.get())):QwenNextn();
+        const bool nextn_file = qwen35_file || (shard < model_shards && impl_->arch == "sensenova_loop");
+        const QwenNextn nextn=nextn_file?(shard<model_shards?model_nextn:QwenNextn(ctx.get())):QwenNextn();
         const bool qwen35_companion=shard>=model_shards && qwen35_file && nextn.layers>0;
         const bool qwen4_companion=shard>=model_shards && architecture_key>=0 &&
             scalar(ctx.get(),architecture_key)=="qwen4exp" &&
@@ -914,7 +951,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx.get()); ++i) {
             const auto* original = gguf_get_tensor_name(ctx.get(), i);
             const auto predictor_name=qwen4_companion?qwen4_nextn.name(original):
-                qwen35_file?nextn.name(original):std::optional<std::string>{};
+                nextn_file?nextn.name(original):std::optional<std::string>{};
             if((qwen35_companion || qwen4_companion) && !predictor_name)continue;
             const auto* tensor = ggml_get_tensor(tensors.get(), original);
             if (!tensor) throw std::runtime_error("GGUF tensor shape is missing");

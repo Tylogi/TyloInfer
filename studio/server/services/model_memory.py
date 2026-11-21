@@ -68,6 +68,8 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, pre
 
     try:
         maximum, layers = integer('max_position_embeddings'), integer('num_hidden_layers')
+        if kind in {'sensenova_loop', 'inkling2_loop'}:
+            layers = integer('num_hidden_visits')
         if min(maximum, layers) <= 0:
             return None
         fixed_components = []
@@ -95,7 +97,38 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, pre
                             bytes_per_row=count * index * 2, tokens_per_row=ratio))
             if any(value not in (0, 4, 128) for value in ratios[:layers]):
                 return None
-        elif kind in {'qwen4_exp', 'qwen4_exp_text', 'qwen3_5', 'qwen3_5_text', 'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next'}:
+        elif kind in {'hy_v4_flash', 'inkling2_loop'}:
+            types = text.get('layer_types')
+            if not isinstance(types, list) or len(types) != layers or any(
+                value not in ('sliding_attention', 'full_attention') for value in types
+            ):
+                return None
+            dim, window = integer('head_dim'), integer('sliding_window')
+            heads = integer('num_key_value_heads')
+            if min(dim, window, heads) <= 0:
+                return None
+            latent = kind == 'hy_v4_flash'
+            group, width = ('MLA', dim * 2) if latent else ('GQA', heads * dim * 4)
+            sliding, full = types.count('sliding_attention'), types.count('full_attention')
+            state(group, 'sliding_window', sliding, sliding * window * width)
+            if full:
+                components.append(ModelCacheComponent(group=group, name='latent_kv' if latent else 'raw_kv', layers=full,
+                    bytes_per_row=full * width, allocation='power_of_two', minimum_rows=16,
+                    head_dimension=dim, kv_heads=heads,
+                    max_read_rows_per_token=integer('indexer_budget') if latent else None))
+            if latent and full:
+                ratio, index = integer('indexer_compress_ratio'), integer('indexer_head_dim')
+                if min(ratio, index) <= 0:
+                    return None
+                state(group, 'indexer_tail', full, full * (ratio - 1) * index * 8)
+                state(group, 'indexer_selection', full, full * integer('indexer_budget') * 4)
+                components.append(ModelCacheComponent(group=group, name='indexer_pooled', subgroup='indexer', layers=full,
+                    bytes_per_row=full * index * 4, tokens_per_row=ratio, allocation='power_of_two',
+                    minimum_rows=16, row_rounding='floor'))
+            if not latent and include_recurrent:
+                state('GQA', 'short_convolution', layers, integer('shortconv_state_elements', 0) * 2)
+        elif kind in {'qwen4_exp', 'qwen4_exp_text', 'qwen3_5', 'qwen3_5_text', 'qwen3_5_moe', 'qwen3_5_moe_text',
+                      'qwen3_next', 'sensenova_loop'}:
             types = text.get('layer_types')
             if not isinstance(types, list):
                 interval = integer('full_attention_interval', 4)

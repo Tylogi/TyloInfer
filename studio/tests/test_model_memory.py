@@ -52,6 +52,32 @@ def test_regular_gqa_uses_kv_heads_and_two_byte_storage():
     assert profile.components[0].max_read_rows_per_token is None
 
 
+def test_loop_cache_profiles_count_execution_visits():
+    sense = cache_profile({'model_type': 'sensenova_loop', 'max_position_embeddings': 32768,
+        'num_hidden_layers': 32, 'num_hidden_visits': 56,
+        'layer_types': ['linear_attention'] * 42 + ['full_attention'] * 14,
+        'num_key_value_heads': 4, 'head_dim': 256}, include_recurrent=False, predictor_layers=1)
+    assert sense.fixed_bytes == 0 and sense.components[0].layers == 15
+
+    inkling = cache_profile({'model_type': 'inkling2_loop', 'max_position_embeddings': 1048576,
+        'num_hidden_layers': 24, 'num_hidden_visits': 48,
+        'layer_types': ['sliding_attention'] * 40 + ['full_attention'] * 8, 'sliding_window': 1024,
+        'num_key_value_heads': 8, 'head_dim': 128, 'shortconv_state_elements': 958464})
+    assert inkling.fixed_bytes == 40 * 1024 * 1024 * 4 + 958464 * 2
+    assert inkling.components[0].layers == 8 and inkling.components[0].bytes_per_row == 8 * 1024 * 4
+
+
+def test_hy4_profile_keeps_one_latent_row_and_pools_only_the_index_keys():
+    profile = cache_profile({'model_type': 'hy_v4_flash', 'max_position_embeddings': 1048576,
+        'num_hidden_layers': 42, 'layer_types': ['sliding_attention'] * 30 + ['full_attention'] * 12,
+        'head_dim': 576, 'num_key_value_heads': 1, 'sliding_window': 512,
+        'indexer_compress_ratio': 4, 'indexer_head_dim': 128, 'indexer_budget': 2048})
+    assert profile.fixed_bytes == 30 * 512 * 576 * 2 + 12 * (3 * 128 * 8 + 2048 * 4)
+    kv, index = profile.components
+    assert kv.bytes_per_row == 12 * 576 * 2 and kv.max_read_rows_per_token == 2048
+    assert index.bytes_per_row == 12 * 128 * 4 and index.tokens_per_row == 4 and index.row_rounding == 'floor'
+
+
 def test_incomplete_unknown_and_invalid_configs_do_not_fabricate_cache_estimates():
     for config in ({}, {'model_type': 'llama'}, {'model_type': 'unknown', 'max_position_embeddings': 4096, 'num_hidden_layers': 32},
                    {'model_type': 'llama', 'max_position_embeddings': -1, 'num_hidden_layers': 32},

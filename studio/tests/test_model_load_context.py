@@ -40,6 +40,12 @@ def test_non_sparse_model_ignores_sparse_only_invalid_combination():
         apply_load_context(request, 'qwen4_exp', 'cuda')
 
 
+def test_hy4_load_preserves_the_metal_ssd_kv_selection():
+    request = ModelLoadRequest(model='hy4', context_management={'automatic': False, 'ssd_kv': True})
+    result = apply_load_context(request, 'hy_v4_flash', 'metal')
+    assert result.qsa_kv_offload.enabled and not result.kv_quantization.enabled
+
+
 def test_explicit_settings_survive_context_defaults_and_legacy_requests_are_unchanged():
     legacy = ModelLoadRequest(model='test')
     assert apply_load_context(legacy, 'qwen4_exp', 'cuda') is legacy

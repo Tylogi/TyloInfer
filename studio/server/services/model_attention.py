@@ -27,7 +27,7 @@ def attention_profile(config: dict[str, Any]) -> ModelAttentionProfile | None:
         if qwen_hybrid or kind in {'glm5_next', 'glm5_next_text'}:
             return None
         hybrid = False
-    sparse_kinds = {'qwen4_exp', 'qwen4_exp_text', 'glm5_next', 'glm5_next_text',
+    sparse_kinds = {'qwen4_exp', 'qwen4_exp_text', 'glm5_next', 'glm5_next_text', 'hy_v4_flash',
         'glm_dsa', 'glm_moe_dsa', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'deepseek_v41_text'}
     dense_kinds = {'qwen2', 'qwen2_moe', 'qwen3', 'qwen3_moe', 'qwen3_5', 'qwen3_5_text',
         'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'llama', 'mistral', 'mixtral',

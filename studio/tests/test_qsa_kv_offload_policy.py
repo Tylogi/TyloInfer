@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -44,6 +45,18 @@ def test_requirement_includes_predictor_and_actual_index_storage(tmp_path):
     assert qsa_index_requirement(model, 262144) == 13 * (128 * (9 * 2 + 65536 * 4) + 2)
 
 
+def test_hy4_requirement_counts_only_target_index_pools(tmp_path):
+    model = replace(artifact(tmp_path), source_config={
+        "model_type": "hy_v4_flash", "max_position_embeddings": 1048576,
+        "num_hidden_layers": 42, "layer_types": ["full_attention"] * 12 + ["sliding_attention"] * 30,
+        "indexer_head_dim": 128, "indexer_compress_ratio": 4,
+        "num_key_value_heads": 1, "head_dim": 576,
+    }, source_tensors={"predictor.block.0.stub.weight": {}})
+    assert qsa_index_requirement(model, 8192, 256 << 10) == 12 * (128 * (18 + 8192) + 2)
+    with pytest.raises(ValueError, match="microblock I/O"):
+        qsa_index_requirement(model, 8192, 128 << 10)
+
+
 def test_yarn_extended_streaming_context_uses_the_enabled_model_limit(tmp_path, monkeypatch):
     model = artifact(tmp_path)
     pool = RuntimePool(ModelCatalog([]), tmp_path / 'native', backend='metal')
@@ -86,7 +99,7 @@ def test_impossible_microblock_buffer_is_rejected_before_reloading(tmp_path):
 def test_non_qsa_config_cannot_bypass_capability_with_its_name(tmp_path):
     model = artifact(tmp_path, "qwen3_5_text")
     pool = RuntimePool(ModelCatalog([]), tmp_path / "native", backend="metal")
-    with pytest.raises(JobExecutionError, match="QSA only"):
+    with pytest.raises(JobExecutionError, match="supported sparse attention model"):
         asyncio.run(pool._validate_qsa_kv_policy(model, QsaKvOffloadPolicy(enabled=True)))
 
 

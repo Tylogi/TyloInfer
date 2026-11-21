@@ -27,8 +27,11 @@ def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes:
     *, maximum_context: int | None = None, cuda: bool = False) -> int:
     config, has_predictor = _configuration(artifact)
     text = config.get("text_config", config)
-    if not isinstance(text, dict) or text.get("model_type") not in {"qwen4_exp", "qwen4_exp_text"}:
-        raise ValueError("KV offload currently supports QSA only")
+    model_type = text.get("model_type") if isinstance(text, dict) else None
+    if not isinstance(model_type, str) or (
+        model_type not in {"qwen4_exp", "qwen4_exp_text"} and (model_type != "hy_v4_flash" or cuda)
+    ):
+        raise ValueError("KV offload requires a supported sparse attention model")
 
     def integer(name: str, default: int | None = None) -> int:
         value: Any = text.get(name, default)
@@ -54,7 +57,7 @@ def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes:
     if not isinstance(types, list) or len(types) != count:
         raise ValueError("invalid QSA layer schedule")
     layers = types.count("full_attention")
-    if has_predictor:
+    if has_predictor and model_type != "hy_v4_flash":
         layers += integer("mtp_num_hidden_layers", 0)
     if not layers:
         raise ValueError("the model has no QSA layers")

@@ -962,6 +962,18 @@ void loop_model_sources(const std::filesystem::path& directory) {
         for (int64_t i = 0; i < ggml_nelements(tensor); ++i) data[i] = static_cast<float>(i);
         ggml_set_name(tensor, sensenova ? "blk.1.attn_qkv_gate.weight" : "blk.1.attn_gate.weight");
         gguf_add_tensor(file.get(), tensor);
+        if (sensenova) {
+            const auto add = [&](ggml_tensor* weight, const char* name) {
+                std::memset(weight->data, 0, ggml_nbytes(weight));
+                ggml_set_name(weight, name);
+                gguf_add_tensor(file.get(), weight);
+            };
+            add(ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 16, 8), "blk.6.nextn.eh_proj.weight");
+            add(ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 8, 16), "blk.6.attn_q.weight");
+            for (const char* name : {"blk.6.nextn.enorm.weight", "blk.6.nextn.hnorm.weight",
+                                     "blk.6.nextn.shared_head_norm.weight"})
+                add(ggml_new_tensor_1d(tensors.get(), GGML_TYPE_F32, 8), name);
+        }
         const auto path = directory / (arch + ".gguf");
         require(gguf_write_to_file(file.get(), path.string().c_str(), false), "loop GGUF write failed");
 
@@ -978,6 +990,8 @@ void loop_model_sources(const std::filesystem::path& directory) {
         require(source.find_tensor(sensenova ? "model.block.1.linear_attention.qkv_gate.weight" :
                     "model.block.1.attention.gate.weight"), "loop GGUF projection name mismatch");
         if (sensenova) {
+            require(config.at("mtp_num_hidden_layers") == 1 && source.find_tensor("predictor.block.0.attention.query.weight"),
+                "SenseNova NextN must be separate from the loop visits");
             const char* gate = "model.block.1.linear_attention.gate.weight";
             const char* qkv = "model.block.1.linear_attention.qkv.weight";
             require(*source.find_tensor(gate)->shape == std::vector<int64_t>{4, 8} &&
@@ -996,6 +1010,16 @@ void hy4_model_source(const std::filesystem::path& directory) {
     auto tensors = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
         ggml_init({1 << 16, nullptr, false}), ggml_free);
     gguf_set_val_str(file.get(), "general.architecture", "hy_v4_flash");
+    gguf_set_val_u32(file.get(), "hy_v4_flash.block_count", 3);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.nextn_predict_layers", 1);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.key_length", 576);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.sliding_window", 512);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.indexer.key_length", 128);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.indexer.kpool", 4);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.indexer.top_k", 2048);
+    const std::array<bool, 3> sliding{false, true, false};
+    gguf_set_arr_data(file.get(), "hy_v4_flash.attention.sliding_window_pattern", GGUF_TYPE_BOOL,
+        sliding.data(), sliding.size());
     for (const char* name : {"blk.0.attn_gate.weight", "blk.0.post_attention_norm.weight",
                              "blk.0.ffn_norm.weight", "blk.0.post_ffw_norm.weight"}) {
         auto* tensor = ggml_new_tensor_1d(tensors.get(), GGML_TYPE_F32, 8);
@@ -1010,6 +1034,10 @@ void hy4_model_source(const std::filesystem::path& directory) {
     const auto path = directory / "hy4.gguf";
     require(gguf_write_to_file(file.get(), path.string().c_str(), false), "Hy4 GGUF write failed");
     const mfq::GgufModelSource source(path);
+    const auto config = nlohmann::json::parse(source.model_config_json());
+    require(config.at("num_hidden_layers") == 2 && config.at("head_dim") == 576 &&
+        config.at("layer_types") == std::vector<std::string>{"full_attention", "sliding_attention"} &&
+        config.at("indexer_compress_ratio") == 4, "Hy4 GGUF IndexPool geometry mismatch");
     require(source.find_tensor("model.block.0.attention.post_norm.weight") &&
             source.find_tensor("model.block.0.attention.gate.weight") &&
             source.find_tensor("model.block.0.mlp.norm.weight") &&

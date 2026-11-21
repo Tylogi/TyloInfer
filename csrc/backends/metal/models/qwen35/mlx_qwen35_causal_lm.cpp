@@ -875,8 +875,6 @@ array MlxQwen35CausalLm::backbone_forward(
                 using Block = std::decay_t<decltype(block)>;
                 if (!loop_hyper_connections_.empty() && loop_hyper_connections_[layer_index]) {
                     const auto& connections = *loop_hyper_connections_[layer_index];
-                    if (speculative_confirmed > 0)
-                        throw std::runtime_error("SenseNova mHC requires serial verification");
                     auto residual = connections.enter ?
                         mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
                             Shape{batch, tokens, config_.loop_hyper_connection->streams, hidden.shape(-1)}) :
@@ -886,8 +884,12 @@ array MlxQwen35CausalLm::backbone_forward(
                         if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>)
                             return block.forward_attention(attention.branch,
                                 explicit_positions ? &*explicit_positions : nullptr, position, use_cache);
-                        else
+                        else {
+                            if (speculative_confirmed > 0)
+                                return block.forward_attention_speculative(
+                                    attention.branch, position, speculative_confirmed);
                             return block.forward_attention(attention.branch, position, use_cache);
+                        }
                     }();
                     residual = MlxHyperConnection::expand(residual, attended, attention);
                     const auto feed_forward = connections.feed_forward.collapse(residual);

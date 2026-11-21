@@ -12,6 +12,7 @@ from server.services.model_attention import attention_profile
     ({'model_type': 'glm_moe_dsa'}, (True, False, False)),
     ({'model_type': 'deepseek_v4', 'compress_ratios': [4, 128]}, (True, True, False)),
     ({'model_type': 'deepseek_v41_text', 'compress_ratios': [0, 2, 1]}, (True, True, False)),
+    ({'model_type': 'hy_v4_flash', 'layer_types': ['full_attention', 'sliding_attention']}, (True, False, False)),
 ])
 def test_attention_categories_follow_text_config(config, expected):
     result = attention_profile({'text_config': config, 'vision_config': {'model_type': 'vision'}})

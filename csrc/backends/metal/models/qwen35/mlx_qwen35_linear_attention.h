@@ -100,6 +100,8 @@ public:
 
     mlx::core::array forward_attention(const mlx::core::array& input,
         int position_offset, bool use_cache);
+    mlx::core::array forward_attention_speculative(
+        const mlx::core::array& input, int position_offset, int confirmed_tokens);
     mlx::core::array forward_feed_forward(const mlx::core::array& input) const {
         return ffn_.forward_normalized(input, ffn_norm_);
     }
@@ -145,6 +147,9 @@ public:
 private:
     void validate_components() const;
     void report_cache_resources() noexcept;
+    mlx::core::array forward_speculative_impl(
+        const mlx::core::array& input, int position_offset, int confirmed_tokens,
+        bool attention_only);
 
     Qwen35Config config_;
     bool gguf_layout_ = false;
