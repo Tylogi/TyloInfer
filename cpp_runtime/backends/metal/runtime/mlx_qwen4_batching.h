@@ -131,14 +131,13 @@ private:
     };
 
     static double three_lane_price(int rows) {
-        // Resident Flash-Next on M5 Max: median verification plus draft
-        // time at 2, 4, 6 and 8 rows per lane, with one row extrapolated.
-        // Only the relative costs affect the row allocation.
-        constexpr std::array knots{3, 6, 12, 18, 24};
-        constexpr std::array costs{27.3, 30.8, 38.0, 44.0, 49.1};
-        const auto end = std::lower_bound(knots.begin() + 1, knots.end() - 1, rows);
-        const auto i = static_cast<std::size_t>(end - knots.begin());
-        return std::lerp(costs[i - 1], costs[i], double(rows - knots[i - 1]) / (knots[i] - knots[i - 1]));
+        // Splash's measured three-lane step costs on resident Flash-Next
+        // and M5 Max. Use the cost of the padded row group, including jumps
+        // at tile boundaries.
+        constexpr std::array last_rows{3, 8, 9, 15, 16, 17, 24};
+        constexpr std::array cycle_ms{25.75, 27.58, 30.00, 32.93, 33.39, 37.07, 40.95};
+        const auto bucket = std::lower_bound(last_rows.begin(), last_rows.end() - 1, rows);
+        return cycle_ms[static_cast<std::size_t>(bucket - last_rows.begin())];
     }
 
     static double price(const Cost& c, int lanes, int rows) {
