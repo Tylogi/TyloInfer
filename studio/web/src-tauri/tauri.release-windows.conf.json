@@ -1,0 +1,28 @@
+{
+  "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "useLocalToolsDir": true,
+    "windows": {
+      "nsis": {
+        "compression": "zlib",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    },
+    "externalBin": [
+      "../../../packaging/sidecars/mfq-runtime"
+    ],
+    "resources": {
+      "../dist": "web-ui",
+      "../../../packaging/windows-runtime/": "",
+      "../../../packaging/Resources/tyloinfer-server": "tyloinfer-server",
+      "../../../packaging/Resources/licenses": "licenses"
+    }
+  }
+}

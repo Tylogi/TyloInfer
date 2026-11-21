@@ -4,7 +4,7 @@ The TyloInfer Agent product runs the complete official DSH Host with external Ty
 
 ## Retired Python facade
 
-The earlier `/api/v1/agent` task and display-settings facade is no longer mounted by the inference core. Its source was moved outside the inference package to a non-distributed compatibility-test directory under `plugins/tyloinfer-host/legacy-python/`. It is not an alternative shipping Agent implementation and is excluded from the Host bundle's package file list.
+The earlier `/api/v1/agent` task and display-settings facade is no longer mounted by the inference core. Its source was moved outside the inference package to a non-distributed compatibility-test directory under `plugins/host/legacy-python/`. It is not an alternative shipping Agent implementation and is excluded from the Host bundle's package file list.
 
 The former `agent` Python extra and instructions to start a second SDK settings carrier do not apply to the supported product. Core health, inference, model management, jobs, sessions and standalone Studio APIs remain independent of DSH. Native Agent access uses the authenticated Host entry, not the core origin.
 

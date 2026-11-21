@@ -1,0 +1,19 @@
+{
+  "name": "@tyloinfer/dsh-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "dsh": "0.2.2-rc.2" },
+  "exports": { ".": "./lib/index.js", "./client": "./lib/client.js" },
+  "files": ["lib", "cordis.patch.yml", "README.md"],
+  "scripts": { "build": "node build.mjs", "test": "node build.mjs && node --test tests/*.test.mjs" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-modules", "@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-settings-general", "@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  },
+  "peerDependencies": { "@deepseek-ai/cordis": "~4.1.0", "react": "^18.2.0" }
+}

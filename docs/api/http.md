@@ -2,7 +2,7 @@
 
 TyloInfer Server provides a persistent HTTP API for TyloInfer, scripts, and SDKs.
 The machine-readable contract is
-[`tyloinfer/server/protocol/openapi.json`](../../tyloinfer/server/protocol/openapi.json); it
+[`studio/server/protocol/openapi.json`](../../studio/server/protocol/openapi.json); it
 defines all fields, constraints, and response schemas.
 
 Default server address:
@@ -562,7 +562,7 @@ it is forwarded only for CUDA artifacts marked `structured_decisions`.
 Send this body to the same `/api/v1/models/load` endpoint and wait for the
 instance to become `ready`. Use [the decision endpoint](#82-structured-decisions)
 only with a supported decision model. For equivalent startup loading, see
-[`--jev-weights`](../cli/serve.md#jev-decision-model-weight-placement).
+[`--jev-weights`](../serve.md#jev-decision-model-weight-placement).
 
 Pinning and idle TTL can be changed on a resident instance without reloading
 it. The updated policy is also retained for later request-driven reloads.
@@ -705,7 +705,7 @@ The CUDA and Metal runtimes serve D3 text and JSON decisions on this route
 from Qwen3.5 checkpoints with a trained HF decision head or D3 GGUF metadata.
 Metal keeps D3 weights resident. D3 image and video decisions, Box, and Track
 are outside the text API. The CUDA and Metal d1 text adapters share this
-route and the managed model lifecycle. See [d1 setup and limitations](../cli/d1-native.md#managed-serving).
+route and the managed model lifecycle. See [the serving guide](../serve.md).
 
 The managed runtime must be ready and idle. Readiness is checked first: a runtime
 in `BUSY` state (including an active chat request) or otherwise not `READY`

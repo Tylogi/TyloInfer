@@ -1,13 +1,7 @@
-
-references/
-.tyloinfer-agent-runtime/
-/research/ds-bot/
-
 # ---- Python ----
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 *.egg
 *.egg-info/
 .eggs/
@@ -17,14 +11,10 @@ develop-eggs/
 pip-wheel-metadata/
 wheels/
 MANIFEST
-
-
 .venv/
 venv/
 env/
 ENV/
-
-
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -33,19 +23,21 @@ ENV/
 htmlcov/
 .tox/
 
+# ---- Node (pnpm) ----
+node_modules/
+.pnpm-store/
 
+# ---- Editors and OS ----
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-
 .DS_Store
 Thumbs.db
 desktop.ini
 
-
+# ---- Native build (CMake, Metal, CUDA) ----
 *.obj
 *.o
 *.a
@@ -59,28 +51,5 @@ CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
 
-
-*.log
-tmp/
-runs/
-.remote_modelscope_parallel_download.sh
-.transfer_*
-.mfq/
+# ---- local scratch ----
 .tyloinfer/
-packaging/docker/deploy.env
-
-
-/models/
-data/*
-*.gguf
-*.mfq
-*.tq
-*.safetensors
-*.logits
-*.sqlite
-*.sqlite3
-*.pt
-*.pth
-docs/benchmarks/
-*.jsonl
-/vendor/dsh/runtime/node_modules/

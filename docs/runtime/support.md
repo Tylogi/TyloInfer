@@ -40,7 +40,7 @@ the backbone from loading.
 - GGUF and TQ checkpoints are public model-file inputs; `.mfq` remains a
   recognized suffix for the shared `MFQ1` container. File recognition does not
   imply support for every tensor type or graph. Legacy NINT/NVQ/MFE/SQ operators
-  require an explicit [compatibility build](../cli/build.md#native-format-profiles)
+  require an explicit [compatibility build](../build.md#native-format-profiles)
   and must not be assumed present in the default runtime.
 - A backend-neutral model-source contract exposes direct TQ/MFQ-container and
   native HF Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
@@ -105,5 +105,5 @@ stubbed.
 MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).
 
-Build requirements and backend selection: [`tyloinfer build`](../cli/build.md).
-Serving and model-pool configuration: [`tyloinfer serve`](../cli/serve.md).
+Build requirements and backend selection: [build the C++ runtime](../build.md).
+Serving and model-pool configuration: [`python -m serve`](../serve.md).
