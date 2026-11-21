@@ -123,7 +123,7 @@ def test_independent_host_external_api_and_cold_restart(tmp_path):
                     assert process.poll() is None, "isolated Host exited before readiness"
                     assert time.monotonic() < deadline, "isolated Host readiness deadline exceeded"
                     time.sleep(0.1)
-                subprocess.run([node, "../plugins/host/tests/independent-host-smoke.mjs", str(state), phase],
+                subprocess.run([node, str(root / "plugins/host/tests/independent-host-smoke.mjs"), str(state), phase],
                     cwd=root / "studio/web", env=environment, check=True, timeout=40)
                 stop()
         assert len(models) >= 2 and all(model == "fixture-external-model" for model in models)
