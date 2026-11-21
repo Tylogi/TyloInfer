@@ -1,4 +1,5 @@
 #include "mlx_inkling2.h"
+#include "mlx_moe_ops.h"
 
 #include "mfq_container.h"
 #include "mlx_gguf_layer_tensors.h"
@@ -61,10 +62,66 @@ struct Controller {
 array short_convolution(const array& input, const array& weight,
     std::optional<array>& state, const std::optional<array>& dynamic = std::nullopt) {
     const int batch = input.shape(0), tokens = input.shape(1), channels = input.shape(2);
+    if (weight.ndim() != 2 || weight.shape(0) != channels || weight.shape(1) <= 0)
+        throw std::invalid_argument("Inkling short convolution filter dimensions disagree");
     const int taps = weight.shape(1);
-    const auto history = concatenate({state.value_or(zeros({batch, taps - 1, channels}, input.dtype())), input}, 1);
-    auto output = astype(input, float32);
+    const Shape state_shape{batch, taps - 1, channels};
     const int groups = dynamic ? dynamic->shape(-1) / taps : 1;
+    if ((state && state->shape() != state_shape) || (dynamic && (groups < 1 || channels % groups ||
+        dynamic->shape() != Shape{batch, tokens, groups * taps})))
+        throw std::invalid_argument("Inkling short convolution state or group dimensions disagree");
+    const auto previous = state ? *state : zeros(state_shape, input.dtype());
+    if (default_device() == Device::gpu && taps >= 2 && taps <= 16 &&
+        (input.dtype() == float16 || input.dtype() == bfloat16)) {
+        static const auto kernel = [] {
+            CompileOptions options;
+            options.math_mode = MathMode::Safe;
+            return fast::metal_kernel("tyloinfer_inkling_short_convolution",
+                {"source", "filter", "previous", "adjust"}, {"output", "next_state"}, R"MSL(
+                const uint channel = thread_position_in_grid.x;
+                const uint tokens = uint(source_shape[1]);
+                const uint channels = uint(source_shape[2]);
+                if (channel >= channels) return;
+                const uint rows = metal::max(tokens, uint(TAPS - 1));
+                const uint batch = thread_position_in_grid.y / rows;
+                const uint row = thread_position_in_grid.y % rows;
+                const ulong source_base = ulong(batch) * tokens * channels + channel;
+                const ulong state_base = ulong(batch) * (TAPS - 1) * channels + channel;
+                if (row < tokens) {
+                    float value = float(source[source_base + ulong(row) * channels]);
+                    for (uint tap = 0u; tap < TAPS; ++tap) {
+                        const uint at = row + tap;
+                        const float sample = at < TAPS - 1
+                            ? float(previous[state_base + ulong(at) * channels])
+                            : float(source[source_base + ulong(at - (TAPS - 1)) * channels]);
+                        value += sample * filter[ulong(channel) * TAPS + tap];
+                        if (DYNAMIC) {
+                            const uint group = channel / (channels / GROUPS);
+                            const ulong offset = ((ulong(batch) * tokens + row) * GROUPS + group) * TAPS;
+                            value += sample * float(adjust[offset + (TAPS - 1 - tap)]);
+                        }
+                    }
+                    output[source_base + ulong(row) * channels] =
+                        T(value / metal::precise::sqrt(float((DYNAMIC ? 2 : 1) * TAPS + 1)));
+                }
+                if (row < TAPS - 1) {
+                    const uint at = tokens + row;
+                    next_state[state_base + ulong(row) * channels] = at < TAPS - 1
+                        ? previous[state_base + ulong(at) * channels]
+                        : source[source_base + ulong(at - (TAPS - 1)) * channels];
+                }
+                )MSL", "", true, false, options);
+        }();
+        auto outputs = kernel({input, weight, previous, dynamic ? *dynamic : zeros({2}, float32)},
+            {input.shape(), state_shape}, {input.dtype(), input.dtype()},
+            {channels, batch * std::max(tokens, taps - 1), 1}, {std::min(channels, 256), 1, 1},
+            {{"T", input.dtype()}, {"TAPS", taps}, {"DYNAMIC", int(dynamic.has_value())}, {"GROUPS", groups}},
+            std::nullopt, false, {});
+        state = std::move(outputs.at(1));
+        return std::move(outputs.at(0));
+    }
+    const auto history = concatenate({previous, input}, 1);
+    auto output = astype(input, float32);
     const auto adjustment = dynamic ?
         std::optional<array>(reshape(astype(*dynamic, float32), {batch, tokens, groups, taps})) : std::nullopt;
     for (int tap = 0; tap < taps; ++tap) {
@@ -177,20 +234,14 @@ struct Layer {
 
     array mixture(const array& input, const Geometry& g) const {
         const auto dims = input.shape();
-        auto flat = reshape(input, {-1, g.hidden});
-        auto probability = sigmoid(astype(router(flat), float32));
-        auto score = router_bias ? probability + *router_bias : probability;
-        auto ids = slice(argpartition(-score, g.routes - 1, -1),
-            {0, 0}, {flat.shape(0), g.routes});
-        auto weights = take_along_axis(probability, ids, -1);
-        weights = weights * array(g.expert_scale) /
-            maximum(sum(weights, -1, true), array(0.00006103515625f));
-        auto projected = astype(gate_up.routed_matmul(flat, ids, true), float32);
+        const auto flat = reshape(input, {-1, g.hidden});
+        const auto route = moe_sigmoid_topk(router(flat), g.routes, router_bias, g.expert_scale);
+        auto projected = astype(gate_up.routed_matmul(flat, route.ids, true), float32);
         const auto split_at = projected.shape(-1) / 2;
         auto parts = split(projected, Shape{split_at}, -1);
         auto activated = tanh(parts[0] / g.situ) * sigmoid(parts[0]) *
             tanh(parts[1] / g.situ_linear) * (g.situ * g.situ_linear);
-        return reshape(down.routed_weighted_matmul(astype(activated, input.dtype()), ids, weights), dims);
+        return reshape(down.routed_weighted_matmul(astype(activated, input.dtype()), route.ids, route.weights), dims);
     }
 };
 
