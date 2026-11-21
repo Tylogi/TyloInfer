@@ -114,6 +114,7 @@ endif()
 
 mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
+target_compile_features(mfq-model-source-test PRIVATE cxx_std_20)
 mfq_add_core_test(tyloinfer-mlx-affine-source-test mlx_affine_model_source_test.cpp)
 target_link_libraries(tyloinfer-mlx-affine-source-test PRIVATE mfq-json)
 mfq_add_core_test(tyloinfer-gguf-model-source-test gguf_model_source_test.cpp)

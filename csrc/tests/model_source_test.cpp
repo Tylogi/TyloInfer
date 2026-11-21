@@ -647,7 +647,7 @@ int main() {
         require(hf_source.has_asset("__mfq_asset__/model_graph.json"),
                 "HF graph asset is missing");
         require(hf_source.find_tensor("model.token_embedding.weight")->shape ==
-                    std::optional<std::vector<std::int64_t>>({1}),
+                    std::optional<std::vector<std::int64_t>>(std::vector<std::int64_t>{1}),
                 "HF tensor shape was lost");
         const auto dense_cross = hf_source.read(
             "model.token_embedding.weight", 11, 3);
