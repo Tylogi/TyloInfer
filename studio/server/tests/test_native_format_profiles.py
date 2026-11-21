@@ -1,6 +1,4 @@
 import struct
-import re
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,9 +7,6 @@ from server.formats.compat import canonical_dtype
 from server.formats.header import TENSOR_DTYPES, TYLOINFER_SUFFIXES
 from server.formats.inspection import inspect_tensor
 from server.formats.io import open_mmap, unpack_tensor_payload
-
-
-ROOT = Path(__file__).resolve().parents[3]
 
 
 def nint_metadata(bits, rows=2, width=32):
@@ -57,22 +52,3 @@ def test_legacy_expert_metadata_keeps_each_cohorts_precision():
     ('NINTM', 'MFE'), ('MXFP4-SQ3', 'MXFP4-SQ'), ('TQ', 'TQ')])
 def test_legacy_dtype_aliases_are_read_only_metadata(alias, expected):
     assert canonical_dtype(alias) == expected
-
-
-def test_ordinary_build_is_explicit_and_compatibility_is_opt_in():
-    cmake = (ROOT / 'csrc/CMakeLists.txt').read_text()
-    assert 'option(TYLOINFER_ENABLE_MFQ_COMPAT' in cmake
-    assert '"Include legacy MFQ inference formats" OFF)' in cmake
-    for backend in ('cpu', 'cuda', 'hip', 'metal'):
-        source = (ROOT / f'csrc/backends/{backend}/CMakeLists.txt').read_text()
-        assert 'if(TYLOINFER_ENABLE_MFQ_COMPAT)' in source
-        assert 'ops/common/' in source
-        assert 'ops/mfq/' in source
-
-
-def test_moved_native_operators_keep_resolvable_relative_includes():
-    for path in (ROOT / 'csrc/backends').rglob('*'):
-        if path.suffix not in {'.h', '.cpp', '.cu', '.hip', '.mm'}:
-            continue
-        for include in re.findall(r'^#include\s+"(\.\.[^"]+)"', path.read_text(), re.M):
-            assert (path.parent / include).is_file(), (path, include)

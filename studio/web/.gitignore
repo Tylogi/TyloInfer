@@ -1,6 +1,3 @@
-node_modules
-.pnpm-store/
-dist/
 artifacts/
 playwright-report/
 test-results/
@@ -11,6 +8,3 @@ src-tauri/gen/
 src-tauri/icons/
 src-tauri/target/
 
-
-!src/features/models/
-!src/features/models/**

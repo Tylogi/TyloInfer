@@ -23,6 +23,18 @@ def budget(tmp_path, monkeypatch):
     return DiskBudget()
 
 
+@pytest.fixture
+def budget_real_volume(tmp_path, monkeypatch):
+    """Same budget root, without the fake free space.
+
+    The native prefix cache and QSA KV store call std::filesystem::space, so a
+    reservation has to be sized against the volume's real free space or the
+    guard decision depends on how full the test machine's disk is.
+    """
+    monkeypatch.setenv('TYLOINFER_DISK_BUDGET_DIR', str(tmp_path / 'reservations'))
+    return DiskBudget()
+
+
 def test_concurrent_downloads_cannot_reserve_the_same_space(budget, tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, 'disk_usage', lambda path: SimpleNamespace(free=100))
     def reserve():
@@ -212,17 +224,21 @@ int main(int argc, char** argv) {
 }
 '''
     result = subprocess.run([compiler, '-std=c++17', '-pthread', '-Wno-deprecated-declarations',
+        # shortcut: this .cpp list mirrors the mfq-core sources the two entry points need;
+        # extend it when the prefix cache or KV store gains another dependency.
         '-I' + str(root / 'csrc/core'), '-I' + str(root / 'csrc/core/include'),
         '-x', 'c++', '-', str(root / 'csrc/core/mfq_paged_prefix_cache.cpp'),
-        str(root / 'csrc/core/qsa_kv_store.cpp'), '-o', str(output),
+        str(root / 'csrc/core/qsa_kv_store.cpp'), str(root / 'csrc/core/file_range_reader.cpp'),
+        str(root / 'csrc/core/host_copy.cpp'), str(root / 'csrc/core/host_parallel.cpp'),
+        '-o', str(output),
         *(['-lcrypto'] if sys.platform != 'darwin' else [])], input=source, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     return output
 
 
-def test_native_prefix_and_active_kv_respect_python_download_reservation(budget, tmp_path, native_writer):
+def test_native_prefix_and_active_kv_respect_python_download_reservation(budget_real_volume, tmp_path, native_writer):
     free = shutil.disk_usage(tmp_path).free
-    reservation = budget.reserve(tmp_path, free + (1 << 30), reclaimable=1 << 30)
+    reservation = budget_real_volume.reserve(tmp_path, free + (1 << 30), reclaimable=1 << 30)
     try:
         result = subprocess.run([str(native_writer), str(tmp_path)], capture_output=True, text=True, timeout=10, check=True)
         assert result.stdout.startswith('0 ')

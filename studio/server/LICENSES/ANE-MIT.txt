@@ -1,6 +1,10 @@
+The private ANE interface and dynamic MIL matmul layout are adapted from
+https://github.com/maderix/ANE (training/ane_runtime.h and
+training/training_dynamic/mil_dynamic.h).
+
 MIT License
 
-Copyright (c) 2026 DeepSeek
+Copyright (c) 2026 maderix
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

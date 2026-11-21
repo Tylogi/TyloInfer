@@ -125,8 +125,6 @@ mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-quant-expert-range-test quant_expert_range_test.cpp)
 mfq_add_core_test(mfq-host-parallel-test host_parallel_test.cpp)
 mfq_add_core_test(mfq-cpu-expert-pool-test cpu_expert_pool_test.cpp)
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-endif()
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 
 # RADIO cropped-position geometry: backend-neutral, no CUDA or weights needed.

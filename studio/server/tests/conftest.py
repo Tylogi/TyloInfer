@@ -7,6 +7,10 @@ import sys
 
 import pytest
 
+# The Agent host launcher lives in the repository's own scripts/ directory; make it
+# importable no matter which directory pytest is started from.
+sys.path.append(str(Path(__file__).resolve().parents[3]))
+
 
 @pytest.fixture(autouse=True)
 def windows_test_capabilities(tmp_path_factory):

@@ -198,7 +198,7 @@ def open_existing(state_root: Path, port: int, opener=None) -> None:
 def main(argv: list[str] | None = None) -> int:
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime-root", type=Path, default=repo / "dsh" / "runtime")
+    parser.add_argument("--runtime-root", type=Path, default=repo / "dsh")
     parser.add_argument("--plugins-root", type=Path, default=repo / "plugins")
     parser.add_argument("--state-root", type=Path, required=True, help="Private profile and workspace directory")
     parser.add_argument("--core-url", default="http://127.0.0.1:8090/v1", help="Initial endpoint for a new profile only")

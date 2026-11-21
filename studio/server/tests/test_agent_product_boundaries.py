@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +11,6 @@ import httpx
 from server.tests.test_server_service import FakeBackend
 from server.server.api import create_app
 from server.server.protocol.models import ErrorDetail
-from server.server.services.download_policy import apply_download_policy
 from server.server.services.service import ServerService
 from server.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
 from server.server.state.storage import SessionStore
@@ -77,29 +75,5 @@ def test_native_job_archive_is_atomic_for_terminal_records_and_preserves_files(t
             assert preserved.read_bytes() == b"fixture"
         finally:
             await service.aclose()
-
-    asyncio.run(run())
-
-
-def test_preview_download_policy_changes_only_registration_in_isolated_state(tmp_path, monkeypatch):
-    root = Path(__file__).resolve().parents[3]
-    spec = importlib.util.spec_from_file_location("isolated_preview_factory", root / "references" / "agent-preview-server.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "apply_download_policy", lambda paths, mode: apply_download_policy(paths, mode, module_available=lambda _name: True))
-
-    async def run():
-        for mode, expected in (("disabled", set()), ("enabled", {"download.huggingface", "download.modelscope"})):
-            service = module.create_preview_service(tmp_path / mode, mode)
-            try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
-                    response = await client.get("/api/v1/jobs/kinds")
-                    assert response.status_code == 200
-                    kinds = {row["kind"] for row in response.json()["data"] if row["kind"].startswith("download.")}
-                    assert kinds == expected
-                    assert (await client.get("/api/v1/runtime/instances")).json()["data"] == []
-                assert not list((tmp_path / mode / "models").iterdir())
-            finally:
-                await service.aclose()
 
     asyncio.run(run())

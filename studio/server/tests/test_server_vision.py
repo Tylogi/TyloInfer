@@ -14,7 +14,6 @@ from threading import Event as ThreadEvent
 import httpx
 import numpy as np
 import pytest
-import torch
 from PIL import Image
 
 from server.server.vision import decode as vision_module
@@ -166,6 +165,7 @@ def _decode_binary_tensor(tensors: dict[str, object], name: str) -> np.ndarray:
 
 
 def test_patch_layout_matches_official_torch_unfold() -> None:
+    torch = pytest.importorskip("torch")
     height, width = 42, 70
     pixels = np.arange(height * width * 3, dtype=np.uint32)
     pixels = (pixels % 256).astype(np.uint8).reshape(height, width, 3)
@@ -183,6 +183,7 @@ def test_patch_layout_matches_official_torch_unfold() -> None:
 
 
 def test_deepseek_v4_processor_matches_official_patch_layout() -> None:
+    torch = pytest.importorskip("torch")
     class TinyProcessor(DeepseekV4VisionProcessor):
         minimum_pixels = 0
 
@@ -699,6 +700,7 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
 
 
 def test_audio_request_builds_exact_mel_and_placeholder_contract() -> None:
+    pytest.importorskip("transformers")  # optional minicpmo45 extra
     sample_rate = 16_000
     samples = np.arange(sample_rate, dtype=np.float32)
     waveform = np.sin(samples * np.float32(2.0 * np.pi * 220.0 / sample_rate))

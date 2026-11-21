@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
 from server.formats import io
 from server.formats.assets import (
@@ -122,6 +121,7 @@ def test_hf_runtime_assets_require_tokenizer_pair(tmp_path: Path) -> None:
 
 
 def test_minicpmo45_resampler_position_asset_matches_official_numpy_bf16() -> None:
+    torch = pytest.importorskip("torch")
     asset = minicpmo45_resampler_pos_embed_asset(
         max_size=(2, 3), embed_dim=8
     )

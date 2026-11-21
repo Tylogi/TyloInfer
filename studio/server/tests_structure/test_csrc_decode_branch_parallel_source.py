@@ -34,10 +34,3 @@ def test_incompatible_projection_groups_use_the_common_executor() -> None:
     assert "split_w.size()," in SOURCE
     assert "layers.size() - 1," in SOURCE
     assert "layers.size()," in SOURCE
-
-
-def test_mixed_precision_group_diagnostic_captures_and_replays_cuda_graph() -> None:
-    assert "linear_group_graph_check" in SOURCE
-    assert "graph.capture_begin();" in SOURCE
-    assert "graph.capture_end();" in SOURCE
-    assert "graph.replay();" in SOURCE

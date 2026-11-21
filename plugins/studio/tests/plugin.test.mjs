@@ -44,7 +44,9 @@ test('uses a lazy Host factory with external React and preserves the native root
     assert.deepEqual(scope.registrations.map(row => row.options.name), ['sidebar.brand.mark', 'sidebar.brand.name', 'conversation.hero.brand.mark', 'shell.overlay', 'settings.launcher', 'main', 'shell.overlay']);
     assert.equal(scope.registrations.find(row => row.options.name === 'main').options.key, 'tyloinfer.inference');
     assert.equal(scope.registrations.find(row => row.options.name === 'settings.launcher').options.priority, -100);
-    assert.ok(!/createRoot|react-dom|startRun|createSession/.test(artifact));
+    // The unminified artifact carries module path comments, so match the calls
+    // that would mean a bundled React runtime, not the word "react-dom".
+    assert.ok(!/createRoot|startRun|createSession/.test(artifact));
     assert.equal(scope.styles.size, 1);
     assert.equal(scope.classes.has('tylo-studio-product'), true);
     assert.equal(scope.tokens(), true);

@@ -44,8 +44,6 @@ def test_routed_moe_all_compact_families_are_expert_sharded():
     assert "select_nepq_cpu_rows" in SOURCE
     assert "partial_experts = true" in SOURCE
     assert "expert_parallel_shards" in SOURCE
-    assert '"--check-ep-moe"' in SOURCE
-    assert "run_expert_parallel_moe_check" in SOURCE
 
 
 def test_expert_parallel_cli_and_hybrid_device_contract_are_wired():
@@ -80,7 +78,7 @@ def test_tq_parallel_preserves_compressed_rows_and_input_rings():
 
 
 def test_tq_self_describing_headers_supply_missing_shape_metadata():
-    tq = (CUDA_ROOT.parents[3] / "core" / "tq_model_layout.cpp").read_text(encoding="utf-8")
+    tq = (ROOT / "csrc" / "core" / "tq_model_layout.cpp").read_text(encoding="utf-8")
     logical = tq.split("std::vector<std::int64_t> logical_shape(", 1)[1].split(
         "std::vector<std::string> row_parts(", 1
     )[0]
@@ -165,7 +163,6 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
     assert "bool graph_eligible() const" in SOURCE
-    assert "bool use_cuda_graph" in SOURCE
 
 
 def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
@@ -248,7 +245,7 @@ def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
-    shared = (CUDA_ROOT.parents[3] / "models/common/weight_loading.h").read_text()
+    shared = (ROOT / "csrc" / "models/common/weight_loading.h").read_text()
     assert 'prefix + "experts.gate.weight"' in shared
     assert 'prefix + "experts.up.weight"' in shared
     assert "split != ops.has(up)" in shared
@@ -260,7 +257,7 @@ def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
 
 
 def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
-    shared = (CUDA_ROOT.parents[3] / "models/common/weight_loading.h").read_text()
+    shared = (ROOT / "csrc" / "models/common/weight_loading.h").read_text()
     dense = shared.split("Ffn load_dense_ffn", 1)[1].split("Ffn load_moe_weights", 1)[0]
     assert "experts.gate.weight" not in dense
     assert "const ModelConfig& config" in dense

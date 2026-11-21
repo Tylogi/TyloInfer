@@ -245,7 +245,7 @@ __global__ void merge(const float* partial, float* output, int count, int dimens
     for (int i = 0; i < Values; ++i) if (lane + i * 32 < dimension)
         output[std::int64_t(item) * dimension + lane + i * 32] = rounded(mass > 0 ? accumulator[i] / mass : 0.f);
 }
-// GPU chain scheduling follows ExLlamaV3 (MIT; ../../../third_party/exllamav3.LICENSE).
+// GPU chain scheduling follows ExLlamaV3 (MIT; LICENSES/exllamav3-MIT.txt).
 // Keep the predecessor chain on the GPU.
 // Dot-product order and tie rules here match this backend's existing selector.
 template<bool CompactSuccessor>

@@ -1,9 +1,11 @@
+"""Desktop package layout and the Rust shell's declared wiring.
 
-
-
-
-
-
+The TypeScript side of the desktop client is tested by the web suite
+(``npm --prefix studio/web test``); nothing here reads ``.ts``/``.tsx``. The Rust
+side stays as a content guard because the Tauri crate needs GTK/WebKit system
+libraries, so ``cargo test`` does not run on every host. Move these checks into
+``src-tauri`` when a Rust test job exists.
+"""
 
 import json
 from pathlib import Path
@@ -13,16 +15,6 @@ STUDIO = ROOT / "studio/web"
 TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
-STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
-PLATFORM_BRIDGE = STUDIO / "src" / "shared" / "platform" / "studio.ts"
-if PLATFORM_BRIDGE.exists():
-    STUDIO_BRIDGE += "\n" + PLATFORM_BRIDGE.read_text(encoding="utf-8")
-MODEL_BROWSER = (
-    STUDIO / "src" / "features" / "models" / "ModelBrowser.tsx"
-).read_text(encoding="utf-8")
-UPDATE_MANAGER = (
-    STUDIO / "src" / "features" / "settings" / "UpdateManager.tsx"
-).read_text(encoding="utf-8")
 UPDATER = (TAURI / "src" / "updater.rs").read_text(encoding="utf-8")
 
 
@@ -77,56 +69,35 @@ def test_studio_keeps_web_ui_available_on_the_server_listener():
         assert config["bundle"]["resources"]["../dist"] == "web-ui"
 
 
-def test_studio_supports_local_and_remote_server_connections_with_voice_controls():
-    for command in ('studio_configure', 'studio_start_local', 'studio_select_model_directory'):
+def test_studio_supports_local_and_remote_server_connections():
+    for command in ("studio_configure", "studio_start_local", "studio_select_model_directory"):
         assert command in RUST
 
 
 def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
-    assert 'rfd::AsyncFileDialog::new()' in RUST
-    assert '.pick_folder()' in RUST
-    assert "tauri.invoke('studio_select_model_directory', { initialDirectory })" in STUDIO_BRIDGE
-    assert '.set_directory(initial_directory)' in RUST
-    assert 'path: path.to_string()' in RUST
+    assert "rfd::AsyncFileDialog::new()" in RUST
+    assert ".pick_folder()" in RUST
+    assert ".set_directory(initial_directory)" in RUST
+    assert "path: path.to_string()" in RUST
 
 
 def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert "fn studio_confirm(message: String) -> bool" in RUST
     assert "rfd::MessageButtons::YesNo" in RUST
     assert "studio_confirm," in RUST
-    assert "tauri.invoke<boolean>('studio_confirm', { message })" in STUDIO_BRIDGE
-
-
-def test_model_hub_resolves_links_and_downloads_selected_variants():
-    community = (STUDIO / "src" / "features" / "models" / "CommunityModelBrowser.tsx").read_text(encoding="utf-8")
-    assert "modelsApi.resolveHubModel(reference, provider, controller.signal)" in community
-    assert (
-        'destination: `${repositoryDownloadPath(source)}${sharedEngram ? "" : `/${variantPath}`}`'
-        in MODEL_BROWSER
-    )
-    assert "return `models/${source.provider}/${source.repo_id.split('/').map(safeSegment).join('/')}`" in MODEL_BROWSER
-    assert "downloadPatterns(variant)" in MODEL_BROWSER
-    assert "jobsApi.createJob" in MODEL_BROWSER
-    assert "selectedOfficial" in MODEL_BROWSER
-    assert "<CommunityModelBrowser" in MODEL_BROWSER
-    assert 'tr("内存压力", "Memory pressure")' not in MODEL_BROWSER
-    assert "not model capability or quality" not in MODEL_BROWSER
-    assert "三星推荐" not in MODEL_BROWSER
-    assert "3-star recommendation" not in MODEL_BROWSER
-    for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
-        assert symbol not in MODEL_BROWSER
 
 
 def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
-    assert "studio_update_status" in RUST
-    assert "studio_update_download" in RUST
-    assert "studio_update_install" in RUST
-    assert "studio_update_delete" in RUST
-    assert "studio_update_progress" in RUST
+    for command in (
+        "studio_update_status",
+        "studio_update_download",
+        "studio_update_install",
+        "studio_update_delete",
+        "studio_update_progress",
+    ):
+        assert command in RUST
     assert "api.github.com/repos/Tylogi/TyloInfer/releases" in UPDATER
     assert "release SHA-256 verification failed" in UPDATER
     assert "snapshot_current_bundle" in UPDATER
     assert "replace_macos_bundle" in UPDATER
     assert "com.tylogi.tyloinfer" in UPDATER
-    assert "studioUpdateStatus(false)" in UPDATE_MANAGER
-    assert "tr('自动检查更新', 'Automatically check for updates')" in UPDATE_MANAGER

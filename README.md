@@ -72,7 +72,7 @@ NVIDIA RTX 3090 Ti · 4K input · 256 output
 
 ### Build and serve
 
-Install [uv](https://docs.astral.sh/uv/), CMake, and a C++ toolchain. CUDA builds also need the NVIDIA CUDA Toolkit; the browser UI needs Node.js and npm.
+Install [uv](https://docs.astral.sh/uv/), CMake 3.26 or newer, and a C++ toolchain. CUDA builds also need the NVIDIA CUDA Toolkit; the browser UI needs Node.js and npm.
 
 ```sh
 git clone https://github.com/Tylogi/TyloInfer.git
@@ -80,28 +80,61 @@ cd TyloInfer
 
 # Apple Silicon
 uv sync --project studio/server --extra metal
-uv run --project studio/server tyloinfer build --backend metal
+cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release \
+  -DTYLOINFER_MLX_ROOT="$(uv run --project studio/server python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
+cmake --build build --target mfq-decode-metal --parallel
 
 # Start the server and discover models in this directory
-uv run --project studio/server python -m server.serve --model-dir ./models
+uv run --project studio/server python -m server.serve --model-dir ./models \
+  --running-executable build/csrc/metal/mfq-decode-metal
 ```
 
-For NVIDIA, replace the two build steps with:
+For NVIDIA, replace the build steps with:
 
 ```sh
 uv sync --project studio/server
-uv run --project studio/server tyloinfer build --backend cuda
+cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target mfq-runtime --parallel
 ```
+
+and start it with `--running-executable build/csrc/mfq-runtime`. CMake selects Metal, CUDA or HIP from the host toolchain; the [build guide](docs/cli/build.md#backend-requirements) lists the requirements per backend.
 
 Open **http://127.0.0.1:8090/**, download a model, and load it from **Models**. To load an existing model at startup:
 
 ```sh
-uv run --project studio/server python -m server.serve --model /models/model.gguf
+uv run --project studio/server python -m server.serve --model /models/model.gguf \
+  --running-executable build/csrc/mfq-runtime
 ```
 
 The same command accepts `.tq` checkpoints. For sharded models, select the first shard and keep the complete set in one directory.
 
 For API requests and authentication, see the [serving guide](docs/cli/serve.md#first-api-request).
+
+### Run the tests
+
+```sh
+# Python server
+uv run --project studio/server --extra dev pytest studio/server/tests
+
+# Structure gate (conventions over the C++/CUDA/Metal tree)
+uv run --project studio/server --extra dev pytest studio/server/tests_structure
+
+# Numerical parity against the pinned reference needs PyTorch:
+uv run --project studio/server --extra dev --extra d1-reference \
+  pytest studio/server/tests/test_d1_reference.py
+
+# Native runtime: configure and build as above, then
+ctest --test-dir build
+
+# Browser UI (needs the studio/web dependencies installed)
+npm --prefix studio/web test
+
+# DSH plugins
+node --test plugins/host/tests/*.test.mjs
+npm --prefix plugins/studio test
+```
+
+The C++ cases under `csrc/tests/` run anywhere; the CUDA and Metal cases need that hardware. Full notes are in the [build guide](docs/cli/build.md#testing).
 
 ### Connect your tools
 

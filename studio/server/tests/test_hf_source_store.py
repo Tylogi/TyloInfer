@@ -5,7 +5,7 @@ import struct
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
+import pytest
 
 from server.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
 from server.formats.hf_source import HfSourceTensorStore
@@ -65,6 +65,7 @@ def test_hf_source_store_exposes_registered_architecture_canonically(
 
 
 def test_hf_source_store_builds_generic_split_expert_views(tmp_path: Path) -> None:
+    save_file = pytest.importorskip("safetensors.numpy").save_file
     root = tmp_path / "glm"
     _write_config(
         root,

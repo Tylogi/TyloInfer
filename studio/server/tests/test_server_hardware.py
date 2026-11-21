@@ -79,6 +79,9 @@ def test_windows_commit_capacity_reports_query_failure(monkeypatch):
 
 def test_linux_physical_cores_not_smt_threads_and_multiple_gpus(monkeypatch):
     monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    # NVML answers before the shell commands, so silence it or the host GPU leaks in.
+    monkeypatch.setattr(hardware, "_nvidia_memory", lambda: ())
+    monkeypatch.setattr(hardware, "_amd_memory", lambda: ())
     monkeypatch.setattr(hardware.Path, "read_text", lambda self: "\n\n".join(
         f"model name : AMD Ryzen 5\nphysical id : 0\ncore id : {core}"
         for core in [0, 0, 1, 1]
@@ -100,6 +103,8 @@ def test_missing_commands_leave_unavailable_fields_unknown(monkeypatch, output):
 
 def test_rocm_gpu_identity_when_nvidia_is_absent(monkeypatch):
     monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hardware, "_nvidia_memory", lambda: ())
+    monkeypatch.setattr(hardware, "_amd_memory", lambda: ())
     monkeypatch.setattr(hardware.Path, "read_text", lambda self: "model name : AMD Ryzen 9")
     monkeypatch.setattr(hardware, "_command", lambda argv: json.dumps({"card0": {"Card series": "AMD Instinct MI300X"}}) if argv[0] == "rocm-smi" else "")
     assert hardware.hardware_identity().gpu_names == ("AMD Instinct MI300X",)

@@ -18,8 +18,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
-import torch.nn.functional as functional
 from PIL import Image
 
 from server.server.vision import RadioVisionProcessor, multimodal_processor_for_architecture
@@ -63,6 +61,8 @@ def _image(width: int, height: int, seed: int = 0) -> Image.Image:
 
 
 def test_antialiased_bicubic_matches_torch() -> None:
+    torch = pytest.importorskip("torch")
+    functional = pytest.importorskip("torch.nn.functional")
     rng = np.random.default_rng(11)
     for height, width, target_height, target_width in RESIZE_CASES:
         pixels = (rng.random((3, height, width)) * 255.0).astype(np.float32)

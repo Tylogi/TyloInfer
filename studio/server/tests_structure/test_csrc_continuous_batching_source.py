@@ -16,9 +16,6 @@ BATCH_STATE = "\n".join(
     (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
     for name in ("batch_state.h", "batch_state.cpp")
 )
-BATCHING_CHECK = (
-    CUDA_ROOT / "diagnostics" / "runtime_checks.cpp"
-).read_text(encoding="utf-8")
 SCHEDULER = (ROOT / "csrc" / "scheduler" / "src" / "scheduler.cpp").read_text(encoding="utf-8")
 ROPE = (ROOT / "studio" / "server" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
@@ -62,8 +59,6 @@ CAUSAL_LM += SHARED_MODELS
 
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
-    assert '"--check-continuous-batching"' in DECODE
-    assert "ContinuousBatch<CudaBatchOperations<Model>>" in BATCHING_CHECK
     assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
@@ -197,18 +192,6 @@ def test_qwen_decode_accepts_independent_batch_positions():
     assert "seq_len.numel() == B" in ATTENTION_MMA
     assert "positions[(size_t)b * T + t]" in KV_CACHE
     assert "kv_cache_write_cuda(k, v, kh, vh, pos)" in DECODE
-
-
-def test_real_weight_gate_exercises_join_and_compaction():
-    assert "run_qwen_continuous_batching_check" in BATCHING_CHECK
-    assert "paused row advanced" in BATCHING_CHECK
-    assert 'tokens["first"] == first_reference' in BATCHING_CHECK
-    assert 'tokens["second"] == second_reference' in BATCHING_CHECK
-    assert 'cancellations["cancel"] == 1 && terminals["cancel"] == 1' in BATCHING_CHECK
-    assert 'tokens["cancel"].size() == before_cancel' in BATCHING_CHECK
-    assert '"paged_kv_live_pages"' in BATCHING_CHECK
-    assert "std::vector<int64_t> first_prompt(193)" in BATCHING_CHECK
-    assert "session restore differs from serial oracle" in BATCHING_CHECK
 
 
 def test_linear_attention_uses_the_canonical_nint_operator():

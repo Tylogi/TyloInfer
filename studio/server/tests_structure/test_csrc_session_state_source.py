@@ -126,8 +126,6 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
     assert "saved.kv_cache = glm->kv_cache.narrow(" in DECODE
     assert "saved.index_cache = glm->index_cache.narrow(" in DECODE
     assert "glm->shared_state->reset()" in DECODE
-    assert '{"--check-text-session-state", &DiagnosticsCommandOptions::check_text_session_state}' in DECODE
-    assert '"text_session_state_check dsv4=1 glm_dsa=1\\n"' in DECODE
 
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:

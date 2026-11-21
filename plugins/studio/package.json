@@ -6,7 +6,7 @@
   "engines": { "dsh": "0.2.2-rc.2" },
   "exports": { ".": "./lib/index.js", "./client": "./lib/client.js" },
   "files": ["lib", "cordis.patch.yml", "README.md"],
-  "scripts": { "build": "node build.mjs", "test": "node --test tests/plugin.test.mjs" },
+  "scripts": { "build": "node build.mjs", "test": "node build.mjs && node --test tests/*.test.mjs" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

@@ -1,51 +1,80 @@
-# `tyloinfer build`
+# Build the C++ runtime
 
-`tyloinfer build` compiles the native inference runtime for the current machine. It
-detects Metal, CUDA or the early HIP backend, invokes CMake, and records the resulting executable so
-that [`python -m server.serve`](serve.md) can find it without a binary path.
-
-The `tyloinfer` command must come from a TyloInfer source checkout containing
-`csrc/CMakeLists.txt`. TyloInfer derives the repository root from the installed
-Python package, not from the current working directory. In an editable
-development environment, run the CLI through uv from that checkout.
+CMake builds the native inference runtime in `csrc/` and selects Metal, CUDA or
+HIP from the host toolchain. Run the result with
+[`python -m server.serve`](serve.md) and `--running-executable`.
 
 ## Quick start
 
-Sync the dependency set for the current host once:
+Install CMake 3.26 or newer and a C++ toolchain.
 
 ```shell
 cd /path/to/TyloInfer
+
+# NVIDIA (Linux or Windows) or AMD (Linux with hipcc): CMake detects the backend
+cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target mfq-runtime --parallel
+
+uv run --project studio/server python -m server.serve --model-dir ./models \
+  --running-executable build/csrc/mfq-runtime
+```
+
+On Apple silicon the target is `mfq-decode-metal` and the binary lands in
+`build/csrc/metal/`. MLX must be located explicitly because CMake searches
+`<repo>/.venv`, while uv keeps the package in the project environment:
+
+```shell
 uv sync --project studio/server --extra metal
+cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release \
+  -DTYLOINFER_MLX_ROOT="$(uv run --project studio/server python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
+cmake --build build --target mfq-decode-metal --parallel
+
+uv run --project studio/server python -m server.serve --model-dir ./models \
+  --running-executable build/csrc/metal/mfq-decode-metal
 ```
 
-On a CUDA host, the native build itself needs no Python accelerator package:
+## Backend requirements
 
-```shell
-uv sync --project studio/server
-```
+### Metal
 
-Build with automatic backend detection:
+- Apple silicon macOS;
+- CMake 3.26 or newer and a C++ toolchain;
+- the `metal` optional dependency, which provides MLX and its native assets.
 
-```shell
-uv run --project studio/server tyloinfer build
-```
+### CUDA
 
-Automatic backend selection uses:
+- Linux or Windows;
+- CMake 3.26 or newer and a C++/CUDA toolchain with `nvcc`;
+- CUDA Toolkit 12 or newer, including `nvcc`, cuBLAS, and the CUDA runtime.
 
-- Metal on Apple silicon macOS;
-- CUDA on Linux or Windows when `nvcc` is available;
-- HIP on Linux when `hipcc` is available and CUDA was not selected.
+The default CUDA runtime needs no Python, PyTorch, or LibTorch. Migration A/B
+builds may set `-DTYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that reference
+target has separate Python and LibTorch requirements.
 
-HIP remains an early backend with limited model coverage; see the
-[support matrix](../runtime/support.md#amd-gpus-and-rocm-hip).
+### HIP (experimental)
 
-Backend detection does not check every compiler dependency. Requirements are
-listed below. Pass the backend explicitly when debugging a build:
+- Linux with a ROCm/HIP toolchain and `hipcc`;
+- CMake 3.26 or newer and a C++ toolchain.
 
-```shell
-uv run --project studio/server tyloinfer build --backend metal
-uv run --project studio/server tyloinfer build --backend cuda
-```
+This is not a claim of CUDA feature parity; consult the
+[known gaps](../runtime/support.md#amd-gpus-and-rocm-hip) before choosing a
+model.
+
+## Build options
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `-DTYLOINFER_BUILD_CUDA_RUNTIME=ON/OFF` | Build the CUDA runtime. | `ON` off macOS when `nvcc` is found |
+| `-DTYLOINFER_BUILD_METAL_RUNTIME=ON/OFF` | Build the MLX/Metal runtime. | `ON` on Apple |
+| `-DTYLOINFER_BUILD_HIP_RUNTIME=ON/OFF` | Build the ROCm/HIP runtime. | `ON` when `hipcc` is found and CUDA was not selected |
+| `-DTYLOINFER_MLX_ROOT=PATH` | MLX package root with `include/`, `lib/libmlx.dylib`, and `lib/mlx.metallib`. | first `mlx` under `<repo>/.venv` |
+| `-DTYLOINFER_BUILD_PRECOMPILED_METAL=ON` | Build the bundled Metal libraries for packaging. | `OFF` |
+| `-DTYLOINFER_ENABLE_MFQ_COMPAT=ON` | Include legacy MFQ inference operators. | `OFF` |
+| `-DTYLOINFER_BUILD_RUNTIME_COMMUNICATION=ON/OFF` | Build the runtime transport component. | `ON` off macOS |
+| `-DBUILD_TESTING=OFF` | Skip the native test executables. | `ON` |
+
+CUDA architectures follow `CMAKE_CUDA_ARCHITECTURES`, for example
+`-DCMAKE_CUDA_ARCHITECTURES=90`.
 
 ## Native format profiles
 
@@ -55,158 +84,65 @@ excluded from the ordinary build. Use a separate build directory for a
 compatibility runtime:
 
 ```shell
-uv run --project studio/server tyloinfer build --build-dir build/native-compat -- -DTYLOINFER_ENABLE_MFQ_COMPAT=ON
+cmake -S csrc -B build/native-compat -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DTYLOINFER_ENABLE_MFQ_COMPAT=ON
 ```
 
 Compatibility adds legacy NINT/NVQ/MFE/SQ inference; it does not add offline
-quantization or calibration. CMake and release packaging default to `OFF`;
-packaging accepts the same `TYLOINFER_ENABLE_MFQ_COMPAT=ON` environment setting.
-ROCm's existing model/format coverage is unchanged; this switch does not add a
-TQ HIP implementation.
+quantization or calibration. ROCm's existing model/format coverage is unchanged;
+this switch does not add a TQ HIP implementation.
 
-## Output and build manifest
-
-The default CMake build directory is `<repo>/build/csrc`. Executable
-paths:
+## Output
 
 | Backend | Executable |
 | --- | --- |
-| Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/csrc/mfq-runtime` |
-| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
+| Metal | `<build>/metal/mfq-decode-metal` |
+| CUDA, HIP | `<build>/mfq-runtime` |
+| CUDA on Windows | usually `<build>\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
 
-`mfq-runtime` runs inference and service mode.
+`mfq-runtime` runs inference and service mode. Multi-configuration generators may
+place the executable in a configuration subdirectory, so pass the path you built
+to `python -m server.serve --running-executable`.
 
-TyloInfer searches the build tree after compilation, so generators may place the
-executable in a configuration subdirectory.
+`python -m server.serve` also reads `<repo>/build/mfq-runtime.json`, a managed-build
+record left by older installations, and uses the executable it names when that
+file is present, current, and points at an existing binary. Nothing in this
+repository writes that file: after a plain CMake build, pass
+`--running-executable`.
 
-A successful build writes `<repo>/build/mfq-runtime.json`. This location is
-fixed relative to the source checkout even when `--build-dir` points elsewhere.
-The manifest stores the backend, source directory, build directory, build type,
-generator, forwarded CMake arguments, target, and the actual absolute
-executable path. It is internal CLI state under the ignored `build/` directory;
-users do not add the native executable to `PATH`.
+## Testing
 
-To inspect a generator-dependent path, read the `executable` field for the
-selected backend in the manifest:
-
-```shell
-uv run --project studio/server -m json.tool build/mfq-runtime.json
-```
-
-`python -m server.serve` reads this manifest automatically. If the executable exists, it is
-used directly. If it was deleted, TyloInfer rebuilds it in the recorded directory with
-the recorded configuration.
-
-## Custom build directory
-
-Use `--build-dir` when the build tree belongs on another disk:
+The native tests are CTest cases. They are configured by default
+(`BUILD_TESTING=ON`), which adds more than 140 test executables to a full build;
+build only what you need:
 
 ```shell
-cd /path/to/TyloInfer
-uv run --project studio/server tyloinfer build --build-dir /mnt/fast-build/tyloinfer
+cmake --build build --target mfq-file-range-reader-test --parallel
+ctest --test-dir build -R file-range-reader --output-on-failure
+ctest --test-dir build --output-on-failure        # everything that was built
 ```
 
-The manifest records the absolute build directory and executable path. A later
-`python -m server.serve` command finds this custom build without another option:
+| Location | Runs on |
+| --- | --- |
+| `csrc/tests/` | any host; no GPU, model weights, or accelerator backend |
+| `csrc/backends/cuda/tests/` | only when the CUDA runtime is enabled, and needs an NVIDIA GPU |
+| `csrc/backends/metal/tests/` | only on Apple silicon |
 
-```shell
-uv run --project studio/server python -m server.serve --model /models/model.tq
-```
-
-Both commands must use the `tyloinfer` installation associated with the same source
-checkout. The current working directory may change between them.
-
-## Forward CMake configuration arguments
-
-Arguments after `--` are passed to the CMake configure command. The separator
-is required so the arguments are not parsed as `tyloinfer build` options.
-
-```shell
-uv run --project studio/server tyloinfer build --backend cuda -- \
-  -DCMAKE_CUDA_ARCHITECTURES=90 \
-  -DGGML_CCACHE=OFF
-```
-
-The build manifest saves these arguments and reuses them when rebuilding a
-missing executable.
-
-## Command options
-
-| Option | Meaning | Default |
-| --- | --- | --- |
-| `--backend {auto,cuda,hip,metal}` | Select or detect the accelerator backend. | `auto` |
-| `--build-dir PATH` | Set the CMake build directory. | `<repo>/build/csrc` |
-| `--build-type TYPE` | Set `CMAKE_BUILD_TYPE` and the build configuration. | `Release` |
-| `-j N`, `--jobs N` | Set parallel build jobs. | Host CPU count |
-| `--generator NAME` | Select a CMake generator. | Ninja when available, otherwise CMake default |
-| `--dry-run` | Print configure and build commands without executing them. | Off |
-| `-- CMAKE_ARG...` | Forward remaining arguments to CMake configuration. | None |
-
-`--dry-run` does not compile an executable or update the manifest.
-
-The public command is `tyloinfer`, not `mfq`. Native executable names such as
-`mfq-runtime` and `mfq-decode-metal`, and the manifest `mfq-runtime.json`, are
-retained internal names; do not rename them when following these instructions.
-
-## Backend requirements
-
-### Metal
-
-- Apple silicon macOS;
-- CMake 3.26 or newer;
-- a C++ toolchain;
-- the `metal` optional dependency, which provides MLX and its native assets.
-
-For a source checkout managed by uv:
-
-```shell
-uv sync --project studio/server --extra metal
-uv run --project studio/server tyloinfer build
-```
-
-### HIP (experimental)
-
-- Linux with a ROCm/HIP toolchain and `hipcc`;
-- CMake 3.26 or newer and a C++ toolchain.
-
-Use `uv run --project studio/server tyloinfer build --backend hip`. This is not a claim of CUDA feature
-parity; consult the [known gaps](../runtime/support.md#amd-gpus-and-rocm-hip)
-before choosing a model.
-
-### CUDA
-
-- Linux or Windows;
-- CMake 3.26 or newer;
-- a C++/CUDA toolchain with `nvcc`;
-- CUDA Toolkit 12 or newer, including `nvcc`, cuBLAS, and the CUDA runtime.
-
-The default CUDA runtime needs no Python, PyTorch, or LibTorch. Migration A/B
-builds may set `-DTYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that reference target
-has separate Python and LibTorch requirements.
-
-TyloInfer checks `CUDACXX`, `PATH`, `CUDA_HOME`, and `CUDA_PATH` when locating
-`nvcc`.
+`ctest --test-dir build -N` lists the cases without running them. The Python,
+browser, and plugin suites are listed in the
+[README](../../README.md#run-the-tests).
 
 ## Troubleshooting
 
 ### No supported accelerator was detected
 
-Confirm the host is Apple silicon, make `nvcc` visible through one of the
-CUDA locations above, or provide a supported Linux ROCm/HIP toolchain. `--backend` validates the requested backend; it does not
-bypass platform and toolchain checks.
+CMake enables a backend only when its compiler is available. Make `nvcc` visible
+through `PATH` or `CUDACXX`, or provide a supported Linux ROCm/HIP toolchain, or
+build on Apple silicon.
 
 ### CMake completed without producing the executable
 
-Check the printed configure and build commands. TyloInfer searches custom generator
-layouts by executable name; if the search still fails, the target was not
-produced.
-
-### Inspect the exact commands
-
-```shell
-uv run --project studio/server tyloinfer build --dry-run --backend cuda -- \
-  -DCMAKE_CUDA_ARCHITECTURES=90
-```
-
-Next: [`python -m server.serve`](serve.md).
+Check the configured backend in the CMake output
+(`TYLOINFER_BUILD_*`), then the generator-specific path under the build
+directory. `cmake --build build --target <name>` builds one target; configure
+output lists the backend that was selected.

@@ -6,7 +6,6 @@ import json
 import httpx
 import numpy as np
 import pytest
-from safetensors.numpy import save_file
 
 from server.formats.header import FileHeader
 from server.formats.io import save
@@ -128,6 +127,7 @@ def test_component_metadata_cache_is_invalidated_when_file_becomes_mixed(tmp_pat
 
 
 def test_safetensors_lists_only_physical_table_shards_and_counts_files_once(tmp_path):
+    save_file = pytest.importorskip("safetensors.numpy").save_file
     root = tmp_path / 'Qwen3.8-Flash-Next-oQ4e'
     root.mkdir()
     (root / 'config.json').write_text(json.dumps({'model_type': 'test'}))
@@ -149,6 +149,7 @@ def test_safetensors_lists_only_physical_table_shards_and_counts_files_once(tmp_
 
 @pytest.mark.parametrize('format', ['tq', 'hf'])
 def test_table_spread_between_pure_and_mixed_shards_is_not_independently_usable(tmp_path, format):
+    save_file = pytest.importorskip("safetensors.numpy").save_file
     first = PLE
     second = PLE.replace('shard.0.', 'shard.1.')
     if format == 'hf':

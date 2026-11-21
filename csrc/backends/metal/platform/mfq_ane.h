@@ -1,3 +1,5 @@
+// Private ANE interface and dynamic MIL matmul layout adapted from maderix/ANE
+// (MIT; LICENSES/ANE-MIT.txt).
 #pragma once
 
 #include <memory>
