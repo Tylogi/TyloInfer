@@ -288,9 +288,10 @@ uv run --project studio python -m serve \
   buffers before growing the tile. Ordinary and MTP prefill share this policy.
   Explicit integers from `1` to `8192` set a smaller limit and are always passed
   to the worker. On Metal and HIP, `auto` preserves their native default policy.
-- `--max-requests-per-runtime N` enables continuous batching on supported
-  native paths; capacity limits and scheduling behavior are documented in
-  [Flash-Next continuous batching](runtime/cuda-continuous-batching.md).
+- `--max-requests-per-runtime N` configures request capacity per worker. It
+  defaults to 8 on CUDA and Metal and 1 on HIP. Batching eligibility depends on
+  the backend, model, and request. See [CUDA Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
+  and [Metal native serving](#metal-native-serving).
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 Persistent Session KV caching is configured with `--prefix-cache-dir`,
@@ -310,9 +311,9 @@ unpinned models; instances may override it through the runtime API.
 
 ## Speculative decoding (MTP / DFlash2)
 
-Native MTP needs predictor weights compatible with the target graph; enabling
-MTP is not enough when those weights are absent. DFlash2 needs a matching draft
-checkpoint. The current CLI exposes these explicit companion controls for CUDA:
+Native MTP requires predictor weights compatible with the target graph.
+DFlash2 requires a matching draft checkpoint. The managed `python -m serve`
+CLI exposes the following explicit companion controls for CUDA.
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
@@ -348,12 +349,50 @@ baseline; `"enable_mtp": true` permits speculation and
 an explicit body value takes precedence. Other header values are ignored.
 Without either override, the chat parser defaults to `true`. This is a
 request-local chat control, not a `/v1/systemone` option. Availability still depends on
-model weights, runtime support, and scheduling (see
-[continuous batching limits](runtime/cuda-continuous-batching.md)). Inspect
+model weights, runtime support, and scheduling. Inspect
 reported `mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate` when present;
 do not assume the requested path actually ran. The metrics name is a retained
 wire-format identifier, not the public CLI name. See the
 [performance guide](benchmarking.md) for measurement steps.
+
+### Metal native serving
+
+The native Metal HTTP server supports continuous batching on Flash-Next,
+including ordinary decode, native MTP with a compatible single-layer
+predictor without predictor LoRA, and DFlash2 with a matching draft checkpoint.
+`--continuous-batching N` sets the maximum concurrent requests for this worker.
+Values of `0` and `1` run serially. The managed CLI's explicit
+`--dflash2-draft` and `--mtp-native-draft` options are CUDA-only.
+
+To serve Flash-Next with DFlash2 directly, use the binary from the
+[Metal build](build.md#quick-start) and pass the draft directory to the worker.
+
+```shell
+TYLOINFER_METAL_DFLASH2_TREES=1 build/metal/mfq-decode-metal \
+  --transport http --model /models/target.gguf \
+  --dflash2-draft /models/matching-dflash2 --continuous-batching 8 \
+  --host 127.0.0.1 --port 8080 --ctx-size 32768
+```
+
+`TYLOINFER_METAL_DFLASH2_TREES=1` enables tree verification for eligible
+greedy requests. The DFlash2 batched path requires text requests with
+`enable_mtp` enabled, an output budget above one token, zero presence and
+frequency penalties, and a repetition penalty of one. Grammar, JSON schema,
+and tool constraints can affect path selection.
+
+Send test requests to the worker's `/runtime/generate` route. Check
+`metrics.mtp_used` in the response. Agent, DS Bot, and other OpenAI-compatible
+clients connect to the managed API. See [native HTTP transport](runtime/transport.md#private-http).
+
+```shell
+curl -fsS http://127.0.0.1:8080/runtime/generate \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "input": {"messages": [{"role": "user", "content": "Explain continuous batching."}]},
+    "sampling": {"enable_mtp": true, "temperature": 0, "max_new_tokens": 128},
+    "stream": false
+  }'
+```
 
 ## Jev decision-model weight placement
 

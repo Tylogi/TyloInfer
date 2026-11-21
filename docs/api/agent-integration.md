@@ -8,4 +8,4 @@ Standalone Studio remains an independent inference desktop application and WebUI
 
 The supported fixed operations are described in [model management](agent-model-bridge.md), [page reads](agent-inference-pages.md), [maintenance](agent-maintenance-bridge.md), [model and download actions](agent-model-actions.md), and [restricted configuration](agent-product-boundaries.md). Only explicit user actions may submit writes; inventory reads and reconnects never load weights or replay a write.
 
-Current-version isolated API and lifecycle checks are not evidence for real-weight tools, arbitrary cross-release upgrades, DS Bot collaboration or final desktop distribution. Those remain separate acceptance work.
+The standalone Agent and DS Bot `0.3.8` have been verified for Web chat against a loaded TyloInfer model on DSH `0.2.2-rc.2`. The [Host and DS Bot guide](../agent-host.md) covers setup, model registration, and output budgets.

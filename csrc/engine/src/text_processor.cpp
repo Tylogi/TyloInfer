@@ -572,15 +572,14 @@ InferenceRequest TextProcessor::prepare(
             work.cache_plan.stable_prefix_tokens = work.prompt.size() - suffix_tokens;
         work.vision = std::move(input.media);
     }
-    if (max_context > 0 &&
-            static_cast<std::int64_t>(work.prompt.size()) +
-                    work.sampling.max_tokens > max_context) {
+    // Generation planning caps output using the remaining context.
+    if (max_context > 0 && work.prompt.size() > static_cast<std::size_t>(max_context)) {
         throw InferenceInputError(
             InferenceInputErrorCode::ContextLength,
-            input.media
-                ? "expanded multimodal prompt plus max_tokens exceed the model context window"
-                : "prompt tokens plus max_tokens exceed the model context window",
-            "max_tokens");
+            work.vision
+                ? "expanded multimodal prompt exceeds the model context window"
+                : "prompt exceeds the model context window",
+            input.chat ? "messages" : "prompt");
     }
 
     std::vector<std::string> unique_stops;

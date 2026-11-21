@@ -1,4 +1,5 @@
 #include "text_processor.h"
+#include "generation_policy.h"
 #include "gguf.h"
 #include "mfq_text.h"
 
@@ -79,7 +80,7 @@ int main() try {
     for (int images : {0, 1, 2}) for (bool enabled : {false, true}) {
         InferenceInput input;
         input.chat = true;
-        input.sampling.max_tokens = 1;
+        input.sampling.max_tokens = 128000;
         input.sampling.enable_thinking = false;
         input.prefix_cache_enabled = enabled;
         input.chat_input.emplace();
@@ -99,6 +100,9 @@ int main() try {
                 input.media->vision_grid.insert(input.media->vision_grid.end(), {3, 6, 1, 2});
         }
         const auto result = processor.prepare(std::move(input), 1024);
+        const auto plan = plan_generation(result.prompt, fixture.vocabulary, 1024, result.sampling.max_tokens);
+        require(plan.generation_tokens == 1024 - static_cast<std::int32_t>(result.prompt.size()),
+            "output budget did not fit the remaining context after tokenization");
         require(result.cache_plan.stable_prefix_tokens == (enabled ? result.prompt.size() - 1 : 0),
             "image expansion moved the stable prefix away from its token boundary");
         if (images) {
@@ -109,6 +113,23 @@ int main() try {
                 "stable prefix does not include expanded image spans");
         }
     }
+    InferenceInput chat;
+    chat.chat = true;
+    chat.chat_input.emplace();
+    chat.chat_input->preformatted_prompt = "abc";
+    chat.sampling.max_tokens = 128000;
+    const auto prompt_tokens = processor.prepare(chat, 128000).prompt.size();
+    const auto full = processor.prepare(chat, prompt_tokens);
+    require(plan_generation(full.prompt, fixture.vocabulary, prompt_tokens, full.sampling.max_tokens)
+            .generation_tokens == 0,
+        "a prompt filling the context must allow zero output tokens");
+    bool over_context_rejected = false;
+    try { (void)processor.prepare(chat, prompt_tokens - 1); }
+    catch (const InferenceInputError& error) {
+        over_context_rejected = error.code == InferenceInputErrorCode::ContextLength;
+    }
+    require(over_context_rejected, "an oversized prompt must return a context length error");
+
     DecisionText decision;
     decision.reads={{"abc",{"A","B"}},{"xyz",{"0","1"}}};
     decision.cache_salt="isolated";decision.prefix_cache=false;decision.full_vocabulary=false;

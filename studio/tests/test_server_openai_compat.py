@@ -168,9 +168,11 @@ def test_missing_model_returns_not_found_for_both_transports(tmp_path, stream) -
     asyncio.run(run())
 
 
-def test_openai_request_defaults_keep_thinking_vision_and_mtp_enabled() -> None:
+def test_openai_request_sampling_defaults() -> None:
     request = _request()
 
+    assert request.sampling.max_tokens == 128_000
+    assert "max_tokens" not in request.sampling.model_fields_set
     assert request.sampling.enable_thinking is True
     assert request.sampling.enable_vision is True
     assert request.sampling.enable_mtp is True
@@ -180,17 +182,22 @@ def test_openai_request_defaults_keep_thinking_vision_and_mtp_enabled() -> None:
 
 def test_openai_request_tracks_explicit_sampling_overrides() -> None:
     request = _request(
+        max_tokens=512,
+        max_completion_tokens=1024,
         enable_mtp=False,
         temperature=0.25,
         seed=None,
         chat_template_kwargs={"enable_thinking": False},
     )
 
+    assert request.sampling.max_tokens == 1024
+    assert _request(max_tokens=512).sampling.max_tokens == 512
     assert request.sampling.enable_mtp is False
     assert request.sampling.enable_thinking is False
     assert request.sampling.model_fields_set == {
         "enable_mtp",
         "enable_thinking",
+        "max_tokens",
         "seed",
         "temperature",
     }

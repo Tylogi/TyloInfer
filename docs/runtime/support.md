@@ -91,6 +91,11 @@ FP16 weight copy. DeepSeek V4/V4.1 and Qwen Flash-Next runtimes also support
 bounded expert residency, while DeepSeek V4.1 can stream Engram storage from
 the internal SSD.
 
+The native Metal worker continuously batches eligible Flash-Next requests,
+including ordinary decode, native MTP, and DFlash2. See
+[Metal native serving](../serve.md#metal-native-serving) for the required
+weights, setup, and request parameters.
+
 ### AMD GPUs and ROCm (HIP)
 
 The HIP worker compiles the CUDA model graph and kernels through ROCm/HIP on

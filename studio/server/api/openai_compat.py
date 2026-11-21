@@ -125,7 +125,7 @@ def parse_chat_request(body: Any) -> OpenAIChatRequest:
 
     max_tokens = body.get("max_completion_tokens")
     if max_tokens is None:
-        max_tokens = _value(body, "max_tokens", 4096)
+        max_tokens = _value(body, "max_tokens", 128_000)
     sampling_values = {
         "max_tokens": max_tokens,
         "temperature": _value(body, "temperature", 1.0),

@@ -1,4 +1,5 @@
 #include "inference.h"
+#include "chat-peg-parser.h"
 #include "generation_policy.h"
 #include "gguf.h"
 #include <cassert>
@@ -55,13 +56,14 @@ int main() {
     first_eos.finish();
     assert(first_eos.result.finish_reason == "stop");
     std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(gguf_init_empty(), &gguf_free);
-    const char* pieces[] = {"a", "b", "c", "d", "e", "f", "g", "<eos>"};
-    const int32_t types[] = {1, 1, 1, 1, 1, 1, 1, 3};
+    const char* pieces[] = {"a", "b", "c", "d", "e", "f", "g", "<eos>",
+        "record[ARGS]{\"body\":\"unfinished", "record[ARGS]{\"body\":\"complete\"}"};
+    const int32_t types[] = {1, 1, 1, 1, 1, 1, 1, 3, 1, 1};
     gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "gpt2");
     gguf_set_val_str(metadata.get(), "tokenizer.ggml.pre", "gpt-2");
-    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", pieces, 8);
+    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", pieces, std::size(pieces));
     gguf_set_arr_str(metadata.get(), "tokenizer.ggml.merges", nullptr, 0);
-    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types, 8);
+    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types, std::size(types));
     gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", 7);
     const uint32_t eog_ids[] = {5, 7};
     gguf_set_arr_data(metadata.get(), "tokenizer.ggml.eog_token_ids", GGUF_TYPE_UINT32, eog_ids, 2);
@@ -89,4 +91,24 @@ int main() {
     assert(tokenized.result.text == unchanged.result.text);
     assert(tokenized.result.finish_reason == unchanged.result.finish_reason);
     assert(tokenized.result.completion_tokens == unchanged.result.completion_tokens);
+
+    InferenceRequest chat;
+    chat.chat = true;
+    chat.chat_parser.parser = build_chat_peg_parser([](common_chat_peg_builder& parser) {
+        return parser.tool_open(parser.tool_name(parser.literal("record")) + "[ARGS]") +
+            parser.tool_args(parser.rest()) + parser.end();
+    });
+    chat.sampling.max_tokens = 1;
+    InferenceOutput truncated(chat, &tokenizer, "truncated-tool");
+    truncated.append({8});
+    truncated.finish();
+    assert(truncated.result.finish_reason == "length" && truncated.result.tool_calls.empty());
+
+    chat.sampling.max_tokens = 2;
+    InferenceOutput complete(chat, &tokenizer, "completed-tool");
+    complete.append({9, 7});
+    complete.finish();
+    assert(complete.result.finish_reason == "tool_calls" && complete.result.tool_calls.size() == 1);
+    assert(complete.result.tool_calls.front().name == "record");
+    assert(complete.result.tool_calls.front().arguments == R"({"body":"complete"})");
 }

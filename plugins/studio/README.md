@@ -63,6 +63,6 @@ Build the installable bundle from the repository root:
 node plugins/studio/build.mjs --dsbot
 ```
 
-Install `plugins/studio/dist/dsbot` into the chosen DSBot profile using DSH's `dsh plugin --profile <profile> add file:<bundle-directory>` command. The bundle includes the Host bridge and adds the usual **Inference engine** controls above Settings at the bottom of the sidebar. Select the TyloInfer provider in DSBot's model settings to use a loaded model. The provider initially points to `http://127.0.0.1:8090/v1` and can be edited in those settings.
+Install `plugins/studio/dist/dsbot` into the chosen DS Bot profile using DSH's `dsh plugin --profile <profile> add file:<bundle-directory>` command. This bundle includes the Host bridge and adds the **Inference engine** controls above Settings at the bottom of the sidebar. The TyloInfer provider defaults to `http://127.0.0.1:8090/v1`. After loading a model, select its automatically registered ID in the DS Bot model settings and configure its context and output limits. See the [model registration and output budget guide](../../docs/agent-host.md#模型登记和输出预算).
 
 Verified with DS Bot `0.3.8` on DSH `0.2.2-rc.2` Web. DS Bot's theme, settings and default model stay under the host profile's control.
