@@ -321,6 +321,13 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
         if not draft.is_dir():
             raise FileNotFoundError(draft)
         runtime_environment["TYLOINFER_DFLASH2_DRAFT"] = str(draft)
+    if args.dfly2_draft is not None:
+        if selected_backend != "metal":
+            raise ValueError("--dfly2-draft requires the Metal runtime")
+        draft = args.dfly2_draft.expanduser().resolve()
+        if not draft.is_file():
+            raise FileNotFoundError(draft)
+        runtime_environment["TYLOINFER_DFLY2_DRAFT"] = str(draft)
     if args.no_prefix_cache:
         runtime_environment["TYLOINFER_RUNTIME_DISABLE_PREFIX_CACHE"] = "1"
     if args.prefix_cache_dir is not None:
@@ -461,6 +468,7 @@ def _parser() -> argparse.ArgumentParser:
     draft = parser.add_mutually_exclusive_group()
     draft.add_argument("--dflash2-draft", type=Path, help="DFlash2 checkpoint directory for compatible CUDA or Metal targets")
     draft.add_argument("--mtp-native-draft", type=Path, help="native MTP GGUF companion for a CUDA GGUF target")
+    parser.add_argument("--dfly2-draft", type=Path, help="Hy4 Flash DFly2 safetensors shard for Metal")
     parser.add_argument("--spec-min-p", "--mtp-min-probability", dest="mtp_spec_min_p", type=_probability,
                         help="CUDA greedy draft probability threshold; 0 disables it")
     parser.add_argument("--draft-conf", "--dflash2-draft-confidence", dest="mtp_draft_conf", type=_probability,

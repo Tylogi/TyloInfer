@@ -429,6 +429,9 @@ mfq-decode-metal --server --model /models/Hy4-flash-IQ2_AH-00001-of-00002.gguf \
   --dfly2-draft /models/hy4-bf16/model-00148-of-00148.safetensors
 ```
 
+Studio's `python -m serve --backend metal` accepts the same `--dfly2-draft`
+option for Hy4 Flash workers.
+
 ## Jev decision-model weight placement
 
 For supported CUDA decision models, `--jev-weights stream` is the default.

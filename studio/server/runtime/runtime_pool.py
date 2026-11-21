@@ -683,6 +683,7 @@ class RuntimePool:
         configured_draft = self.runtime_environment.get("TYLOINFER_DFLASH2_DRAFT")
         draft_path = draft.path if draft is not None else (
             Path(configured_draft) if configured_draft and self.backend in {"cuda", "metal"} and not is_d1_config(artifact.source_config)
+            and artifact.resource.architecture != "hy_v4_flash"
             else None
         )
         if is_d1_config(artifact.source_config):
@@ -4984,6 +4985,9 @@ class RuntimePool:
         command.extend(native_gguf_companion_arguments(artifact.path, request.gguf_companions, self.backend))
         if dflash2_path is not None:
             command.extend(["--dflash2-draft", str(dflash2_path)])
+        if self.backend == "metal" and artifact.resource.architecture == "hy_v4_flash":
+            if dfly2_path := self.runtime_environment.get("TYLOINFER_DFLY2_DRAFT"):
+                command.extend(["--dfly2-draft", dfly2_path])
         if request.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
 
