@@ -157,13 +157,15 @@ struct QsaKvStore::Impl {
     }
 
     void evict(std::unique_lock<std::recursive_mutex>& guard) {
-        while (hot_bytes > hot_limit() && !hot.empty()) {
+        const auto capacity = hot_limit();
+        const auto pinned_index_capacity = capacity - std::min(config.buffer_bytes, capacity / 4);
+        while (hot_bytes > capacity && !hot.empty()) {
             int priority = 0;
-            if (live_index_bytes <= hot_limit()) {
+            if (live_index_bytes <= pinned_index_capacity) {
                 while (priority < 2 && lru[priority].empty()) ++priority;
             } else {
-                // A partial index scan must share the hot tier with the rows
-                // it selects when the complete index no longer fits.
+                // A large index scan must share the hot tier with the rows
+                // it selects. Leave room for history even when the index fits.
                 auto oldest = std::numeric_limits<std::uint64_t>::max();
                 for (int candidate = 0; candidate < 3; ++candidate) {
                     if (lru[candidate].empty()) continue;

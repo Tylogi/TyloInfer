@@ -804,6 +804,10 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
             container, Codec::name, context_size);
         if constexpr (recurrent || std::is_same_v<Runtime, mfq::metal::MlxHy4Runtime>)
             config.compatibility_key += mfq::metal::mlx_kv_quantization_tag();
+        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxHy4Runtime>) {
+            if (mfq::metal::mlx_kv_quantization().enabled())
+                config.compatibility_key += "\nhy4-indexpool-fp16-v1";
+        }
         if constexpr (recurrent) {
             const auto native_context = [&] {
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)

@@ -53,6 +53,7 @@ def test_hy4_requirement_counts_only_target_index_pools(tmp_path):
         "num_key_value_heads": 1, "head_dim": 576,
     }, source_tensors={"predictor.block.0.stub.weight": {}})
     assert qsa_index_requirement(model, 8192, 256 << 10) == 12 * (128 * (18 + 8192) + 2)
+    assert qsa_index_requirement(model, 8192, 256 << 10, packed_kv=True) == 12 * (128 * (18 + 4096) + 2)
     with pytest.raises(ValueError, match="microblock I/O"):
         qsa_index_requirement(model, 8192, 128 << 10)
 

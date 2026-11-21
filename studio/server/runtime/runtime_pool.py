@@ -1259,12 +1259,14 @@ class RuntimePool:
             self.inference_policy = policy.model_copy()
         return self.inference_policy.model_dump()
 
-    async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *, yarn_enabled: bool | None = None) -> int:
+    async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *,
+        yarn_enabled: bool | None = None, packed_kv: bool = False) -> int:
         if self.backend not in {"metal", "cuda"}:
             raise _job_error("qsa_kv_offload_unsupported", "KV offload requires a Metal or CUDA QSA backend")
         try:
             return await asyncio.to_thread(qsa_index_requirement, artifact, policy.target_context,
-                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled), cuda=self.backend == "cuda")
+                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled),
+                cuda=self.backend == "cuda", packed_kv=packed_kv)
         except (ValueError, OSError, KeyError) as error:
             raise _job_error("qsa_kv_configuration_invalid", str(error)) from error
 
@@ -1279,7 +1281,8 @@ class RuntimePool:
         policy = request.qsa_kv_offload
         target = target_context or instance.context_size
         policy = policy.model_copy(update={"target_context": instance.context_size})
-        required = await self._validate_qsa_kv_policy(instance.artifact, policy.model_copy(update={"target_context": target})) if supported else None
+        required = await self._validate_qsa_kv_policy(instance.artifact, policy.model_copy(update={"target_context": target}),
+            packed_kv=request.kv_quantization.enabled) if supported else None
         return {"supported": supported, "architecture": architecture, "policy": policy.model_dump(),
             "required_index_bytes": required, "buffer_bytes": min(QSA_KV_BUFFER_BYTES, policy.budget_bytes // 4),
             "target_context": target, "reason": None if supported else "model_or_backend_unsupported"}

@@ -30,10 +30,13 @@ def _cache_bytes(profile, tokens: int, precision: float, *, contiguous: bool, ml
             words = (_packed_words(item.head_dimension, math.floor(precision)) +
                      _packed_words(item.head_dimension, math.ceil(precision)))
             width = item.layers * item.kv_heads * words * 4
-        if precision != 16 and mla_rank and item.name == 'latent_kv':
-            words = (_packed_words(mla_rank, math.ceil(precision)) +
-                     _packed_words(item.head_dimension - mla_rank, math.floor(precision)))
-            width = item.layers * words * 4
+        if precision != 16 and mla_rank:
+            if item.name == 'latent_kv':
+                words = (_packed_words(mla_rank, math.ceil(precision)) +
+                         _packed_words(item.head_dimension - mla_rank, math.floor(precision)))
+                width = item.layers * words * 4
+            elif item.name == 'indexer_pooled':
+                width //= 2
         total += rows * width
     return total
 

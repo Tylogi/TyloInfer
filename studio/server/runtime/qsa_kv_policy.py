@@ -24,7 +24,7 @@ def _configuration(artifact: DiscoveredModel) -> tuple[dict, bool]:
 
 
 def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes: int | None = None,
-    *, maximum_context: int | None = None, cuda: bool = False) -> int:
+    *, maximum_context: int | None = None, cuda: bool = False, packed_kv: bool = False) -> int:
     config, has_predictor = _configuration(artifact)
     text = config.get("text_config", config)
     model_type = text.get("model_type") if isinstance(text, dict) else None
@@ -73,4 +73,5 @@ def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes:
                 raise ValueError(f"CUDA QSA KV budget needs at least {staging * 4} bytes for one selected context")
     if cuda:
         return layers * width * (context + context // ratio) * 2
-    return layers * (width * ((ratio + 5) * 2 + (context // ratio) * 4) + 2)
+    key_bytes = 2 if model_type == "hy_v4_flash" and packed_kv else 4
+    return layers * (width * ((ratio + 5) * 2 + (context // ratio) * key_bytes) + 2)

@@ -54,6 +54,8 @@ struct Geometry {
     std::vector<bool> sliding;
     std::vector<float> clamp;
     MlxMlaKvFormat indexed_kv;
+
+    Dtype index_pool_dtype() const noexcept { return indexed_kv.quantization.enabled() ? float16 : float32; }
 };
 
 Geometry geometry(const json& metadata, int context) {
@@ -396,7 +398,7 @@ void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, cons
     const auto pooled = index.pool_norm(sum(masses * values, 2), float32);
     const int first = position - position % g.group_size;
     const auto positions = arange(first, first + split, g.group_size, int32);
-    const auto rotated = trailing_rope(pooled, positions, g.rotary, g.rotary_base);
+    const auto rotated = astype(trailing_rope(pooled, positions, g.rotary, g.rotary_base), g.index_pool_dtype());
     if (cache.offloaded_groups) cache.offloaded_groups->append(rotated);
     else cache.groups->append(rotated);
 }
@@ -440,10 +442,10 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     if (!cache.latent && !cache.offloaded_latent) {
         if (offload) {
             cache.offloaded_latent.emplace(offload, stored.shape(-1), stored.dtype(), 1);
-            cache.offloaded_groups.emplace(offload, g.index_width, float32, kMlxQsaIndexPriority);
+            cache.offloaded_groups.emplace(offload, g.index_width, g.index_pool_dtype(), kMlxQsaIndexPriority);
         } else {
             cache.latent.emplace(g.context, stored.shape(-1), stored.dtype());
-            cache.groups.emplace(std::max(1, g.context / g.group_size), g.index_width, float32);
+            cache.groups.emplace(std::max(1, g.context / g.group_size), g.index_width, g.index_pool_dtype());
         }
     }
     if (cache.offloaded_latent) cache.offloaded_latent->append(stored);
@@ -469,7 +471,8 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     std::optional<array> dense_rows;
     if (resident && count >= 4 && end <= 2 * g.index_budget)
         dense_rows = g.indexed_kv.unpack(*resident);
-    const auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
+    auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
+    if (pooled && pooled->dtype() != float32) pooled = astype(*pooled, float32);
     const auto& quantization = g.indexed_kv.quantization;
     // Packed recalls can share more SSD blocks across queries within one gather.
     const int query_tile = cache.offloaded_latent && end > 2 * g.index_budget &&
@@ -1059,7 +1062,7 @@ MlxHy4Cache MlxHy4Model::restore(const TextSessionState& state) const {
             restore_rows(source.latent, position, g.context, g.indexed_kv.width(), g.indexed_kv.dtype(), 1, w.offload,
                 layer.latent, layer.offloaded_latent);
             restore_rows(source.groups, position / g.group_size, std::max(1, g.context / g.group_size),
-                g.index_width, float32, kMlxQsaIndexPriority, w.offload, layer.groups, layer.offloaded_groups);
+                g.index_width, g.index_pool_dtype(), kMlxQsaIndexPriority, w.offload, layer.groups, layer.offloaded_groups);
             layer.index_tail = source.index_tail;
             layer.last_indices = source.last_indices;
         }

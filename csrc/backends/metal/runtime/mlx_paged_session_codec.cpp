@@ -1441,6 +1441,7 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
     state.bytes = position * sizeof(tokens.front());
     const auto store = mlx_qsa_kv_offload_store();
     std::optional<Dtype> indexed_dtype;
+    auto group_dtype = mlx::core::float32;
     struct LayerRows {
         bool sliding = false;
         Hy4PrefixRows latent, groups;
@@ -1499,10 +1500,11 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
                 (indexed_dtype && *indexed_dtype != latent.dtype))
                 throw std::runtime_error("Hy4 prefix latent KV dtype changed");
             indexed_dtype = latent.dtype;
+            group_dtype = latent.dtype == mlx::core::uint32 ? mlx::core::float16 : mlx::core::float32;
             layer.latent.append(latent, start, 0, end - start, position, *indexed_dtype, 1, store);
             const auto first_group = start / ratio, groups = end / ratio - first_group;
             if (groups) layer.groups.append(reader.tensor(), first_group, 0, groups, position / ratio,
-                mlx::core::float32, kMlxQsaIndexPriority, store);
+                group_dtype, kMlxQsaIndexPriority, store);
             if (exact) {
                 std::optional<SerializedTensor> tail;
                 if (end % ratio) tail = reader.tensor();
@@ -1533,7 +1535,7 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
                 mlx::core::float16, state.bytes).resident;
         } else {
             output.latent = layer.latent.finish(position, *indexed_dtype, state.bytes);
-            output.groups = layer.groups.finish(position / state.group_size, mlx::core::float32, state.bytes);
+            output.groups = layer.groups.finish(position / state.group_size, group_dtype, state.bytes);
         }
     }
     return state;

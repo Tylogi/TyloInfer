@@ -52,7 +52,13 @@ void test_dynamic_store() {
     auto before = store->stats();
     for (int i = 0; i < 4; ++i) require(store->read(index[i])->at(0) == i, "indexer contents changed");
     require(store->stats().reads == before.reads, "raw KV evicted higher-priority indexer keys");
-    for (int i = 4; i < 12; ++i) index.push_back(store->write(std::vector<std::uint8_t>(4096, i), 2));
+    index.push_back(store->write(std::vector<std::uint8_t>(4096, 4), 2));
+    store->flush();
+    for (int i = 0; i < 2; ++i) store->read(raw[i]);
+    const auto history_reads = store->stats().reads;
+    for (int i = 0; i < 2; ++i) require(store->read(raw[i])->at(0) == i + 10, "history block changed");
+    require(store->stats().reads == history_reads, "a large index evicted the active history working set");
+    for (int i = 5; i < 12; ++i) index.push_back(store->write(std::vector<std::uint8_t>(4096, i), 2));
     store->flush();
     require(store->stats().hot_bytes <= 24576 && store->stats().disk_bytes > 8192,
         "indexer did not spill when it exceeded the budget");
@@ -85,6 +91,46 @@ void test_snapshot_rollback() {
     require(std::equal(read.begin(), read.begin() + 997 * 32, original.begin()), "unaligned snapshot prefix changed");
     sequence.restore(snapshot);
     require(sequence.position() == 1000, "snapshot restore changed position");
+}
+
+void test_hy4_index_prefix() {
+    using Codec = MlxPagedSessionCodec<MlxHy4TextSessionState>;
+    constexpr std::size_t block_size = 5;
+    for (const auto kv_dtype : {float16, uint32}) {
+        const auto key_dtype = kv_dtype == uint32 ? float16 : float32;
+        MlxHy4TextSessionState state;
+        state.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        state.group_size = 4;
+        state.window = 8;
+        state.last_hidden = values({1, 1, 4}, 5);
+        state.last_logits = values({1, 1, 16}, 3, float32);
+        state.layers.resize(1);
+        auto& layer = state.layers.front();
+        layer.latent.resident = reshape(arange(44, kv_dtype), {1, 11, 4});
+        layer.groups.resident = values({1, 2, 4}, 117, key_dtype);
+        layer.index_tail = values({1, 3, 8}, 61, float32);
+        layer.last_indices = reshape(arange(11, int32), {1, 1, 11});
+        std::vector<MlxPagedPayload> pages;
+        for (std::size_t block = 0; block * block_size < state.tokens.size(); ++block)
+            pages.push_back(Codec::encode_block(state, block_size, block));
+        const auto resident = Codec::decode(pages, state.tokens, block_size);
+        const auto& keys = resident.layers.front().groups.resident;
+        require(keys && keys->dtype() == key_dtype && all(*keys == *layer.groups.resident).item<bool>(),
+            "Hy4 prefix lost resident pooled index rows");
+
+        QsaKvStoreConfig config;
+        config.budget_bytes = 32768;
+        config.buffer_bytes = 8192;
+        auto store = std::make_shared<QsaKvStore>(config);
+        mlx_set_qsa_kv_offload_store(store);
+        const auto offloaded = Codec::decode(pages, state.tokens, block_size);
+        mlx_set_qsa_kv_offload_store({});
+        const auto& rows = offloaded.layers.front().groups.offloaded;
+        require(rows && rows->dtype == key_dtype, "Hy4 prefix changed the offloaded index dtype");
+        MlxQsaIndexOffload index(store, 4, key_dtype, kMlxQsaIndexPriority);
+        index.restore(*rows);
+        require(all(index.view(0, 2) == *layer.groups.resident).item<bool>(), "Hy4 prefix lost offloaded index rows");
+    }
 }
 
 void test_store_telemetry() {
@@ -465,6 +511,7 @@ int main(int argc, char** argv) {
         if (argc >= 2) { test_model(argv[1], argc >= 3 ? std::stoull(argv[2]) : 131072); return 0; }
         test_dynamic_store();
         test_snapshot_rollback();
+        test_hy4_index_prefix();
         test_store_telemetry();
         test_shared_resident_guard();
         test_indexer();
