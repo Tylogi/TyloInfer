@@ -39,6 +39,7 @@
 #include "runtime/execution_options.h"
 #include "tyloinfer/host_memory.h"
 #include "tyloinfer/gguf_model_source.h"
+#include <nlohmann/json.hpp>
 #include "tyloinfer/cpu_expert_pool.h"
 #include "tyloinfer/runtime.h"
 #include "tyloinfer/cpu_wait.h"
@@ -296,6 +297,9 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
     struct PrefillDemand {
         std::array<std::weak_ptr<GgufRoutedWeight>,3> banks;
         std::vector<std::uint64_t> counts;
+        std::vector<float> recent_usage;
+        std::size_t rows=0;
+        bool observed=false;
     };
     std::map<int,std::map<std::uint64_t,PrefillDemand>> prefill_demand_;
     std::unordered_set<int> prefill_rebalance_pending_,decode_seed_pending_;
@@ -303,6 +307,10 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
     std::uint64_t decode_seed_rebalances_=0;
     std::size_t prefill_resident_experts_=0;
     double prefill_rebalance_ms_=0;
+    std::uint64_t prefill_refill_replacements_=0;
+    std::uint64_t prefill_profile_replacements_=0;
+    std::size_t profile_seeded_experts_=0;
+    double profile_seed_ms_=0;
     CudaProfiler& profiler_;
     std::map<int,MfqCudaStream> prefill_streams_;
     std::map<int,MfqCudaStream> admission_streams_;
@@ -959,7 +967,7 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
         device_copies_.erase(copy);
         host_index_duplicate(key,false);
     }
-    std::shared_ptr<HostImage> read_host(const GgufRoutedWeight& bank, std::int64_t expert) {
+    std::shared_ptr<HostImage> read_host(const GgufRoutedWeight& bank, std::int64_t expert,bool allow_pin_upgrade=true) {
         const auto key = (bank.source_id << 32) | std::uint64_t(expert);
         if (auto found = host_.find(key); found != host_.end()) {
             host_index_touch(key);
@@ -969,7 +977,7 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
             if(available)image->ready_on_host=true;
             // Upgrade an earlier pageable fallback when hot VRAM duplicates
             // have released pinning capacity. Never mutate an in-flight image.
-            if (!image->block && !image->snapshot && available) {
+            if (allow_pin_upgrade && !image->block && !image->snapshot && available) {
                 if (auto block = allocate_pinned(image->bytes)) {
                     auto pinned = std::make_shared<HostImage>(); pinned->bytes = image->bytes;
                     pinned->block = std::move(block); std::memcpy(pinned->data(), image->data(), image->bytes);
@@ -1197,6 +1205,53 @@ public:
         return capacity-offset;
     }
     void suspend_prefill_loan() {mfq::cuda::default_context(mfq_current_cuda_device())->suspend_workspace_loan();}
+    static float prefill_slot_decode_weight(const SlotTier& tier,std::size_t rows) {
+        // Keep the replacement margin in prefill route counts. Applying
+        // the decode margin after normalization rejects short-prompt heat.
+        return rows && tier.windows>=mfq::cuda::expert_usage_interval ?
+            1.f/mfq::cuda::expert_prefill_usage(1,rows):0.f;
+    }
+    static float prefill_refill_score(const SlotTier& tier,std::size_t layer,std::size_t expert,
+            const PrefillDemand& demand,float decode_weight) {
+        if(decode_weight)return demand.counts[expert]+decode_weight*tier.usage[layer][expert];
+        const float route_weight=demand.rows?1.f/mfq::cuda::expert_prefill_usage(1,demand.rows):0.f;
+        return demand.counts[expert]+route_weight*demand.recent_usage[expert];
+    }
+    void refresh_prefill_loan(SlotTier& tier,const std::map<std::uint64_t,PrefillDemand>& demand) {
+        using Score=std::pair<float,std::int32_t>;
+        std::vector<std::vector<Score>> victims(tier.banks.size());
+        for(auto slot=tier.loan_first;slot<tier.cache->slots();++slot) {
+            const auto& owner=tier.owners[slot];
+            if(!owner.touched)continue;
+            const auto gate=owner.banks[0].lock();
+            if(!gate)continue;
+            const auto row=demand.find(gate->source_id);
+            if(row==demand.end() || !row->second.observed)continue;
+            const auto layer=tier.roles.at(gate->source_id).layer;
+            const auto decode_weight=prefill_slot_decode_weight(tier,row->second.rows);
+            const auto score=prefill_refill_score(tier,layer,owner.expert,row->second,decode_weight);
+            victims[layer].emplace_back(score,owner.expert);
+        }
+        for(std::size_t layer=0;layer<victims.size();++layer) {
+            if(victims[layer].empty())continue;
+            const auto& row=demand.at(tier.admission_banks[layer][0]->source_id);
+            const auto decode_weight=prefill_slot_decode_weight(tier,row.rows);
+            std::vector<Score> candidates;
+            for(std::size_t expert=0;expert<row.counts.size();++expert) {
+                const auto score=prefill_refill_score(tier,layer,expert,row,decode_weight);
+                if(score>0.f && tier.cache->slot_of(layer,expert)<0)
+                    candidates.emplace_back(score,expert);
+            }
+            // Compare the experts that are already going to be uploaded.
+            // The number of transferred slots and their byte sizes stay fixed.
+            mfq::cuda::rank_routed_replacements(candidates,victims[layer],[&](auto,auto incoming,auto outgoing) {
+                const auto slot=tier.cache->slot_of(layer,outgoing);
+                tier.cache->replace(layer,outgoing,incoming);
+                tier.owners[slot].expert=incoming;
+                ++prefill_refill_replacements_;
+            });
+        }
+    }
     void end_prefill_loan() {
         wait_direct_admission();const auto device=mfq_current_cuda_device();
         std::vector<SlotOwner> restore;
@@ -1208,20 +1263,31 @@ public:
             // owners. Retire them before checking the loan's live tensors.
             TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));reap();
             mfq::cuda::default_context(device)->end_workspace_loan();
+            if(const auto demand=prefill_demand_.find(device);demand!=prefill_demand_.end())
+                refresh_prefill_loan(tier,demand->second);
             restore.assign(tier.owners.begin()+tier.loan_first,tier.owners.begin()+tier.cache->slots());
             tier.loan_first=tier.cache->slots();tier.loan_active=false;
         }
         // As in Strata, this refill follows computation_finished and remains
         // part of TTFT. It never changes the PP or stable-decode timer.
+        struct RefillBatch {
+            std::array<std::shared_ptr<GgufRoutedWeight>,3> banks;
+            std::vector<std::int64_t> experts;
+        };
+        std::map<std::uint64_t,RefillBatch> batches;
         for(const auto& owner:restore) {
             if(!owner.touched)continue;
-            std::array<std::shared_ptr<GgufRoutedWeight>,3> banks;
-            for(int role=0;role<3;++role) {
-                banks[role]=owner.banks[role].lock();
-                if(!banks[role])throw std::runtime_error("GGUF borrowed expert owner expired");
+            const auto gate=owner.banks[0].lock();
+            if(!gate)throw std::runtime_error("GGUF borrowed expert owner expired");
+            auto& batch=batches[gate->source_id];
+            if(batch.experts.empty()) {
+                batch.banks={gate,owner.banks[1].lock(),owner.banks[2].lock()};
+                if(!batch.banks[1] || !batch.banks[2])throw std::runtime_error("GGUF borrowed expert owner expired");
             }
-            (void)acquire_moe(banks,{owner.expert},device);
+            batch.experts.push_back(owner.expert);
         }
+        for(const auto& [source,batch]:batches)
+            (void)acquire_moe(batch.banks,batch.experts,device,true,nullptr,nullptr,UploadPurpose::CacheAdmission);
     }
     void wait_direct_admission() {
         if(!admission_executor_->pending() && !layer_admission_)return;
@@ -1530,18 +1596,81 @@ public:
         std::lock_guard lock(mutex_);return std::exchange(reuse_learning_,enabled);
     }
     void record_prefill(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
-            const std::vector<std::vector<std::int64_t>>& routes) {
+            const std::vector<std::vector<std::int64_t>>& routes,std::size_t rows,std::size_t topk) {
         if(banks[0]->resident_packed.defined())return;
         if(banks[0]->cache!=banks[1]->cache || banks[0]->cache!=banks[2]->cache)return;
         std::lock_guard lock(mutex_);
         if(!reuse_learning_)return;
         const auto device=mfq_current_cuda_device();
         auto& demand=prefill_demand_[device][banks[0]->source_id];
+        demand.observed=true;
+        demand.rows=rows;
         for(int role=0;role<3;++role)demand.banks[role]=banks[role];
         demand.counts.resize(routes.size());
-        for(std::size_t expert=0;expert<routes.size();++expert)demand.counts[expert]=routes[expert].size();
+        demand.recent_usage.assign(routes.size(),0.f);
+        const auto tier=slot_tiers_.find(device);
+        const bool cold=tier!=slot_tiers_.end() && !prefill_slot_decode_weight(tier->second,rows);
+        // Use the live decode cache's heat lifetime for the prompt tail too.
+        // The full prompt counts stabilize the score for experts absent there.
+        std::vector<float> tail;
+        if(cold) {
+            const auto decay=mfq::cuda::expert_usage_decay(1);
+            for(float weight=1.f;tail.size()<rows && weight>=.01f;weight*=decay)
+                tail.push_back(weight);
+        }
+        for(std::size_t expert=0;expert<routes.size();++expert) {
+            demand.counts[expert]=routes[expert].size();
+            if(!cold)continue;
+            for(auto slot=routes[expert].rbegin();slot!=routes[expert].rend();++slot) {
+                const auto age=rows-1-std::size_t(*slot)/topk;
+                if(age>=tail.size())break;
+                demand.recent_usage[expert]+=tail[age];
+            }
+        }
         decode_seed_bytes_[device]=0;decode_seed_pending_.erase(device);
         prefill_rebalance_pending_.insert(device);
+    }
+    void refine_prefill_slots(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
+            const std::vector<std::vector<std::int64_t>>& routes,std::size_t rows,std::vector<std::uint8_t>& admission,int device) {
+        if(banks[0]->cache.get()!=this || banks[1]->cache.get()!=this || banks[2]->cache.get()!=this)return;
+        wait_direct_admission();
+        using Score=std::pair<float,std::int32_t>;
+        std::vector<std::pair<std::int32_t,std::int32_t>> swaps;
+        {
+            std::lock_guard lock(mutex_);
+            const auto tier=slot_tiers_.find(device);
+            if(!reuse_learning_ || !profile_seeded_experts_ || tier==slot_tiers_.end())return;
+            const auto role=tier->second.roles.find(banks[0]->source_id);
+            if(role==tier->second.roles.end())return;
+            const auto layer=role->second.layer;
+            const auto decode_weight=prefill_slot_decode_weight(tier->second,rows);
+            const auto& usage=tier->second.usage[layer];
+            std::vector<Score> candidates,victims;
+            for(std::size_t expert=0;expert<routes.size();++expert) {
+                const auto slot=tier->second.cache->slot_of(layer,expert);
+                const auto count=routes[expert].size();
+                const float score=count+decode_weight*usage[expert];
+                if(slot<0 && (admission[expert] || (decode_weight && count)))
+                    candidates.emplace_back(score,expert);
+                else if(slot>=0 && slot<tier->second.loan_first && (decode_weight?!admission[expert]:!count))
+                    victims.emplace_back(score,expert);
+            }
+            // An incoming image is needed by this PP. On the first request,
+            // only recycle slots the cohort will not read. Later requests
+            // also have decode observations to price the trade-off.
+            mfq::cuda::rank_routed_replacements(candidates,victims,[&](auto,auto incoming,auto outgoing) {
+                swaps.emplace_back(incoming,outgoing);
+            });
+        }
+        std::size_t replaced=0;
+        for(const auto& [incoming,outgoing]:swaps)if(prepare_slot_expert(banks,incoming,device,outgoing)) {
+            admission[incoming]=1;
+            ++replaced;
+        }
+        if(replaced) {
+            std::lock_guard lock(mutex_);
+            prefill_profile_replacements_+=replaced;
+        }
     }
     void record_decode_seed(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
             const std::vector<RoutedExpertTouch>& touches,int device) {
@@ -1561,7 +1690,60 @@ public:
             count+=std::min(touch.uses,UINT64_MAX-count);decode_seed_pending_.insert(device);
         }
     }
-    void rebalance_prefill() {
+    void seed_profile(const mfq::ModelSource& source) {
+        if(!strata_slots_requested() || (source.architecture()!="qwen4_exp" && source.architecture()!="qwen4exp"))return;
+        const auto metadata=source.metadata().find("gguf_metadata");
+        if(metadata==source.metadata().end())return;
+        const auto info=nlohmann::json::parse(metadata->second,nullptr,false);
+        if(!info.is_object() || !info.contains("general.name") || !info["general.name"].is_string())return;
+        const auto& name=info["general.name"].get_ref<const std::string&>();
+        constexpr std::string_view family="Qwen3.8-Flash-Next";
+        if(!name.starts_with(family) || (name.size()>family.size() && name[family.size()]!=' ' && name[family.size()]!='-'))return;
+
+        constexpr int layers=48, experts=512;
+        static constexpr std::uint16_t rank[]{
+#include "flash_next_expert_profile.inc"
+        };
+        static_assert(std::size(rank)==layers*experts);
+        const int device=mfq_current_cuda_device();
+        std::array<PrefillDemand,layers> demand;
+        {
+            std::lock_guard lock(mutex_);
+            if(slot_tiers_.count(device) || !device_limit_.count(device) || !device_limit_.at(device))return;
+            if(reclaim_banks_.size()!=layers*3)return;
+            std::unordered_map<std::string_view,std::shared_ptr<GgufRoutedWeight>> banks;
+            for(const auto& [id,bank]:reclaim_banks_) {
+                const auto group=group_sources_.find(id);
+                if(group==group_sources_.end() || bank->experts!=experts)return;
+                banks.emplace(group->second.name,bank);
+            }
+            constexpr std::array<std::string_view,3> roles{"gate","up","down"};
+            for(int layer=0;layer<layers;++layer) {
+                auto& row=demand[layer];
+                row.counts.resize(experts);
+                const auto prefix="model.block."+std::to_string(layer)+".mlp.experts.";
+                for(int role=0;role<3;++role) {
+                    const auto bank=banks.find(prefix+std::string(roles[role])+".weight");
+                    if(bank==banks.end())return;
+                    row.banks[role]=bank->second;
+                }
+            }
+            for(std::size_t i=0;i<std::size(rank);++i)
+                demand[rank[i]/experts].counts[rank[i]%experts]=std::size(rank)-i;
+            for(auto& row:demand)prefill_demand_[device][row.banks[0].lock()->source_id]=std::move(row);
+            prefill_rebalance_pending_.insert(device);
+        }
+        try {
+            rebalance_prefill(true);
+        } catch(const MfqResourceExhausted&) {
+            std::lock_guard lock(mutex_);
+            if(slot_tiers_.count(device))release_slot_tier(device);
+            prefill_demand_.erase(device);
+            prefill_rebalance_pending_.erase(device);
+        }
+        std::fprintf(stderr,"native_gguf_expert_profile experts=%zu ms=%.3f\n",profile_seeded_experts_,profile_seed_ms_);
+    }
+    void rebalance_prefill(bool profile=false) {
         wait_direct_admission();
         struct Candidate {
             std::array<std::shared_ptr<GgufRoutedWeight>,3> banks;
@@ -1667,8 +1849,10 @@ public:
         for(const auto& [source,group]:groups) {
             std::vector<std::int64_t> experts;experts.reserve(group.size());
             for(const auto* candidate:group)experts.push_back(candidate->expert);
-            (void)acquire_moe(group.front()->banks,experts,ordinal);
+            (void)acquire_moe(group.front()->banks,experts,ordinal,true,nullptr,nullptr,
+                profile?UploadPurpose::CacheAdmission:UploadPurpose::Streamed);
         }
+        if(profile && retained_host.empty())TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
         if(!retained_host.empty()) {
             // Upload sources must become reusable before recovering RAM
             // holes. This finite join is at the existing TTFT boundary.
@@ -1697,8 +1881,15 @@ public:
                 std::fprintf(stderr,"native_gguf_decode_slot_seed actual_match=1 observed_bytes=%zu cache_bytes=%llu\n",
                     decode_seed_bytes_[ordinal],static_cast<unsigned long long>(slot_tiers_.at(ordinal).cache->bytes()));
         }
-        prefill_resident_experts_=std::count_if(selected.begin(),selected.end(),[](const auto& candidate){return candidate.count!=0;});
-        prefill_rebalance_ms_=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+        const auto count=std::count_if(selected.begin(),selected.end(),[](const auto& candidate){return candidate.count!=0;});
+        const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+        if(profile) {
+            profile_seeded_experts_=count;
+            profile_seed_ms_=elapsed;
+        } else {
+            prefill_resident_experts_=count;
+            prefill_rebalance_ms_=elapsed;
+        }
     }
     void finish_direct(bool frequent=false) {
         // Window completion precedes this callback. Destroying even a ready
@@ -2548,6 +2739,10 @@ public:
             {"gguf_direct_expert_bytes", double(direct_bytes_)},
             {"gguf_prefill_resident_experts",double(prefill_resident_experts_)},
             {"gguf_prefill_rebalance_ms",prefill_rebalance_ms_},
+            {"gguf_prefill_refill_replacements",double(prefill_refill_replacements_)},
+            {"gguf_prefill_profile_replacements",double(prefill_profile_replacements_)},
+            {"gguf_profile_seeded_experts",double(profile_seeded_experts_)},
+            {"gguf_profile_seed_ms",profile_seed_ms_},
             {"expert_cache_hits", double(gpu_hits_)}, {"expert_cache_misses", double(calls_ - gpu_hits_)},
             {"expert_cache_evictions", double(device_evictions_)}, {"expert_host_fetch_ms", fetch_ms_},
             {"host_tensor_bytes", double(mfq::cuda::tensor_host_bytes.load())}};
@@ -2659,7 +2854,8 @@ public:
             }
             const auto started = std::chrono::steady_clock::now();
             const auto temporary=transient.find(key.image);
-            const auto image=temporary!=transient.end()?temporary->second:read_host(bank,expert);
+            const auto image=temporary!=transient.end()?temporary->second:
+                read_host(bank,expert,!staged_host_jobs_.count(key.image));
             fetch_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             // Free the promoted image's logical RAM slot before demoting the
             // VRAM victim, otherwise a full cache discards a different cold
@@ -2776,7 +2972,7 @@ public:
                     // arenas or pageable memory; CUDA registration stays out.
                     for(const auto& candidate:banks)read_host_batch(*candidate,selected,device);
                 }
-                auto image=read_host(bank,id);
+                auto image=read_host(bank,id,false);
                 // CPU consumers require completed D2H data even on the same stream.
                 if(image->ready && !image->ready->ready())image->ready->synchronize();
                 fetch_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
@@ -2810,7 +3006,7 @@ public:
         std::lock_guard lock(mutex_);
         const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_HOST_STAGE");
         const auto* dma=std::getenv("TYLOINFER_GGUF_PREFILL_DMA");
-        if(!RoutedPrefillStager::enabled() || !snapshot_ || (setting && setting[0]=='0') || (dma && dma[0]=='0'))return {};
+        if(!RoutedPrefillStager::enabled() || (setting && setting[0]=='0') || (dma && dma[0]=='0'))return {};
         if(!staged_host_jobs_.empty())throw std::logic_error("overlapping GGUF host staging");
         RoutedPrefillStagePlan plan;
         std::size_t first=0;
@@ -2819,7 +3015,10 @@ public:
                 if(bank->resident_packed.defined())continue;
                 const auto expert=active[i];const Key key{(bank->source_id<<32)|std::uint64_t(expert),device};
                 if(device_.count(key))continue;
-                auto image=read_host(*bank,expert);if(image->pinned())continue;
+                std::shared_ptr<HostImage> image;
+                if(const auto cached=host_.find(key.image);cached!=host_.end())image=cached->second.image;
+                else if(snapshot_ && snapshot_sources_.count(bank->source_id))image=read_host(*bank,expert);
+                if(!image || image->pinned() || (image->ready && !image->ready->ready()))continue;
                 plan.add(key.image,{image->data(),image->bytes,image});
             }
             first=end;
@@ -3117,14 +3316,19 @@ public:
             std::array<std::vector<mfq::cuda::PinnedUploadRange>,2> phases;
             phases[0].reserve(batch.images.size());
             if(phased)phases[1].reserve(experts.size());
+            auto& dma_images=cache_admission?admission_dma_images_:prefill_dma_images_;
+            auto& dma_bytes=cache_admission?admission_dma_bytes_:prefill_dma_bytes_;
+            auto& dma_copies=cache_admission?admission_dma_copies_:prefill_dma_copies_;
             for(const auto& image:batch.images)if(const auto found=staged_host_jobs_.find(image.key.image);found!=staged_host_jobs_.end()) {
                 const auto before=std::chrono::steady_clock::now();
+                prefill_host_stager_->pass(found->second);
                 const auto* source=prefill_host_stager_->wait(found->second);
                 prefill_host_staging_wait_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
                 TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(image.weight.packed.data_ptr(),source,image.source->bytes,cudaMemcpyHostToDevice,stream));
                 prefill_host_stager_->issued_one(found->second,stream);prefill_host_staged_bytes_+=image.source->bytes;
+                ++dma_images;++dma_copies;dma_bytes+=image.source->bytes;
             }
-            for(const auto& image:batch.images)if(image.source->pinned()) {
+            for(const auto& image:batch.images)if(image.source->pinned() && !staged_host_jobs_.count(image.key.image)) {
                 if(image.source->ready && image.source->producer!=stream)
                     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,image.source->ready->get(),0));
                 auto* destination=reinterpret_cast<std::byte*>(image.weight.packed.data_ptr());
@@ -3142,9 +3346,6 @@ public:
                 phases[phase].push_back({reinterpret_cast<const std::byte*>(image.source->data()),
                     destination,image.source->bytes,image.source->registration_id(),destination_root});
             }
-            auto& dma_images=cache_admission?admission_dma_images_:prefill_dma_images_;
-            auto& dma_bytes=cache_admission?admission_dma_bytes_:prefill_dma_bytes_;
-            auto& dma_copies=cache_admission?admission_dma_copies_:prefill_dma_copies_;
             for(int phase=0;phase<(phased?2:1);++phase) {
                 auto& copies=phases[phase];
                 dma_images+=copies.size();
@@ -3318,6 +3519,10 @@ bool prepare_gguf_graph_pool(const std::shared_ptr<GgufExpertCache>& cache) {
 }
 void finalize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache, std::size_t reserve) {
     if (cache) cache->finalize(reserve);
+}
+
+void seed_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache,const mfq::ModelSource& source) {
+    if(cache)cache->seed_profile(source);
 }
 void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>& cache, std::size_t bytes) {
     if (cache) cache->reserve_workspace(bytes);
@@ -4164,7 +4369,9 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
         direct_mmq[role]=use_mmq && mmq::direct_fits(int(bank.type),bank.out*(joined_mmq && role==0?2:1),bank.input,source.get_device());
         expert_major_mmq&=direct_mmq[role];
     }
-    const auto selected = ids.cpu().contiguous();
+    const auto selected = banks.up->cache->profile_prefill("gguf.pp.route_readback",[&] {
+        return ids.cpu().contiguous();
+    });
     std::vector<std::vector<std::int64_t>> grouped(banks.up->experts);
     for (std::int64_t slot = 0; slot < slots; ++slot) {
         const auto expert = selected.data_ptr<std::int64_t>()[slot];
@@ -4181,12 +4388,16 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
         }
     }
     const auto plan=host.defined()?banks.up->cache->upload_packet(std::move(host),source.get_device()):tb::Tensor{};
-    banks.up->cache->record_prefill(projections,grouped);
+    banks.up->cache->record_prefill(projections,grouped,tokens,routes);
     std::vector<std::uint8_t> admission(banks.up->experts,0);
     auto ranking=active;
     std::stable_sort(ranking.begin(),ranking.end(),[&](auto a,auto b){return grouped[a].size()>grouped[b].size();});
     const auto quota=banks.up->cache->prefill_quota(banks.up->experts,source.get_device());
     for(std::size_t rank=0;rank<std::min(quota,ranking.size());++rank) admission[ranking[rank]]=1;
+    banks.up->cache->profile_prefill("gguf.pp.residency",[&] {
+        banks.up->cache->refine_prefill_slots(projections,grouped,tokens,admission,source.get_device());
+        return true;
+    });
     // Similar row counts keep both the BMM padding and MMQ's shared tile
     // width efficient. Preserve those groups when scheduling their uploads.
     active=std::move(ranking);
@@ -4207,7 +4418,9 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
     if(use_mmq)group=std::min(group,std::size_t(mmq::group_capacity));
     const auto group_ends=mfq::cuda::routed_prefill_group_ends(active.size(),group,
         [&](auto i){return grouped[active[i]].size();});
-    auto host_staging=banks.up->cache->prepare_host_staging(projections,active,group_ends,source.get_device());
+    auto host_staging=banks.up->cache->profile_prefill("gguf.pp.host_stage",[&] {
+        return banks.up->cache->prepare_host_staging(projections,active,group_ends,source.get_device());
+    });
     std::size_t mmq_guard_bytes=0;
     if(use_mmq)for(const auto& bank:projections)mmq_guard_bytes+=128*ggml_type_size(bank->type)+15;
     const auto arena_bytes=aligned_compressed_bytes*group+mmq_guard_bytes;
@@ -4238,6 +4451,7 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
     // which can synchronize otherwise asynchronous uploads and GEMMs.
     tb::Tensor job_metadata,mmq_metadata,mmq_packet,mmq_inverse;
     std::vector<std::int64_t> mmq_offsets,mmq_row_offsets;
+    std::int64_t mmq_max_rows=0;
     banks.up->cache->profile_prefill("gguf.pp.metadata",[&] {
         job_metadata=use_mmq?tb::Tensor{}:tb::empty({std::int64_t(3*active.size()*sizeof(mfq::cuda::gguf::GemmJob))},
             source.options().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
@@ -4257,6 +4471,7 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 mmq_row_offsets.push_back(compact_row);
                 const auto n=std::int64_t(end-begin);
                 const auto count=route_plan->rows(begin,end);
+                mmq_max_rows=std::max(mmq_max_rows,count);
                 auto* bounds=mmq_metadata.data_ptr<std::int32_t>()+mmq_cursor;bounds[0]=0;
                 auto* identity=bounds+n+1;auto* output_ids=identity+count+mmq::id_guard;
                 std::fill_n(identity+count,mmq::id_guard,0);
@@ -4299,6 +4514,14 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 int(bank.type),bank.input,tokens,int(routes),stream);return true;
         });
         activation.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    }
+    tb::Tensor mmq_gate_up,mmq_hidden,mmq_output;
+    if(use_mmq) {
+        const auto float_options=source.options().dtype(tb::kFloat32);
+        mmq_gate_up=tb::empty({mmq_max_rows,2*banks.up->out},float_options);
+        mmq_hidden=tb::empty({std::int64_t(mmq::activation_bytes(mmq_max_rows,banks.down->input))},
+            source.options().dtype(tb::kUInt8));
+        mmq_output=tb::empty({mmq_max_rows,banks.down->out},float_options);
     }
     source = source.contiguous();
     for (const auto& tensor : {source, pairs, plan,mmq_packet})
@@ -4360,7 +4583,7 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
             return true;
         });
     };
-    pipeline.run(upload_groups.size(),acquire_group,[&](std::size_t group_index) {
+    const auto compute_group=[&](std::size_t group_index) {
         const auto begin=group_index?group_ends[group_index-1]:0;
         const auto stage_index=group_index%2,end=group_ends[group_index];
         auto& job=upload_groups[group_index];auto& weight_stage=job.stage;
@@ -4422,7 +4645,9 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 } else mmq::gather(copies,int(n),stream);
                 return true;
             });
-            auto gu=tb::empty({count,2*banks.up->out},source.options().dtype(tb::kFloat32));
+            // Compute groups use one stream, so their scratch can be reused
+            // while the transfer stream prepares the next group's weights.
+            auto& gu=mmq_gate_up;
             const auto product=[&](int role,std::int64_t rows,std::size_t expert_bytes,const tb::Tensor& activation,
                     float* output,std::int64_t stride) {
                 const auto& bank=*projections[role];
@@ -4438,7 +4663,7 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 const auto& up_activation=mmq_layer_input[1];
                 product(1,banks.up->out,banks.up->expert_bytes,up_activation,gu.data_ptr<float>()+banks.gate->out,gu.size(1));
             }
-            auto hidden_q=tb::empty({std::int64_t(mmq::activation_bytes(count,banks.down->input))},source.options().dtype(tb::kUInt8));
+            auto& hidden_q=mmq_hidden;
             banks.up->cache->profile_prefill("gguf.pp.mmq.quantize",[&] {
                 if(banks.down->rotation) {
                     auto hidden=tb::empty({count,banks.down->input},gu.options());
@@ -4449,16 +4674,14 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 } else mmq::swiglu_quantize(gu.data_ptr<float>(),hidden_q.data_ptr(),int(banks.down->type),
                     banks.down->input,count,limit,stream);return true;
             });
-            hidden_q.record_stream(reinterpret_cast<std::uintptr_t>(stream));
             if(weight_stage.gate_up_submitted)banks.up->cache->profile_prefill("gguf.pp.mmq.gather_down",[&] {
                 TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,weight_ready[stage_index].get(),0));
                 mmq::Copy down_copies[3]={copies[0],copies[1],copies[2]};
                 for(int role=0;role<2;++role)down_copies[role].bytes=down_copies[role].guard_bytes=0;
                 mmq::gather(down_copies,int(n),stream);return true;
             });
-            auto result=tb::empty({count,banks.down->out},gu.options());
-            product(2,banks.down->out,banks.down->expert_bytes,hidden_q,result.data_ptr<float>(),banks.down->out);
-            mmq::scatter(result.data_ptr<float>(),pairs.data_ptr(),device_output,count,banks.down->out,stream);
+            product(2,banks.down->out,banks.down->expert_bytes,hidden_q,mmq_output.data_ptr<float>(),banks.down->out);
+            mmq::scatter(mmq_output.data_ptr<float>(),pairs.data_ptr(),device_output,count,banks.down->out,stream);
             if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
                 static std::atomic<bool> reported{false};
                 if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
@@ -4534,10 +4757,16 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
         });
         mfq::cuda::gguf::grouped_scatter_f16(reinterpret_cast<const mfq::cuda::gguf::GemmJob*>(packets[2].data_ptr()),
             int(batch),maximum,banks.down->out,result.data_ptr(),pairs.data_ptr(),stream);
-    },[&](std::size_t group_index) {
-        for(auto& bank:upload_groups[group_index].acquired)bank.clear();
+    };
+    banks.up->cache->profile_prefill("gguf.pp.pipeline",[&] {
+        pipeline.run(upload_groups.size(),acquire_group,compute_group,[&](std::size_t group_index) {
+            for(auto& bank:upload_groups[group_index].acquired)bank.clear();
+        });
+        return true;
     });
-    return moe_weighted_reduce_cuda(pairs, weights.to(tb::kFloat32).contiguous());
+    return banks.up->cache->profile_prefill("gguf.pp.reduce",[&] {
+        return moe_weighted_reduce_cuda(pairs,weights.to(tb::kFloat32).contiguous());
+    });
 }
 }
 

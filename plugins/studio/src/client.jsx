@@ -13,6 +13,7 @@ import { Icon, ScreenHeader } from '../../../studio/web/src/app/display.tsx';
 import { ModelsContent } from './models-page.jsx';
 import { modelMessages } from './model-messages.js';
 import { createPageApi } from './page-api.js';
+import { terminalStates } from './model-api.js';
 import { usePageRead, usePageMutation, PageMutationStatus } from './page-kit.jsx';
 import { OverviewContent, ResourcesContent, LogsContent } from './runtime-pages.jsx';
 import { LogUpdateControl } from '../../../studio/web/src/features/runtime/LogUpdateControl.tsx';
@@ -28,6 +29,7 @@ const messages = {
 };
 const entries = ['overview', 'models', 'service', 'resources', 'downloads', 'analysis', 'logs'];
 const mainKey = 'tyloinfer.inference';
+const modelFolderKey = 'tyloinfer.agent.model-folder.v1';
 
 const inferenceIcons = { overview: 'gauge', models: 'folder', service: 'server-rack', resources: 'droplet', downloads: 'download', analysis: 'search', logs: 'scroll' };
 function InferenceIcon({ name }) {
@@ -64,8 +66,18 @@ function InferencePanel({ t, useSelection, useModelState, watchModels, modelActi
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [logsPaused, setLogsPaused] = useState(false);
   const [analysisSelection, setAnalysisSelection] = useState('');
-  const [folderPath, setFolderPath] = useState(null);
+  const [folderPath, setFolderPath] = useState(() => {
+    try { return window.localStorage.getItem(modelFolderKey); } catch { return null; }
+  });
   const directoryTrigger = useRef(null);
+  const chooseDirectory = event => {
+    directoryTrigger.current = event?.currentTarget ?? document.activeElement;
+    setDirectoryOpen(true);
+  };
+  const rememberFolder = path => {
+    setFolderPath(path);
+    try { window.localStorage.setItem(modelFolderKey, path); } catch {}
+  };
   useEffect(() => { setDirectoryOpen(false); }, [view]);
   const [filters, setFilters] = useState({ query: '', sort: 'recent', offset: 0, limit: 100 });
   const language = t('languageCode');
@@ -74,20 +86,31 @@ function InferencePanel({ t, useSelection, useModelState, watchModels, modelActi
   const [selectedModel, setSelectedModel] = useState('');
   const selectedInstance = state.inventory?.instances.find(item => item.model === selectedModel && ['ready', 'busy'].includes(item.state)) || state.inventory?.instances.find(item => ['ready', 'busy'].includes(item.state));
   const selectedName = selectedInstance?.model || '';
-  const page = usePageRead(pageApi, view, { prefix_cache: filters, logs: { limit: 500 }, metrics: { limit: 500 }, jobs: { limit: 200 }, serving: { scope: 'session' }, ...(['overview', 'resources'].includes(view) && selectedInstance ? { status: { instance_id: selectedInstance.id } } : {}) }, refreshKey);
-  const mutation = usePageMutation(pageApi, refresh, refreshKey, pageCheckpoint);
+  const settled = view === 'models' && terminalStates.has(state.operation?.status) ? state.operation.id : '';
+  const page = usePageRead(pageApi, view, { prefix_cache: filters, logs: { limit: 500 }, metrics: { limit: 500 },
+    jobs: { limit: ['overview', 'models'].includes(view) ? 40 : 200 },
+    serving: { scope: 'session', ...(view === 'overview' && selectedName ? { model: selectedName } : {}) },
+    ...(['overview', 'resources'].includes(view) && selectedInstance ? { status: { instance_id: selectedInstance.id } } : {}) }, `${refreshKey}:${settled}`);
+  const liveInstanceIds = page.values.instances?.value?.data?.map(item => item.id).sort().join(',');
+  useEffect(() => {
+    if (['overview', 'models'].includes(view) && liveInstanceIds != null && state.inventory &&
+        liveInstanceIds !== state.inventory.instances.map(item => item.id).sort().join(',')) void modelActions.refresh();
+  }, [view, liveInstanceIds, modelActions]);
+  const mutation = usePageMutation(pageApi, refresh, refreshKey, pageCheckpoint, view);
+  const inventoryReady = Boolean(state.inventory) && !state.loading && !state.inventoryError;
+  const reviewReady = inventoryReady && (view === 'models' || !page.loading && Object.values(page.values).every(entry => !entry.error));
   useEffect(() => watchModels(), [watchModels]);
-  const props = { values: page.values, inventory: state.inventory, api: pageApi, mutation, tr, go: showInference, refreshKey, refresh, directoryOpen, onDirectoryChange: setDirectoryOpen, directoryTrigger, selectedModel: selectedName, selectModel: setSelectedModel, loading: page.loading, logsPaused, analysisSelection, setAnalysisSelection, folderPath, setFolderPath, inventoryLoading: state.loading, inventoryError: state.inventoryError };
+  const props = { values: page.values, inventory: state.inventory, api: pageApi, mutation, tr, go: showInference, refreshKey, refresh, directoryOpen, onDirectoryChange: setDirectoryOpen, chooseDirectory, directoryTrigger, selectedModel: selectedName, selectModel: setSelectedModel, loading: page.loading, logsPaused, analysisSelection, setAnalysisSelection, folderPath, rememberFolder, inventoryLoading: state.loading, inventoryError: state.inventoryError };
   const subtitles = {
     overview: tr('本机推理状态与性能。', 'Local inference status and performance.'), models: tr('管理本地模型与运行实例。', 'Manage local models and runtime instances.'), service: tr('运行服务、连接与模型默认值。', 'Runtime service, connections, and model defaults.'), resources: tr('监视计算占用、权重与 KV 流量、前缀缓存。', 'Monitor compute utilization, weight and KV traffic, and prefix caching.'), downloads: tr('为设备寻找模型与精度档位。', 'Find models and precision tiers for your device.'), analysis: tr('探索检查点架构、参数与精度。', 'Explore checkpoint architecture, parameters and precision.'), logs: tr('查看服务事件、请求性能与任务记录。', 'Inspect service events, request performance, and job records.'),
   };
   return <section ref={pageElement} className="tylo-studio-inference" aria-label={t('engine')} data-inference-page={view} data-studio-theme={appearance.active?.colorScheme || appearance.preference}>
     <SharedPresenters tr={tr} inventory={state.inventory} runtime={page.values.status?.value} operation={state.operation} jobs={[...(page.values.jobs?.value?.data || []), ...(mutation.operation ? [mutation.operation] : [])]}><div className="tylo-restored-page">
-    <ScreenHeader title={view === 'downloads' ? tr('模型下载', 'Model downloads') : t(view)} subtitle={subtitles[view]} trailing={<>{view === 'logs' && <LogUpdateControl paused={logsPaused} onChange={setLogsPaused} tr={tr} />}{view === 'models' && <><button type="button" onClick={() => showInference('downloads')}><Icon name="download" size={14} />{tr('模型下载', 'Model downloads')}</button><button ref={directoryTrigger} type="button" className="primary" onClick={() => setDirectoryOpen(true)}><Icon name="folder" size={14} />{tr('添加模型', 'Add model')}</button></>}<button type="button" onClick={backToChat}>{t('back')}</button><button type="button" disabled={state.loading || page.loading} onClick={refresh}><Icon name="refresh" size={14} />{t('refresh')}</button></>} />
+    <ScreenHeader title={view === 'downloads' ? tr('模型下载', 'Model downloads') : t(view)} subtitle={subtitles[view]} trailing={<>{view === 'logs' && <LogUpdateControl paused={logsPaused} onChange={setLogsPaused} tr={tr} />}{view === 'models' && <><button type="button" onClick={() => showInference('downloads')}><Icon name="download" size={14} />{tr('模型下载', 'Model downloads')}</button><button type="button" className="primary" onClick={chooseDirectory}><Icon name="folder" size={14} />{tr('添加模型', 'Add model')}</button></>}<button type="button" onClick={backToChat}>{t('back')}</button><button type="button" disabled={state.loading || page.loading} onClick={refresh}><Icon name="refresh" size={14} />{t('refresh')}</button></>} />
     {(state.loading || page.loading) && <p role="status">{t('loading')}</p>}
     {state.inventoryError && <div role="alert"><p>{t(state.inventory ? 'staleInventory' : 'managementUnavailable')}</p><p>{state.inventoryError.message}</p></div>}
     {view === 'models' && <OperationPanel state={state} actions={modelActions} t={t} />}
-    {['models', 'service', 'resources', 'downloads', 'logs'].includes(view) && <PageMutationStatus mutation={mutation} tr={tr} refreshKey={refreshKey} reviewReady={!page.loading && !state.loading && !state.inventoryError && Object.values(page.values).every(entry => !entry.error)} />}
+    {['models', 'service', 'resources', 'downloads', 'logs'].includes(view) && <PageMutationStatus mutation={mutation} tr={tr} refreshKey={refreshKey} reviewReady={reviewReady} />}
     {view === 'overview' && <OverviewContent {...props} />}
     {view === 'models' && <ModelsContent {...props} state={state} actions={modelActions} t={t} />}
     {view === 'service' && <ServiceContent {...props} openSettings={openProductSettings} />}

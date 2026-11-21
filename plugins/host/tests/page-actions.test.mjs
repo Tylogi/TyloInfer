@@ -18,13 +18,95 @@ function harness(route, kinds = ['download.huggingface', 'download.modelscope'])
     } });
   return { calls, call: (method, payload, peer = owner) => bridge(method, payload, undefined, peer) };
 }
-for (const endpoint of ['hub/search', 'hub/info', 'hub/official', 'models/register', 'downloads/create', 'downloads/get', 'downloads/cancel', 'service/configure', 'service/get', 'service/cancel']) {
+for (const endpoint of ['hub/search', 'hub/info', 'hub/official', 'models/browse-directory', 'models/register', 'models/open-directory', 'downloads/create', 'downloads/get', 'downloads/cancel', 'service/configure', 'service/get', 'service/cancel', 'service/configure-listener', 'service/configure-authentication', 'service/remote-nodes', 'service/add-remote-node', 'service/delete-remote-node']) {
   test(endpoint + ' refuses non-owner before any network', async () => {
     const h = harness(() => assert.fail('network'));
     assert.equal((await h.call(endpoint, {}, { principal: { kind: 'viewer' } })).error.code, 'tyloinfer/forbidden');
     assert.equal(h.calls.length, 0);
   });
 }
+test('opens the directory identified by the model browser', async () => {
+  const h = harness((url, init) => {
+    assert.equal(url.pathname, '/api/v1/models/directories/open');
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(JSON.parse(init.body), { directory_id: directory });
+    return json({ opened: true });
+  });
+  assert.deepEqual(await h.call('models/open-directory', { directory_id: directory }), { ok: true, value: { opened: true } });
+  assert.equal((await h.call('models/open-directory', { path: '/outside' })).error.code, 'tyloinfer/bad-request');
+});
+test('adds and deletes remote nodes through fixed core routes', async () => {
+  const draft = { name: 'worker', url: 'https://worker.invalid', api_key_env: null, enabled: true };
+  const node = { ...draft, id, healthy: false, models: [], active_requests: 0, metrics: {} };
+  const h = harness((url, init) => {
+    assert.equal(url.pathname, '/api/v1/cluster/nodes' + (init.method === 'DELETE' ? '/' + id : ''));
+    if (init.method === 'DELETE') return new Response(null, { status: 204 });
+    if (init.method === 'GET') {
+      assert.equal(url.searchParams.get('refresh'), 'false');
+      return json({ data: [node] });
+    }
+    assert.deepEqual(JSON.parse(init.body), draft);
+    return json(node, 201);
+  });
+  assert.equal((await h.call('service/remote-nodes', { refresh: false })).value.data.length, 1);
+  assert.equal((await h.call('service/add-remote-node', draft)).value.id, id);
+  assert.deepEqual(await h.call('service/delete-remote-node', { id }), { ok: true, value: null });
+  assert.equal((await h.call('service/add-remote-node', { ...draft, url: 'http://user@worker.invalid' })).error.code, 'tyloinfer/bad-request');
+});
+test('submits global context reload as the native context job', async () => {
+  const h = harness((url, init) => {
+    assert.equal(url.pathname, '/api/v1/runtime/context');
+    assert.deepEqual(JSON.parse(init.body), { apply_global_cap: true });
+    return json(job('runtime.context.configure', 'queued'), 202);
+  }, ['runtime.context.configure']);
+  assert.equal((await h.call('context/configure', { request: { apply_global_cap: true }, confirmed: true })).value.id, id);
+  assert.equal((await h.call('context/configure', { request: { apply_global_cap: true, instance_id: id }, confirmed: true })).error.code, 'tyloinfer/bad-request');
+});
+test('updates the Agent provider after the core accepts an OpenAI listener change', async () => {
+  const selected = { baseURL: 'http://core.invalid:8090/v1' };
+  let applied = false;
+  let updated = false;
+  const bridge = createCoreBridge({ getProvider: () => selected, resolveCredential: async () => undefined,
+    async prepareProviderUpdate(provider, patch) {
+      assert.equal(provider, selected);
+      assert.deepEqual(patch, { baseURL: 'http://core.invalid:8092/v1' });
+      return { async commit() { assert(applied); updated = true; } };
+    },
+    async fetchImpl(url, init) {
+      if (url.pathname === '/health') return json({ service: 'tyloinfer-server', protocol_version: '1.0' });
+      assert.equal(url.pathname, '/api/v1/runtime/listener');
+      if (init.method === 'GET') return json({ port: 8090, configurable: true });
+      assert.deepEqual(JSON.parse(init.body), { port: 8092, protocol: 'openai' });
+      applied = true;
+      return json({ port: 8092, configurable: true });
+    },
+  });
+  assert.equal((await bridge('service/configure-listener', { port: 8092, protocol: 'openai' }, undefined, owner)).ok, true);
+  assert(updated);
+});
+test('stages the new key privately and acknowledges only safe authentication status', async () => {
+  const fixture = 'fixture-only';
+  let staged = false;
+  let committed = false;
+  const bridge = createCoreBridge({ getProvider: () => ({ baseURL: 'http://core.invalid/v1' }),
+    resolveCredential: async () => undefined,
+    async prepareProviderUpdate(_provider, change) {
+      assert.deepEqual(change, { apiKey: fixture });
+      staged = true;
+      return { async commit() { committed = true; } };
+    },
+    async fetchImpl(url, init) {
+      if (url.pathname === '/health') return json({ service: 'tyloinfer-server', protocol_version: '1.0' });
+      assert.equal(url.pathname, '/api/v1/auth/policy');
+      assert(staged);
+      assert.deepEqual(JSON.parse(init.body), { enabled: true, api_key: fixture });
+      return json({ enabled: true, has_key: true, unexpected: fixture });
+    },
+  });
+  const reply = await bridge('service/configure-authentication', { enabled: true, api_key: fixture }, undefined, owner);
+  assert.deepEqual(reply, { ok: true, value: { enabled: true, has_key: true } });
+  assert(committed);
+});
 for (const [endpoint, payload, path, params] of [
   ['hub/search', { provider: 'huggingface', query: 'model & version', formats: ['tq', 'gguf'], sort: 'downloads', direction: 'desc', cursor: 'a'.repeat(16), limit: 40 }, '/api/v1/hub/models',
     { provider: 'huggingface', query: 'model & version', formats: 'tq,gguf', sort: 'downloads', direction: 'desc', cursor: 'a'.repeat(16), limit: '40', browse: 'true' }],
@@ -39,9 +121,38 @@ for (const [endpoint, payload, path, params] of [
   });
 }
 test('registers only the core-issued directory id without opening or loading anything', async () => {
-  const h = harness((url, init) => { assert.equal(url.pathname, '/api/v1/models/directories/register'); assert.equal(init.method, 'POST'); assert.deepEqual(JSON.parse(init.body), { directory_id: directory }); return json({ data: [] }); });
+  const h = harness((url, init) => { assert.equal(url.pathname, '/api/v1/models/directories/register'); assert.equal(init.method, 'POST');
+    assert.equal(url.searchParams.get('allow_empty'), 'true'); assert.deepEqual(JSON.parse(init.body), { directory_id: directory }); return json({ data: [] }); });
   assert.deepEqual(await h.call('models/register', { directory_id: directory }), { ok: true, value: { data: [] } });
   assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('imports only the selected file inside the browsed directory', async () => {
+  const file = 'model-00002-of-00002.gguf';
+  const h = harness((_url, init) => {
+    assert.deepEqual(JSON.parse(init.body), { directory_id: directory, file_name: file });
+    return json({ data: [{ name: 'model' }] });
+  });
+  assert.equal((await h.call('models/register', { directory_id: directory, file_name: file })).ok, true);
+  for (const invalid of ['../model.gguf', 'sub\\model.gguf', 'X:model.gguf', '..']) {
+    const reply = await h.call('models/register', { directory_id: directory, file_name: invalid });
+    assert.equal(reply.error.code, 'tyloinfer/bad-request');
+  }
+  assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('browses a manually entered directory through the fixed listing endpoint', async () => {
+  const path = String.raw`X:\Models & downloads\Empty`;
+  const listing = { current_id: directory, current_path: path, model_file_count: 0, data: [] };
+  const h = harness((url, init) => {
+    assert.equal(url.pathname, '/api/v1/models/directories');
+    assert.equal(init.method, 'GET');
+    assert.deepEqual(Object.fromEntries(url.searchParams), { path });
+    return json(listing);
+  });
+  assert.deepEqual(await h.call('models/browse-directory', { path }), { ok: true, value: listing });
+  for (const invalid of ['relative', 'X:relative', '//network/share', 'https://example.invalid', '/bad\npath']) {
+    assert.equal((await h.call('models/browse-directory', { path: invalid })).error.code, 'tyloinfer/bad-request');
+  }
+  assert.equal(h.calls.length, 2);
 });
 for (const provider of ['huggingface', 'modelscope']) {
   test('preserves the native ' + provider + ' download JobResource without inventing completion', async () => {

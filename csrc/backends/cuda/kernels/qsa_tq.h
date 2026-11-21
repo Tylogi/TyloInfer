@@ -61,9 +61,14 @@ int tq_prepare_affine8(const void* keys,const void* values,bool fp16,
 // Unpack H4/RHT modes to [blocks, heads, 4, padded_width] for each K/V kind.
 int tq_decode_modes(const TqBlockView* blocks,float* keys,float* values,
     const std::uint16_t* relative,int count,int heads,int padded_width,cudaStream_t stream);
+struct RestoreTailIndex {
+    const std::uint16_t* source;
+    float* destination;
+    int elements;
+};
 int tq_restore_modes(const float* keys,const float* values,const float* key_signs,
     const float* value_signs,float* restored_keys,float* restored_values,
-    int blocks,int heads,int width,int padded_width,cudaStream_t stream);
+    int blocks,int heads,int width,int padded_width,cudaStream_t stream,const RestoreTailIndex* index=nullptr);
 // The native QSA selector returns contiguous four-token groups plus a tail.
 int tq_group_selected(const std::int32_t* tokens,SelectedBlock* blocks,
     int queries,int columns,cudaStream_t stream);
@@ -157,6 +162,8 @@ int tq_publish_contiguous_views(TqBlockView base,TqBlockView* output,int image_b
 // Self-contained INT16 affine rows: width codes, FP16 scale bits, INT16 zero.
 // Raw and pooled Indexer caches use the same representation on every KV tier.
 int indexer_affine16_pack(const float* input,std::int16_t* records,int rows,int width,cudaStream_t stream);
+int indexer_affine16_pack_at(const void* input,bool half_input,std::int64_t row_stride,std::int16_t* records,
+    const void* positions,bool wide_positions,int rows,int width,int capacity,cudaStream_t stream);
 int indexer_affine16_unpack(const std::int16_t* records,float* output,int rows,int width,cudaStream_t stream);
 int indexer_affine16_record_scores(const float* query,const std::int16_t* records,const std::int64_t* positions,float* output,
     int queries,int heads,int width,int blocks,int pool,cudaStream_t stream);

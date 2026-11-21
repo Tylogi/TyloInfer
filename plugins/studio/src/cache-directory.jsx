@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ModelDirectoryDialog } from '../../../studio/web/src/features/models/ModelDirectoryDialog.tsx';
-import { Dialog } from './shared-primitives.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
 import { terminalStates } from './model-api.js';
+import { Facts } from './page-kit.jsx';
 
 export function CacheDirectoryControl({ api, mutation, tr, refreshKey, inventory, currentDirectory }) {
   const [open, setOpen] = useState(false);
@@ -36,13 +37,11 @@ export function CacheDirectoryControl({ api, mutation, tr, refreshKey, inventory
       jumpToModelDirectory: event => event.preventDefault(), openModelDirectory: id => setDirectoryId(id || null),
       modelDirectoryPath: browser.value?.current_path || browser.value?.current_name || '', setModelDirectoryPath() {}, registerCurrentModelDirectory: choose, openCurrentDirectory() {},
     }} />
-    <Dialog open={Boolean(confirmation)} onOpenChange={value => { if (!value) setConfirmation(null); }} title={tr('更改全部模型的缓存目录', 'Change cache folder for all loaded models')} closeLabel={tr('关闭', 'Close')} returnFocusRef={trigger}>
-      <div className="tylo-model-confirm"><p>{tr('当前目录', 'Current folder')}: {currentDirectory || '—'}</p><strong>{confirmation?.path}</strong>
-        <p>{tr('范围：全部已加载模型。全局内存规划可能先卸载再重载所有模型，并清空活动 KV；进行中的请求不会被自动取消。此操作不是普通路径保存，失败也可能已有部分副作用。', 'Scope: all loaded models. Global memory planning may unload and reload every model and clear active KV. Active requests are not cancelled automatically. This is not a simple path save; failures may still have partial side effects.')}</p>
-        <p>{tr('当前已加载模型', 'Currently loaded models')}: {(inventory?.instances || []).filter(item => ['ready', 'busy', 'loading'].includes(item.state)).map(item => item.model).join(' · ') || tr('无', 'None')}</p>
-        <p>{tr('仅提交所选核心目录 ID，不修改预算默认值；实际目录可写性与模型恢复由核心校验。受理后自动跟踪内存规划作业，不会重发。', 'Submit only the selected core directory ID without resetting budget defaults. The core checks writability and model recovery. Native memory-plan progress is tracked after acceptance without replaying the request.')}</p>
-        <div className="tylo-model-confirm-actions"><button type="button" onClick={() => setConfirmation(null)}>{tr('取消', 'Cancel')}</button><button type="button" className="danger" disabled={blocked} onClick={() => void confirm()}>{tr('确认更改全部模型目录', 'Confirm global folder change')}</button></div>
-      </div>
-    </Dialog>
+    <ConfirmationDialog open={Boolean(confirmation)} tr={tr} title={tr('更改前缀缓存目录', 'Change prefix cache folder')}
+      description={tr('更改会应用到全部模型，可能重载模型并清空活动 KV。', 'This change applies to every model and may reload models and clear active KV.')}
+      returnFocusRef={trigger} confirmLabel={tr('更改目录', 'Change folder')} onCancel={() => setConfirmation(null)} onConfirm={confirm} disabled={blocked} danger>
+      <Facts entries={[[tr('当前目录', 'Current folder'), currentDirectory || null], [tr('新目录', 'New folder'), confirmation?.path],
+        [tr('已加载的模型', 'Loaded models'), (inventory?.instances || []).filter(item => ['ready', 'busy', 'loading'].includes(item.state)).map(item => item.model).join(' · ') || tr('无', 'None')]]} />
+    </ConfirmationDialog>
   </>;
 }

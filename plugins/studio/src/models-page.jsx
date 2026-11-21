@@ -25,17 +25,21 @@ function ModelLibrary({ state, runtime, tr, openLoad, openUnload, openSettings, 
     openModelFiles: openFiles,
   };
   return <>
-    <ModelLibrarySummary artifacts={artifacts} instances={state.inventory.instances} folderPath={folderPath} tr={tr} />
-    <LocalCheckpoints catalog={catalog} companionMode="registered-id" />
+    <ModelLibrarySummary artifacts={artifacts} instances={state.inventory.instances} folderPath={folderPath}
+      onChooseFolder={chooseDirectory} busy={disabled || deletionBusy} tr={tr} />
+    <LocalCheckpoints catalog={catalog} companionMode="both" />
     {unlisted.length > 0 && <><SectionLabel title={tr('运行实例', 'Runtime instances')} /><TMPanel className="model-catalog-panel"><div className="model-list">{unlisted.map(model => <div className="model-row" key={model.instance_id || model.id}><span className="model-state active" /><div className="checkpoint-row-details"><strong>{model.model || model.id}</strong><small>{model.state}</small></div><button type="button" disabled={disabled} onClick={() => openUnload(model)}>{tr('卸载', 'Unload')}</button></div>)}</div></TMPanel></>}
   </>;
 }
-export function ModelsContent({ values, state, actions, t, api, mutation, refreshKey, refresh, tr, directoryOpen, onDirectoryChange, directoryTrigger, folderPath, setFolderPath }) {
+export function ModelsContent({ values, state, actions, t, api, mutation, refreshKey, refresh, tr, directoryOpen, onDirectoryChange, chooseDirectory, directoryTrigger, folderPath, rememberFolder }) {
   const [filesModel, setFilesModel] = useState(null);
   const fileTrigger = useRef(null);
   const deleteTrigger = useRef(null);
   const deletionRequest = useRef(null);
   const [deletion, setDeletion] = useState({ plan: null, loading: false, error: null });
+  const runtime = values.status?.error ? null : values.status?.value;
+  const catalogState = state.inventory && values.instances?.value
+    ? { ...state, inventory: { ...state.inventory, instances: values.instances.value.data } } : state;
   useEffect(() => { deletionRequest.current?.abort(); setDeletion({ plan: null, loading: false, error: null }); }, [refreshKey]);
   useEffect(() => () => deletionRequest.current?.abort(), []);
   async function prepareModelDeletion(id) {
@@ -54,8 +58,8 @@ export function ModelsContent({ values, state, actions, t, api, mutation, refres
     const result = await mutation.run(signal => api.deleteArtifact(plan.model_id, plan.token, signal));
     if (result) setDeletion({ plan: null, loading: false, error: null });
   }
-  return <>{values.status?.error && <CoreError error={values.status.error} />}<ModelRegistration api={api} mutation={mutation} refreshKey={refreshKey} open={directoryOpen} onOpenChange={onDirectoryChange} triggerRef={directoryTrigger} onRegistered={setFolderPath} />
-    {state.inventory && <ModelManagement state={state} actions={actions} t={t} tr={tr} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} runtime={values.status?.value} renderCatalog={controls => <ModelLibrary {...controls} folderPath={folderPath} refreshKey={refreshKey} state={state} runtime={values.status?.value} tr={tr} prepareModelDeletion={prepareModelDeletion} deletionBusy={deletion.loading} chooseDirectory={() => onDirectoryChange(true)} openFiles={id => { fileTrigger.current = document.activeElement; setFilesModel(id); }} />} />}
+  return <>{values.status?.error && <CoreError error={values.status.error} />}<ModelRegistration api={api} mutation={mutation} refreshKey={refreshKey} open={directoryOpen} onOpenChange={onDirectoryChange} triggerRef={directoryTrigger} startPath={folderPath} onRegistered={rememberFolder} />
+    {catalogState.inventory && <ModelManagement state={catalogState} actions={actions} t={t} tr={tr} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} runtime={runtime} renderCatalog={controls => <ModelLibrary {...controls} folderPath={folderPath} refreshKey={refreshKey} state={catalogState} runtime={runtime} tr={tr} prepareModelDeletion={prepareModelDeletion} deletionBusy={deletion.loading} chooseDirectory={chooseDirectory} openFiles={id => { fileTrigger.current = document.activeElement; setFilesModel(id); }} />} />}
     {deletion.loading && <p role="status">{tr('正在读取删除范围…', 'Reading deletion scope…')}</p>}{deletion.error && <CoreError error={deletion.error} />}
     <ModelDeleteDialog catalog={{ modelDeletion: deletion.plan, busy: mutation.busy || mutation.unknown, deletionTriggerRef: deleteTrigger, cancelModelDeletion: () => setDeletion({ plan: null, loading: false, error: null }), confirmModelDeletion }} />
     {filesModel && <ModelRegistration key={filesModel} api={api} mutation={mutation} refreshKey={refreshKey} open modelId={filesModel} onOpenChange={open => { if (!open) setFilesModel(null); }} triggerRef={fileTrigger} />}

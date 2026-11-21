@@ -7,20 +7,42 @@
 
 namespace mfq::transport_detail {
 namespace {
-std::string text(const json& value,const std::string& field,std::size_t maximum,bool nonempty = false) {
+using OrderedJson = nlohmann::ordered_json;
+
+std::string text(const OrderedJson& value,const std::string& field,std::size_t maximum,bool nonempty = false) {
     if(!value.is_string() || value.get_ref<const std::string&>().size()>maximum ||
             (nonempty && value.get_ref<const std::string&>().empty()))
         throw ApiError(400,"invalid_request_error","invalid decision text field",field);
     return value.get<std::string>();
 }
-void fields(const json& value,const std::set<std::string>& allowed,const std::string& parent) {
+void fields(const OrderedJson& value,const std::set<std::string>& allowed,const std::string& parent) {
     if(!value.is_object())throw ApiError(400,"invalid_request_error","decision parameters must be objects",parent);
     for(const auto& item:value.items())if(!allowed.contains(item.key()))
         throw ApiError(400,"invalid_request_error","unsupported decision parameter",parent+item.key());
 }
+
+std::string decision_state(const OrderedJson& value, const std::string& compact) {
+    if (value.is_null()) return {};
+    if (value.is_string()) return compact;
+    std::string formatted;
+    formatted.reserve(compact.size());
+    bool quoted = false, escaped = false;
+    for (const char ch : compact) {
+        formatted += ch;
+        if (quoted) {
+            if (!escaped && ch == '"') quoted = false;
+            escaped = !escaped && ch == '\\';
+        } else if (ch == '"') {
+            quoted = true;
+        } else if (ch == ':' || ch == ',') {
+            formatted += ' ';
+        }
+    }
+    return formatted;
+}
 }
 
-DecisionRequest parse_decision_request(const json& body,bool allow_conditional) {
+DecisionRequest parse_decision_request(const OrderedJson& body,bool allow_conditional) {
     std::set<std::string> allowed{"model","state","questions","instructions","chat_template_kwargs","cache_salt","joint"};
     if(allow_conditional) {allowed.insert("full_vocabulary");allowed.insert("prefix_cache");}
     fields(body,allowed,"");
@@ -45,6 +67,7 @@ DecisionRequest parse_decision_request(const json& body,bool allow_conditional) 
     }
     auto state=body["state"].is_string()?body["state"].get<std::string>():body["state"].dump();
     if(state.size()>262144)throw ApiError(400,"invalid_request_error","decision state exceeds the text limit","state");
+    const auto trained_state = decision_state(body["state"], state);
     std::string prefix;
     if(body.contains("instructions"))prefix=text(body["instructions"],"instructions",65536)+"\n\n";
     prefix+="State:\n"+state+"\n\n";
@@ -56,11 +79,11 @@ DecisionRequest parse_decision_request(const json& body,bool allow_conditional) 
         const auto& question=item.value();
         if(!question.contains("type"))throw ApiError(400,"invalid_request_error","decision question type is required",field+"type");
         DecisionQuestion descriptor;descriptor.id=item.key();descriptor.type=text(question["type"],field+"type",16,true);
-        mfq::engine::DecisionTextRead read;read.prompt=prefix;read.state=state;read.type=descriptor.type;
+        mfq::engine::DecisionTextRead read;read.prompt=prefix;read.state=trained_state;read.type=descriptor.type;
         if(question.contains("instructions"))read.instructions=text(question["instructions"],field+"instructions",65536);
         if(question.contains("instructions"))read.prompt+="Question:\n"+text(question["instructions"],field+"instructions",65536)+"\n";
         read.prompt+="Options:\n";
-        const auto criteria=question.value("criteria",json(nullptr));
+        const auto criteria=question.value("criteria",OrderedJson(nullptr));
         if(descriptor.type=="choice") {
             if(!criteria.is_object() || criteria.empty() || criteria.size()>255)
                 throw ApiError(400,"invalid_request_error","choice requires 1 to 255 named options",field+"criteria");

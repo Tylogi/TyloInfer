@@ -530,6 +530,51 @@ void test_gdn_decode_step(
         }
     }
 
+    for (int batch = 2; batch <= 8; ++batch) {
+        std::vector<std::vector<array>> projections(5);
+        std::vector<mfq::metal::MlxGatedDeltaDecodeState> states;
+        std::vector<mfq::metal::MlxGatedDeltaDecodeResult> expected;
+        states.reserve(batch);
+        expected.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            const auto scale = array(1.0f + 0.125f * row);
+            projections[0].push_back(astype(qk * scale, qk.dtype()));
+            projections[1].push_back(astype(value / scale, value.dtype()));
+            projections[2].push_back(astype(output_gate * scale, output_gate.dtype()));
+            projections[3].push_back(astype(alpha / scale, alpha.dtype()));
+            projections[4].push_back(astype(beta * scale, beta.dtype()));
+            states.push_back({convolution_state * scale, recurrent_state / scale});
+            expected.push_back(mfq::metal::gated_delta_decode_step(projections[0].back(), projections[1].back(),
+                projections[2].back(), projections[3].back(), projections[4].back(), states.back().convolution,
+                states.back().recurrent, convolution_weight, bias, decay, norm, key_heads, value_heads, dimension,
+                1e-6f, 1e-6f, true));
+        }
+        std::vector<array> packed;
+        for (const auto& projection : projections) packed.push_back(concatenate(projection, 1));
+        const int value_width = packed[1].shape(-1);
+        const auto padding = zeros({1, batch, 1}, packed[1].dtype());
+        packed[1] = slice(concatenate({padding, packed[1], padding}, -1),
+            {0, 0, 1}, {1, batch, value_width + 1});
+        const int gate_width = packed[3].shape(-1);
+        const auto gate = expand_dims(packed[3], -1);
+        packed[3] = slice(reshape(concatenate({zeros_like(gate), gate}, -1), {1, batch, 2 * gate_width}),
+            {0, 0, 1}, {1, batch, 2 * gate_width}, {1, 1, 2});
+        auto actual = mfq::metal::gated_delta_decode_batch(packed, states, convolution_weight, bias, decay, norm,
+            key_heads, value_heads, 1e-6f, 1e-6f, true, false, float32);
+        for (int row = 0; row < batch; ++row) {
+            auto output = slice(actual.output, {0, row, 0}, {1, row + 1, actual.output.shape(2)});
+            const std::array<array, 3> result{output, actual.states[row].convolution, actual.states[row].recurrent};
+            const std::array<array, 3> reference{expected[row].output, expected[row].convolution_state,
+                expected[row].recurrent_state};
+            for (int field = 0; field < 3; ++field) {
+                eval(result[field], reference[field]);
+                require_vector_close(result[field].data<float>(), std::vector<float>(
+                    reference[field].data<float>(), reference[field].data<float>() + reference[field].size()),
+                    0.0f, "GDN grouped decode must match independent requests");
+            }
+        }
+    }
+
     for (const bool transposed_state : {false, true})
     for (const bool tiled_heads : {false, true}) for (const bool silu_gate : {false, true}) {
         for (int tokens = 2; tokens <= 8; ++tokens) {
@@ -557,6 +602,19 @@ void test_gdn_decode_step(
             const bool split_heads = !transposed_state && cores > 0 && value_heads < cores * 2;
             if (!prepared || (prepared->preparation_key().find("_split4") != std::string::npos) != split_heads)
                 throw std::runtime_error("GDN sequence head partition dispatch mismatch");
+            if (transposed_state && tokens == 8 && !tiled_heads && !silu_gate) {
+                const auto& second = requests[1];
+                const mfq::metal::MlxGatedDeltaDecodeInput short_request{
+                    qs[0], vs[0], zs[0], as[0], bs[0], second.convolution_state, second.recurrent_state};
+                const auto ragged = mfq::metal::gated_delta_decode_steps({requests[0], short_request},
+                    convolution_weight, bias, decay, norm, key_heads, value_heads, dimension,
+                    1e-6f, 1e-6f);
+                const auto single = mfq::metal::gated_delta_decode_steps({short_request}, convolution_weight,
+                    bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f).front();
+                require_bit_exact(ragged[0].output, actual[0].output, "GDN long window in mixed batch");
+                require_bit_exact(ragged[1].output, single.output, "GDN anchor-only window in mixed batch");
+                require_bit_exact(ragged[1].recurrent_state, single.recurrent_state, "GDN mixed anchor recurrent state");
+            }
             for (const auto output_dtype : {float16, bfloat16}) {
                 auto rounded = mfq::metal::gated_delta_decode_steps(requests, convolution_weight,
                     bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f, silu_gate, tiled_heads, output_dtype, transposed_state);
@@ -939,6 +997,94 @@ void test_cached_depthwise_dilated_decode() {
 
 } // namespace
 
+void test_bfloat16_gdn_tree() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    constexpr int heads = 2, key_heads = 1, rows = 3, width = 128, channels = 4 * width;
+    const std::array parents{-1, 0, 0};
+    const MlxGatedDeltaDecodeInput input{full({1, rows, 2 * width}, .25f, bfloat16),
+        full({1, rows, heads * width}, .5f, bfloat16), zeros({1, rows, heads * width}, bfloat16),
+        zeros({1, rows, heads}, bfloat16), zeros({1, rows, heads}, bfloat16),
+        zeros({1, 3, channels}, float32), zeros({1, heads, width, width}, float32)};
+    const auto weights = full({channels, 4}, .25f, float32);
+    const auto bias = zeros({heads}, float32);
+    const auto norm = ones({width}, float32);
+    const auto result = gated_delta_decode_tree(input, parents, weights, bias, bias, norm,
+        key_heads, heads, 1.e-6f, false, false, bfloat16);
+    const auto reference = gated_delta_decode_tree(input, parents, weights, bias, bias, norm,
+        key_heads, heads, 1.e-6f, false, false, float32);
+    if (result.output.dtype() != bfloat16 || !all(result.output == astype(reference.output, bfloat16)).item<bool>())
+        throw std::runtime_error("GDN tree output rounding disagrees");
+}
+
+void test_packed_gdn_trees() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    constexpr int heads = 2, key_heads = 1, width = 128, channels = 4 * width;
+    const std::array first_parents{-1, 0, 0};
+    const std::array second_parents{-1, 0, 1, 0, 3};
+    const auto weight = full({channels, 4}, .25f, float32);
+    const auto bias = full({heads}, .2f, float32);
+    const auto scale = full({heads}, -.6f, float32);
+    const auto norm = ones({width}, float32);
+    const auto lane_input = [](int rows, float offset) {
+        auto make = [&](int columns, float multiplier) {
+            auto base = reshape(arange(rows * columns, float32), {1, rows, columns});
+            return astype(sin(base * array(multiplier) + array(offset)), bfloat16);
+        };
+        return MlxGatedDeltaDecodeInput{make(2 * width, .91f), make(heads * width, 1.07f),
+            make(heads * width, 1.13f), make(heads, .63f), make(heads, .44f),
+            full({1, 3, channels}, offset, float32),
+            full({1, heads, width, width}, offset * .005f, float32)};
+    };
+    const std::array third_parents{-1, 0};
+    const std::array fourth_parents{-1, 0, 0, 2, 3, 0};
+    const std::array<std::span<const int>, 4> parents{first_parents, second_parents, third_parents, fourth_parents};
+    const std::array inputs{lane_input(first_parents.size(), .1f), lane_input(second_parents.size(), -.2f),
+        lane_input(third_parents.size(), .3f), lane_input(fourth_parents.size(), -.4f)};
+    std::vector<MlxGatedDeltaTreeLane> lanes;
+    std::vector<MlxGatedDeltaTreeResult> reference;
+    std::vector<array> outputs;
+    for (std::size_t i = 0; i < parents.size(); ++i) {
+        const auto& input = inputs[i];
+        lanes.push_back({parents[i], input.convolution_state, input.recurrent_state});
+        reference.push_back(gated_delta_decode_tree(input, parents[i], weight, bias, scale, norm,
+            key_heads, heads, 1.e-6f, true, false, bfloat16));
+        outputs.push_back(reference.back().output);
+    }
+    for (std::size_t width = 2; width <= inputs.size(); ++width) {
+        const auto pack = [&](auto member) {
+            std::vector<array> cases;
+            for (std::size_t i = 0; i < width; ++i) cases.push_back(inputs[i].*member);
+            return concatenate(cases, 1);
+        };
+        using Input = MlxGatedDeltaDecodeInput;
+        const auto packed = gated_delta_decode_packed_trees(
+            {pack(&Input::qk), pack(&Input::value), pack(&Input::output_gate), pack(&Input::alpha), pack(&Input::beta)},
+            std::span(lanes).first(width), weight, bias, scale, norm, key_heads, heads, 1.e-6f, true, false, bfloat16);
+        require_bit_exact(packed.output, concatenate(std::vector<array>(outputs.begin(), outputs.begin() + width), 1),
+            "packed GDN verify output");
+        for (std::size_t i = 0; i < width; ++i) {
+            const auto& state = inputs[i];
+            const auto& expected = reference[i];
+            const auto& tape = packed.tapes[i];
+            const auto retained = i == 1 ? array({0, 3, 4}) : array({0, 1});
+            const auto fold = [&](const auto& tape) {
+                return fold_gated_delta_tree({state.convolution_state, state.recurrent_state}, state.qk, state.value,
+                    tape.keys, tape.values, tape.decay, tape.beta, retained, false);
+            };
+            require_bit_exact(tape.keys, expected.keys, "packed GDN keys");
+            require_bit_exact(tape.values, expected.values, "packed GDN values");
+            require_bit_exact(tape.decay, expected.decay, "packed GDN decay");
+            require_bit_exact(tape.beta, expected.beta, "packed GDN beta");
+            const auto actual_fold = fold(tape);
+            const auto expected_fold = fold(expected);
+            require_bit_exact(actual_fold.convolution, expected_fold.convolution, "packed GDN committed convolution");
+            require_bit_exact(actual_fold.recurrent, expected_fold.recurrent, "packed GDN committed recurrence");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace mlx::core;
@@ -954,6 +1100,8 @@ int main(int argc, char** argv) {
         test_gdn_gates();
         test_runtime_token_kernel_reuse();
         test_gdn_output_norm();
+        test_bfloat16_gdn_tree();
+        test_packed_gdn_trees();
         test_mixed_gdn_projection_types();
         test_linear_conv_prefill();
         test_linear_conv_prefill(48);

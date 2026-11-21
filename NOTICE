@@ -74,6 +74,16 @@ Copyright (c) 2026 David Dalcu
 License: MIT (`LICENSES/mlx-serve-MIT.txt`)
 Source: https://github.com/ddalcu/mlx-serve
 
+MLX
+---
+The grouped QSA decode kernel follows the online softmax reduction order of
+the MLX v0.32.4 vector SDPA kernel, with separate FP16 K/V inputs per request.
+DFlash2 draft attention follows the same reduction order and reads BF16 K/V
+directly from each request's cache.
+Copyright (c) 2024 Apple Inc.
+License: MIT (`LICENSES/MLX-MIT.txt`)
+Source: https://github.com/ml-explore/mlx
+
 llama.cpp / GGML
 ----------------
 TyloInfer's GGUF reader, tokenizer, grammar, chat-template/Jinja implementation, and
@@ -133,6 +143,8 @@ TyloInfer's CUDA multi-row warp reduction in
 `studio/server/kernels/cuda/warp_multi_sum.cuh`
 is adapted from Strata's s26_tsum.cuh, with TyloInfer-specific dispatch and packed
 weight integration.
+The Flash-Next expert ranking is derived from Strata's `data/expert-profile.bin`.
+The CUDA runtime uses Strata's direct SSD reader for streamed PLE rows.
 Copyright (c) 2026 Niko1221 and the Strata contributors
 License: MIT (`LICENSES/Strata-MIT.txt`)
 Source: https://github.com/Niko1221/strata
@@ -191,6 +203,21 @@ License: Apache License 2.0 (`csrc/third_party/agention-gyro/LICENSE`).
 See `csrc/third_party/agention-gyro/NOTICE` and
 `studio/server/_gyro/NOTICE` for the two copies that ship with the native and
 Python packages.
+
+Splash
+------
+The ancestor-query transform and recurrent scan in the Flash-Next Gated
+DeltaNet verification kernel are adapted from Splash's
+`gdn_decode_prologue`, `gdn_decode_transform`, `gdn_decode_scan`,
+`gdn_decode_gate` and `gdn_fold_rows`. Flash-Next
+PLE also adapts its tree convolution and retained history from
+`runtime/metal/kernels/shared/ngram_embedding.metal`.
+The greedy DFlash2 tree growth and history lookup priors also adapt
+`runtime/metal/kernels/decode/sampling.metal` and `runtime/model/LookupProposals.hpp`.
+Packed row allocation adapts `runtime/model/StepCosts.cpp`.
+License: Apache-2.0 (`LICENSE`)
+Source: https://github.com/incoai/splash
+Reference: release 1.7.0, runtime/metal/kernels/decode/gdn.metal
 
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.

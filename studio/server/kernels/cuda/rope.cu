@@ -58,6 +58,7 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
         int tokens,int width,int pool,int maximum,int rotary_maximum,int pairs,int axes,float eps,
         int64_t row_stride,int64_t column_stride,double attention_factor) {
     const int token=blockIdx.x,column=threadIdx.x;
+    if constexpr(Compact)if(cache && *cache%pool!=pool-1)return;
     const int64_t block=Compact?int64_t(token):cache[token]/pool,start=block*pool;
     // A verify batch can touch one block repeatedly. Only its last query writes
     // the pooled entry; all queries observe the same completed raw cache.
@@ -97,6 +98,7 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
                 const int pair=column%pairs;int axis=selected_axes[pair];if(axis>=axes)axis=0;
                 int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token);
                 if constexpr(!Compact)raw+=start-cache[token];
+                else if(cache)raw-=pool-1;
                 const int pos=max(0,min(rotary_maximum-1,int(raw)));
                 const float angle=__fmul_rn(float(pos),frequencies[pair]);
                 double sine,cosine;::sincos(double(angle),&sine,&cosine);
@@ -125,6 +127,7 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
     int axis=selected_axes[column];if(axis>=axes)axis=0;
     int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token);
     if constexpr(!Compact)raw+=start-cache[token];
+    else if(cache)raw-=pool-1;
     int position;
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     position=wide_positions?__double2int_rz(double(raw)):int(raw);
@@ -179,7 +182,7 @@ void qsa_pool_rotary_cache_cuda(const mfq_tensor_backend::Tensor& index,const mf
 void qsa_pool_rotary_cuda(const mfq_tensor_backend::Tensor& index,const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& frequencies,
         const mfq_tensor_backend::Tensor& axes,const mfq_tensor_backend::Tensor& output,
-        int64_t pool,int64_t rotary_maximum,double eps,double attention_factor) {
+        int64_t pool,int64_t rotary_maximum,double eps,double attention_factor,const mfq_tensor_backend::Tensor& completion_position) {
     namespace tb=mfq_tensor_backend;
     TYLOINFER_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(1)>0 &&
         index.size(1)<=INT_MAX && index.size(2)>0 && index.size(2)<=(index.scalar_type()==tb::kInt16?258:256) && pool>0 && pool<=INT_MAX &&
@@ -187,6 +190,9 @@ void qsa_pool_rotary_cuda(const mfq_tensor_backend::Tensor& index,const mfq_tens
         rotary_maximum>0 && rotary_maximum<=INT_MAX && std::isfinite(eps) && eps>=0 && std::isfinite(attention_factor) && attention_factor>0,
         "invalid compact pooled rotary geometry");
     const int64_t tokens=index.size(1)/pool;
+    TYLOINFER_RUNTIME_CHECK(!completion_position.defined() ||
+        (tokens==1 && completion_position.device()==index.device() && completion_position.numel()==1 &&
+         completion_position.scalar_type()==tb::kInt64),"invalid compact pool completion position");
     TYLOINFER_RUNTIME_CHECK(positions.device()==index.device() && positions.is_contiguous() &&
         positions.dim()>=1 && positions.dim()<=3 && positions.size(-1)==tokens &&
         (positions.dim()<3 || positions.size(1)==1) &&
@@ -204,7 +210,8 @@ void qsa_pool_rotary_cuda(const mfq_tensor_backend::Tensor& index,const mfq_tens
     const int threads=width<=32?32:width<=64?64:width<=128?128:256;
     const auto launch=[&](auto* source,auto* target) {
         qsa_pool_rotary_cache_kernel<true,std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,std::is_same_v<std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,int16_t>><<<unsigned(tokens),threads,0,mfq_current_cuda_stream()>>>(source,
-            weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==tb::kInt64,nullptr,
+            weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==tb::kInt64,
+            completion_position.defined()?completion_position.data_ptr<int64_t>():nullptr,
             frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),target,int(tokens),width,int(pool),int(index.size(1)),
             int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),
             float(eps),index.stride(1),index.stride(2),attention_factor);

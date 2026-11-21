@@ -13,16 +13,18 @@ const modelCount = (count: number) => `${count} ${count === 1 ? 'model' : 'model
 const resourceBytes = (bytes: number) => bytes < 1024 ? `${formatNumber(bytes)} B` :
   formatBytes(bytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
 
-export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, connectionRevision = 0, detailed = false, summary }: {
+export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, connectionRevision = 0, detailed = false, compact = false, summary }: {
   instances: RuntimeInstance[];
   runtime?: RuntimeStatus | null;
   memoryCapacityBytes?: number | null;
   connectionRevision?: number;
   detailed?: boolean;
+  compact?: boolean;
   summary?: ReactNode;
 }) {
   const { tr } = useSettings();
   const separate = hasSeparateVram(runtime);
+  const ramOnlyPrefix = separate && runtime?.prefix_cache_hot_tier === 'ram';
   const loadOrder = useRef({ revision: connectionRevision, ids: [] as string[] });
   if (loadOrder.current.revision !== connectionRevision) {
     loadOrder.current = { revision: connectionRevision, ids: [] };
@@ -69,8 +71,8 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
   const tiers: { id: Tier; title: string; detail: string }[] = [
     { id: 'weights', title: separate ? tr('显存常驻权重和缓冲区', 'VRAM-resident weights and buffers') : tr('常驻专家与稠密权重', 'Resident experts and dense weights'),
       detail: tr(`${loaded.length} 个模型`, modelCount(loaded.length)) },
-    { id: 'kv', title: separate ? tr('显存常驻 KV Cache 与前缀缓存', 'VRAM-resident KV and prefix cache') : tr('常驻 KV Cache 与前缀缓存', 'Resident KV and prefix cache'),
-      detail: tr(`${contextCount} 组上下文，${cacheBlocks} 个缓存块`, `${contextCount} contexts · ${cacheBlocks} cache blocks`) },
+    { id: 'kv', title: ramOnlyPrefix ? tr('显存常驻 KV Cache', 'VRAM-resident KV cache') : separate ? tr('显存常驻 KV Cache 与前缀缓存', 'VRAM-resident KV and prefix cache') : tr('常驻 KV Cache 与前缀缓存', 'Resident KV and prefix cache'),
+      detail: ramOnlyPrefix ? tr(`${contextCount} 组上下文`, `${contextCount} contexts`) : tr(`${contextCount} 组上下文，${cacheBlocks} 个缓存块`, `${contextCount} contexts · ${cacheBlocks} cache blocks`) },
     ...(separate ? [
       { id: 'ram-experts' as const, title: tr('内存流式加载权重', 'RAM-streamed weights'), detail: streamedCount('ram_experts') },
       ...(loaded.some(item => (item.memory?.ram_embedding_bytes ?? 0) > 0) ? [{ id: 'ram-embedding' as const, title: tr('RAM 流式加载嵌入表', 'RAM-streamed embedding tables'), detail: payloadCount('ram_embedding_bytes') }] : []),
@@ -125,11 +127,11 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
             <h2>{detailed ? tr('资源分配', 'Resource allocation') : tr('运行资源', 'Runtime resources')}</h2>
             <Tooltip content={<div>
             <strong>{tr('资源分工', 'Resource tiers')}</strong>
-            <p>{separate ? tr('VRAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存。', 'VRAM: resident weights, buffers, active KV and hot prefixes.')
+            <p>{ramOnlyPrefix ? tr('VRAM：常驻权重、缓冲区和活跃 KV。', 'VRAM holds resident weights, buffers and active KV.') : separate ? tr('VRAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存。', 'VRAM: resident weights, buffers, active KV and hot prefixes.')
               : tr('RAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存；统一内存设备由 CPU 与 GPU 共享。', 'RAM: resident experts and dense weights, active KV and hot prefixes; unified-memory devices share it between CPU and GPU.')}</p>
             {separate && <p>{tr('RAM：保存流式专家、层权重、嵌入表和 KV，按需传入显存；冷 KV 经 LRU 淘汰后写入 SSD。', 'RAM: streamed experts, layer weights, embedding tables and KV, transferred to VRAM on demand; LRU-evicted cold KV is written to SSD.')}</p>}
             <p>{tr('SSD：流式权重按需加载，PLE 表按 token 读取对应行，流式 KV 按选中的块读取。', 'SSD: weights are loaded on demand, PLE tables supply the rows for each token, and streamed KV supplies selected blocks.')}</p>
-            <p>{separate ? tr('前缀缓存使用显存、RAM 和可选 SSD 三层。RAM 优先让出内存，按 LRU 转存至 SSD；关闭 SSD 时直接销毁。', 'Prefix caching uses VRAM, RAM and optional SSD. RAM yields to other allocations: LRU eviction spills to SSD, or discards blocks when SSD is disabled.') : tr('前缀缓存由 RAM 热层与 SSD 冷层组成。', 'Prefix caching uses a RAM hot tier and SSD cold tier.')}</p>
+            <p>{separate && !ramOnlyPrefix ? tr('前缀缓存使用显存、RAM 和可选 SSD 三层。RAM 优先让出内存，按 LRU 转存至 SSD；关闭 SSD 时直接销毁。', 'Prefix caching uses VRAM, RAM and optional SSD. RAM yields to other allocations: LRU eviction spills to SSD, or discards blocks when SSD is disabled.') : tr('前缀缓存由 RAM 热层与 SSD 冷层组成。', 'Prefix caching uses a RAM hot tier and SSD cold tier.')}</p>
             <p>{tr('SSD 流式 KV 不含前缀缓存，后者在缓存管理中单独统计。', 'Streamed SSD KV excludes prefix caches, which are tracked separately in cache management.')}</p>
           </div>}>
               <button className="memory-capacity-help" type="button" aria-label={tr('资源分层说明', 'Memory tier details')}>
@@ -137,8 +139,11 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
               </button>
             </Tooltip>
           </div>
-          <p className="memory-capacity-note">{tr('下方内存、显存上限为扣除系统和其他进程占用后的 TyloInfer 可用容量，包含 TyloInfer 已占用与当前空余空间。',
-            'Memory and VRAM limits below reflect capacity available to TyloInfer after system and other process usage, including TyloInfer allocations and remaining free space.')}</p>
+          <p className="memory-capacity-note">{compact
+            ? tr('容量包含 TyloInfer 已占用和当前空余空间，已扣除系统和其他进程占用。',
+              'Capacity includes TyloInfer allocations and current free space, after system and other process usage.')
+            : tr('下方内存、显存上限为扣除系统和其他进程占用后的 TyloInfer 可用容量，包含 TyloInfer 已占用与当前空余空间。',
+              'Memory and VRAM limits below reflect capacity available to TyloInfer after system and other process usage, including TyloInfer allocations and remaining free space.')}</p>
         </div>
       </div>
       {summary}
@@ -165,10 +170,16 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
             ? memoryCapacityBytes ?? group.gpu.memory_total_bytes : group.gpu.memory_total_bytes,
             groupItems.map(item => value(item, 'weights')), groupItems.map(item => value(item, 'kv')),
             group.gpu.memory_available_bytes) : residentPool;
+          const visibleTiers = tiers.filter(tier => group.ids.includes(tier.id) &&
+            (!compact || tier.id === 'weights' || tier.id === 'kv' || groupItems.some(item => value(item, tier.id) !== 0)));
+          const free = group.gpu?.memory_available_bytes ?? (group.name === 'RAM' ? runtime?.host_memory_available_bytes : null);
           return <section className="memory-tier-group" key={group.gpu ? `gpu-${group.gpu.id}` : group.name}
             data-memory-group={group.name} data-gpu-id={group.gpu?.id} data-storage={group.name.toLowerCase()}>
-          <div className="memory-tier-group-heading"><h3>{group.name === 'VRAM' ? `${tr('显存', 'VRAM')} · GPU ${group.gpu!.id}` : group.name === 'RAM' ? tr('内存', 'RAM') : group.name}</h3><i aria-hidden="true" /><span>{group.detail}</span></div>
-          {tiers.filter((tier) => group.ids.includes(tier.id)).map((tier) => {
+          <div className="memory-tier-group-heading" title={group.detail}><h3>{group.name === 'VRAM' ? `${tr('显存', 'VRAM')} · GPU ${group.gpu!.id}` : group.name === 'RAM' ? tr('内存', 'RAM') : group.name}</h3><i aria-hidden="true" />
+            <span>{!compact || free == null ? group.detail : tr(`空余 ${resourceBytes(free)}`, `${resourceBytes(free)} free`)}</span>
+          </div>
+          {visibleTiers.length === 0 && <p className="memory-tier-empty">{tr('无流式占用', 'No streamed data in use')}</p>}
+          {visibleTiers.map((tier) => {
           const amounts = groupItems.map((item) => ({ item, bytes: value(item, tier.id) }))
             .filter(({ bytes }) => tier.id !== 'ram-embedding' || (bytes ?? 0) > 0);
           const missing = amounts.filter(({ bytes }) => bytes == null);
@@ -224,7 +235,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
                         memory?.wired_available === true ? `${tr('锁页', 'Wired')} ${memory.wired_bytes == null ? '--' : resourceBytes(memory.wired_bytes)}`
                           : memory?.wired_available === false ? tr('锁页不可用', 'Wiring unavailable') : null].filter(Boolean).join(' · ')
                     : tier.id === 'kv'
-                      ? `${tr('活跃 KV', 'Active KV')} ${liveKv == null ? '--' : resourceBytes(liveKv)} · ${separate ? tr('前缀显存', 'Prefix VRAM') : tr('前缀 RAM', 'Prefix RAM')} ${prefix == null ? '--' : resourceBytes(prefix)}${gpuGroups.length > 1 ? '' : ` / ${memory?.prefix_cache_limit_bytes == null ? '--' : resourceBytes(memory.prefix_cache_limit_bytes)}`}`
+                      ? `${tr('活跃 KV', 'Active KV')} ${liveKv == null ? '--' : resourceBytes(liveKv)}${ramOnlyPrefix ? '' : ` · ${separate ? tr('前缀显存', 'Prefix VRAM') : tr('前缀 RAM', 'Prefix RAM')} ${prefix == null ? '--' : resourceBytes(prefix)}${gpuGroups.length > 1 ? '' : ` / ${memory?.prefix_cache_limit_bytes == null ? '--' : resourceBytes(memory.prefix_cache_limit_bytes)}`}`}`
                       : ramWeights
                         ? tr('按需从 RAM 传入显存', 'Transferred from RAM to VRAM on demand')
                       : tier.id === 'ram-prefix'
@@ -245,7 +256,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
                     <div className="resource-tier-model-name"><i style={{ backgroundColor: 'var(--bar-fill)' }} />
                       <span title={item.model}>{item.model}</span></div>
                     <strong>{bytes == null ? tr('未上报', 'Not reported') : resourceBytes(bytes)}</strong>
-                    <small>{detail}{tier.id === 'kv' && ` · ${memory?.context_count == null ? '--' : formatNumber(memory.context_count)} ${tr('组上下文', 'contexts')} · ${memory?.prefix_cache_blocks == null ? '--' : formatNumber(memory.prefix_cache_blocks)} ${separate ? tr('个显存缓存块', 'VRAM cache blocks') : tr('个 RAM 缓存块', 'RAM cache blocks')}`}</small>
+                    <small>{detail}{tier.id === 'kv' && ` · ${memory?.context_count == null ? '--' : formatNumber(memory.context_count)} ${tr('组上下文', 'contexts')}`}{tier.id === 'kv' && !ramOnlyPrefix && ` · ${memory?.prefix_cache_blocks == null ? '--' : formatNumber(memory.prefix_cache_blocks)} ${separate ? tr('个显存缓存块', 'VRAM cache blocks') : tr('个 RAM 缓存块', 'RAM cache blocks')}`}</small>
                     {tier.id === 'ssd-kv' && memory?.ssd_kv && streamingStats([item])}
                   </div>;
                 })}
@@ -255,7 +266,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
                   {tr('部分模型的 Metal 锁页不可用，权重可能被系统换出。',
                     'Metal memory wiring is unavailable for some models; weights may be paged out.')}
                 </small>}
-              {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
+              {!compact && unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
                 {tr(`${missing.map(({ item }) => item.model).join('、')}：明细未上报`,
                   `${missing.map(({ item }) => item.model).join(', ')}: breakdown not reported`)}
               </small>}

@@ -194,7 +194,8 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
 void validate_qwen35_model_bindings(
     const MfqContainer& model,
     const Qwen35Config& config,
-    const Qwen35TensorNames& names);
+    const Qwen35TensorNames& names,
+    bool trained_readout = false);
 
 using Qwen35RmsNorm = MlxRmsNorm;
 
@@ -213,6 +214,7 @@ public:
     explicit Qwen35Linear(MlxLinear linear);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
+    mlx::core::array project_rows(const mlx::core::array& input, const mlx::core::array& rows) const;
 
     int input_size() const noexcept {
         return linear_.input_size();

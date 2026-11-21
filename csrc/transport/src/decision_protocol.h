@@ -13,7 +13,7 @@ struct DecisionRequest {
     std::vector<DecisionQuestion> questions;
     std::string model;
 };
-DecisionRequest parse_decision_request(const json& body,bool allow_conditional = false);
+DecisionRequest parse_decision_request(const nlohmann::ordered_json& body,bool allow_conditional = false);
 json decision_result_json(const DecisionRequest& request,const mfq::engine::DecisionResult& result,
     const std::string& default_model);
 

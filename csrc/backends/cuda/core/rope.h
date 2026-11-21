@@ -67,7 +67,7 @@ public:
         int64_t pool,int64_t maximum,double eps) const;
     mfq_tensor_backend::Tensor pool_normalized(const mfq_tensor_backend::Tensor& index,
         const mfq_tensor_backend::Tensor& weight,const mfq_tensor_backend::Tensor& positions,
-        int64_t pool,double eps) const;
+        int64_t pool,double eps,const mfq_tensor_backend::Tensor& completion_position = {}) const;
     mfq_tensor_backend::Tensor forward_normalized(
         const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions, double eps,

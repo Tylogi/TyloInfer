@@ -106,6 +106,7 @@ std::size_t share_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&,std::
 std::vector<std::pair<std::string, double>> gguf_expert_memory_metrics(const std::shared_ptr<GgufExpertCache>&);
 bool prepare_gguf_graph_pool(const std::shared_ptr<GgufExpertCache>&);
 void finalize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>&, std::size_t reserve_bytes = 0);
+void seed_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>&, const mfq::ModelSource&);
 void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>&, std::size_t bytes);
 // A prepared decoder can price its remaining transient tensors separately
 // from graph/KV storage which is already allocated. No estimate preserves the

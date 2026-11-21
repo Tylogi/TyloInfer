@@ -50,8 +50,10 @@ __device__ float warp_max(float value) {
 }
 
 template<int W> __global__ void restore_modes(const float* keys,const float* values,
-    const float* ks,const float* vs,float* out_k,float* out_v,int heads,int width) {
+    const float* ks,const float* vs,float* out_k,float* out_v,int heads,int width,RestoreTailIndex index) {
     const int d=threadIdx.x,head=blockIdx.x,block=blockIdx.y,kind=blockIdx.z;
+    if(!head && !block && !kind)
+        for(int i=d;i<index.elements;i+=W)index.destination[i]=__half2float(__ushort_as_half(index.source[i]));
     const float* input=kind?values:keys;const float* signs=kind?vs:ks;
     float* output=kind?out_v:out_k;
     __shared__ float work[4*W];
@@ -338,15 +340,15 @@ template<int W,bool F16> __global__ void prepare_modes(const void* keys,const vo
     }
 }
 
-template<bool Records=false> __global__ void affine_encode(const float* input,int16_t* output,uint16_t* scales,
-                            int16_t* zero,int width,const int64_t* position=nullptr,int capacity=INT_MAX,bool complete_only=false) {
-    if(complete_only && ((*position&3)!=3))return;
-    const int input_row=blockIdx.x,lane=threadIdx.x;
-    const int64_t row=position?*position/4+input_row:input_row;
-    if(row>=capacity)return;
+__device__ __forceinline__ float affine_value(float x) {return x;}
+__device__ __forceinline__ float affine_value(half x) {return __half2float(x);}
+
+template<bool Records,typename Input> __device__ __forceinline__ void affine_encode_row(const Input* input,
+        int16_t* output,uint16_t* scales,int16_t* zero,int width,int64_t row) {
+    const int lane=threadIdx.x;
     float lo=0,hi=0;
     for (int d=lane;d<width;d+=32) {
-        const auto x=input[int64_t(input_row)*width+d];lo=fminf(lo,x);hi=fmaxf(hi,x);
+        const float x=affine_value(input[d]);lo=fminf(lo,x);hi=fmaxf(hi,x);
     }
     lo=warp_min(lo);hi=warp_max(hi);
     // Keep the range subtraction and reciprocal multiplication separately
@@ -361,9 +363,25 @@ template<bool Records=false> __global__ void affine_encode(const float* input,in
         else {scales[row]=__half_as_ushort(scale);zero[row]=int16_t(zp);}
     }
     for (int d=lane;d<width;d+=32) {
-        const int code=max(-32768,min(32767,int(nearbyintf(input[int64_t(input_row)*width+d]/s))+zp));
+        const float x=affine_value(input[d]);
+        const int code=max(-32768,min(32767,int(nearbyintf(x/s))+zp));
         output[int64_t(row)*(width+(Records?2:0))+d]=int16_t(code);
     }
+}
+
+template<bool Records> __global__ void affine_encode(const float* input,int16_t* output,uint16_t* scales,
+        int16_t* zero,int width,const int64_t* position=nullptr,int capacity=INT_MAX,bool complete_only=false) {
+    if(complete_only && ((*position&3)!=3))return;
+    const int64_t input_row=blockIdx.x;
+    const int64_t row=position?*position/4+input_row:input_row;
+    if(row>=0 && row<capacity)affine_encode_row<Records>(input+input_row*width,output,scales,zero,width,row);
+}
+
+template<typename Input> __global__ void affine_encode_at(const Input* input,int64_t stride,int16_t* records,
+        const void* positions,bool wide_positions,int width,int capacity) {
+    const int64_t i=blockIdx.x;
+    const int64_t row=wide_positions?static_cast<const int64_t*>(positions)[i]:static_cast<const int32_t*>(positions)[i];
+    if(row>=0 && row<capacity)affine_encode_row<true>(input+i*stride,records,nullptr,nullptr,width,row);
 }
 
 // A single-query warp shares its query across four keys and four heads.
@@ -1300,6 +1318,22 @@ int indexer_affine16_pack(const float* input,int16_t* output,int rows,int width,
     if(!input || !output || rows<=0 || width<=0)return int(cudaErrorInvalidValue);
     affine_encode<true><<<rows,32,0,stream>>>(input,output,nullptr,nullptr,width);return int(cudaGetLastError());
 }
+int indexer_affine16_pack_at(const void* input,bool half_input,int64_t row_stride,int16_t* records,
+        const void* positions,bool wide_positions,int rows,int width,int capacity,cudaStream_t stream) {
+    if(!input || !records || !positions || rows<1 || width<1 || width>INT_MAX-2 ||
+            row_stride<width || capacity<rows)return int(cudaErrorInvalidValue);
+    if(half_input)affine_encode_at<<<rows,32,0,stream>>>(static_cast<const half*>(input),row_stride,records,
+        positions,wide_positions,width,capacity);
+    else affine_encode_at<<<rows,32,0,stream>>>(static_cast<const float*>(input),row_stride,records,
+        positions,wide_positions,width,capacity);
+    const auto status=cudaGetLastError();
+    if(status==cudaSuccess)if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<unsigned> printed{0};const unsigned path=rows==1?1u:2u;
+        if(!(printed.fetch_or(path)&path))std::fprintf(stderr,
+            "native_indexer_affine16_pack_at actual_match=1 rows=%d width=%d source_half=%d\n",rows,width,int(half_input));
+    }
+    return int(status);
+}
 int indexer_affine16_unpack(const int16_t* records,float* output,int rows,int width,cudaStream_t stream) {
     if(!records || !output || rows<=0 || width<=0)return int(cudaErrorInvalidValue);
     const auto n=int64_t(rows)*width;
@@ -1329,10 +1363,11 @@ int tq8_fit_online(const float* rows,const uint16_t* codebook,const uint8_t* can
     return int(cudaGetLastError());
 }
 int tq_restore_modes(const float* keys,const float* values,const float* ks,const float* vs,
-    float* out_k,float* out_v,int blocks,int heads,int width,int padded,cudaStream_t stream) {
-    if(!keys || !values || !ks || !vs || !out_k || !out_v || blocks<=0 || heads<=0 || width<=0 || width>padded)
+    float* out_k,float* out_v,int blocks,int heads,int width,int padded,cudaStream_t stream,const RestoreTailIndex* index) {
+    if(!keys || !values || !ks || !vs || !out_k || !out_v || blocks<=0 || heads<=0 || width<=0 || width>padded ||
+        (index && (!index->source || !index->destination || index->elements<=0 || blocks!=1)))
         return int(cudaErrorInvalidValue);
-#define RESTORE(W) restore_modes<W><<<dim3(heads,blocks,2),W,0,stream>>>(keys,values,ks,vs,out_k,out_v,heads,width)
+#define RESTORE(W) restore_modes<W><<<dim3(heads,blocks,2),W,0,stream>>>(keys,values,ks,vs,out_k,out_v,heads,width,index?*index:RestoreTailIndex{})
     switch(padded){case 256:RESTORE(256);break;case 512:RESTORE(512);break;case 1024:RESTORE(1024);break;default:return int(cudaErrorInvalidValue);}
 #undef RESTORE
     return int(cudaGetLastError());

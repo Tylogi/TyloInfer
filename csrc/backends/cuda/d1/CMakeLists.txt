@@ -24,7 +24,11 @@ if(NOT TARGET mfq-model-source)
     add_subdirectory("${_runtime}/core" "core")
 endif()
 find_package(CUDAToolkit 11.2 REQUIRED)
-add_executable(tyloinfer-d1-native main.cpp input.cpp engine.cu "${_runtime}/backends/cuda/kernels/gguf_gemm.cu")
+add_executable(tyloinfer-d1-native
+    "${_runtime}/models/lfm3/main.cpp"
+    "${_runtime}/models/lfm3/input.cpp"
+    engine.cu
+    "${_runtime}/backends/cuda/kernels/gguf_gemm.cu")
 target_include_directories(tyloinfer-d1-native PRIVATE "${_runtime}" "${_runtime}/components/ggml/src" "${_runtime}/core/include")
 target_link_libraries(tyloinfer-d1-native PRIVATE mfq-model-source mfq-ggml mfq-json CUDA::cudart CUDA::cublas)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

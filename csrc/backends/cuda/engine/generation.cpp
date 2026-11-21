@@ -10,6 +10,8 @@
 #include "models/glm_dsa/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
+#include "models/qwen35/linear_attention.h"
+#include "models/qwen35/mtp.h"
 #include "models/nemotron_h/ops.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ops.h"
@@ -20,6 +22,8 @@
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
 #include "runtime/prefill_projection_plan.h"
+#include "runtime/layer_weight_stream.h"
+#include "tyloinfer/host_memory.h"
 #include "prefill_budget.h"
 
 #include <algorithm>
@@ -484,6 +488,16 @@ template <class Model> struct CudaGenerationContext {
     }
     void prepare_request(const mfq::engine::InferenceRequest& input) {
         trace_expert_cache("begin");
+        if constexpr(std::is_same_v<Model,Qwen35CausalLm>) {
+            if(mfq::cuda::runtime_options::kv_vram_request_sized()) {
+                const auto limit = model.max_position_embeddings();
+                const auto draft = mtp && input.sampling.enable_mtp ? mtp->maximum_draft_depth() : 0;
+                const auto tokens = int64_t(input.prompt.size()) + std::max<int64_t>(0, input.sampling.max_tokens) + draft;
+                const auto capacity = batching ? 0 : decode_graph_bucket(std::min<int64_t>(limit, tokens), limit);
+                if(capacity > model.execution->full_attention_request_capacity) graph.invalidate();
+                model.execution->full_attention_request_capacity = capacity;
+            }
+        }
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             model.decode_reserve_until=std::min<int64_t>(model.max_position_embeddings(),
@@ -527,6 +541,62 @@ template <class Model> struct CudaGenerationContext {
         return model.cache_pos>0 && tokens<=128 &&
             moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
     }
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    std::size_t borrow_qwen35_prefill_workspace(mfq::cuda::Context& context,std::size_t required) {
+        auto& execution=*model.execution;
+        auto available=available_prefill_workspace(context);
+        if(required<=available)return available;
+        if(batching || model.config.num_experts || model.layer_weights || execution.dense_cpu_layer_count ||
+           model_parallel_enabled(execution) || execution.layer_placement.enabled())return available;
+        qwen35_release_decode_graphs(model,mtp,graph);
+        context.reclaim_idle_memory();
+        available=available_prefill_workspace(context);
+        if(required<=available)return available;
+        const int device=execution.layer_placement.primary_device();
+        int mapped=0;
+        TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&mapped,cudaDevAttrCanMapHostMemory,device));
+        if(!mapped)return available;
+        auto& borrowed=execution.borrowed_prefill_weights;
+        std::vector<mfq_tensor_backend::Tensor*> candidates;
+        for(auto block=model.blocks.rbegin();block!=model.blocks.rend();++block) {
+            FFN* ffn=nullptr;
+            if(auto* full=dynamic_cast<FullBlock*>(block->get()))ffn=&full->ffn;
+            if(auto* linear=dynamic_cast<qwen35::LinearAttentionBlock*>(block->get()))ffn=&linear->ffn;
+            if(!ffn || ffn->is_moe)continue;
+            if(auto* weight=dense_prefill_gguf_image(ffn->down,device))candidates.push_back(weight);
+            for(auto& projection:ffn->gate_up.layers)
+                if(auto* weight=dense_prefill_gguf_image(projection,device))candidates.push_back(weight);
+        }
+        borrowed.reserve(borrowed.size()+candidates.size());
+        if(borrowed.empty())execution.prefill_restore_headroom=context.available_memory();
+        std::size_t moved=0,pending=0;
+        for(auto* weight:candidates) {
+            const auto bytes=whole_prefill_weight_bytes(*weight);
+            if(!bytes)continue;
+            try {
+                cache.reserve_ram(bytes);
+                if(bytes>mfq::sample_host_memory().available_host_bytes())continue;
+                if(!borrow_prefill_weight(*weight))continue;
+                borrowed.push_back(weight);
+                moved+=bytes;
+                pending+=bytes;
+                if(pending<required-available)continue;
+                context.reclaim_idle_memory();
+                available=available_prefill_workspace(context);
+                pending=0;
+                if(available>=required)break;
+            } catch(const MfqResourceExhausted&) {
+                (void)cudaGetLastError();
+            }
+        }
+        if(pending) {
+            context.reclaim_idle_memory();
+            available=available_prefill_workspace(context);
+        }
+        if(moved)std::cerr<<"runtime_dense_prefill_weight_loan bytes="<<moved<<" available="<<available<<'\n';
+        return available;
+    }
+#endif
     int64_t prefill_chunk(std::size_t tokens) {
         reuse_prefill_workspace=false;
         // Reuse ordinary/MTP widths before allocating wider temporary graphs
@@ -592,6 +662,9 @@ template <class Model> struct CudaGenerationContext {
             available=mfq::engine::prefill_budget_add(
                 context->available_memory()+context->workspace_available(),budget.lendable_bytes);
         }
+        if constexpr(std::is_same_v<Model,Qwen35CausalLm>)
+            if(required>available && !batching && model.config.num_experts==0)
+                available=borrow_qwen35_prefill_workspace(*context,required);
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             if(!model.config.experts) {
                 if(required>available && append_workspace && context->reusable_workspace_bytes()) {
@@ -705,8 +778,10 @@ template <class Model> struct CudaGenerationContext {
             // Transposing graph KV can temporarily hold a contiguous copy in
             // addition to the checkpoint. Include that peak and metadata.
             const auto needed=incoming*(std::is_same_v<Model,Qwen4CausalLm>?2:1)+(std::size_t(64)<<20);
-            reserve_workspace(needed);
-            const auto available=mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
+            const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+            if(cuda_has_separate_memory())context->reclaim_idle_memory();
+            else reserve_workspace(needed);
+            const auto available=context->available_memory();
             if(available<needed) {
                 std::cerr<<"runtime_session_cache action=skip reason=workspace_pressure"
                     <<" requested_bytes="<<needed<<" available_bytes="<<available<<'\n';
@@ -731,6 +806,9 @@ template <class Model> struct CudaGenerationContext {
         trace_expert_cache("end");
         try {
             reset();
+            if constexpr(std::is_same_v<Model,Qwen35CausalLm>)
+                if(!model.execution->borrowed_prefill_weights.empty() && model.restore_decode_workspace)
+                    model.restore_decode_workspace();
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
                 qwen4_release_idle_qsa(model,mtp);
         }
@@ -772,6 +850,20 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen35CausalLm>) {
+            const auto capacity=model.max_position_embeddings();
+            const auto length=qwen35::mtp_attention_capacity(
+                std::min<int64_t>(capacity,int64_t(input.prompt.size())+1),capacity);
+            const auto* predictor=dynamic_cast<Qwen35Mtp*>(mtp);
+            if((predictor && predictor->target_graphs && predictor->target_graphs->holds_other_plan(length)) ||
+               (model.hidden_capture && model.hidden_capture->target_graphs &&
+                model.hidden_capture->target_graphs->holds_other_plan(length))) {
+                qwen35_release_decode_graphs(model,mtp,graph);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
         prepare_prefill_workspace(input.prompt.size()-reused);
         return run_mtp_generation(model,
             *mtp,

@@ -1336,6 +1336,19 @@ class ServerService:
                 "Could not delete all model files; check permissions and refresh the list",
             ) from error
 
+    async def model_load_plan(self, model_id: str, **options):
+        planner = getattr(self.runtime_manager, "model_load_plan", None)
+        if self.catalog is None or planner is None:
+            raise ServiceError(501, "model_load_plan_unavailable", "model load planning is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        try:
+            return await planner(artifact, **options)
+        except (ValueError, OSError) as error:
+            raise ServiceError(422, "model_load_plan_unavailable", "checkpoint memory requirements cannot be read") from error
+
     async def model_cache_profile(
         self, model_id: str, *, include_recurrent: bool = False
     ) -> ModelCacheProfile | None:
@@ -1405,6 +1418,8 @@ class ServerService:
     async def register_model_directory(
         self,
         request: RegisterModelDirectoryRequest,
+        *,
+        allow_empty: bool = False,
     ) -> ModelArtifactList:
         if self.catalog is None:
             raise ServiceError(
@@ -1416,6 +1431,8 @@ class ServerService:
             return await self.catalog.register_directory(
                 directory_id=request.directory_id,
                 path=request.path,
+                allow_empty=allow_empty,
+                file_name=request.file_name,
             )
         except ModelDirectoryNotFoundError as error:
             raise ServiceError(

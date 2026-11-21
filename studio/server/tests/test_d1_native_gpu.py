@@ -104,7 +104,11 @@ def check(executable: Path, directory: Path, weights: Path | None = None):
                     if t["storage"] == "Q8_0" and t["name"] != "embed_tokens.weight"
                 ]
                 assert frame["packed_gemm_calls_per_forward"] == len(projections)
-                assert frame["bf16_gemm_calls_per_forward"] == 1
+                if frame["backend"] == "native-metal-mlx-lfm3":
+                    assert frame["fp32_candidate_gemm_calls_per_forward"] == 1
+                    assert frame["bf16_gemm_calls_per_forward"] == 0
+                else:
+                    assert frame["bf16_gemm_calls_per_forward"] == 1
                 assert frame["packed_embedding_rows_per_forward"] == len(
                     case["request"]["tokens"]
                 ) + len(case["request"]["candidate_ids"])
@@ -114,7 +118,9 @@ def check(executable: Path, directory: Path, weights: Path | None = None):
                 for a, b in zip(actual, expected, strict=True)
             )
             assert error <= 0.15, {"fused": fused, "max_abs": error}
-            results.append({"fused": fused, "max_abs": error, "gpu_ms": frame["gpu_ms"]})
+            timings = frame.get("gpu_ms", frame.get("forward_wall_ms"))
+            assert len(timings) == case["request"]["iterations"]
+            results.append({"fused": fused, "max_abs": error, "forward_samples_ms": timings})
     return results
 
 

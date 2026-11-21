@@ -8,9 +8,12 @@ const JOB_STATES = new Set(['queued', 'running', 'cancelling', 'succeeded', 'fai
 const CANCELLABLE = new Set(['queued', 'running']);
 const MAX_REQUEST_BYTES = 65536;
 const MAX_RESPONSE_BYTES = 4194304;
+const MAX_ANALYSIS_RESPONSE_BYTES = 32 * 1024 * 1024;
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const exact = (value, key) => record(value) && Object.keys(value).length === 1 && Object.hasOwn(value, key);
 const uuid = value => typeof value === 'string' && UUID.test(value);
+const companionPath = value => typeof value === 'string' && value.length <= 4096 &&
+  /^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(value) && !/[\x00-\x1f\x7f]/.test(value);
 
 class BridgeFailure extends Error {
   constructor(code, message, details = {}) { super(message); this.code = code; this.details = details; }
@@ -26,24 +29,30 @@ function parseCall(endpoint, payload) {
     if (!call) throw badRequest();
     return call;
   }
-  if (endpoint === 'models/cache-profile' || endpoint === 'models/directory') {
+  if (endpoint === 'models/cache-profile' || endpoint === 'models/directory' || endpoint === 'models/load-plan') {
     const call = resolveModelDetails(endpoint, payload);
     if (!call) throw badRequest();
     return call;
   }
   if (endpoint === 'models/load' || endpoint === 'models/unload') {
-    const loadFields = endpoint === 'models/load' ? ['request', 'companion_ids'] : ['request'];
+    const loadFields = endpoint === 'models/load' ? ['request', 'companion_ids', 'companion_paths'] : ['request'];
     if (!record(payload) || !Object.hasOwn(payload, 'request') || !Object.keys(payload).every(key => loadFields.includes(key)) || !record(payload.request)) throw badRequest();
     if (endpoint === 'models/load' && (typeof payload.request.model !== 'string' || !payload.request.model.trim()
       || Object.hasOwn(payload.request, 'gguf_companions'))) throw badRequest();
     if (Object.hasOwn(payload, 'companion_ids') && (!Array.isArray(payload.companion_ids) || payload.companion_ids.length > 16
       || !Array.from(payload.companion_ids).every(value => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value))
       || new Set(payload.companion_ids).size !== payload.companion_ids.length)) throw badRequest();
+    if (Object.hasOwn(payload, 'companion_paths') && (Object.hasOwn(payload, 'companion_ids')
+      || !Array.isArray(payload.companion_paths) || payload.companion_paths.length > 16
+      || !Array.from(payload.companion_paths).every(companionPath)
+      || new Set(payload.companion_paths).size !== payload.companion_paths.length)) throw badRequest();
     if (endpoint === 'models/unload' && (!uuid(payload.request.instance_id)
       || (Object.hasOwn(payload.request, 'force') && typeof payload.request.force !== 'boolean'))) throw badRequest();
     let body;
     try {
-      body = JSON.stringify(payload.request, (_key, value) => {
+      const request = Object.hasOwn(payload, 'companion_paths')
+        ? { ...payload.request, gguf_companions: payload.companion_paths } : payload.request;
+      body = JSON.stringify(request, (_key, value) => {
         if (value === undefined || typeof value === 'function' || typeof value === 'symbol'
           || typeof value === 'bigint' || (typeof value === 'number' && !Number.isFinite(value))) throw badRequest();
         return value;
@@ -65,7 +74,7 @@ function parseCall(endpoint, payload) {
   throw badRequest();
 }
 
-async function readJson(response, credential, maxBytes) {
+export async function readJson(response, credential, maxBytes) {
   if (!response.body) throw new BridgeFailure('tyloinfer/core-invalid-response', 'The core returned no JSON body');
   const reader = response.body.getReader();
   const chunks = [];
@@ -125,15 +134,22 @@ function managedJob(value, id, jobKinds) {
   return value;
 }
 
-export function createCoreBridge({ getProvider, resolveCredential, fetchImpl = globalThis.fetch,
-  timeoutMs = 5000, maintenanceTimeoutMs = 30000, maxResponseBytes = MAX_RESPONSE_BYTES }) {
+export function createCoreBridge({ getProvider, resolveCredential, prepareProviderUpdate, fetchImpl = globalThis.fetch,
+  timeoutMs = 5000, maintenanceTimeoutMs = 30000, maxResponseBytes }) {
+  let changingConnection = false;
   return async (endpoint, payload, callerSignal, peer) => {
     const failure = error => ({ ok: false, error: { code: error.code, message: error.message, details: error.details } });
     if (peer?.principal?.kind !== 'owner') return failure(new BridgeFailure('tyloinfer/forbidden', 'Core access requires the owner'));
     let submitted = false;
     let operationId = null;
+    let connectionChange = false;
+    let providerUpdate;
     try {
       const call = parseCall(endpoint, payload);
+      if (call.authChange || call.listenerChange) {
+        if (changingConnection) throw new BridgeFailure('tyloinfer/connection-busy', 'A core connection change is already in progress');
+        connectionChange = changingConnection = true;
+      }
       operationId = call.id ?? null;
       const selected = getProvider();
       if (!selected?.baseURL) throw new BridgeFailure('tyloinfer/core-unavailable', 'TyloInfer provider is not configured');
@@ -165,11 +181,12 @@ export function createCoreBridge({ getProvider, resolveCredential, fetchImpl = g
         if (write && response.status >= 500) throw unknownOutcome(operationId);
         if (options.empty === true && response.status === 204) return { value: null, status: 204 };
         let value;
-        try { value = await readJson(response, credential, maxResponseBytes); }
+        const responseLimit = maxResponseBytes ?? (options.analysis && response.ok ? MAX_ANALYSIS_RESPONSE_BYTES : MAX_RESPONSE_BYTES);
+        try { value = await readJson(response, options.privateResult ? '' : credential, responseLimit); }
         catch (error) { if (write && response.ok) throw unknownOutcome(operationId); throw error; }
         if (!response.ok) throw new BridgeFailure('tyloinfer/core-rejected', 'The core rejected this request', {
           http_status: response.status,
-          ...(record(value?.error) ? { core_error: value.error } : {}),
+          ...(!options.privateResult && record(value?.error) ? { core_error: value.error } : {}),
           retryable: false,
         });
         return { value, status: response.status };
@@ -177,6 +194,29 @@ export function createCoreBridge({ getProvider, resolveCredential, fetchImpl = g
       const health = (await request('/health')).value;
       if (health?.service !== 'tyloinfer-server' || health?.protocol_version !== '1.0') {
         throw new BridgeFailure('tyloinfer/core-incompatible', 'The endpoint is not a compatible TyloInfer core');
+      }
+      if (call.listenerChange) {
+        const listener = (await request('/api/v1/runtime/listener')).value;
+        if (listener?.configurable !== true) {
+          throw new BridgeFailure('tyloinfer/operation-not-supported', 'The core listener is managed outside TyloInfer');
+        }
+        const { port, protocol } = call.listenerChange;
+        if (protocol === 'openai' && port !== listener.port) {
+          const currentPort = Number(base.port || (base.protocol === 'https:' ? 443 : 80));
+          if (prefix || currentPort !== listener.port) {
+            throw new BridgeFailure('tyloinfer/operation-not-supported', 'Changing the OpenAI port requires a direct connection to the core listener');
+          }
+          const next = new URL(base);
+          next.port = String(port);
+          if (!prepareProviderUpdate) throw new BridgeFailure('tyloinfer/operation-not-supported', 'The Host cannot update its core endpoint');
+          providerUpdate = await prepareProviderUpdate(selected, { baseURL: next.toString() });
+        }
+      }
+      if (call.authChange?.api_key) {
+        if (!prepareProviderUpdate) throw new BridgeFailure('tyloinfer/operation-not-supported', 'The Host cannot save the core credential');
+        providerUpdate = await prepareProviderUpdate(selected, { apiKey: call.authChange.api_key });
+      } else if (call.authChange?.enabled && !credential) {
+        throw new BridgeFailure('tyloinfer/bad-request', 'Enter an API key so Agent can reconnect');
       }
       if (call.kind === 'connection-info') {
         if (credential && base.toString().includes(credential)) {
@@ -239,7 +279,9 @@ export function createCoreBridge({ getProvider, resolveCredential, fetchImpl = g
         return { ok: true, value: response.value };
       }
       if (call.kind === 'read') {
-        const value = call.resource === 'health' ? health : (await request(call.path, 'GET', undefined, call.query)).value;
+        const value = call.resource === 'health' ? health : (await request(call.path, 'GET', undefined, call.query, {
+          analysis: call.resource === 'model_analysis',
+        })).value;
         if (call.validResult && !call.validResult(value)) throw new BridgeFailure('tyloinfer/core-invalid-response', 'The core returned invalid maintenance data');
         return { ok: true, value };
       }
@@ -308,19 +350,31 @@ export function createCoreBridge({ getProvider, resolveCredential, fetchImpl = g
         if (response.status !== 204) throw unknownOutcome(operationId);
         return { ok: true, value: null };
       }
-      const accepted = await request(call.path, call.method, call.body);
+      const accepted = await request(call.path, call.method, call.body, call.query, { privateResult: Boolean(call.authChange) });
       if (call.format === 'accepted') {
         if (accepted.status !== 202 || !record(accepted.value) || !uuid(accepted.value.operation_id) || accepted.value.status !== 'accepted') throw unknownOutcome(null);
       } else if (call.format === 'job') {
         if (accepted.status !== 202) throw unknownOutcome(null);
         try { managedJob(accepted.value, null, call.jobKinds); }
         catch { throw unknownOutcome(null); }
-      } else if (accepted.status !== 200 || !call.validResult(accepted.value)) throw unknownOutcome(null);
-      return { ok: true, value: accepted.value };
+      } else if (accepted.status !== (call.status ?? 200) || !call.validResult(accepted.value)) throw unknownOutcome(null);
+      if (providerUpdate) {
+        try { await providerUpdate.commit(); }
+        catch {
+          throw new BridgeFailure('tyloinfer/provider-update-failed', 'The core accepted the change, but Agent could not save its connection settings',
+            { ...(call.listenerChange ? { port: call.listenerChange.port } : {}), retryable: false });
+        }
+      }
+      return { ok: true, value: call.authChange ? { enabled: accepted.value.enabled, has_key: accepted.value.has_key } : accepted.value };
     } catch (error) {
+      if (providerUpdate && (!submitted || error instanceof BridgeFailure && error.code === 'tyloinfer/core-rejected')) {
+        try { await providerUpdate.discard?.(); } catch { /* Leave the unused credential private if storage is unavailable. */ }
+      }
       if (error instanceof BridgeFailure) return failure(error);
       if (submitted) return failure(unknownOutcome(operationId));
       return failure(new BridgeFailure(callerSignal?.aborted ? 'tyloinfer/cancelled' : 'tyloinfer/core-unavailable', 'Core request did not complete'));
+    } finally {
+      if (connectionChange) changingConnection = false;
     }
   };
 }

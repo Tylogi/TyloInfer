@@ -3,7 +3,7 @@
 #include "nlohmann/json.hpp"
 #include <memory>
 
-namespace mfq::cuda::d1 {
+namespace mfq::models::lfm3::d1 {
 class Engine {
 public:
     Engine(Input& input, bool fused_projections, bool stream_weights = false);

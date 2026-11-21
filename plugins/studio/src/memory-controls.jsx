@@ -3,7 +3,7 @@ import { MemoryBudgetControlsView } from '../../../studio/web/src/features/conne
 import { PrefixCacheControlsView } from '../../../studio/web/src/features/connections/PrefixCacheControlsView.tsx';
 import { hasSeparateVram } from '../../../studio/web/src/features/runtime/memoryArchitecture.ts';
 import { SectionLabel, SettingRow, TMPanel } from '../../../studio/web/src/app/display.tsx';
-import { Dialog } from './shared-primitives.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
 import { CacheDirectoryControl } from './cache-directory.jsx';
 import { bytes, CoreError, Facts } from './page-kit.jsx';
 import { terminalStates } from './model-api.js';
@@ -35,6 +35,7 @@ export function MemoryControls({ values, inventory, api, mutation, tr, refreshKe
   }
   const runtime = values.status?.value;
   const separate = hasSeparateVram(runtime);
+  const vramPrefix = separate && runtime?.prefix_cache_hot_tier !== 'ram';
   const loaded = (inventory?.instances || []).filter(item => ['ready', 'busy'].includes(item.state));
   const amounts = loaded.map(item => item.memory?.resident_weight_bytes ?? item.resident_bytes);
   const total = amounts.reduce((sum, value) => sum + (value ?? 0), 0);
@@ -47,7 +48,7 @@ export function MemoryControls({ values, inventory, api, mutation, tr, refreshKe
     <SectionLabel title={cache ? tr('持久化前缀缓存', 'Persistent prefix cache') : separate ? tr('显存与内存规划', 'VRAM and RAM plan') : tr('内存规划', 'Memory plan')} />
     <TMPanel className={`server-settings-panel ${cache ? 'server-prefix-panel' : 'server-memory-panel'}`}><div className="setting-list">
       {values.memory_policy?.error ? <CoreError error={values.memory_policy.error} /> : values.memory_policy?.value ? cache ? <>
-        <SettingRow title={tr('前缀缓存层级', 'Prefix cache hierarchy')} detail={separate ? tr('显存热层 + 低优先级 RAM 层 + 可选 SSD 冷层。', 'VRAM hot tier + low-priority RAM tier + optional SSD cold tier.') : tr('RAM 热层 + SSD 冷层。', 'RAM hot tier + SSD cold tier.')} trailing={<span className="server-managed-value">{separate ? 'VRAM → RAM → SSD' : 'RAM → SSD'}</span>} />
+        <SettingRow title={tr('前缀缓存层级', 'Prefix cache hierarchy')} detail={vramPrefix ? tr('显存热层 + 低优先级 RAM 层 + 可选 SSD 冷层。', 'VRAM hot tier + low-priority RAM tier + optional SSD cold tier.') : tr('RAM 热层 + SSD 冷层。', 'RAM hot tier + SSD cold tier.')} trailing={<span className="server-managed-value">{vramPrefix ? 'VRAM → RAM → SSD' : 'RAM → SSD'}</span>} />
         <SettingRow title={tr('前缀块大小', 'Prefix block size')} detail={tr('较大的块有利于长提示词吞吐，较小的块提供更细粒度的部分前缀复用。', 'Larger blocks favor long-prompt throughput; smaller blocks allow finer partial-prefix reuse.')} trailing={<div className="server-unit-value"><strong>{runtime?.prefix_cache_block_tokens ?? '—'}</strong><span>tokens</span></div>} />
         <PrefixCacheControlsView key={refreshKey} {...common} budget={runtime?.prefix_cache_total_disk_max_bytes ?? runtime?.prefix_cache_disk_max_bytes ?? 0} connectionRevision={refreshKey} allowDirectoryEdit={false} directoryControl={<CacheDirectoryControl api={api} mutation={mutation} tr={tr} refreshKey={refreshKey} inventory={inventory} currentDirectory={values.memory_policy.value.actual_prefix_directory} />} />
         <p className="configuration-effect">{tr('目录只能从核心提供的位置中选择；更改目录需要单独确认全部模型的重载影响。', 'Choose only locations supplied by the core. Folder changes require separate confirmation of the reload impact on all models.')}</p>
@@ -57,11 +58,10 @@ export function MemoryControls({ values, inventory, api, mutation, tr, refreshKe
       </MemoryBudgetControlsView> : <p role="status">…</p>}
       {notice && <p role="status">{notice}</p>}
     </div></TMPanel>
-    <Dialog open={Boolean(confirmation)} onOpenChange={open => { if (!open) cancel(); }} title={tr('应用内存与缓存规划', 'Apply memory and cache plan')} closeLabel={tr('关闭', 'Close')}>
-      <div className="tylo-model-confirm"><p>{tr('调整所有模型共用的预算，可能回收前缀缓存或改变专家驻留。提交后自动显示原生作业进度；受理不代表完成。', 'Change budgets shared by all models. This may evict prefix caches or change expert residency. Native job progress appears automatically; acceptance is not completion.')}</p>
-        <Facts entries={Object.entries(confirmation?.request || {}).map(([key, value]) => [labels[key] || key, value == null ? tr('自动', 'Automatic') : bytes(value)])} />
-        <div className="tylo-model-confirm-actions"><button type="button" onClick={cancel}>{tr('取消', 'Cancel')}</button><button type="button" className="primary" disabled={blocked} onClick={() => void confirm()}>{tr('确认应用', 'Confirm changes')}</button></div>
-      </div>
-    </Dialog>
+    <ConfirmationDialog open={Boolean(confirmation)} tr={tr} title={tr('应用内存与缓存规划', 'Apply memory and cache plan')}
+      description={tr('这些预算由所有模型共用。调整可能回收前缀缓存或改变专家驻留。', 'All models share these budgets. Applying them may evict prefix caches or change expert residency.')}
+      confirmLabel={tr('应用', 'Apply')} onCancel={cancel} onConfirm={confirm} disabled={blocked}>
+      <Facts entries={Object.entries(confirmation?.request || {}).map(([key, value]) => [labels[key] || key, value == null ? tr('自动', 'Automatic') : bytes(value)])} />
+    </ConfirmationDialog>
   </>;
 }

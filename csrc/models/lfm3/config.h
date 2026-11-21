@@ -83,6 +83,7 @@ Tensor forward(const Config& config, Ops& ops, Tensor input) {
         auto ffn = ops.feed_forward(ops.normalize(x, layer, "ffn_norm"), layer);
         if (config.sandwich) ffn = ops.normalize(ffn, layer, "post_ffn_norm");
         x = ops.add(x, ffn);
+        ops.finish_layer(x);
     }
     return ops.finalize(x);
 }

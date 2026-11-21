@@ -97,7 +97,25 @@ mfq::engine::PrefillChunk FlashNextBatchOperations::prefill_chunk(
     initialize_prefill(request,chunk);
     // The restored dense path can lend weights before choosing its tile.
     if(!model_.config.experts && request->reused_prefix)return chunk;
+    // The layer-major planner sizes its tiles with the expert loan available.
+    if(layer_major_prefill(*request,chunk.count))return chunk;
     return budget_batch_prefill(model_,execution_,chunk,request->cache->prefill_growth_bytes(chunk.count));
+}
+
+bool FlashNextBatchOperations::layer_major_prefill(const Request& request,int64_t tokens) const {
+    return model_.config.experts && !request.predictor && qwen4_layer_major_prefill_eligible(model_,tokens);
+}
+
+int64_t FlashNextBatchOperations::solo_prefill_span(const std::shared_ptr<Request>& request,
+        int64_t compute_chunk) const {
+    if(compute_chunk<=8 || request->reused_prefix || (predictor_ && request->sampling.enable_mtp))
+        return compute_chunk;
+    const auto tokens=int64_t(request->prefix_boundary?request->prefix_boundary:request->prompt.size());
+    // Preserve the checkpoint boundary. One traversal can share expert
+    // images across several compute tiles within that uncached prefix.
+    if(tokens<=compute_chunk || !layer_major_prefill(*request,tokens))return compute_chunk;
+    request->prefill_compute_chunk=compute_chunk;
+    return tokens;
 }
 
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &model,
@@ -640,6 +658,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
         {"continuous_batching_packed_prefill_batches",double(packed_prefill_batches_)},
         {"continuous_batching_packed_prefill_requests",double(packed_prefill_requests_)},
         {"continuous_batching_packed_prefill_tokens",double(packed_prefill_tokens_)},
+        {"continuous_batching_layer_major_prefill_chunks",double(layer_major_prefill_chunks_)},
         {"continuous_batching_mtp_batches",double(mtp_batches_)},
         {"continuous_batching_mtp_maximum_batch",double(mtp_maximum_batch_)},
         {"continuous_batching_moe_cached_row_serial",0.0},
@@ -845,6 +864,23 @@ FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill(
     try {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     initialize_prefill(request,chunk);
+    if(layer_major_prefill(*request,chunk.count)) {
+        auto timer=std::make_unique<PrefillCudaTimer>();
+        auto ids=request->prefill_ids.narrow(1,chunk.offset-static_cast<int64_t>(request->reused_prefix),
+            chunk.count).contiguous();
+        const auto rows=request->prefill_compute_chunk?std::min(chunk.count,request->prefill_compute_chunk):chunk.count;
+        auto hidden=request->cache->prefill_layer_major(model_,std::move(ids),rows,[&] {
+            TYLOINFER_CUDA_CHECK(cudaEventRecord(timer->finished_event(),mfq_get_current_cuda_stream()));
+        });
+        request->prefill_timers.push_back(std::move(timer));
+        ++layer_major_prefill_chunks_;
+        Tensor next;
+        if(chunk.offset+chunk.count==static_cast<int64_t>(request->prompt.size()))
+            next=sample_logits(*request->sampler,
+                model_.logits_from_hidden(model_.last_hidden(std::move(hidden))).reshape({1,-1}),
+                request->counts,request->token_constraint);
+        return finish_prefill(request,std::move(next));
+    }
     RoutedPrefillWorkspaceLoan workspace(execution_);
     const bool restored_dense=!model_.config.experts && request->reused_prefix;
     const auto workspace_bytes=[&](int64_t rows,bool packed_history=false) {
@@ -974,6 +1010,14 @@ FlashNextBatchOperations::prefill_batch(
     }
     const auto execute=[&](auto&& self,const std::vector<std::size_t>& rows)->void {
         if (rows.empty()) return;
+        if(rows.size()==1) {
+            const auto row=rows.front();
+            if(layer_major_prefill(*items[row].first,items[row].second.count)) {
+                try { result[row].sample=prefill(items[row].first,items[row].second); }
+                catch (...) { result[row].failure=flash_next_prefill_failure(std::current_exception()); }
+                return;
+            }
+        }
         std::size_t growth=model_.config.experts?(std::size_t(256)<<20):0;
         std::size_t attention=0;
         int64_t tokens=0;

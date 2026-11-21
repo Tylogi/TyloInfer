@@ -31,6 +31,7 @@ export function MemoryBudgetControlsView({ residency, children, runtime, jobs, s
     }
   }, [operation?.id, operation?.status]);
   const separate = hasSeparateVram(runtime);
+  const ramOnlyPrefix = separate && runtime?.prefix_cache_hot_tier === 'ram';
   const totalLabel = separate ? tr('总显存常驻预算', 'Total resident VRAM budget') : tr('总常驻内存预算', 'Total resident memory budget');
   const modelLabel = separate ? tr('模型显存驻留', 'Model VRAM residency') : tr('模型总驻留', 'Total model residency');
   const prefixLabel = separate ? tr('前缀显存配额', 'Prefix VRAM allowance') : tr('前缀 RAM 配额', 'Prefix RAM allowance');
@@ -75,7 +76,7 @@ export function MemoryBudgetControlsView({ residency, children, runtime, jobs, s
     if (policy.prefix_limit_bytes != null) setPrefixDraft(String(policy.prefix_limit_bytes / 2 ** 30));
   }
   const validBudget = (text: string, zero: boolean) => text.trim() !== '' && Number.isSafeInteger(Math.round(Number(text) * 2 ** 30)) && (zero ? Number(text) >= 0 : Math.round(Number(text) * 2 ** 30) > 0);
-  const valid = (!totalManual || validBudget(totalDraft, false)) && (!modelManual || validBudget(modelDraft, false)) && (!prefixManual || validBudget(prefixDraft, true));
+  const valid = (!totalManual || validBudget(totalDraft, false)) && (!modelManual || validBudget(modelDraft, false)) && (ramOnlyPrefix || !prefixManual || validBudget(prefixDraft, true));
   async function apply() {
     if (!valid || saving || pending) return;
     const current = connectionScope();
@@ -85,7 +86,7 @@ export function MemoryBudgetControlsView({ residency, children, runtime, jobs, s
       const accepted = await services.configureMemoryPolicy({
         total_limit_bytes: totalManual ? Math.round(Number(totalDraft) * 2 ** 30) : null,
         model_limit_bytes: modelManual ? Math.round(Number(modelDraft) * 2 ** 30) : null,
-        prefix_limit_bytes: prefixManual ? Math.round(Number(prefixDraft) * 2 ** 30) : null,
+        ...(!ramOnlyPrefix && { prefix_limit_bytes: prefixManual ? Math.round(Number(prefixDraft) * 2 ** 30) : null }),
       });
       if (!current() || !accepted) return;
       submitted = true;
@@ -124,7 +125,7 @@ export function MemoryBudgetControlsView({ residency, children, runtime, jobs, s
   return <>
     {externalError}
     <SettingRow title={totalLabel}
-      detail={separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；RAM 专家、KV 和前缀缓存单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. RAM experts, KV and prefix caches are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
+      detail={ramOnlyPrefix ? tr('显存权重、缓冲区和活跃 KV 共用此预算。', 'VRAM weights, buffers and live KV share this budget.') : separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；RAM 专家、KV 和前缀缓存单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. RAM experts, KV and prefix caches are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
       trailing={<>{!totalManual && <small className="memory-budget-available">{automaticTotal != null ? `${(automaticTotal / 2 ** 30).toFixed(1)} GiB` : '--'}</small>}
         {control(totalLabel, totalManual, changeTotalMode, totalDraft, setTotalDraft, 0.1)}</>} />
     <details className="configuration-disclosure">
@@ -133,9 +134,9 @@ export function MemoryBudgetControlsView({ residency, children, runtime, jobs, s
     <SettingRow title={modelLabel}
       detail={separate ? tr('所有模型权重的显存上限；放不下的 MoE 专家在 RAM 中按需传入显存，SSD 专家流式加载尚未支持。', 'VRAM ceiling across model weights; overflowing MoE experts stream from RAM to VRAM. SSD expert streaming is not yet supported.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
       trailing={control(modelLabel, modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
-    <SettingRow title={prefixLabel}
+    {!ramOnlyPrefix && <SettingRow title={prefixLabel}
       detail={separate ? tr('所有模型可复用前缀的显存上限，不含活跃 KV；RAM 与 SSD 前缀缓存配额单独设置。', 'VRAM limit for reusable prefixes, excluding live KV. RAM and SSD prefix allowances are configured separately.') : tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}
-      trailing={control(prefixLabel, prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />
+      trailing={control(prefixLabel, prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />}
     {children}
     </details>
     <div className="memory-budget-actions"><small>{tr('当前模型驻留', 'Current weight residency')}: {residency}</small>

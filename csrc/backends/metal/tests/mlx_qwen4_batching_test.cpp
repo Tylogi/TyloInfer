@@ -548,6 +548,56 @@ static void check_ragged_speculative(MlxQwen4CausalLm& runtime) {
     runtime.clear_cache();
     std::cout << "Ragged ordinary/speculative windows and independent rollback passed\n";
 }
+static void check_tree_speculative(MlxQwen4CausalLm& runtime, bool short_context) {
+    const std::vector<MlxQwen4RequestTree> trees{
+        {{1, 5, 9, 3, 7, 11, 13, 15, 21, 27, 29}, {-1, 0, 0, 2, 1, 3, 3, 6, 7, 8, 9}},
+        {{4, runtime.config().eos_token_id, 12, 16}, {-1, 0, 0, 1}},
+        {{6}, {-1}}};
+    const std::array kept{2, 3, -1};
+    std::vector<std::shared_ptr<MlxQwen4RequestCache>> caches, references;
+    std::vector<array> expected;
+    for (int lane = 0; lane < static_cast<int>(trees.size()); ++lane) {
+        auto history = prompt(short_context ? 17 + 11 * lane : 63 + 64 * lane, lane);
+        auto cache = runtime.make_request_cache();
+        runtime.prefill_request(*cache, history);
+        if (!runtime.can_verify_request_tree(*cache)) return;
+        caches.push_back(std::move(cache));
+        const auto& tree = trees[lane];
+        const auto path_to = [&](int node) {
+            std::vector<std::int64_t> path;
+            for (; node != -1; node = tree.parents[node]) path.push_back(tree.tokens[node]);
+            std::reverse(path.begin(), path.end());
+            return path;
+        };
+        const auto state = runtime.capture_request_cache(*caches.back(), history);
+        for (int node = 0; node < static_cast<int>(tree.tokens.size()); ++node) {
+            auto path = path_to(node);
+            runtime.restore_text_session_state(state);
+            auto scores = runtime.forward(array(path.begin(), {1, static_cast<int>(path.size())}, int32));
+            expected.push_back(slice(scores, {0, scores.shape(1) - 1, 0}, {1, scores.shape(1), scores.shape(2)}));
+            expected.back().eval();
+        }
+        auto reference = runtime.make_request_cache();
+        runtime.restore_request_cache(*reference, state);
+        if (kept[lane] >= 0) for (const auto token : path_to(kept[lane]))
+            runtime.decode_requests({reference}, {token}).eval();
+        references.push_back(std::move(reference));
+    }
+    runtime.clear_cache();
+    std::size_t dense_lanes = 0;
+    auto actual = runtime.forward_request_trees(caches, trees, &dense_lanes);
+    require((dense_lanes > 0) == short_context, "tree did not select the expected dense or sparse QSA path");
+    near(actual, concatenate(expected, 1));
+    for (int lane = 0; lane < static_cast<int>(caches.size()); ++lane) {
+        runtime.resolve_request_tree(*caches[lane], kept[lane]);
+        require(runtime.request_cache_position(*caches[lane]) == runtime.request_cache_position(*references[lane]),
+            "tree rollback committed an unrelated path");
+    }
+    near(runtime.decode_requests(caches, {17, 18, 19}), runtime.decode_requests(references, {17, 18, 19}));
+    runtime.clear_cache();
+    std::cout << "Branch logits, accepted prefixes and cancelled tree match independent QSA/GDN/PLE state\n";
+}
+
 static void check_penalties(MlxQwen4CausalLm& runtime) {
     InferenceRequest input;
     input.sampling.enable_mtp = false;
@@ -744,6 +794,8 @@ int main(int argc, char** argv) {
         check_speculative(runtime, 8);
         check_mtp_depth_metrics(runtime);
         check_ragged_speculative(runtime);
+        check_tree_speculative(runtime, true);
+        check_tree_speculative(runtime, false);
         std::cout << "Independent speculative verification and rollback passed\n";
         check_penalties(runtime);
         check_scheduler(runtime, false);

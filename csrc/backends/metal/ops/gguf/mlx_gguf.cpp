@@ -169,8 +169,8 @@ for (uint j = 0u; j < 4u; ++j) y[ulong(token) * K + col + j] = T(values[j]);
 )METAL";
 
 constexpr const char* prefill_source = R"METAL(
-threadgroup half a_tile[16 * 32];
-threadgroup half b_tile[32 * 32];
+threadgroup W a_tile[16 * 32];
+threadgroup W b_tile[32 * 32];
 threadgroup float result[16 * 32];
 uint t = thread_index_in_threadgroup;
 uint sg = simdgroup_index_in_threadgroup;
@@ -181,15 +181,15 @@ simdgroup_float8x8 c0(0.f), c1(0.f);
 for (uint base_k = 0u; base_k < K; base_k += 32u) {
     for (uint i = t; i < 16u * 32u; i += 128u) {
         uint m = base_m + i / 32u, k = base_k + i % 32u;
-        a_tile[i] = m < M && k < K ? half(x[ulong(m) * K + k]) : half(0);
+        a_tile[i] = m < M && k < K ? W(x[ulong(m) * K + k]) : W(0);
     }
     for (uint i = t; i < 32u * 32u; i += 128u) {
         uint k = base_k + i / 32u, n = base_n + i % 32u;
-        b_tile[i] = n < N && k < K ? half(gguf_value<F>(packed + ulong(n) * stride, k)) : half(0);
+        b_tile[i] = n < N && k < K ? W(gguf_value<F>(packed + ulong(n) * stride, k)) : W(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint k = 0u; k < 32u; k += 8u) {
-        simdgroup_half8x8 a, b0, b1;
+        simdgroup_matrix<W, 8, 8> a, b0, b1;
         simdgroup_load(a, a_tile + (sg / 2u) * 8u * 32u + k, 32);
         simdgroup_load(b0, b_tile + k * 32u + (sg % 2u) * 16u, 32);
         simdgroup_load(b1, b_tile + k * 32u + (sg % 2u) * 16u + 8u, 32);
@@ -717,6 +717,18 @@ gguf_matmul<F, BM>(matrix, x, y, K, N, stride, rows, m0, n0, input_row, output_r
 )METAL", indirect_decode_header() + kGgufNax, true, false);
     return routed ? experts : ordinary;
 }
+const fast::CustomKernelFunction& q8_bf16_nax_kernel() {
+    static const auto kernel = fast::metal_kernel("tinfer_gguf_prefill_q8_bf16_nax",
+        {"packed", "x", "params"}, {"y"}, R"METAL(
+const uint m0 = threadgroup_position_in_grid.y * BM;
+const uint n0 = threadgroup_position_in_grid.x * 128u + simdgroup_index_in_threadgroup * 32u;
+auto identity = [](uint row) { return row; };
+gguf_matmul<8, BM, bfloat, bfloat>(packed, x, y, params[0], params[1], params[3], params[2],
+    m0, n0, identity, identity);
+)METAL", std::string(kGgufDecode) + kGgufNax, true, false);
+    return kernel;
+}
+
 bool use_nax() {
     return !mlx_metal_nax_disabled() && mlx_apple_chip_starts_with("Apple M5");
 }
@@ -815,10 +827,10 @@ MlxGgufWeight MlxGgufWeight::allocate_packed(std::string_view dtype, Shape shape
     return MlxGgufWeight(std::move(packed), std::move(shape), format->id, row_bytes);
 }
 MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
-    std::span<const std::uint8_t> bytes, Shape shape) {
+    std::span<const std::uint8_t> bytes, Shape shape, bool stage) {
     auto result = allocate_packed(dtype, std::move(shape), bytes.size());
     std::memcpy(result.bytes_.data<std::uint8_t>(), bytes.data(), bytes.size());
-    if (use_nax() && result.expert_count() <= 512)
+    if (stage && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
     MlxWeightResidency::track(result.bytes_);
     if (result.planes_) for (const auto& plane : *result.planes_) MlxWeightResidency::track(plane);
@@ -867,7 +879,8 @@ bool MlxGgufWeight::supports_native(const MfqContainer& model, const std::string
     return mlx_native_gguf_supported(format->id, int(shape[shape.size() - 2]), int(shape.back()));
 }
 
-MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& name, bool native_projection) {
+MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& name,
+    bool native_projection, bool retain_row_major) {
     Shape shape;
     for (const auto d : model.tensor_shape(name)) {
         if (d <= 0 || d > INT_MAX) throw std::invalid_argument("invalid GGUF tensor dimension");
@@ -910,10 +923,11 @@ MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& 
         eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
         for (const auto& plane : prepared.planes) MlxWeightResidency::track(plane);
         result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
+        if (!retain_row_major) result.bytes_ = zeros({0}, uint8);
     }
     if (!result.native_ && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    MlxWeightResidency::track(result.bytes_);
+    if (result.bytes_.size()) MlxWeightResidency::track(result.bytes_);
     if (result.planes_) for (const auto& plane : *result.planes_) MlxWeightResidency::track(plane);
     model.record_prepared(name);
     return result;
@@ -985,7 +999,28 @@ array MlxGgufWeight::matmul(const array& input) const {
     }
     return prefill_kernel()({bytes_, x, params}, {shape}, {input.dtype()},
         {((output_size() + 31) / 32) * 128, (m + 15) / 16, 1}, {128, 1, 1},
-        {{"F", format_}, {"T", input.dtype()}}, std::nullopt, false, {}).front();
+        {{"F", format_}, {"T", input.dtype()}, {"W", float16}}, std::nullopt, false, {}).front();
+}
+
+array MlxGgufWeight::matmul_q8_bf16(const array& input) const {
+    check_input(input, input_size());
+    if (format_ != 8 || input.dtype() != bfloat16 || shape_.size() != 2 || planes_ || rotation_ || native_)
+        throw std::invalid_argument("BF16 packed projection requires row-major Q8_0 weights");
+    const int rows = checked_int(input.size() / input_size());
+    auto shape = input.shape();
+    shape.back() = output_size();
+    if (!rows) return zeros(shape, bfloat16);
+    auto x = contiguous(input);
+    auto params = parameters(input_size(), output_size(), rows, row_bytes_, 1);
+    if (rows >= 16 && use_nax()) {
+        const int tile_rows = rows >= 32 ? 32 : 16;
+        return q8_bf16_nax_kernel()({bytes_, x, params}, {shape}, {bfloat16},
+            {((output_size() + 127) / 128) * 128, (rows + tile_rows - 1) / tile_rows, 1}, {128, 1, 1},
+            {{"BM", tile_rows}}, std::nullopt, false, {}).front();
+    }
+    return prefill_kernel()({bytes_, x, params},
+        {shape}, {bfloat16}, {((output_size() + 31) / 32) * 128, (rows + 15) / 16, 1}, {128, 1, 1},
+        {{"F", format_}, {"T", bfloat16}, {"W", bfloat16}}, std::nullopt, false, {}).front();
 }
 array MlxGgufWeight::embedding(const array& ids, Dtype dtype) const {
     if (shape_.size() != 2 || (dtype != float16 && dtype != bfloat16 && dtype != float32))
@@ -993,6 +1028,7 @@ array MlxGgufWeight::embedding(const array& ids, Dtype dtype) const {
     auto shape = ids.shape(); shape.push_back(input_size());
     if (!ids.size()) return zeros(shape, dtype);
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return unrotate_rows(plain.embedding(ids, float32), dtype); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_) return MlxGgufStagedPrefill::embedding(*this, ids, dtype);
     return embedding_kernel()({bytes_, contiguous(astype(ids, int32)),
         parameters(input_size(), output_size(), checked_int(ids.size()), row_bytes_, 1)},
@@ -1019,7 +1055,8 @@ array MlxGgufWeight::swiglu(const MlxGgufWeight& up, const array& input) const {
         return moe_swiglu_pair(values[0], values[1]);
     }
     if (planes_ || up.planes_) return moe_swiglu_pair(matmul(input), up.matmul(input));
-    if (rows > 6) return moe_swiglu_pair(matmul(input), up.matmul(input));
+    if (rows > 6 || !bytes_.size() || !up.bytes_.size())
+        return moe_swiglu_pair(matmul(input), up.matmul(input));
     const auto [lanes, values] = swiglu_geometry(format_, up.format_, input_size(), output_size());
     return array(shape, input.dtype(), std::make_shared<GgufSwiGLU>(default_stream(Device::gpu),
         std::array<std::uint32_t, 10>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(rows), uint32_t(row_bytes_),
@@ -1032,6 +1069,7 @@ array MlxGgufWeight::dequantize(Dtype dtype) const {
     if (dtype != float16 && dtype != bfloat16 && dtype != float32)
         throw std::invalid_argument("GGUF dequantization requires floating output");
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return unrotate_rows(plain.dequantize(float32), dtype); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_) return MlxGgufStagedPrefill::dequantize(*this, dtype);
     const auto rows = checked_int(std::size_t(output_size()) * expert_count());
     const auto blocks = std::size_t(rows) * input_size() / 32;
@@ -1048,6 +1086,7 @@ array MlxGgufWeight::grouped_row_matmul(const array& input, int groups) const {
     auto shape = input.shape(); shape.back() = output_size() / groups;
     if (!rows) return zeros(shape, input.dtype());
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return plain.grouped_row_matmul(rotate_input(input), groups); }
+    if (!bytes_.size()) throw std::logic_error("GGUF projection has no row-major weights");
     if (planes_ && (rows <= 8 || (output_size() / groups) % 64))
         return MlxGgufStagedPrefill::project(*this, input, groups);
     if (rows <= 8 && !planes_) {

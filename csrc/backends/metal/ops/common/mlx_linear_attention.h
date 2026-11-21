@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -30,6 +31,55 @@ struct MlxGatedDeltaDecodeInput {
     mlx::core::array qk, value, output_gate, alpha, beta;
     mlx::core::array convolution_state, recurrent_state;
 };
+
+struct MlxGatedDeltaTreeResult {
+    mlx::core::array output, keys, values, decay, beta;
+};
+
+MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& input,
+    std::span<const int> parents, const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias, const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight, int key_heads, int value_heads,
+    float norm_eps, bool silu_gate, bool tiled_heads, mlx::core::Dtype output_dtype);
+
+struct MlxGatedDeltaTreeLane {
+    std::span<const int> parents;
+    mlx::core::array convolution, recurrent;
+};
+
+struct MlxGatedDeltaPackedTreeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaTreeResult> tapes;
+};
+
+MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
+    const std::vector<mlx::core::array>& projections, std::span<const MlxGatedDeltaTreeLane> lanes,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float norm_eps, bool silu_gate, bool tiled_heads,
+    mlx::core::Dtype output_dtype);
+
+struct MlxGatedDeltaDecodeState {
+    mlx::core::array convolution, recurrent;
+};
+
+MlxGatedDeltaDecodeState fold_gated_delta_tree(const MlxGatedDeltaDecodeState& state,
+    const mlx::core::array& qk, const mlx::core::array& value, const mlx::core::array& keys,
+    const mlx::core::array& values, const mlx::core::array& decay, const mlx::core::array& beta,
+    const mlx::core::array& retained, bool tiled_heads);
+
+struct MlxGatedDeltaBatchDecodeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaDecodeState> states;
+};
+
+MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
+    const std::vector<mlx::core::array>& projections,
+    const std::vector<MlxGatedDeltaDecodeState>& states,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float convolution_eps, float norm_eps,
+    bool output_gate_silu, bool tiled_heads, mlx::core::Dtype output_dtype);
 
 std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     const std::vector<MlxGatedDeltaDecodeInput>& requests,
@@ -163,6 +213,10 @@ MlxCachedDepthwiseConvResult cached_depthwise_conv_silu(
     const std::optional<mlx::core::array>& state = std::nullopt,
     int dilation = 1,
     const std::optional<mlx::core::array>& bias = std::nullopt);
+
+mlx::core::array tree_depthwise_conv_silu(
+    const mlx::core::array& input, const mlx::core::array& weight,
+    const mlx::core::array& history, const mlx::core::array& taps);
 
 MlxLinearConvQkvResult linear_conv_qkv(
     const mlx::core::array& state,

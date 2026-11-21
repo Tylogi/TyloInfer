@@ -2,17 +2,13 @@
 #include "../models/dflash2/mlx_dflash2.h"
 #include "mlx_resident_budget.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_server_components.h"
+#include "runtime_config.h"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace mfq::metal {
-
-bool mlx_dflash2_sampling_supported(const MfqSamplingParams& sampling,
-    const MfqTokenConstraintPtr& constraint) noexcept {
-    return sampling.enable_mtp && sampling.max_tokens > 1 &&
-        sampling.presence_penalty == 0 && sampling.frequency_penalty == 0 &&
-        sampling.repetition_penalty == 1 && !constraint;
-}
 
 namespace {
 
@@ -21,6 +17,7 @@ void configure_dflash2(MlxEngineComponents& components,
     std::shared_ptr<std::optional<Runtime>> runtime,
     const std::filesystem::path& directory, const MlxSamplingParams& sampling) {
     auto draft = std::make_shared<MlxDFlash2>(MlxDFlash2::load(directory));
+    components.dflash2 = draft;
     components.prepare_speculative = [runtime, draft, sampling] {
         if (!runtime || !runtime->has_value()) throw std::logic_error("DFlash2 target is unavailable");
         auto& target = runtime->value();
@@ -30,7 +27,9 @@ void configure_dflash2(MlxEngineComponents& components,
             throw std::invalid_argument("DFlash2 checkpoint is incompatible with target geometry");
         draft->track_weights();
         target.set_hidden_capture_layers(config.target_layers);
-        draft->prepare([&](const auto& hidden) { return target.project_hidden_logits(hidden); });
+        const bool tree_batch = std::is_same_v<Runtime, MlxQwen4CausalLm> &&
+            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false);
+        draft->prepare([&](const auto& hidden) { return target.project_hidden_logits(hidden); }, tree_batch);
         if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
             for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
                 const auto logits = mlx::core::zeros({8, config.vocabulary}, dtype);

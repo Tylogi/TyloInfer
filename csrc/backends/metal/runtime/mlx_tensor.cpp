@@ -1,6 +1,8 @@
 #include "mlx_tensor.h"
+#include "tyloinfer/channel_fp8.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
+#include "mlx_platform.h"
 #include "mlx_reference.h"
 #include "mlx_transformer.h"
 #include "mlx_weight_residency.h"
@@ -493,9 +495,173 @@ array load_dense_array(
     return result;
 }
 
+MlxChannelFp8Weight MlxChannelFp8Weight::from_blob(std::span<const std::uint8_t> blob) {
+    namespace mx = mlx::core;
+    const auto layout = channel_fp8::parse(reinterpret_cast<const std::byte*>(blob.data()), blob.size());
+    const auto outputs = static_cast<int>(layout.outputs);
+    const auto width = static_cast<int>(layout.width);
+    if (width % 32)
+        throw std::invalid_argument("Metal channel FP8 requires a weight width divisible by 32");
+
+    auto values = array(mx::allocator::malloc(layout.scales - channel_fp8::header_bytes),
+        {outputs, width / 4}, mx::uint32);
+    std::memcpy(values.data<std::uint32_t>(), blob.data() + channel_fp8::header_bytes, values.nbytes());
+    const auto dtype = layout.scale_kind == channel_fp8::ScaleKind::Bf16 ? mx::bfloat16
+        : layout.scale_kind == channel_fp8::ScaleKind::F16 ? mx::float16 : mx::float32;
+    auto scales = array(mx::allocator::malloc(layout.bytes - layout.scales), {outputs}, dtype);
+    std::memcpy(scales.data<std::uint8_t>(), blob.data() + layout.scales, scales.nbytes());
+
+    // E8M0 byte 127 contributes a factor of one. Apply the checkpoint's
+    // actual per-channel scales after the product.
+    auto units = mx::full(Shape{outputs, width / 32}, array(127, mx::uint8));
+    units.eval();
+    MlxWeightResidency::track(values);
+    MlxWeightResidency::track(scales);
+    MlxWeightResidency::track(units);
+    return MlxChannelFp8Weight(std::move(values), std::move(units), std::move(scales), layout.dynamic_activations);
+}
+
+MlxChannelFp8Weight::MlxChannelFp8Weight(array values, array unit_scales,
+    array channel_scales, bool dynamic_activations)
+    : values_(std::move(values)), unit_scales_(std::move(unit_scales)),
+      channel_scales_(std::move(channel_scales)), dynamic_activations_(dynamic_activations) {}
+
+MlxChannelFp8Weight::Activation MlxChannelFp8Weight::quantize(const array& input) {
+    namespace mx = mlx::core;
+    if (input.ndim() == 0 || input.size() == 0)
+        throw std::invalid_argument("Metal channel FP8 activation must be non-empty");
+    const auto width = input.shape(-1);
+    const auto rows = static_cast<int>(input.size() / width);
+    const auto flat = mx::reshape(input, {rows, width});
+    if (input.dtype() != mx::bfloat16 || rows < 64 || rows > std::numeric_limits<int>::max() / 256 ||
+        !mx::metal::is_available()) {
+        const auto x = mx::astype(flat, mx::float32);
+        const auto scales = mx::maximum(mx::max(mx::abs(x), -1, true), array(1e-12f)) / array(448.f);
+        const auto dtype = input.dtype() == mx::float32 ? mx::float32 : mx::bfloat16;
+        return {mx::from_fp8(mx::to_fp8(mx::clip(x / scales, array(-448.f), array(448.f))), dtype), scales};
+    }
+
+    static const auto kernel = mx::fast::metal_kernel(
+        "tylo_channel_fp8_quantize_rows", {"x"}, {"q", "scales"}, R"METAL(
+        const uint row = threadgroup_position_in_grid.x;
+        const uint tid = thread_position_in_threadgroup.x;
+        const ulong base = ulong(row) * K;
+        float largest = 1e-12f;
+        for (uint k = tid; k < K; k += 256u)
+            largest = max(largest, abs(float(x[base + k])));
+        largest = simd_max(largest);
+        threadgroup float maxima[8];
+        if (thread_index_in_simdgroup == 0u)
+            maxima[simdgroup_index_in_threadgroup] = largest;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        largest = 1e-12f;
+        for (uint group = 0u; group < 8u; ++group) largest = max(largest, maxima[group]);
+        const float scale = largest / 448.0f;
+        if (tid == 0u) scales[row] = scale;
+        for (uint k = tid; k < K; k += 256u) {
+            const float v = clamp(float(x[base + k]) / scale, -448.0f, 448.0f);
+            const int exp = int((as_type<uint>(abs(v)) >> 23) & 255u) - 130;
+            const float step = as_type<float>(uint(max(exp, -9) + 127) << 23);
+            q[base + k] = bfloat(rint(v / step) * step);
+        }
+        )METAL", "", true, false, CompileOptions(static_cast<int>(MathMode::Safe)));
+    auto packed = kernel({flat}, {{rows, width}, {rows, 1}}, {mx::bfloat16, mx::float32},
+        {rows * 256, 1, 1}, {256, 1, 1}, {{"K", width}}, std::nullopt, false, {});
+    return {std::move(packed[0]), std::move(packed[1])};
+}
+
+array MlxChannelFp8Weight::product(const array& source) const {
+    namespace mx = mlx::core;
+    if (source.dtype() == mx::bfloat16 && source.shape(0) >= 4096 &&
+        mlx_apple_chip_starts_with("Apple M5") && !mlx_metal_nax_disabled()) {
+        const auto expanded = values_.nbytes() * 2;
+        const auto active = mx::get_active_memory(), limit = mx::get_memory_limit();
+        if (expanded <= (256u << 20) && active < limit && expanded <= (limit - active) / 4) {
+            // The 8-bit checkpoint remains resident. Dense prefill consumes
+            // this projection's temporary expansion and releases it.
+            const auto dense = mx::from_fp8(mx::view(values_, mx::uint8), mx::bfloat16);
+            return mx::matmul(source, mx::transpose(dense));
+        }
+    }
+    return mx::quantized_matmul(source, values_, unit_scales_, std::nullopt, true, 32, 8, "mxfp8");
+}
+
+array MlxChannelFp8Weight::matmul(const array& input) const {
+    namespace mx = mlx::core;
+    if (input.ndim() == 0 || input.shape(-1) != input_size())
+        throw std::invalid_argument("Metal channel FP8 input width mismatch");
+    auto output_shape = input.shape();
+    output_shape.back() = output_size();
+    if (input.size() == 0) return mx::zeros(output_shape, input.dtype());
+    if (dynamic_activations_) return matmul(input, quantize(input));
+
+    const auto dtype = input.dtype() == mx::float32 ? mx::float32 : mx::bfloat16;
+    const auto source = mx::astype(mx::reshape(input, {-1, input_size()}), dtype);
+    const auto result = product(source);
+    return mx::reshape(mx::astype(mx::astype(result, mx::float32) *
+        mx::astype(channel_scales_, mx::float32), input.dtype()), output_shape);
+}
+
+array MlxChannelFp8Weight::matmul(const array& input, const Activation& activation) const {
+    namespace mx = mlx::core;
+    auto shape = input.shape();
+    shape.back() = output_size();
+    const auto projected = product(activation.values);
+    if (input.dtype() == mx::bfloat16 && projected.shape(0) >= 64 &&
+        projected.size() <= std::size_t(std::numeric_limits<int>::max()) && mx::metal::is_available()) {
+        static const auto kernel = mx::fast::metal_kernel(
+            "tylo_channel_fp8_scale_product", {"x", "token", "channel"}, {"y"}, R"METAL(
+            const uint i = thread_position_in_grid.x;
+            y[i] = bfloat((float(x[i]) * token[i / N]) * float(channel[i % N]));
+            )METAL", "", true, false, CompileOptions(static_cast<int>(MathMode::Safe)));
+        return kernel({projected, activation.scales, channel_scales_}, {shape}, {mx::bfloat16},
+            {static_cast<int>(projected.size()), 1, 1}, {256, 1, 1}, {{"N", output_size()}},
+            std::nullopt, false, {}).front();
+    }
+    const auto result = mx::astype(projected, mx::float32) * activation.scales *
+        mx::astype(channel_scales_, mx::float32);
+    return mx::reshape(mx::astype(result, input.dtype()), shape);
+}
+
+std::optional<array> MlxChannelFp8Weight::fused_swiglu(const MlxChannelFp8Weight& up, const array& input) const {
+    namespace mx = mlx::core;
+    if (!dynamic_activations_ || !up.dynamic_activations_ || input.dtype() != mx::bfloat16 ||
+        input.ndim() < 2 || input.shape(-1) != input_size() || input_size() != up.input_size() ||
+        output_size() != up.output_size() || !mx::metal::is_available())
+        return std::nullopt;
+    const auto rows = input.size() / input_size();
+    const auto count = rows * output_size();
+    if (rows < 64 || count > std::size_t(std::numeric_limits<int>::max())) return std::nullopt;
+    const auto activation = quantize(input);
+    const auto gate_product = product(activation.values);
+    const auto up_product = up.product(activation.values);
+    auto shape = input.shape();
+    shape.back() = output_size();
+    static const auto kernel = mx::fast::metal_kernel(
+        "tylo_channel_fp8_scale_swiglu", {"gate", "up", "token", "gc", "uc"}, {"y"}, R"METAL(
+        const uint i = thread_position_in_grid.x;
+        const uint row = i / N;
+        const uint col = i % N;
+        const float g = float(bfloat((float(gate[i]) * token[row]) * float(gc[col])));
+        const float u = float(bfloat((float(up[i]) * token[row]) * float(uc[col])));
+        y[i] = bfloat((g / (1.0f + exp(-g))) * u);
+        )METAL", "", true, false, CompileOptions(static_cast<int>(MathMode::Safe)));
+    return kernel({gate_product, up_product, activation.scales, channel_scales_, up.channel_scales_},
+        {shape}, {mx::bfloat16}, {static_cast<int>(count), 1, 1}, {256, 1, 1},
+        {{"N", output_size()}}, std::nullopt, false, {}).front();
+}
+
+array MlxChannelFp8Weight::embedding(const array& rows, Dtype dtype) const {
+    namespace mx = mlx::core;
+    const auto values = mx::from_fp8(mx::view(mx::take(values_, rows, 0), mx::uint8), mx::float32);
+    const auto scales = mx::expand_dims(mx::astype(mx::take(channel_scales_, rows, 0), mx::float32), -1);
+    return mx::astype(values * scales, dtype);
+}
+
 MlxLinear MlxLinear::load(
     const MfqContainer& model,
-    const std::string& name) {
+    const std::string& name,
+    GgufAccess gguf_access) {
     const auto finish = [](MlxLinear result) {
         if (mlx_predequantize_fp16_enabled()) {
             result.materialize_fp16();
@@ -518,6 +684,11 @@ MlxLinear MlxLinear::load(
         return result;
     };
     const auto& record = model.record(name);
+    if (record.dtype == channel_fp8::dtype) {
+        auto weight = MlxChannelFp8Weight::from_blob(model.read(name));
+        model.record_prepared(name);
+        return finish(MlxLinear(std::move(weight)));
+    }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (is_nint8_zero_dtype(record.dtype)) return finish(MlxLinear(MlxNint8ZeroWeight::from_blob(model.map_record(name).view())));
     if (is_nint_dtype(record.dtype)) return finish(MlxLinear(MlxNintWeight::from_blob(model.map_record(name).view())));
@@ -526,7 +697,13 @@ MlxLinear MlxLinear::load(
     if (is_mxfp4_sq_dtype(record.dtype)) return finish(MlxLinear(MlxMxfp4SqWeight::from_blob(model.map_record(name).view())));
 #endif
     if (record.dtype == "TQ") return finish(MlxLinear(MlxTqWeight::load(model, name)));
-    if (is_gguf_dtype(record.dtype)) return finish(MlxLinear(MlxGgufWeight::load(model, name, true)));
+    if (is_gguf_dtype(record.dtype)) {
+        const bool can_drop_rows = record.dtype == "GGUF_Q8_0" || record.dtype == "GGUF_Q4_1";
+        const bool retain_rows = gguf_access != GgufAccess::projection_only ||
+            !can_drop_rows || mlx_predequantize_fp16_enabled();
+        const bool native_projection = gguf_access != GgufAccess::row_lookup;
+        return finish(MlxLinear(MlxGgufWeight::load(model, name, native_projection, retain_rows)));
+    }
     if (record.dtype == "MLX-AFFINE") return finish(MlxLinear(MlxAffineWeight::load(model, name)));
     if (is_mx_dtype(record.dtype)) {
         return finish(MlxLinear(
@@ -565,6 +742,9 @@ MlxLinear::MlxLinear(MlxMxWeight weight)
       weight_(std::move(weight)) {}
 
 
+MlxLinear::MlxLinear(MlxChannelFp8Weight weight)
+    : weight_(weight), input_size_(weight.input_size()), output_size_(weight.output_size()) {}
+
 MlxLinear::MlxLinear(array weight)
     : weight_(std::move(weight)) {
     const auto& dense = std::get<array>(weight_);
@@ -597,6 +777,7 @@ array MlxLinear::operator()(const array& input) const {
     if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->matmul(input);
     if (const auto* gguf = std::get_if<MlxGgufWeight>(&weight_)) return gguf->matmul(input);
     if (const auto* affine = std::get_if<MlxAffineWeight>(&weight_)) return affine->matmul(input);
+    if (const auto* fp8 = std::get_if<MlxChannelFp8Weight>(&weight_)) return fp8->matmul(input);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, output_size_)) {
@@ -900,11 +1081,16 @@ void MlxLinear::prepare_grouped_gguf() {
     if (auto* weight = std::get_if<MlxGgufWeight>(&weight_)) weight->prepare_grouped();
 }
 
+const MlxChannelFp8Weight* MlxLinear::channel_fp8_weight_ref() const noexcept {
+    return std::get_if<MlxChannelFp8Weight>(&weight_);
+}
+
 const array* MlxLinear::dense_weight_ref() const noexcept {
     return std::get_if<array>(&weight_);
 }
 
 void MlxLinear::materialize_fp16() {
+    if (std::holds_alternative<MlxChannelFp8Weight>(weight_)) return;
     if (std::holds_alternative<MlxAffineWeight>(weight_)) return;
     if (std::holds_alternative<MlxGgufWeight>(weight_)) return;
     if (std::holds_alternative<MlxTqWeight>(weight_)) return;
@@ -1123,6 +1309,7 @@ std::vector<array> MlxProjectionBatch::project(
         : input.size() /
             static_cast<std::size_t>(input.shape(-1));
     std::vector<array> outputs(impl_->linears.size(), input);
+    std::optional<MlxChannelFp8Weight::Activation> fp8_activation;
     for (const auto& segment : impl_->segments) {
         const bool affine_vector = rows == 1 && std::all_of(segment.indices.begin(), segment.indices.end(),
             [&](const auto index) { return impl_->linears[index].affine_weight_ref() != nullptr; });
@@ -1164,7 +1351,13 @@ std::vector<array> MlxProjectionBatch::project(
                     continue;
                 }
             }
-            outputs[index] = impl_->linears[index](input);
+            const auto* fp8 = impl_->linears[index].channel_fp8_weight_ref();
+            if (rows && fp8 && fp8->dynamic_activations() && input.shape(-1) == fp8->input_size()) {
+                if (!fp8_activation) fp8_activation.emplace(MlxChannelFp8Weight::quantize(input));
+                outputs[index] = fp8->matmul(input, *fp8_activation);
+            } else {
+                outputs[index] = impl_->linears[index](input);
+            }
         }
     }
     return outputs;
@@ -1194,6 +1387,11 @@ array MlxProjectionBatch::swiglu(
         }
     }
     if (limit == 0.0f) {
+        if (const auto* gate = impl_->linears[0].channel_fp8_weight_ref()) {
+            if (const auto* up = impl_->linears[1].channel_fp8_weight_ref()) {
+                if (auto fused = gate->fused_swiglu(*up, input)) return std::move(*fused);
+            }
+        }
         if (const auto* gate = impl_->linears[0].gguf_weight_ref(); gate && gate->native_weight_ref()) {
             if (const auto* up = impl_->linears[1].gguf_weight_ref(); up && up->native_weight_ref())
                 return mlx_native_gguf_swiglu(*gate->native_weight_ref(), *up->native_weight_ref(), input);

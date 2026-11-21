@@ -15,9 +15,12 @@ struct TqPrefillAttention {
     std::int64_t query_token_stride=0,query_head_stride=0;
     const void* gate=nullptr;std::int64_t gate_token_stride=0,gate_head_stride=0;
     bool query_half=false,gate_half=false,output_half=false;
+    bool resident_kv=false;
     cudaStream_t stream=nullptr;
 };
 // Decoded K/V are [four-token block, KV head, token, padded channel].
+// Resident FP16 K/V are [KV head, token, channel] and need no rotation.
+// Resident attention returns FP32 directly in the first rows of temporary.
 // A byte stores the four visibility bits of one selected microblock.
 // Reuses the retired partial-output arena. Returns cudaErrorNotSupported
 // before launching anything if the device image or workspace is unsuitable.

@@ -52,7 +52,8 @@ class D1Worker:
                       jev_weights_streamed=float(ready.get('weight_placement') == 'stream'))
         result['native_metrics'] = {key: value for key, value in self.adapter.last_frame.items()
                                     if key in {'packed_kernel', 'packed_kernel_dispatch', 'packed_gemm_calls_per_forward',
-                                               'bf16_gemm_calls_per_forward', 'temporary_pool_reserved_high_bytes',
+                                               'bf16_gemm_calls_per_forward', 'fp32_candidate_gemm_calls_per_forward',
+                                               'temporary_pool_reserved_high_bytes',
                                                'temporary_pool_used_high_bytes'}}
         return result
 

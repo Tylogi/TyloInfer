@@ -1,95 +1,133 @@
-import { useId, useState, type ReactNode } from 'react';
-import { CaretRightIcon } from '@phosphor-icons/react';
-import { SettingRow } from '../../app/display';
+import { useEffect, useId, useState } from 'react';
 import { useSettings } from '../settings/SettingsProvider';
-import type { LoadContextDefaults } from './loadContextDefaults';
-import type { KvQuantizationSettings, RuntimeContextPolicy } from '../../shared/api/resources/runtime';
+import type { ModelLoadPlan, ModelLoadPlanQuery } from '../../shared/api/resources/models';
 import type { ModelArtifact } from '../../shared/api/types';
+import type { LoadContextDefaults } from './loadContextDefaults';
+import './model-load-context.css';
 
-export function ModelLoadContextView({ value, onChange, disabled = false, model, policy, backend, renderMemoryEstimate }: {
- value: LoadContextDefaults; onChange(value: LoadContextDefaults): void; disabled?: boolean;
- model?: ModelArtifact; policy: RuntimeContextPolicy | null; backend?: string;
- renderMemoryEstimate(props: { value: LoadContextDefaults; valid: boolean; onSparseChange(sparse: boolean | null): void }): ReactNode;
+const tiers = [
+  { reserve: 5, zh: '激进', en: 'Aggressive' },
+  { reserve: 10, zh: '普通', en: 'Balanced' },
+  { reserve: 20, zh: '安全', en: 'Safe' },
+] as const;
+
+type LoadPlanReader = (id: string, query: ModelLoadPlanQuery, signal: AbortSignal) => Promise<ModelLoadPlan>;
+
+function missingPlanEndpoint(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const response = error as { status?: number; code?: string; details?: { http_status?: number; core_error?: unknown } };
+  return response.status === 404 && response.code !== 'model_artifact_not_found'
+    || response.details?.http_status === 404 && response.details.core_error == null;
+}
+
+export function ModelLoadContextView({ value, onChange, disabled = false, model, device, readPlan, onReadyChange }: {
+  value: LoadContextDefaults;
+  onChange(value: LoadContextDefaults): void;
+  disabled?: boolean;
+  model: ModelArtifact;
+  device?: string;
+  readPlan: LoadPlanReader;
+  onReadyChange?(ready: boolean): void;
 }) {
- const { tr } = useSettings();
- const id = useId();
- const [expanded, setExpanded] = useState(false);
- const [kind, setKind] = useState<'sparse' | 'full'>('sparse');
- const [detectedSparse, setDetectedSparse] = useState<boolean | null>(null);
-  const [contextDraft, setContextDraft] = useState<string | null>(null);
-  const context = contextDraft ?? (value.context_size == null ? '' : String(value.context_size));
-  const valid = context === '' || Number.isSafeInteger(Number(context)) && Number(context) >= 512 && Number(context) <= 2147483647;
-  const patch = (change: Partial<LoadContextDefaults>) => onChange({ ...value, ...change });
-  const locked = disabled || value.automatic;
-  const sparse = model ? detectedSparse === true : kind === 'sparse';
-  const cudaQsa = sparse && backend === 'cuda' && (!model || model.architecture.toLowerCase().startsWith('qwen4_exp'));
-  const savedMemory = model && policy?.model_kv_memory?.[model.name];
-  const savedQuantization = model && policy?.model_kv_quantization?.[model.name];
-  const automaticSsd = cudaQsa && (savedMemory ? savedMemory.placement === 'auto_ssd' : !savedQuantization?.enabled);
-  const automaticRam = !cudaQsa || savedMemory?.ram_preallocated !== false;
-  const automaticContext = model ? policy?.model_overrides[model.name]
-    ?? (model.context_capacity ? Math.min(model.context_capacity, policy?.max_context_size ?? Infinity) : policy?.fallback_context_size) : undefined;
-  return <section className="model-load-context" aria-label={tr('上下文管理', 'Context management')}>
-    <h3>{tr('上下文管理', 'Context management')}</h3>
-    <SettingRow title={tr('加载上下文', 'Load context')}
-      detail={tr('留空遵循服务端保存的单模型设置与全局上限。加载选项保存在当前浏览器，仅用于此模型的下次加载。',
-        'Leave empty to follow the saved server-side model settings and global cap. Load options are saved in this browser for this model’s next load only.')}
-      trailing={<input type="number" min={512} max={2147483647} step={1} placeholder={tr('自动', 'Automatic')} value={context}
-        aria-label={tr('加载上下文', 'Load context')} aria-invalid={!valid} disabled={disabled}
-        onChange={event => {
-          const text = event.target.value;
-          setContextDraft(text);
-          if (text === '' || Number.isSafeInteger(Number(text)) && Number(text) >= 512 && Number(text) <= 2147483647)
-            patch({ context_size: text === '' ? null : Number(text) });
-        }} onBlur={() => { if (!valid) setContextDraft(null); }} />} />
-    {!valid && <p role="alert">{tr('请输入不小于 512 的有效整数，或留空使用服务端设置。', 'Enter a valid integer of at least 512, or leave empty to follow server settings.')}</p>}
-    {renderMemoryEstimate({ value: { ...value, context_size: value.context_size ?? automaticContext ?? null }, valid, onSparseChange: setDetectedSparse })}
-    <div className="model-load-advanced-heading">
-      <button type="button" className="model-load-advanced-toggle" aria-expanded={expanded} aria-controls={id}
-        onClick={() => setExpanded(open => !open)}>
-        <CaretRightIcon size={15} aria-hidden="true" />{tr('高级', 'Advanced')}
-      </button>
-      <label><input type="checkbox" checked={value.automatic} disabled={disabled}
-        onChange={event => { patch({ automatic: event.target.checked }); if (!event.target.checked) setExpanded(true); }} />{tr('自动', 'Automatic')}</label>
+  const { tr } = useSettings();
+  const id = useId();
+  const [draft, setDraft] = useState<string | null>(null);
+  const [result, setResult] = useState<{ key: string; plan: ModelLoadPlan | null; endpointMissing?: boolean } | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const { context_size, reserve_percent, precision, vram_preallocated, jev_weights } = value;
+  const streamed = jev_weights !== 'vram';
+  const valid = draft == null || draft === '' || Number.isSafeInteger(Number(draft)) && Number(draft) >= 512 && Number(draft) <= 2147483647;
+  const key = JSON.stringify([model.id, device, context_size, reserve_percent, precision, vram_preallocated, streamed, attempt]);
+  const plan = result?.key === key ? result.plan : null;
+  const loading = result?.key !== key;
+  const ready = valid && !!plan?.usable;
+  const patch = (next: Partial<LoadContextDefaults>) => onChange({ ...value, ...next });
+  const automatic = context_size == null;
+  const context = draft ?? (automatic ? plan?.context_size ?? '' : context_size);
+  const label = tr('上下文长度', 'Context length');
+  const precisionLabel = (bits: number) => bits === 16 ? tr('原生', 'Native') : bits === 8 ? 'INT8' : tr(`${bits} 位`, `${bits}-bit`);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      void readPlan(model.id, {
+        reserve: reserve_percent, preallocate: vram_preallocated, streamed_jev: streamed,
+        ...(context_size == null ? {} : { context_size }), ...(precision == null ? {} : { precision }),
+        ...(device ? { device } : {}),
+      }, controller.signal).then(plan => {
+        if (!controller.signal.aborted) setResult({ key, plan });
+      }).catch(error => {
+        if (!controller.signal.aborted) setResult({ key, plan: null, endpointMissing: missingPlanEndpoint(error) });
+      });
+    }, 140);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [key, model.id, readPlan, vram_preallocated, streamed, reserve_percent, context_size, precision, device]);
+
+  useEffect(() => { onReadyChange?.(ready); }, [ready, onReadyChange]);
+
+  const issue = !valid ? tr('请输入至少 512 的整数。', 'Enter a whole number of at least 512.')
+    : loading ? '' : !plan
+      ? result?.endpointMissing
+        ? tr('当前核心版本缺少加载方案接口。', 'The connected core version has no load-plan endpoint.')
+        : tr('无法读取加载方案。请重试。', 'Could not read the load plan. Retry to check again.')
+      : plan.reason === 'memory_unavailable'
+        ? tr('核心缺少可用内存或模型 KV 容量数据。', 'The core could not measure available memory or this model’s KV size.')
+      : plan.reason === 'precision_unsupported'
+        ? tr('请选择此模型支持的 KV 精度。', 'Select a KV precision supported by this model.')
+        : plan.reason === 'model_limit'
+          ? tr('超出模型支持的上下文长度。', 'The context exceeds the model limit.')
+          : !plan.usable ? tr('所选设置超出可用容量。', 'These settings exceed the available memory.') : '';
+
+  return <section className="model-load-context" aria-label={tr('加载选项', 'Load options')}>
+    <fieldset className="model-load-tiers">
+      <legend>{tr('内存余量', 'Memory reserve')}</legend>
+      {tiers.map(tier => <label className="model-load-tier" key={tier.reserve}>
+        <input type="radio" name={id} value={tier.reserve} checked={reserve_percent === tier.reserve} disabled={disabled}
+          onChange={() => patch({ reserve_percent: tier.reserve })} />
+        <span>{tr(tier.zh, tier.en)}</span><strong>{tier.reserve}%</strong>
+      </label>)}
+    </fieldset>
+    <div className="model-load-inputs">
+      <div className="model-load-field">
+        <label htmlFor={id + '-context'}>{label}</label>
+        <div className="model-load-context-input">
+          <input id={id + '-context'} type="number" min={512} max={2147483647} step={1} value={context}
+            aria-invalid={!valid || !!plan?.reason} disabled={disabled}
+            onChange={event => {
+              const raw = event.target.value;
+              setDraft(raw);
+              const number = Number(raw);
+              if (raw === '' || Number.isSafeInteger(number) && number >= 512 && number <= 2147483647)
+                patch({ context_size: raw === '' ? null : number });
+            }} onBlur={() => setDraft(null)} />
+          {automatic ? <span>{tr('自动', 'Auto')}</span>
+            : <button type="button" disabled={disabled} onClick={() => { setDraft(null); patch({ context_size: null }); }}>{tr('恢复自动', 'Reset')}</button>}
+        </div>
+        <small aria-live="polite">{loading ? tr('计算中…', 'Calculating…') : plan?.max_context
+          ? tr(`上限 ${plan.max_context.toLocaleString()} tokens`, `Up to ${plan.max_context.toLocaleString()} tokens`) : '\u00a0'}</small>
+      </div>
+      <div className="model-load-field">
+        <label htmlFor={id + '-precision'}>{tr('KV 精度', 'KV precision')}</label>
+        <select id={id + '-precision'} value={precision ?? ''} disabled={disabled}
+          onChange={event => patch({ precision: event.target.value === '' ? null : Number(event.target.value) })}>
+          <option value="">{tr('自动', 'Auto')}{plan ? ' · ' + precisionLabel(plan.precision) : ''}</option>
+          {[...new Set([...(result?.plan?.precisions ?? []), ...(precision == null ? [] : [precision])])].filter(bits => bits < 16)
+            .map(bits => <option key={bits} value={bits}>{precisionLabel(bits)}</option>)}
+        </select>
+      </div>
     </div>
-    <div id={id} hidden={!expanded} className="model-load-advanced-body">
-      <p>{cudaQsa
-        ? tr('自动默认使用固定 INT8、开启 SSD KV 和 RAM 预分配。已保存的模型设置优先。',
-          'Automatic defaults to fixed INT8, SSD KV and RAM preallocation. Saved model settings take precedence.')
-        : sparse ? tr('自动：关闭 SSD KV、开启预分配、关闭 KV 量化。取消勾选后可手动调整。',
-          'Automatic: SSD KV off, preallocation on, KV quantization off. Uncheck to customize.')
-        : tr('自动：开启预分配、关闭 KV 量化。取消勾选后可手动调整。',
-          'Automatic: preallocation on, KV quantization off. Uncheck to customize.')}</p>
-      {!model && <div className="model-load-context-kinds" role="group" aria-label={tr('模型类型', 'Model type')}>
-        <button type="button" aria-pressed={sparse} onClick={() => setKind('sparse')}>{tr('稀疏注意力模型', 'Sparse-attention models')}</button>
-        <button type="button" aria-pressed={!sparse} onClick={() => setKind('full')}>{tr('非稀疏注意力模型', 'Other models')}</button>
-      </div>}
-      {sparse && <SettingRow title="SSD KV"
-        detail={tr('显存和内存容纳不下的冷 KV 写入 SSD；长上下文可能变慢，并占用磁盘空间。',
-          'Cold KV spills to SSD when VRAM and RAM are full; this can slow long contexts and use disk space.')}
-        trailing={<input type="checkbox" aria-label="SSD KV" disabled={locked}
-          checked={value.automatic ? automaticSsd : value.ssd_kv}
-          onChange={event => patch({ ssd_kv: event.target.checked, ...(event.target.checked ? {} : { ram_preallocated: true }) })} />} />}
-      <SettingRow title={sparse ? tr('RAM 预分配', 'RAM preallocation') : tr('VRAM 预分配', 'VRAM preallocation')}
-        detail={sparse
-          ? tr('为显存预算之外的 KV 预留内存。关闭时会同时开启 SSD KV，以便内存不足时继续增长；SSD 空间不足会明确报错。',
-            'Reserve RAM for KV beyond the VRAM budget. Turning this off also enables SSD KV for further growth; insufficient disk space produces an error.')
-          : tr('加载时为目标上下文预留 KV 显存，关闭后按需分配。',
-            'Reserve KV VRAM for the target context at load time. When off, allocate on demand.')}
-        trailing={<input type="checkbox" aria-label={sparse ? tr('RAM 预分配', 'RAM preallocation') : tr('VRAM 预分配', 'VRAM preallocation')}
-          disabled={locked} checked={value.automatic ? automaticRam : (sparse ? value.ram_preallocated : value.vram_preallocated)}
-          onChange={event => patch(sparse ? { ram_preallocated: event.target.checked, ...(!event.target.checked ? { ssd_kv: true } : {}) }
-            : { vram_preallocated: event.target.checked })} />} />
-      <SettingRow title={tr('默认 KV 量化档位', 'Default KV quantization')}
-        detail={tr('适用于支持 TurboQuant 的模型。低精度节省 KV 空间，可能影响输出质量；Indexer Cache 和线性注意力递推状态保持原精度。不支持的模型使用原精度。',
-          'Applies to models supporting TurboQuant. Lower precision saves KV space and may affect quality. Indexer caches and recurrent states retain their precision; unsupported models use native precision.')}
-        trailing={<select aria-label={tr('默认 KV 量化档位', 'Default KV quantization')} disabled={locked}
-          value={value.automatic || !value.kv_quantization.enabled ? 'off' : String(value.kv_quantization.bits)}
-          onChange={event => patch({ kv_quantization: { algorithm: 'turboquant', enabled: event.target.value !== 'off',
-            bits: event.target.value === 'off' ? value.kv_quantization.bits : Number(event.target.value) as KvQuantizationSettings['bits'] } })}>
-          <option value="off">{tr('关闭 TurboQuant', 'TurboQuant off')}</option>
-          {[2, 2.5, 3, 3.5, 4, 6, 8].map(bits => <option key={bits} value={bits}>{bits} bit</option>)}
-        </select>} />
-    </div>
+    {!model.structured_decisions && <div className="model-load-allocation">
+      <label htmlFor={id + '-allocation'}>{tr('KV 分配', 'KV allocation')}</label>
+      <select id={id + '-allocation'} value={vram_preallocated ? 'preallocate' : 'dynamic'} disabled={disabled}
+        onChange={event => patch({ vram_preallocated: event.target.value === 'preallocate' })}>
+        <option value="preallocate">{tr('加载时预分配', 'Preallocate on load')}</option>
+        <option value="dynamic">{tr('按需分配', 'Allocate on demand')}</option>
+      </select>
+    </div>}
+    {issue && <div className="model-load-status">
+      <p className="model-load-issue" role="alert">{issue}</p>
+      {valid && (!plan || plan.reason === 'memory_unavailable') && <button type="button" disabled={disabled}
+        onClick={() => setAttempt(value => value + 1)}>{tr('重试', 'Retry')}</button>}
+    </div>}
   </section>;
 }

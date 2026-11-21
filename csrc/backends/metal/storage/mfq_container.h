@@ -89,6 +89,10 @@ public:
         return static_cast<bool>(hf_source_);
     }
 
+    const mfq::ModelSource* native_source() const noexcept {
+        return hf_source_ ? hf_source_.get() : gguf_source_.get();
+    }
+
     const std::unordered_map<std::string, MfqRecord>& records() const noexcept {
         return records_;
     }

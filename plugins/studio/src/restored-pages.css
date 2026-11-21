@@ -48,10 +48,32 @@
 .tylo-studio-inference .tylo-shared-tooltip { position: relative; display: inline-flex; }
 .tylo-studio-inference .tylo-shared-tooltip > [role='tooltip'] { display: none; position: absolute; z-index: 8; left: 0; top: 100%; width: min(360px, 70vw); padding: 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface-raised); box-shadow: var(--shadow-sm); font-size: 12px; line-height: 1.7; }
 .tylo-studio-inference .tylo-shared-tooltip:is(:hover, :focus-within) > [role='tooltip'] { display: block; }
-.tylo-studio-inference dialog.studio-dialog { margin: auto; color: var(--ink); background: var(--surface); border: 1px solid var(--line); max-height: calc(100dvh - 40px); overflow: auto; }
-.tylo-studio-inference dialog.studio-dialog::backdrop { background: rgb(0 0 0 / 40%); }
-.tylo-studio-inference .studio-dialog > header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
-.tylo-studio-inference .studio-dialog > header p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.tylo-studio-inference dialog.studio-dialog { box-sizing: border-box; margin: auto; padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--line); max-width: calc(100vw - 24px); max-height: calc(100dvh - 32px); overflow: auto; }
+.tylo-studio-inference dialog.studio-dialog::backdrop { background: rgb(0 0 0 / 48%); }
+.tylo-studio-inference .studio-dialog > header { display: flex; align-items: start; justify-content: space-between; gap: 14px; }
+.tylo-studio-inference .studio-dialog > header > div { min-width: 0; }
+.tylo-studio-inference .studio-dialog > header h2 { margin: 2px 0 0; color: var(--ink-strong); font-size: 18px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+.tylo-studio-inference .studio-dialog > header p { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.tylo-studio-inference .studio-dialog > header > button { display: grid; place-items: center; flex: none; width: 30px; min-height: 30px; padding: 0; border: 0; color: var(--muted); font-size: 20px; line-height: 1; }
+.tylo-studio-inference .studio-dialog > header > button:hover { background: var(--surface-control); color: var(--ink-strong); }
+.tylo-studio-inference dialog.tylo-action-dialog { display: flex; flex-direction: column; width: 460px; overflow: hidden; }
+.tylo-studio-inference .tylo-action-dialog > header { flex: none; padding: 22px 22px 18px; }
+.tylo-studio-inference .tylo-action-dialog > form { display: flex; flex-direction: column; min-width: 0; min-height: 0; margin: 0; }
+.tylo-studio-inference .tylo-action-body { display: grid; gap: 12px; padding: 0 22px 20px; font-size: 13px; line-height: 1.5; overflow-y: auto; overflow-wrap: anywhere; }
+.tylo-studio-inference .tylo-action-body p { margin: 0; color: var(--muted); }
+.tylo-studio-inference .tylo-action-body :is(.tylo-page-facts, .tylo-action-summary) { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--canvas); }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts { grid-template-columns: minmax(0, 1fr); gap: 8px !important; }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts > div { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 1.6fr); align-items: baseline; gap: 10px; }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts dd { margin: 0 !important; color: var(--ink-strong); font-weight: 550; }
+.tylo-studio-inference .tylo-action-summary { gap: 4px; }
+.tylo-studio-inference .tylo-action-summary > span { color: var(--muted); font-size: 12px; }
+.tylo-studio-inference .tylo-action-body ul { max-height: 28dvh; overflow: auto; margin: 0; padding-inline-start: 20px; }
+.tylo-studio-inference .tylo-action-body label > span { display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
+.tylo-studio-inference .tylo-action-body input[type='number'] { width: min(150px, 100%); }
+.tylo-studio-inference .tylo-action-dialog footer { flex: none; flex-wrap: wrap; gap: 8px; padding: 12px 22px; }
+.tylo-studio-inference .tylo-action-dialog footer button { min-width: 76px; }
+.tylo-studio-inference .tylo-action-dialog footer .danger { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, var(--surface)); font-weight: 650; }
+.tylo-studio-inference .tylo-action-dialog footer .danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 16%, var(--surface)); }
 .tylo-studio-inference .analysis-facts { display: grid; }
 .tylo-studio-inference .analysis-facts dd { margin: 0; font-size: 14px; }
 .tylo-studio-inference .analysis-page .architecture-flow { max-width: none; }

@@ -62,6 +62,24 @@ export function resolveModelAnalysis(payload) {
 
 /** Resolve local model metadata by catalog identity without accepting filesystem inputs. */
 export function resolveModelDetails(endpoint, payload) {
+  if (endpoint === 'models/load-plan') {
+    if (!object(payload) || !identifier(payload.model_id)) return null;
+    const validators = {
+      reserve: value => [5, 10, 20].includes(value),
+      context_size: value => Number.isSafeInteger(value) && value >= 512 && value <= 2147483647,
+      precision: value => [2, 2.5, 3, 3.5, 4, 6, 8, 16].includes(value),
+      preallocate: value => typeof value === 'boolean',
+      streamed_jev: value => typeof value === 'boolean',
+      device: value => typeof value === 'string' && /^[a-z0-9_-]{1,64}$/i.test(value),
+    };
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+      if (key === 'model_id') continue;
+      if (!Object.hasOwn(validators, key) || !validators[key](value)) return null;
+      query.set(key, String(value));
+    }
+    return { kind: 'read', resource: 'model_load_plan', path: '/api/v1/models/' + payload.model_id + '/load-plan', query: query.toString() };
+  }
   const profile = endpoint === 'models/cache-profile';
   if (!profile && endpoint !== 'models/directory') return null;
   const allowed = profile ? ['model_id', 'include_recurrent'] : ['model_id'];

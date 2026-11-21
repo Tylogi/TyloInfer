@@ -102,6 +102,7 @@ struct FlashNextBatchRequest : mfq::engine::BatchRequest {
     mfq::engine::mtp::GenerationStats mtp_stats;
     int64_t first_token = 0;
     int64_t decode_row = -1;
+    int64_t prefill_compute_chunk = 0;
     double packed_prefill_ms = 0;
 };
 class FlashNextBatchOperations {
@@ -125,6 +126,7 @@ class FlashNextBatchOperations {
     void suspend_decode();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
+    int64_t solo_prefill_span(const std::shared_ptr<Request>&,int64_t compute_chunk) const;
     std::size_t prefill_batch_limit() const;
     int64_t prefill_batch_token_budget() const;
     std::vector<mfq::engine::PrefillBatchResult<Sample>> prefill_batch(
@@ -147,6 +149,7 @@ class FlashNextBatchOperations {
         std::function<void()>,std::function<bool()>,std::function<void()>);
     Decoded verify_mtp(State&);
     void initialize_prefill(const std::shared_ptr<Request>&,mfq::engine::PrefillChunk);
+    bool layer_major_prefill(const Request&, int64_t tokens) const;
     std::size_t release_spare_qsa_cache();
     void borrow_dense_prefill_workspace(std::size_t bytes,int64_t tokens);
     std::size_t reclaim_indexer_for_admission(std::size_t bytes);
@@ -162,6 +165,7 @@ class FlashNextBatchOperations {
     bool routed_workspace_restore_pending_ = false;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
     int64_t packed_prefill_batches_ = 0, packed_prefill_requests_ = 0, packed_prefill_tokens_ = 0;
+    int64_t layer_major_prefill_chunks_ = 0;
     int64_t mtp_batches_ = 0, mtp_maximum_batch_ = 0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<

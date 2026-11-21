@@ -26,7 +26,8 @@ std::array<mlx::core::array, 2> mlx_native_gguf_hyper(const mlx::core::array& st
     const mlx::core::array& norm, const MlxNativeGgufWeight& down, const MlxNativeGgufWeight& up,
     const mlx::core::array* inject);
 MlxNativeGgufWeight mlx_native_gguf_float(const mlx::core::array& weight);
-mlx::core::array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const mlx::core::array& input);
+mlx::core::array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const mlx::core::array& input,
+    bool uniform_expert_rows = false, bool use_short_expert_tiles = false);
 bool mlx_native_gguf_supported(int ggml_type, int rows, int width) noexcept;
 MlxNativeGgufWeight mlx_native_gguf_pack(const mlx::core::array& packed,
     int ggml_type, int rows, int width, int row_bytes);

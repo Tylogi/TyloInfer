@@ -4629,6 +4629,13 @@
               }
             ],
             "title": "Parent Id"
+          },
+          "shortcuts": {
+            "items": {
+              "$ref": "#/components/schemas/ModelDirectoryEntry"
+            },
+            "title": "Shortcuts",
+            "type": "array"
           }
         },
         "required": [
@@ -4690,10 +4697,46 @@
           "kv_quantization": {
             "$ref": "#/components/schemas/KvQuantizationSettings"
           },
+          "precision": {
+            "anyOf": [
+              {
+                "enum": [
+                  2,
+                  2.5,
+                  3,
+                  3.5,
+                  4,
+                  6,
+                  8,
+                  16
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Precision"
+          },
           "ram_preallocated": {
             "default": true,
             "title": "Ram Preallocated",
             "type": "boolean"
+          },
+          "reserve_percent": {
+            "anyOf": [
+              {
+                "enum": [
+                  5,
+                  10,
+                  20
+                ],
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reserve Percent"
           },
           "ssd_kv": {
             "default": false,
@@ -4707,6 +4750,78 @@
           }
         },
         "title": "ModelLoadContextSettings",
+        "type": "object"
+      },
+      "ModelLoadPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "context_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
+          },
+          "gpu_budget_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpu Budget Bytes"
+          },
+          "max_context": {
+            "title": "Max Context",
+            "type": "integer"
+          },
+          "precision": {
+            "title": "Precision",
+            "type": "number"
+          },
+          "precisions": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Precisions",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "model_limit",
+                  "memory_limit",
+                  "memory_unavailable",
+                  "precision_unsupported"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "usable": {
+            "title": "Usable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "max_context",
+          "context_size",
+          "precision",
+          "precisions",
+          "usable"
+        ],
+        "title": "ModelLoadPlan",
         "type": "object"
       },
       "ModelLoadRequest": {
@@ -5725,6 +5840,19 @@
               }
             ],
             "title": "Directory Id"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
           },
           "path": {
             "anyOf": [
@@ -15654,6 +15782,18 @@
     "/api/v1/models/directories/register": {
       "post": {
         "operationId": "register_model_directory_api_v1_models_directories_register_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "allow_empty",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Empty",
+              "type": "boolean"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -16958,6 +17098,232 @@
           }
         },
         "summary": "Model Artifact Directory",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/models/{model_id}/load-plan": {
+      "get": {
+        "operationId": "model_load_plan_api_v1_models__model_id__load_plan_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reserve",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 20,
+              "minimum": 5,
+              "title": "Reserve",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "context_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 512,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Context Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "precision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Precision"
+            }
+          },
+          {
+            "in": "query",
+            "name": "preallocate",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Preallocate",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "device",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "pattern": "^[A-Za-z0-9_-]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device"
+            }
+          },
+          {
+            "in": "query",
+            "name": "streamed_jev",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Streamed Jev",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelLoadPlan"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Model Load Plan",
         "tags": [
           "models"
         ]

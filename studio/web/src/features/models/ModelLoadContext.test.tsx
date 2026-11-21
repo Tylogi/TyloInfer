@@ -5,133 +5,78 @@ import { ModelLoadContext } from './ModelLoadContext';
 import { DEFAULT_LOAD_CONTEXT, readLoadContext, saveLoadContext } from './loadContextDefaults';
 import { setApiBaseUrl } from '../../shared/api/client';
 import { modelsApi } from '../../shared/api/resources/models';
-import { runtimeApi } from '../../shared/api/resources/runtime';
-import type { ModelArtifact, ModelCacheProfile, RuntimeStatus } from '../../shared/api/types';
+import type { ModelArtifact } from '../../shared/api/types';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string) => zh }) }));
 
-beforeEach(() => { vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl('');
-  vi.spyOn(runtimeApi, 'contextPolicy').mockResolvedValue({ max_context_size: null, model_overrides: {}, fallback_context_size: 32768 });
+const model: ModelArtifact = { id: 'fixture', name: 'Dense model', architecture: 'qwen3_5', format: 'gguf',
+  shard_count: 1, total_bytes: 2 ** 30, tensor_count: 1, record_count: 1, dtypes: [],
+  complete: true, loadable: true, modified_at: '2026-01-01T00:00:00Z' };
+
+beforeEach(() => {
+  vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl('');
+  vi.spyOn(modelsApi, 'modelLoadPlan').mockImplementation(async (_id, query) => {
+    const cap = !query.preallocate ? 262144 : (30 - query.reserve) * 2048;
+    return { context_size: query.context_size || cap, max_context: cap, precision: query.precision || 8,
+      precisions: [8, 4], usable: (query.context_size || cap) <= cap,
+      reason: (query.context_size || cap) > cap ? 'memory_limit' : null };
+  });
 });
-function Form({ models = [], runtime }: { models?: ModelArtifact[]; runtime?: RuntimeStatus } = {}) {
+
+function Form() {
   const [value, setValue] = useState(readLoadContext);
-  return <ModelLoadContext models={models} runtime={runtime} value={value} onChange={next => { setValue(next); saveLoadContext(next); }} />;
+  return <ModelLoadContext models={[model]} value={value} onChange={next => { setValue(next); saveLoadContext(next); }} />;
 }
 
-it('defers empty context to the server with collapsed automatic settings and remembers explicit context', () => {
-  const view = render(<Form />);
-  const context = screen.getByRole('spinbutton', { name: '加载上下文' });
-  expect(context).toHaveAttribute('placeholder', '自动');
-  expect(context).toHaveValue(null);
-  expect(screen.getByRole('button', { name: '高级' })).toHaveAttribute('aria-expanded', 'false');
-  expect(screen.getByRole('checkbox', { name: '自动' })).toBeChecked();
-  fireEvent.change(context, { target: { value: '65536' } });
-  view.unmount(); render(<Form />);
-  expect(screen.getByRole('spinbutton')).toHaveValue(65536);
-  fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '' } });
+it('puts the computed default in the field and recalculates it for another tier', async () => {
+  render(<Form />);
+  const context = screen.getByRole('spinbutton', { name: '上下文长度' });
+  await waitFor(() => expect(context).toHaveValue(40960));
+  expect(screen.getByRole('radio', { name: /普通/ })).toBeChecked();
+  expect(screen.getByRole('option', { name: '自动 · INT8' })).toHaveProperty('selected', true);
+  fireEvent.click(screen.getByRole('radio', { name: /安全/ }));
+  await waitFor(() => expect(context).toHaveValue(20480));
+  expect(readLoadContext()).toMatchObject({ context_size: null, reserve_percent: 20 });
+});
+
+it('preserves a manual context, applies the memory limit only with preallocation, and resets to auto', async () => {
+  render(<Form />);
+  const context = screen.getByRole('spinbutton');
+  await waitFor(() => expect(context).toHaveValue(40960));
+  fireEvent.change(context, { target: { value: '131072' } });
+  expect(await screen.findByRole('alert')).toHaveTextContent('超出可用容量');
+  expect(screen.getByRole('combobox', { name: 'KV 分配' })).toHaveValue('preallocate');
+  fireEvent.change(screen.getByRole('combobox', { name: 'KV 分配' }), { target: { value: 'dynamic' } });
+  await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  fireEvent.change(screen.getByRole('combobox', { name: 'KV 精度' }), { target: { value: '4' } });
+  expect(readLoadContext()).toMatchObject({ context_size: 131072, precision: 4, vram_preallocated: false });
+  fireEvent.click(screen.getByRole('button', { name: '恢复自动' }));
+  await waitFor(() => expect(context).toHaveValue(262144));
   expect(readLoadContext().context_size).toBeNull();
 });
 
-it('enforces the sparse RAM/SSD dependency and keeps non-sparse KV in VRAM', () => {
-  render(<Form />);
-  fireEvent.click(screen.getByRole('button', { name: '高级' }));
-  expect(screen.getByRole('checkbox', { name: 'SSD KV' })).toBeDisabled();
-  expect(screen.getByRole('combobox', { name: '默认 KV 量化档位' })).toBeDisabled();
-  fireEvent.click(screen.getByRole('checkbox', { name: '自动' }));
-  fireEvent.click(screen.getByRole('checkbox', { name: 'RAM 预分配' }));
-  expect(screen.getByRole('checkbox', { name: 'SSD KV' })).toBeChecked();
-  fireEvent.click(screen.getByRole('checkbox', { name: 'SSD KV' }));
-  expect(screen.getByRole('checkbox', { name: 'RAM 预分配' })).toBeChecked();
-  fireEvent.click(screen.getByRole('button', { name: '非稀疏注意力模型' }));
-  expect(screen.queryByRole('checkbox', { name: 'SSD KV' })).not.toBeInTheDocument();
-  expect(screen.queryByText(/SSD KV/)).not.toBeInTheDocument();
-  expect(screen.queryByRole('checkbox', { name: 'RAM 预分配' })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('checkbox', { name: 'VRAM 预分配' }));
-  expect(readLoadContext().vram_preallocated).toBe(false);
-  fireEvent.change(screen.getByRole('combobox', { name: '默认 KV 量化档位' }), { target: { value: '2.5' } });
-  expect(readLoadContext().kv_quantization).toEqual({ enabled: true, bits: 2.5, algorithm: 'turboquant' });
-  fireEvent.click(screen.getByRole('checkbox', { name: '自动' }));
-  expect(screen.getByRole('combobox', { name: '默认 KV 量化档位' })).toHaveValue('off');
-  expect(screen.getByRole('checkbox', { name: 'VRAM 预分配' })).toBeChecked();
-  fireEvent.click(screen.getByRole('checkbox', { name: '自动' }));
-  expect(screen.getByRole('combobox', { name: '默认 KV 量化档位' })).toHaveValue('2.5');
-});
-
-it.each([['cuda', true], ['metal', false]])('displays automatic SSD KV for %s', (backend, enabled) => {
-  render(<Form runtime={{ backend }} />);
-  fireEvent.click(screen.getByRole('button', { name: '高级' }));
-  const ssd = screen.getByRole('checkbox', { name: 'SSD KV' });
-  expect(ssd).toBeDisabled();
-  expect((ssd as HTMLInputElement).checked).toBe(enabled);
-});
-
-const GiB = 2 ** 30;
-const model: ModelArtifact = { id: 'small', name: 'Qwen-S2-L', architecture: 'qwen4_exp', format: 'tq',
-  shard_count: 5, total_bytes: 40 * GiB, estimated_resident_weight_bytes: 8 * GiB, ssd_ple_bytes: 32 * GiB,
-  context_capacity: 131072, tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true,
-  modified_at: '2026-10-15T00:00:00Z' };
-const profile: ModelCacheProfile = { max_context: 131072, fixed_bytes: GiB,
-  fixed_components: [{ group: 'GDN', name: 'recurrent_state', bytes: GiB }],
-  components: [{ group: 'QSA', name: 'raw_kv', layers: 2, kv_heads: 16, head_dimension: 256,
-    bytes_per_row: 32768, tokens_per_row: 1, allocation: 'exact', minimum_rows: 16 }] };
-
-it('shows zero backend headroom even when the OS still reports three GiB available', () => {
-  render(<Form runtime={{ memory_architecture: 'unified', host_memory_available_bytes: 3 * GiB,
-    runtime_memory_headroom_bytes: 0 }} />);
-  expect(screen.getByText(/当前剩余/)).toHaveTextContent('0 GiB');
-});
-
-it('uses the selected model directly and updates estimates without loading or asking for its architecture', async () => {
-  const cache = vi.spyOn(modelsApi, 'modelCacheProfile').mockResolvedValue(profile);
-  const load = vi.spyOn(modelsApi, 'loadModel');
-  render(<Form models={[model]} runtime={{ memory_architecture: 'discrete', host_memory_available_bytes: 12 * GiB,
-    gpu_devices: [{ id: '0', name: 'GPU', memory_available_bytes: 3 * GiB }] }} />);
-  expect(screen.queryByRole('combobox', { name: '估算模型' })).not.toBeInTheDocument();
-  expect(screen.getByText(/当前剩余/)).toHaveTextContent('15 GiB');
-  await waitFor(() => expect(screen.getByLabelText('预计总占用')).toHaveTextContent('13 GiB'));
-  expect(cache).toHaveBeenCalledWith(model.id, expect.any(AbortSignal), true);
-  fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '65536' } });
-  expect(screen.getByLabelText('预计总占用')).toHaveTextContent('11 GiB');
-  fireEvent.click(screen.getByRole('checkbox', { name: '自动' }));
-  expect(screen.queryByRole('button', { name: '稀疏注意力模型' })).not.toBeInTheDocument();
-  expect(screen.getByRole('checkbox', { name: 'SSD KV' })).toBeEnabled();
-  fireEvent.change(screen.getByRole('combobox', { name: '默认 KV 量化档位' }), { target: { value: '4' } });
-  expect(screen.getByLabelText('预计总占用')).toHaveTextContent('9.5 GiB');
-  expect(cache).toHaveBeenCalledTimes(1);
-  expect(load).not.toHaveBeenCalled();
-});
-
-it('marks insufficient space and clears a stale estimate when the model disappears', async () => {
-  vi.spyOn(modelsApi, 'modelCacheProfile').mockResolvedValue(profile);
-  const runtime: RuntimeStatus = { memory_architecture: 'unified', host_memory_available_bytes: 9 * GiB };
-  const view = render(<Form models={[model]} runtime={runtime} />);
-  await waitFor(() => expect(screen.getByLabelText('预计总占用')).toHaveClass('model-load-memory-exceeded'));
-  view.rerender(<Form models={[]} runtime={runtime} />);
-  expect(screen.getByRole('combobox', { name: '估算模型' })).toHaveValue('');
-  expect(screen.getByLabelText('预计总占用')).toHaveTextContent('—');
-});
-
-it('does not report a partial total when cache metadata is unavailable', async () => {
-  vi.spyOn(modelsApi, 'modelCacheProfile').mockResolvedValue(null);
-  render(<Form models={[model]} />);
-  await waitFor(() => expect(screen.getByLabelText('预计总占用')).toHaveTextContent('暂无法估算'));
-});
-
-it('isolates stored defaults by server and tolerates blocked storage', () => {
+it('isolates stored defaults by server and model', () => {
   setApiBaseUrl('http://127.0.0.1:8090');
-  saveLoadContext({ ...DEFAULT_LOAD_CONTEXT, context_size: 8192 });
-  setApiBaseUrl('http://127.0.0.1:8092');
+  saveLoadContext({ ...DEFAULT_LOAD_CONTEXT, reserve_percent: 5, context_size: 8192 }, model.name);
+  expect(readLoadContext(model.name)).toMatchObject({ reserve_percent: 5, context_size: 8192 });
   expect(readLoadContext()).toEqual(DEFAULT_LOAD_CONTEXT);
-  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked'); });
-  expect(() => saveLoadContext(DEFAULT_LOAD_CONTEXT)).not.toThrow();
-  write.mockRestore();
-  setApiBaseUrl('http://127.0.0.1:8090');
-  expect(readLoadContext().context_size).toBe(8192);
+  setApiBaseUrl('http://127.0.0.1:8092');
+  expect(readLoadContext(model.name)).toEqual(DEFAULT_LOAD_CONTEXT);
 });
 
-it('isolates next-load options by model and does not inherit the removed browser-wide override', () => {
-  saveLoadContext({ ...DEFAULT_LOAD_CONTEXT, context_size: 8192 });
-  saveLoadContext({ ...DEFAULT_LOAD_CONTEXT, context_size: 65536 }, 'Model A');
-  expect(readLoadContext('Model A').context_size).toBe(65536);
-  expect(readLoadContext('Model B').context_size).toBeNull();
+it.each([
+  [new Error('Fixture connection failure'), '无法读取加载方案'],
+  [{ status: 404, code: 'http_404' }, '当前核心版本缺少加载方案接口'],
+])('keeps context editing and KV allocation independent when the load plan fails', async (error, message) => {
+  vi.mocked(modelsApi.modelLoadPlan).mockRejectedValueOnce(error);
+  render(<Form />);
+  expect(await screen.findByRole('alert')).toHaveTextContent(message);
+  const allocation = screen.getByRole('combobox', { name: 'KV 分配' });
+  expect(allocation).toHaveValue('preallocate');
+  const context = screen.getByRole('spinbutton');
+  fireEvent.change(context, { target: { value: '8192' } });
+  fireEvent.blur(context);
+  expect(allocation).toHaveValue('preallocate');
+  expect(readLoadContext()).toMatchObject({ context_size: 8192, vram_preallocated: true });
+  await waitFor(() => expect(screen.getByText(/上限/)).toBeInTheDocument());
 });

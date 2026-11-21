@@ -1,23 +1,25 @@
 import { Icon, MetricTile, SectionLabel, TMPanel } from '../../app/display';
+import { ArrowDownLeftIcon, ArrowUpRightIcon } from '@phosphor-icons/react';
 import { formatDuration, formatNumber } from '../../app/formatters';
 import type { RuntimeStatus, ServingStatistics } from '../../shared/api/contracts/runtime';
 import { useSettings } from '../settings/SettingsProvider';
 import './serving.css';
 
-type StatisticsProps = { data: ServingStatistics | null; scope: ServingStatistics['scope'] };
+type StatisticsProps = { data: ServingStatistics | null; scope: ServingStatistics['scope']; model?: string };
 
-export function ServingStatisticsPanel({ data, error, scope, onScopeChange }: StatisticsProps & {
+export function ServingStatisticsPanel({ data, error, scope, onScopeChange, model }: StatisticsProps & {
   error: string | null;
   onScopeChange: (scope: ServingStatistics['scope']) => void;
 }) {
   const { tr } = useSettings();
   const totals = data?.totals;
-  const active = data?.activity.filter(item => item.active_requests > 0 || item.queued_requests > 0) ?? [];
-  const concurrency = data?.activity.reduce((total, item) => total + item.active_requests, 0);
-  const queued = data?.activity.reduce((total, item) => total + item.queued_requests, 0);
+  const activity = data?.activity.filter(item => !model || item.model === model);
+  const active = activity?.filter(item => item.active_requests > 0 || item.queued_requests > 0) ?? [];
+  const concurrency = activity?.reduce((total, item) => total + item.active_requests, 0);
+  const queued = activity?.reduce((total, item) => total + item.queued_requests, 0);
   return <>
     <div className="serving-heading">
-      <SectionLabel title={tr('服务统计', 'Serving statistics')} subtitle={tr('已完成请求 · 所有模型', 'Completed requests · all models')} />
+      <SectionLabel title={tr('服务统计', 'Serving statistics')} subtitle={model || tr('已完成请求 · 所有模型', 'Completed requests · all models')} />
       <div className="serving-scope" role="group" aria-label={tr('统计范围', 'Statistics scope')}>
         <button type="button" aria-pressed={scope === 'session'} onClick={() => onScopeChange('session')}>{tr('本次运行', 'Session')}</button>
         <button type="button" aria-pressed={scope === 'alltime'} onClick={() => onScopeChange('alltime')}>{tr('全部历史', 'All time')}</button>
@@ -57,22 +59,39 @@ export function ServingStatisticsPanel({ data, error, scope, onScopeChange }: St
   </>;
 }
 
-export function ServingTotalsPanel({ data, scope, runtime }: StatisticsProps & { runtime: RuntimeStatus | null }) {
+export function ServingTotalsPanel({ data, scope, runtime, model }: StatisticsProps & { runtime: RuntimeStatus | null }) {
   const { tr } = useSettings();
   const uptime = data ? Math.max(0, Date.now() / 1000 - data.started_at) : runtime?.uptime_seconds;
-  const active = data?.activity.reduce((total, item) => total + item.active_requests, 0) ?? runtime?.active_requests;
+  const active = data?.activity.filter(item => !model || item.model === model)
+    .reduce((total, item) => total + item.active_requests, 0) ?? runtime?.active_requests;
+  const failed = runtime?.failed_requests;
   return <TMPanel className="overview-session-panel">
     <div className="overview-panel-title">
       <Icon name="chart" size={15} />
       <h2>{scope === 'session' ? tr('本次运行', 'Session') : tr('全部历史', 'All time')}</h2>
-      <span title={tr('本次运行时长', 'Session uptime')}>{formatDuration(uptime)}</span>
+      <span className="overview-session-uptime" title={tr('本次运行时长', 'Session uptime')}>
+        <Icon name="clock" size={13} />{formatDuration(uptime)}
+      </span>
     </div>
-    <div className="overview-session-stats">
-      <div><strong>{formatNumber(data?.totals.completed_requests)}</strong><small>{tr('已完成', 'Completed')}</small></div>
-      <div><strong>{formatNumber(data?.totals.prompt_tokens)}</strong><small>{tr('输入', 'Input')}</small></div>
-      <div><strong>{formatNumber(data?.totals.completion_tokens)}</strong><small>{tr('输出', 'Output')}</small></div>
+    <div className="overview-session-body">
+      <div className="overview-session-stats">
+        <div>
+          <small><Icon name="check" size={14} />{tr('已完成', 'Completed')}</small>
+          <strong>{formatNumber(data?.totals.completed_requests)}</strong>
+        </div>
+        <div>
+          <small><ArrowDownLeftIcon size={14} aria-hidden="true" />{tr('输入 token', 'Input tokens')}</small>
+          <strong>{formatNumber(data?.totals.prompt_tokens)}</strong>
+        </div>
+        <div>
+          <small><ArrowUpRightIcon size={14} aria-hidden="true" />{tr('输出 token', 'Output tokens')}</small>
+          <strong>{formatNumber(data?.totals.completion_tokens)}</strong>
+        </div>
+      </div>
+      <div className="overview-session-status">
+        <span className={active ? 'active' : undefined}>{tr(`${formatNumber(active)} 个活动请求`, `${formatNumber(active)} active`)}</span>
+        <span className={failed ? 'failed' : undefined}>{tr(`${formatNumber(failed)} 个失败请求`, `${formatNumber(failed)} failed`)}</span>
+      </div>
     </div>
-    <p>{formatNumber(runtime?.failed_requests)} {tr('个失败请求', 'failed requests')} ·{' '}
-      {formatNumber(active)} {tr('个活动请求', 'active')}</p>
   </TMPanel>;
 }

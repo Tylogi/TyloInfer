@@ -17,18 +17,19 @@ it('shows streamed Jev placement and updates pressure when full VRAM is selected
     structured_decisions: true, tensor_count: 1, record_count: 1, dtypes: [], complete: true,
     loadable: true, modified_at: '' } as ModelArtifact;
   const catalog = { runtime: { memory_architecture: 'discrete', device_memory_total_bytes: 24 * GiB,
-    host_memory_total_bytes: 64 * GiB }, artifacts: [artifact], filteredArtifacts: [artifact], instances: [],
+    host_memory_total_bytes: 64 * GiB, device_free_bytes: 16 * GiB,
+    host_memory_available_bytes: 50 * GiB }, artifacts: [artifact], filteredArtifacts: [artifact], instances: [],
     busy: false, modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact: vi.fn(),
     chooseModelDirectory: vi.fn(), openModelFiles: vi.fn(), loadContextForModel: () => DEFAULT_LOAD_CONTEXT,
   } as unknown as ReturnType<typeof useModelCatalog>;
   const { rerender } = render(<LocalCheckpoints catalog={catalog} />);
   expect(screen.getByText('Estimated resident VRAM', { exact: false })).toHaveTextContent('0.5 GiB · RAM-streamed weights 16 GiB');
-  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 18.8%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 25.0%' })).toBeInTheDocument();
   rerender(<LocalCheckpoints catalog={{ ...catalog,
     loadContextForModel: () => ({ ...DEFAULT_LOAD_CONTEXT, jev_weights: 'vram' }) }} />);
   expect(screen.getByText('Estimated resident VRAM', { exact: false })).toHaveTextContent('16 GiB');
   expect(screen.queryByText('RAM-streamed weights', { exact: false })).toBeNull();
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 66.7%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 100.0%' })).toBeInTheDocument();
 });
 
 it('passes an explicit external Engram path only for the selected GGUF model', async () => {
@@ -75,7 +76,7 @@ it('selects only complete registered GGUF companion identities when embedded in 
   expect(screen.getByRole('button', { name: 'Load' })).toBeDisabled();
 });
 
-it('opens deletion confirmation by ID and prevents deleting loaded models', async () => {
+it('uses the instance list for unload, reload and deletion while the summary is stale', async () => {
   const artifact = { id: 'a', name: 'Model', architecture: 'qwen35', format: 'tq', shard_count: 1,
     total_bytes: 100, tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '' } as ModelArtifact;
   const prepareModelDeletion = vi.fn();
@@ -88,23 +89,39 @@ it('opens deletion confirmation by ID and prevents deleting loaded models', asyn
   await userEvent.click(screen.getByRole('button', { name: 'Delete model: Model' }));
   expect(prepareModelDeletion).toHaveBeenCalledExactlyOnceWith('a');
   catalog.runtime = { model: 'Model' };
+  catalog.instances = [{ id: 'instance', model: 'Model', state: 'ready' } as typeof catalog.instances[number]];
   view.rerender(<LocalCheckpoints catalog={catalog} />);
   expect(screen.getByRole('button', { name: 'Delete model: Model' })).toBeDisabled();
+  await userEvent.click(screen.getByRole('button', { name: 'Unload' }));
+  expect(catalog.unloadInstance).toHaveBeenCalledExactlyOnceWith('instance');
+
+  catalog.instances = [];
+  view.rerender(<LocalCheckpoints catalog={catalog} />);
+  const load = screen.getByRole('button', { name: 'Load' });
+  expect(load).toBeEnabled();
+  await userEvent.click(load);
+  expect(catalog.loadArtifact).toHaveBeenCalledExactlyOnceWith('Model');
+  expect(screen.getByRole('button', { name: 'Delete model: Model' })).toBeEnabled();
 });
 
-it('uses one combined MoE pressure bar without capacity details, matching the download page', () => {
+it('updates the combined MoE pressure and SSD warning from the same live memory sample', () => {
   const GiB = 2 ** 30;
   const artifact: ModelArtifact = { id: 'a', name: 'MoE', architecture: 'qwen4_exp', format: 'tq',
     shard_count: 1, total_bytes: 133 * GiB, estimated_resident_weight_bytes: 83 * GiB, ssd_ple_bytes: 50 * GiB,
     estimated_weight_bytes_by_role: { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB },
     tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '2026-10-11' };
   const catalog = { runtime: { memory_architecture: 'discrete', device_memory_total_bytes: 24 * GiB,
-    host_memory_total_bytes: 64 * GiB, runtime_memory_headroom_bytes: 8 * GiB },
+    host_memory_total_bytes: 64 * GiB, host_memory_available_bytes: 56 * GiB, device_free_bytes: 16 * GiB },
     artifacts: [artifact], filteredArtifacts: [artifact], instances: [], busy: false,
     modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact: vi.fn(),
     chooseModelDirectory: vi.fn(), openModelFiles: vi.fn() } as unknown as ReturnType<typeof useModelCatalog>;
-  render(<LocalCheckpoints catalog={catalog} />);
+  const { rerender } = render(<LocalCheckpoints catalog={catalog} />);
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 115.3%' })).toBeInTheDocument();
+  expect(screen.getByText(/Experts that do not fit/)).toBeInTheDocument();
+  catalog.runtime = { ...catalog.runtime, host_memory_available_bytes: 64 * GiB, device_free_bytes: 24 * GiB };
+  rerender(<LocalCheckpoints catalog={catalog} />);
   expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
+  expect(screen.queryByText(/Experts that do not fit/)).not.toBeInTheDocument();
   expect(screen.getAllByRole('progressbar')).toHaveLength(1);
   expect(document.querySelector('.variant-memory-caption')).toBeNull();
   expect(screen.getByText(/SSD PLE 50/)).toBeInTheDocument();

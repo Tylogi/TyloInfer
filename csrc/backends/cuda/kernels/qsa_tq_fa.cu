@@ -16,7 +16,7 @@ struct QsaFaConfiguration {
 static thread_local QsaFaConfiguration qsa_fa_configuration;
 
 static int qsa_llama_launch(const float* query,const half* keys,const half* values,const half* mask,
-        const int* indices,float* output,int queries,int kv_heads,int kv_rows,cudaStream_t stream,QsaFaHistory history,int requested_heads=0,float softmax_scale=1.f/16,int index_rows=0) {
+        const int* indices,float* output,int queries,int kv_heads,int kv_rows,cudaStream_t stream,QsaFaHistory history,int requested_heads=0,float softmax_scale=1.f/16,int index_rows=0,bool resident_kv=false) {
     constexpr int width=256;
     const auto fn=flash_attn_ext_f16<256,256,8,8,false,false,true>;
     auto& cached=qsa_fa_configuration;
@@ -74,7 +74,8 @@ static int qsa_llama_launch(const float* query,const half* keys,const half* valu
     history.gqa=heads/kv_heads;
     const int tiles=((queries+7)/8)*kv_heads*((history.gqa+7)/8);
     const bool packed=history.microblock_heads>1;
-    const int row_stride=(packed?1:kv_heads)*width*2,head_stride=(packed?4:1)*width*2;
+    const int row_stride=(resident_kv || packed?1:kv_heads)*width*2;
+    const int head_stride=(resident_kv?kv_rows:packed?4:1)*width*2;
     fn<<<tiles,dim3(32,warps),shared,stream>>>(reinterpret_cast<const char*>(query),reinterpret_cast<const char*>(keys),
         reinterpret_cast<const char*>(values),reinterpret_cast<const char*>(mask),nullptr,indices,nullptr,output,nullptr,
         softmax_scale,0.f,1.f,1.f,0,0.f,
@@ -272,6 +273,10 @@ static __device__ __forceinline__ float qsa_fa_read(const void* x,bool half_inpu
 }
 __global__ void qsa_fa_rotate(tyloinfer::qsa::TqPrefillAttention a) {
     const int d=threadIdx.x,row=blockIdx.x,t=row/a.heads,h=row%a.heads;__shared__ float work[256];
+    if(a.resident_kv) {
+        a.rotated[int64_t(row)*256+d]=qsa_fa_read(a.query,a.query_half,int64_t(t)*a.query_token_stride+int64_t(h)*a.query_head_stride+d);
+        return;
+    }
     float x=d<a.width?qsa_fa_read(a.query,a.query_half,int64_t(t)*a.query_token_stride+int64_t(h)*a.query_head_stride+d)*a.key_signs[d]:0.f;
     for(int stride=1;stride<256;stride*=2) {
         if(stride<32){const float other=__shfl_xor_sync(0xffffffffu,x,stride);x=(d&stride)?other-x:x+other;}
@@ -295,6 +300,8 @@ __global__ void qsa_fa_restore(tyloinfer::qsa::TqPrefillAttention a) {
 }
 static int qsa_prefill_supported(const tyloinfer::qsa::TqPrefillAttention& a) {
     if(a.queries<32 || a.width<1 || a.width>256 || a.heads<1 || a.kv_heads<1 || a.heads%a.kv_heads || a.kv_rows<4 || a.kv_rows%4 || a.count<1)
+        return int(cudaErrorNotSupported);
+    if(a.resident_kv && (a.width!=256 || a.kv_rows>INT_MAX/512 || a.output_half || a.output!=a.temporary || a.gate))
         return int(cudaErrorNotSupported);
     if(a.mass && (!a.hits || !a.logmass || !a.norm))return int(cudaErrorInvalidValue);
     if(tyloinfer::qsa::tq_prefill_attention_scratch(a.queries,a.heads,a.kv_rows)>a.temporary_bytes)
@@ -335,7 +342,7 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
         else if(a.count<=512)prepare_sparse_selected_union<16><<<tiles,256,0,a.stream>>>(mask,inverse,a.selected,a.positions,a.count,ids,counts,a.kv_rows,a.queries,index_rows);
         else prepare_sparse_selected_union<32><<<tiles,256,0,a.stream>>>(mask,inverse,a.selected,a.positions,a.count,ids,counts,a.kv_rows,a.queries,index_rows);
     } else qsa_llama_prepare(a.selected,a.positions,inverse,mask,ids,a.queries,a.kv_rows,a.count,index_rows,a.stream);
-    QsaFaHistory history{inverse,a.logmass,a.norm,a.kv_rows/4,a.count,a.heads/a.kv_heads,a.kv_heads};
+    QsaFaHistory history{inverse,a.logmass,a.norm,a.kv_rows/4,a.count,a.heads/a.kv_heads,a.resident_kv?1:a.kv_heads};
     if(parts>1) {
         auto* partial=reinterpret_cast<float*>(bytes+used);
         auto* norms=partial+int64_t(parts)*a.queries*a.heads*256;
@@ -344,7 +351,7 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
         qsa_fa_merge<<<a.queries*a.heads,256,0,a.stream>>>(a.temporary,a.norm,partial,norms,a.queries*a.heads,parts);
     } else {
         const auto status=qsa_llama_launch(a.rotated,reinterpret_cast<const half*>(a.keys),reinterpret_cast<const half*>(a.values),mask,ids,a.temporary,
-            a.queries,a.kv_heads,a.kv_rows,a.stream,history,a.heads,1.f/sqrtf(float(a.width)),index_rows);
+            a.queries,a.kv_heads,a.kv_rows,a.stream,history,a.heads,1.f/sqrtf(float(a.width)),index_rows,a.resident_kv);
         if(status!=int(cudaSuccess))return status;
     }
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
@@ -355,7 +362,7 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
                 a.queries,a.kv_rows,index_rows,parts,int(sort_union));
         }
     }
-    qsa_fa_restore<<<a.queries*a.heads,256,0,a.stream>>>(a);
+    if(!a.resident_kv)qsa_fa_restore<<<a.queries*a.heads,256,0,a.stream>>>(a);
     if(a.hits) {
         if(a.mass)qsa_llama_observe(a.selected,a.positions,a.logmass,a.norm,a.hits,a.mass,a.queries,a.heads,a.count,a.stream);
         else {
@@ -364,7 +371,9 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
         }
     }
     if(const auto* flag=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");flag && flag[0]=='1') {
-        static std::atomic<bool> printed{false};if(!printed.exchange(true)){std::fprintf(stderr,"native_qsa_tq_prefill_fa actual_match=1 queries=%d heads=%d kv_heads=%d width=%d kv_rows=%d scratch_reused=1 history=1 packed_mask=1 fused_selection=1\n",a.queries,a.heads,a.kv_heads,a.width,a.kv_rows);}
+        static std::atomic<unsigned> printed{0};const unsigned path=a.resident_kv?1u:2u;
+        if(!(printed.fetch_or(path)&path))std::fprintf(stderr,"native_qsa_tq_prefill_fa actual_match=1 queries=%d heads=%d kv_heads=%d width=%d kv_rows=%d scratch_reused=1 history=%d packed_mask=1 fused_selection=1 resident_kv=%d\n",
+            a.queries,a.heads,a.kv_heads,a.width,a.kv_rows,int(a.hits!=nullptr),int(a.resident_kv));
     }
     return int(cudaGetLastError());
 }

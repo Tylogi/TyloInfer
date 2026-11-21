@@ -605,11 +605,23 @@ class ConfigureQsaKvOffloadRequest(ProtocolModel):
 
 
 class ModelLoadContextSettings(ProtocolModel):
+    reserve_percent: Literal[5, 10, 20] | None = None
+    precision: Literal[2, 2.5, 3, 3.5, 4, 6, 8, 16] | None = None
     automatic: bool = Field(default=True, strict=True)
     ssd_kv: bool = Field(default=False, strict=True)
     ram_preallocated: bool = Field(default=True, strict=True)
     vram_preallocated: bool = Field(default=True, strict=True)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
+
+
+class ModelLoadPlan(ProtocolModel):
+    max_context: int
+    context_size: int | None
+    precision: float
+    precisions: list[float]
+    usable: bool
+    gpu_budget_bytes: int | None = None
+    reason: Literal['model_limit', 'memory_limit', 'memory_unavailable', 'precision_unsupported'] | None = None
 
 
 class ModelLoadRequest(ProtocolModel):
@@ -1009,12 +1021,14 @@ class ModelDirectoryList(ProtocolModel):
     files: list[ModelDirectoryFile] = Field(default_factory=list)
     can_open_directory: bool = False
     can_open_in_finder: bool = False
+    shortcuts: list[ModelDirectoryEntry] = Field(default_factory=list)
     data: list[ModelDirectoryEntry]
 
 
 class RegisterModelDirectoryRequest(ProtocolModel):
     directory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     path: str | None = Field(default=None, min_length=1, max_length=4096)
+    file_name: str | None = Field(default=None, min_length=1, max_length=512)
 
     @model_validator(mode="after")
     def validate_source(self) -> RegisterModelDirectoryRequest:

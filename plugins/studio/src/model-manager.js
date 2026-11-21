@@ -1,6 +1,6 @@
 import { createModelApi, isOperationId, terminalStates } from './model-api.js';
 import { describeCoreRuntime } from './core-runtime.js';
-import { companionsAvailable } from './companion-options.js';
+import { companionsAvailable, validCompanionPaths } from './companion-options.js';
 
 export function createModelManager(connection, { checkpoint, schedule = callback => { const timer = setTimeout(callback, 1000); return () => clearTimeout(timer); } } = {}) {
   const api = createModelApi(connection);
@@ -63,7 +63,9 @@ export function createModelManager(connection, { checkpoint, schedule = callback
     if (!writable()) return false;
     if (kind === 'load') {
       const model = state.inventory.models.find(row => row.id === request.model && row.loadable === true);
-      if (!model || Object.hasOwn(request, 'gguf_companions') || companionIds !== undefined && !companionsAvailable(state.inventory.models, request.model, companionIds) || model.gguf_companion_required && !companionIds?.length) return false;
+      const validCompanions = companionIds === undefined || validCompanionPaths(companionIds)
+        || companionsAvailable(state.inventory.models, request.model, companionIds);
+      if (!model || Object.hasOwn(request, 'gguf_companions') || !validCompanions || model.gguf_companion_required && !companionIds?.length) return false;
     }
     if (kind === 'unload' && !state.inventory.loadedModels.some(row => row.instance_id === request.instance_id && isOperationId(row.instance_id))) return false;
     publish({ writePending: true, operation: null, cancelIssued: false, writeError: null, operationError: null, operationLabel: kind === 'load' ? state.inventory.models.find(row => row.id === request.model)?.name || '' : state.inventory.loadedModels.find(row => row.instance_id === request.instance_id)?.model || '' });

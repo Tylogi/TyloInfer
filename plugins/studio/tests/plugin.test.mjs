@@ -7,7 +7,7 @@ const require = createRequire(new URL('../../../studio/web/package.json', import
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 const artifact = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
-function harness() {
+function harness(sessionStorage) {
   let definition;
   const imports = [];
   const styles = new Set();
@@ -15,7 +15,7 @@ function harness() {
   const icons = new Set();
   const document = { querySelectorAll: () => [], createElement: tag => ({ dataset: {}, remove() { styles.delete(this); icons.delete(this); }, tag }), head: { append: item => item.tag === 'link' ? icons.add(item) : styles.add(item) },
     body: { classList: { add: value => classes.add(value), remove: value => classes.delete(value) } } };
-  vm.runInNewContext(artifact, { document, AbortController, setTimeout, clearTimeout, window: { __ModuleLoader__: { load: value => { definition = value; } } } });
+  vm.runInNewContext(artifact, { document, AbortController, setTimeout, clearTimeout, window: { sessionStorage, __ModuleLoader__: { load: value => { definition = value; } } } });
   const plugin = definition.factory((name) => { imports.push(name); assert.equal(name, 'react'); return React; });
   const registrations = [];
   const disposers = [];
@@ -95,6 +95,24 @@ test('renders inventory through the native selector hook contract', () => {
     assert.doesNotMatch(markup, /tylo-model-registration/);
   } finally { scope.dispose(); }
 });
+test('reloading the model page unlocks controls left by a legacy untracked write', () => {
+  const legacy = JSON.stringify({ version: 1, id: null, kind: null, unknown: true, label: '' });
+  const scope = harness({ getItem: key => key === 'tyloinfer.page-operation.v1' ? legacy : null });
+  try {
+    const row = scope.registrations.find(item => item.options.name === 'main');
+    const model = { id: 'a'.repeat(32), name: 'Fixture', architecture: 'qwen35', format: 'gguf',
+      complete: true, loadable: true, total_bytes: 1024, shard_count: 1 };
+    const state = { inventory: { models: [model], loadedModels: [], instances: [] }, loading: false };
+    const markup = renderToStaticMarkup(React.createElement(row.Component, { t: key => key,
+      useSelection: selector => selector('models'), useModelState: selector => selector(state), ...row.options.inject() }));
+    assert.doesNotMatch(markup, /Outcome unknown/);
+    for (const action of ['load', 'settings']) {
+      const button = markup.match(new RegExp('<button class="model-' + action + '-action(?: [^"]*)?"[^>]*>'))?.[0];
+      assert.ok(button, action);
+      assert.doesNotMatch(button, /\sdisabled/);
+    }
+  } finally { scope.dispose(); }
+});
 test('reuses Studio presentation without importing its standalone transport or renderer', () => {
   const scope = harness();
   try {
@@ -116,7 +134,7 @@ test('keeps all seven restored page structures inside the native main slot', () 
   const scope = harness();
   try {
     const row = scope.registrations.find(row => row.options.name === 'main');
-    const expected = { overview: 'overview-memory-tiers', models: 'model-library-summary', service: 'configuration-tabs', resources: 'resource-budget-summary', downloads: 'model-browser-layout', analysis: 'analysis-checkpoint-bar', logs: 'logs-console' };
+    const expected = { overview: 'overview-footer-grid', models: 'model-library-summary', service: 'configuration-tabs', resources: 'resource-budget-summary', downloads: 'model-browser-layout', analysis: 'analysis-checkpoint-bar', logs: 'logs-console' };
     for (const [view, marker] of Object.entries(expected)) {
       const state = { inventory: { models: [], loadedModels: [], instances: [] }, loading: false };
       const markup = renderToStaticMarkup(React.createElement(row.Component, { t: key => key, useSelection: selector => selector(view), useModelState: selector => selector(state), ...row.options.inject() }));

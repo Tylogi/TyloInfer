@@ -3,9 +3,11 @@
 #include "gguf_prefill_fusion.h"
 #include "runtime/execution_options.h"
 #include "runtime/decision_attention.h"
+#include "runtime/prefill_projection_plan.h"
 #include "models/common/attention.h"
 #include "models/common/gated_mlp.h"
 #include "models/common/transformer_layer.h"
+#include "tyloinfer/runtime.h"
 #include <array>
 
 #include "mfq_cuda_activation_ops.h"
@@ -107,16 +109,24 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
     const int64_t hd = attention_head_dim;
     const int64_t attn_width = nh * hd;
     const auto kl_capacity = execution.kl_mmq.kv_cache_capacity;
-    const int64_t cache_capacity =
-        sliding ? attention_window
-                : (kl_capacity > 0 ? std::max<int64_t>(cache_pos + T, kl_capacity)
-                                   : max_position_embeddings);
+    const auto request_capacity = execution.full_attention_request_capacity;
+    int64_t cache_capacity = max_position_embeddings;
+    if (sliding) cache_capacity = attention_window;
+    else if (kl_capacity > 0) cache_capacity = std::max<int64_t>(cache_pos + T, kl_capacity);
+    else if (request_capacity > 0) cache_capacity = std::min(request_capacity, max_position_embeddings);
     const RopeCache &active_rope = attention_rope.cos.defined() ? attention_rope : rope;
     const bool apply_rotary = !no_rope;
-    if (!cache.defined()) {
-        cache =
-            KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
-                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
+    const bool grow = request_capacity > 0 && cache.defined() && !sliding && !cache.is_paged()
+        && cache.k.size(2) < cache_capacity;
+    if (!cache.defined() || grow) {
+        KVCache replacement(B, nkh, cache_capacity, hd, sliding, x.device(),
+            official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
+        if (grow && cache_pos > 0) {
+            const auto prefix = std::min(cache_pos, cache.k.size(2));
+            replacement.k.narrow(2, 0, prefix).copy_(cache.k.narrow(2, 0, prefix));
+            replacement.v.narrow(2, 0, prefix).copy_(cache.v.narrow(2, 0, prefix));
+        }
+        cache = std::move(replacement);
     }
     cache.quantization=kv_quantization;
     if (x.is_cuda()) {
@@ -503,6 +513,31 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         }
                         if(cache.quantization.enabled()) {
                             attention_token_major=true;
+                            if(T>=32 && hd==256 && !sliding && !cache.is_paged() &&
+                                    !seq_len.has_value() && !cache_positions.has_value() &&
+                                    !attention_mask.has_value() && execution.config.mma_attention) {
+                                int major=0;
+                                TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,q.get_device()));
+                                const auto visible=cache_pos+T;
+                                // Limit the floating KV copy to one layer and
+                                // use the same live arena as prefill projections.
+                                const auto bytes=std::size_t(B)*hd*
+                                    (std::size_t(nkh)*visible*12+std::size_t(nh)*T*8);
+                                const auto context=mfq::cuda::default_context(q.get_device());
+                                if(major>=7 && bytes<=mfq::cuda::available_prefill_workspace(*context)) {
+                                    try {
+                                        const auto key=mfq::cuda::cuda_kv_decode(cache.k.narrow(2,0,visible),
+                                            hd,cache.quantization.key_bits(),false);
+                                        const auto value=mfq::cuda::cuda_kv_decode(cache.v.narrow(2,0,visible),
+                                            hd,cache.quantization.value_bits(),true);
+                                        return mfq_attention_mma256_prefix_cuda(
+                                            q.to(mfq_tensor_backend::kFloat32).contiguous(),key,value,attn_scale);
+                                    } catch(const MfqResourceExhausted&) {
+                                        (void)cudaGetLastError();
+                                        context->reclaim_idle_memory();
+                                    }
+                                }
+                            }
                             const auto capacity=planned_kv_length>0?planned_kv_length:cache_pos+T;
                             return mfq::cuda::cuda_kv_attention(q,cache.k,cache.v,cache.quantization,{},write_positions,
                                 cache_pos,cache.quantized_pages(),capacity,seq_len.value_or(mfq_tensor_backend::Tensor{}),

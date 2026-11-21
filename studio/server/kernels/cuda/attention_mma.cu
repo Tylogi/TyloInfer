@@ -261,7 +261,7 @@ static MfqAttentionMmaCache & mfq_attention_mma_swa_cache(
     return cache;
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2>
+template<int DKQ, int DV, int ncols1, int ncols2, bool prefix = false>
 static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale,
     bool sliding, int window)
@@ -272,6 +272,7 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     const int T = (int)q.size(2);
     const int D = (int)q.size(3);
     const int Hk = (int)k.size(1);
+    const int K = (int)k.size(2);
 
     int device = 0;
     cudaDeviceProp properties{};
@@ -306,14 +307,18 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
         q_in_reg ? std::max(shared_q, shared_kv + shared_mask)
                  : shared_q + shared_kv + shared_mask);
 
-    auto & cache = sliding
-        ? mfq_attention_mma_swa_cache(B, T, window, ncols1, nbatch_fa)
-        : mfq_attention_mma_cache(B, T, ncols1, nbatch_fa);
+    const auto bounds = [&] {
+        if constexpr(prefix)
+            return mfq_tensor_backend::full({B},K,q.options().dtype(mfq_tensor_backend::kInt64));
+        else
+            return sliding ? mfq_attention_mma_swa_cache(B,T,window,ncols1,nbatch_fa).kv_range
+                           : mfq_attention_mma_cache(B,T,ncols1,nbatch_fa).kv_range;
+    }();
     auto out = mfq_tensor_backend::empty({B, T, Hq, DV}, q.options());
     using Kernel = decltype(&flash_attn_ext_f16<
-        DKQ, DV, ncols1, ncols2, false, false, true>);
+        DKQ, DV, ncols1, ncols2, false, false, !prefix, prefix>);
     Kernel kernel = flash_attn_ext_f16<
-        DKQ, DV, ncols1, ncols2, false, false, true>;
+        DKQ, DV, ncols1, ncols2, false, false, !prefix, prefix>;
     static bool shared_limit_set[32] = {};
     TYLOINFER_RUNTIME_CHECK(device >= 0 && device < 32, "mfq_attention_mma256: unsupported CUDA device index");
     if (!shared_limit_set[device]) {
@@ -336,14 +341,14 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
         reinterpret_cast<const char*>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v.data_ptr<mfq_half>()),
         mask_pointer,
-        nullptr, static_cast<int*>(cache.kv_range.data_ptr()),
+        nullptr, reinterpret_cast<const typename mfq_fattn_bound_type<prefix>::type*>(bounds.data_ptr()),
         static_cast<float*>(out.data_ptr()), nullptr,
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
         D, ne01, Hq, B,
         D * (int)sizeof(float), T * D * (int)sizeof(float), Hq * T * D * (int)sizeof(float),
-        D, T, Hk, B,
-        D * (int)sizeof(half), T * D * (int)sizeof(half), (int64_t)Hk * T * D * (int)sizeof(half),
-        D * (int)sizeof(half), T * D * (int)sizeof(half), (int64_t)Hk * T * D * (int)sizeof(half),
+        D, K, Hk, B,
+        D * (int)sizeof(half), K * D * (int)sizeof(half), (int64_t)Hk * K * D * (int)sizeof(half),
+        D * (int)sizeof(half), K * D * (int)sizeof(half), (int64_t)Hk * K * D * (int)sizeof(half),
         T, 1, 1,
         0, 0, 0);
     const auto status = cudaGetLastError();
@@ -360,6 +365,17 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
         }
     }
     return out;
+}
+
+mfq_tensor_backend::Tensor mfq_attention_mma256_prefix_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale)
+{
+    const auto ratio=q.size(1)/k.size(1);
+    if(ratio==4 && k.size(2)%FATTN_KQ_STRIDE==0)
+        return mfq_attention_mma_launch<256,256,16,4,true>(q,k,v,scale,false,0);
+    if(ratio==8 && k.size(2)%FATTN_KQ_STRIDE==0)
+        return mfq_attention_mma_launch<256,256,8,8,true>(q,k,v,scale,false,0);
+    return mfq_attention_mma_launch<256,256,32,1,true>(q,k,v,scale,false,0);
 }
 
 mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(

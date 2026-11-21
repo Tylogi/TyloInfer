@@ -22,8 +22,8 @@ int main(int argc, char** argv) {
         }
         if (assets.empty()) throw std::invalid_argument("d1 native requires local configuration assets");
         if (weights.empty()) weights = assets;
-        mfq::cuda::d1::Input input(assets, weights);
-        mfq::cuda::d1::Engine engine(input, fused, stream);
+        mfq::models::lfm3::d1::Input input(assets, weights);
+        mfq::models::lfm3::d1::Engine engine(input, fused, stream);
         std::cout << engine.ready().dump() << std::endl;
         std::string line;
         while (std::getline(std::cin, line)) {

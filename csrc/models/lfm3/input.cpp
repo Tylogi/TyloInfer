@@ -11,7 +11,7 @@
 #include <numeric>
 #include <stdexcept>
 
-namespace mfq::cuda::d1 {
+namespace mfq::models::lfm3::d1 {
 namespace {
 using Clock = std::chrono::steady_clock;
 std::uint16_t bf16(float x) {

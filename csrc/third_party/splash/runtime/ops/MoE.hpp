@@ -227,6 +227,7 @@ struct MoeConfig final {
   // The tile of the F32 router; the execution plans derive it from the
   // device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  bool uniformExpertRows = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

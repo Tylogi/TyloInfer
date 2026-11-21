@@ -180,6 +180,7 @@ export interface ModelDirectoryList {
   can_open_directory?: boolean;
   can_open_in_finder?: boolean;
   data: ModelDirectoryEntry[];
+  shortcuts?: ModelDirectoryEntry[];
 }
 
 export interface HubModelSummary {

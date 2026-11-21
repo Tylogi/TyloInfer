@@ -5,7 +5,14 @@
 #include <utility>
 #include <vector>
 struct Block;
+struct QuantLinear;
 namespace mfq::cuda {
+class Context;
+mfq_tensor_backend::Tensor* dense_prefill_gguf_image(QuantLinear& projection,int device);
+std::size_t whole_prefill_weight_bytes(const mfq_tensor_backend::Tensor& weight);
+std::size_t borrow_prefill_weight(mfq_tensor_backend::Tensor& weight);
+std::size_t restore_prefill_weight(mfq_tensor_backend::Tensor& weight,Context& context,std::size_t floor);
+
 struct LayerWeightBinding {
     mfq_tensor_backend::Tensor* tensor=nullptr;
     std::function<void(mfq_tensor_backend::Tensor)> assign;

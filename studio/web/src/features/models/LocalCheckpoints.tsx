@@ -9,11 +9,11 @@ import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
 import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 import { ModelDeleteDialog } from './ModelDeleteDialog';
-import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate';
+import { availableLoadPools, estimateModelWeights } from './loadMemoryEstimate';
 import { readLoadContext } from './loadContextDefaults';
 import { groupCheckpoints } from './checkpointGroups';
 
-export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = 'path' }: { catalog: ReturnType<typeof useModelCatalog>; capabilities?: { files?: boolean; settings?: boolean; deletion?: boolean; companions?: boolean }; companionMode?: 'path' | 'registered-id' }) {
+export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = 'path' }: { catalog: ReturnType<typeof useModelCatalog>; capabilities?: { files?: boolean; settings?: boolean; deletion?: boolean; companions?: boolean }; companionMode?: 'path' | 'registered-id' | 'both' }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
     setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
@@ -26,21 +26,22 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
   const isComponent = (item: typeof artifacts[number]) => !!item.asset_kind && item.asset_kind !== 'model';
   const components = artifacts.filter(isComponent).length;
   useEffect(() => { setCompanions({}); }, [catalog.connectionRevision]);
-  const isLoaded = (name: string) => instances.some(item => item.model === name && item.state !== 'failed') || name === runtime?.model;
+  const activeInstances = new Map(instances.filter(item => item.state !== 'failed').map(item => [item.model, item]));
   const visibleArtifacts = filteredArtifacts.filter(item =>
     (architecture === 'all' || item.architecture === architecture) && (format === 'all' || item.format === format) &&
-    (status === 'all' || status === 'loaded' && isLoaded(item.name) || status === 'loadable' && item.loadable ||
+    (status === 'all' || status === 'loaded' && activeInstances.has(item.name) || status === 'loadable' && item.loadable ||
       status === 'incomplete' && !item.complete || status === 'components' && isComponent(item) || status === 'unavailable' && !item.loadable && !isComponent(item)))
     .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
   const families = groupCheckpoints(visibleArtifacts);
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
   const separate = hasSeparateVram(runtime);
-  const available = separate ? runtime?.runtime_memory_headroom_bytes : availableResidentMemory(runtime);
-  const loadMemory = availableLoadMemory(runtime, catalog.loadDeviceIds);
-  const system = separate ? { physical_memory_bytes: runtime?.host_memory_total_bytes, memory_pools: [
-    { kind: 'vram' as const, capacity_bytes: runtime?.device_memory_total_bytes },
-    { kind: 'ram' as const, capacity_bytes: runtime?.host_memory_total_bytes },
+  const available = availableResidentMemory(runtime);
+  const { vram, ram } = availableLoadPools(runtime, catalog.loadDeviceIds);
+  const loadMemory = separate ? vram == null || ram == null ? null : vram + ram : available;
+  const system = separate ? { memory_pools: [
+    { kind: 'vram' as const, capacity_bytes: vram },
+    { kind: 'ram' as const, capacity_bytes: ram },
   ] } : undefined;
   const gib = (bytes?: number | null) => bytes == null ? '—' : `${formatNumber(bytes / 2 ** 30, 1)} GiB`;
   return (
@@ -87,13 +88,14 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
             {group.artifacts.map((item) => {
               const component = isComponent(item);
               const companion = companions[item.id]?.trim();
-              const validCompanion = Boolean(companion && (companionMode === 'path' || artifacts.some(candidate => candidate.id === companion && candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && /^[0-9a-f]{32}$/.test(candidate.id))));
+              const isCompanionId = /^[0-9a-f]{32}$/.test(companion || '');
+              const validCompanion = Boolean(companion && (companionMode === 'path'
+                || (companionMode === 'both' && /^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(companion))
+                || artifacts.some(candidate => candidate.id === companion && candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && isCompanionId)));
               const componentLabel = item.asset_kind === 'engram' ? tr('可独立使用的Engram', 'Independently usable Engram')
                 : tr('可独立使用的PLE', 'Independently usable PLE');
-              const instance = instances.find(
-                (candidate) => candidate.model === item.name && candidate.state !== 'failed',
-              );
-              const loaded = Boolean(instance) || item.name === runtime?.model;
+              const instance = activeInstances.get(item.name);
+              const loaded = Boolean(instance);
               const placement = instance?.memory?.ram_weight_bytes != null
                 ? instance.memory.ram_weight_bytes > 0 ? 'stream' : 'vram'
                 : (catalog.loadContextForModel?.(item.name) ?? readLoadContext(item.name)).jev_weights ?? 'stream';
@@ -128,13 +130,13 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
                     {!component && <ModelLoadProgress model={item.name} />}
                     {capabilities.companions !== false && !loaded && item.gguf_companion_required && <details className="model-companion-picker">
                       <summary>{tr('Engram 配套文件', 'Engram companion')}</summary>
-                      {companionMode === 'registered-id' ? <>
-                        <select aria-label={tr(`Engram 配套资产：${item.name}`, `Engram companion: ${item.name}`)} disabled={busy} value={companions[item.id] ?? ''} onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))}>
+                      {companionMode !== 'path' &&
+                        <select aria-label={tr(`Engram 配套资产：${item.name}`, `Engram companion: ${item.name}`)} disabled={busy} value={isCompanionId ? companion : ''} onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))}>
                           <option value="">{tr('选择已登记 GGUF 配套资产', 'Select a registered GGUF companion')}</option>
                           {artifacts.filter(candidate => candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && /^[0-9a-f]{32}$/.test(candidate.id)).map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
-                        </select><small>{tr('核心将核实所选工件与实际文件，兼容性由加载器校验；不接受任意路径。', 'The core verifies the selected artifact and file; the loader checks compatibility. Arbitrary paths are not accepted.')}</small>
-                      </> : <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
-                        disabled={busy} value={companions[item.id] ?? ''}
+                        </select>}
+                      {companionMode !== 'registered-id' && <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
+                        disabled={busy} value={companionMode === 'both' && isCompanionId ? '' : companions[item.id] ?? ''}
                         placeholder={tr('服务端的 GGUF/TQ/MFQ 表文件或 Engram 文件夹', 'Server-side GGUF/TQ/MFQ table file or Engram folder')}
                         onChange={event => setCompanions(previous => ({ ...previous, [item.id]: event.target.value }))} />}
                     </details>}
@@ -161,10 +163,8 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
                     </button>
-                  ) : loaded ? (
-                    <em className="model-load-action">{tr('已加载', 'Loaded')}</em>
                   ) : (
-                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !validCompanion)} title={!item.loadable ? item.error || unavailableLabel : undefined}
+                    <button className="model-load-action model-start-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !validCompanion)} title={!item.loadable ? item.error || unavailableLabel : undefined}
                       aria-describedby={!item.loadable ? `checkpoint-unavailable-${item.id}` : streamsExperts ? `expert-streaming-${item.id}` : undefined}
                       onClick={() => void (companions[item.id]?.trim()
                         ? loadArtifact(item.name, [companions[item.id].trim()]) : loadArtifact(item.name))} type="button">

@@ -7,6 +7,7 @@ import { hasSeparateVram } from './memoryArchitecture';
 export function PrefixCacheOverview({ runtime, busy = false, onClear, onTrim }: { runtime?: RuntimeStatus | null; busy?: boolean; onClear?(): void; onTrim?(): void }) {
  const { tr } = useSettings();
  const separate = hasSeparateVram(runtime);
+ const vramPrefix = separate && runtime?.prefix_cache_hot_tier !== 'ram';
   const prefixCacheRamBudget = Number(runtime?.prefix_cache_total_hot_max_bytes ?? runtime?.prefix_cache_max_bytes ?? 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
@@ -45,7 +46,7 @@ export function PrefixCacheOverview({ runtime, busy = false, onClear, onTrim }: 
                       '当前进程内的单条设备热前缀；切换会话或编辑 prompt 会重新 prefill',
                       'One device-hot prefix in this process; switching sessions or editing the prompt triggers a fresh prefill',
                     )
-                  : separate ? tr('显存热缓存、低优先级 RAM 前缀缓存与可选 SSD 冷层', 'VRAM hot cache, low-priority RAM prefixes and optional SSD cold tier') : tr(
+                  : vramPrefix ? tr('显存热缓存、低优先级 RAM 前缀缓存与可选 SSD 冷层', 'VRAM hot cache, low-priority RAM prefixes and optional SSD cold tier') : tr(
                       'RAM 热缓存与可跨重启复用的 SSD 前缀块',
                       'RAM hot cache with persistent SSD prefix blocks',
                     )}
@@ -98,11 +99,11 @@ export function PrefixCacheOverview({ runtime, busy = false, onClear, onTrim }: 
           ) : (
             <>
               <div className="cache-usage-bars">
-                <UsageBar
-                  label={separate ? tr('显存热缓存总占用', 'Total VRAM hot cache') : tr('RAM 热缓存总占用', 'Total RAM hot cache')}
+                {(!separate || vramPrefix) && <UsageBar
+                  label={vramPrefix ? tr('显存热缓存总占用', 'Total VRAM hot cache') : tr('RAM 热缓存总占用', 'Total RAM hot cache')}
                   used={prefixCacheHotBytes}
                   total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
-                />
+                />}
                 {separate && <UsageBar
                   label={tr('RAM 前缀缓存总占用', 'Total RAM prefix cache')}
                   used={runtime?.prefix_cache_total_ram_bytes ?? runtime?.prefix_cache_ram_bytes ?? 0}
@@ -159,7 +160,7 @@ export function PrefixCacheOverview({ runtime, busy = false, onClear, onTrim }: 
                 <div>
                   <span>{tr('SSD 命中', 'SSD hits')}</span>
                   <strong>{formatNumber(runtime?.prefix_cache_disk_hits)}</strong>
-                  <small>{formatNumber(runtime?.prefix_cache_hot_hits)} {separate ? 'VRAM' : 'RAM'} hits</small>
+                  <small>{formatNumber(separate && !vramPrefix ? runtime?.prefix_cache_ram_hits : runtime?.prefix_cache_hot_hits)} {vramPrefix ? 'VRAM' : 'RAM'} hits</small>
                   {separate && <small>{formatNumber(runtime?.prefix_cache_ram_hits)} RAM hits</small>}
                 </div>
                 <div>

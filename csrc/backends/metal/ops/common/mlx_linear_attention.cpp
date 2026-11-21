@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -412,11 +413,12 @@ struct GdnStepConfig {
     bool transposed_state;
     int head_splits = 1;
     bool round_fp16 = false;
+    int batch_size = 1;
 };
 
 std::string gdn_step_source(
     const GdnStepConfig& config,
-    const std::string& kernel_name) {
+    const std::string& kernel_name, int lanes) {
     const auto metal_type = [](Dtype dtype) {
         if (dtype == mlx::core::float16) return "half";
         if (dtype == mlx::core::bfloat16) return "bfloat";
@@ -451,22 +453,50 @@ std::string gdn_step_source(
         "dt_bias", "decay_scale", "norm_weight"};
     for (int index = 0; index < 6; ++index) {
         source += "device const float* " + std::string(state_names[index]) +
+            (lanes > 1 && index < 2 ? "0" : "") +
             " [[buffer(" + std::to_string(index + 5) + ")]], ";
     }
     source +=
         "constant float* params [[buffer(11)]], ";
     source += "device " + std::string(config.head_splits > 1 ? "float" : metal_type(config.output_dtype)) + "* output [[buffer(12)]], ";
-    source +=
-        "device float* convolution_out [[buffer(13)]], "
-        "device float* recurrent_out [[buffer(14)]], ";
+    const std::string state_suffix = lanes > 1 ? "0" : "";
+    source += "device float* convolution_out" + state_suffix + " [[buffer(13)]], ";
+    source += "device float* recurrent_out" + state_suffix + " [[buffer(14)]], ";
+    if (lanes > 1) for (int lane = 1; lane < lanes; ++lane) {
+        const auto suffix = std::to_string(lane);
+        const int slot = 15 + 4 * (lane - 1);
+        source += "device const float* convolution_state" + suffix + " [[buffer(" + std::to_string(slot) + ")]], ";
+        source += "device const float* recurrent_state" + suffix + " [[buffer(" + std::to_string(slot + 1) + ")]], ";
+        source += "device float* convolution_out" + suffix + " [[buffer(" + std::to_string(slot + 2) + ")]], ";
+        source += "device float* recurrent_out" + suffix + " [[buffer(" + std::to_string(slot + 3) + ")]], ";
+    }
     if (config.sequence) source +=
         "constant uint& tokens [[buffer(15)]], "
         "device float* gate_out [[buffer(16)]], "
         "device float* beta_out [[buffer(17)]], ";
+    if (lanes > 1) source += "constant uint* projection_strides [[buffer(27)]], ";
     source +=
         "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
         "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
         "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    if (lanes > 1) {
+        source += R"METAL(
+const uint row = threadgroup_position_in_grid.y;
+qk += ulong(row) * projection_strides[0];
+value += ulong(row) * projection_strides[1];
+output_gate += ulong(row) * projection_strides[2];
+alpha += ulong(row) * projection_strides[3];
+beta += ulong(row) * projection_strides[4];
+output += row * uint(HV * D);
+)METAL";
+        for (const auto* name : {"convolution_state", "recurrent_state", "convolution_out", "recurrent_out"}) {
+            const bool read_only = std::string_view(name).ends_with("_state");
+            source += (read_only ? "device const float* " : "device float* ") + std::string(name) + " = ";
+            for (int lane = 1; lane < lanes; ++lane)
+                source += "row == " + std::to_string(lane) + "u ? " + name + std::to_string(lane) + " : ";
+            source += std::string(name) + "0;\n";
+        }
+    }
     source += kGatedDeltaDecodeStepSource;
     source += "}\n";
     if (config.head_splits > 1) {
@@ -500,20 +530,30 @@ public:
         if (config_.round_fp16) kernel_name_ += "_round_f16";
     }
 
-    std::string preparation_key() const override { return kernel_name_; }
+    std::string preparation_key() const override {
+        if (config_.batch_size == 1) return kernel_name_;
+        auto key = kernel_name_;
+        for (int remaining = config_.batch_size; remaining; remaining -= batch_lanes(remaining))
+            key += "_rows" + std::to_string(batch_lanes(remaining));
+        return key;
+    }
     void prepare_gpu() override {
-        (void)prepared_kernel();
-        if (config_.head_splits > 1) (void)prepared_kernel(true);
+        if (config_.batch_size > 1) {
+            for (int remaining = config_.batch_size; remaining; remaining -= batch_lanes(remaining))
+                (void)prepared_kernel(false, batch_lanes(remaining));
+        } else {
+            (void)prepared_kernel();
+            if (config_.head_splits > 1) (void)prepared_kernel(true);
+        }
     }
 
-    MTL::ComputePipelineState* prepared_kernel(bool normalize = false) {
+    MTL::ComputePipelineState* prepared_kernel(bool normalize = false, int lanes = 1) {
         auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_, options,
-            [this] { return gdn_step_source(config_, kernel_name_); });
-        return device.get_kernel(normalize ? kernel_name_ + "_norm" : kernel_name_, library);
+        const auto name = lanes > 1 ? kernel_name_ + "_rows" + std::to_string(lanes) : kernel_name_;
+        auto* library = device.get_library(name, options, [&] { return gdn_step_source(config_, name, lanes); });
+        return device.get_kernel(normalize ? name + "_norm" : name, library);
     }
 
     void eval_cpu(
@@ -527,6 +567,10 @@ public:
         std::vector<array>& outputs) override {
         for (auto& output : outputs) {
             output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        if (config_.batch_size > 1) {
+            eval_batch(inputs, outputs);
+            return;
         }
         auto* kernel = prepared_kernel();
         auto* norm_kernel = config_.head_splits > 1 ? prepared_kernel(true) : nullptr;
@@ -572,8 +616,71 @@ public:
     const char* name() const override { return "GatedDeltaDecodeStep"; }
 
 private:
+    static int batch_lanes(int remaining) {
+        // The fixed Metal buffer bindings fit four requests. Use groups of three
+        // and two when five requests remain to avoid a singleton dispatch.
+        return remaining == 5 ? 3 : std::min(4, remaining);
+    }
+
+    void eval_batch(const std::vector<array>& inputs, std::vector<array>& outputs) {
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        auto concurrent = encoder.start_concurrent();
+        const auto row_bytes = [](const array& value) { return value.shape(-1) * value.itemsize(); };
+        for (int first = 0; first < config_.batch_size;) {
+            const int lanes = batch_lanes(config_.batch_size - first);
+            encoder.set_compute_pipeline_state(prepared_kernel(false, lanes));
+            for (int index = 0; index < 4; ++index)
+                encoder.set_input_array(inputs[index], index + 7);
+            encoder.set_bytes(config_.eps, 11);
+            std::array<uint32_t, 5> projection_strides{};
+            for (int index = 0; index < 5; ++index) {
+                const auto& projection = inputs[4 + index];
+                const auto stride = projection.strides()[1];
+                projection_strides[index] = static_cast<uint32_t>(stride);
+                encoder.set_input_array(projection, index, first * stride * projection.itemsize());
+            }
+            encoder.set_bytes(projection_strides, 27);
+            encoder.set_output_array(outputs[0], 12, first * row_bytes(outputs[0]));
+            for (int row = 0; row < lanes; ++row) {
+                const int in = 9 + 2 * (first + row), out = 1 + 2 * (first + row);
+                const int slot = row == 0 ? 5 : 15 + 4 * (row - 1);
+                const int result = row == 0 ? 13 : slot + 2;
+                encoder.set_input_array(inputs[in], slot);
+                encoder.set_input_array(inputs[in + 1], slot + 1);
+                encoder.set_output_array(outputs[out], result);
+                encoder.set_output_array(outputs[out + 1], result + 1);
+            }
+            encoder.dispatch_threadgroups(MTL::Size(1, lanes, config_.value_heads), MTL::Size(32, 16, 1));
+            first += lanes;
+        }
+    }
+
     GdnStepConfig config_;
     std::string kernel_name_;
+};
+
+// Grouped input projections often share a buffer with padded rows. Resolve
+// their strides after MLX has materialized the lazy projection views.
+class GdnProjectionRows final : public mlx::core::Primitive {
+public:
+    GdnProjectionRows(const array& input, mlx::core::Stream stream)
+        : Primitive(stream), copy_(mlx::core::contiguous(input, false, stream).primitive_ptr()) {}
+    const char* name() const override { return "GdnProjectionRows"; }
+    void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        if (has_feature_rows(inputs.front())) outputs.front().copy_shared_buffer(inputs.front());
+        else copy_->eval_cpu(inputs, outputs);
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        if (has_feature_rows(inputs.front())) outputs.front().copy_shared_buffer(inputs.front());
+        else copy_->eval_gpu(inputs, outputs);
+    }
+private:
+    static bool has_feature_rows(const array& input) {
+        const auto& strides = input.strides();
+        return strides[2] == 1 && strides[1] >= 0 &&
+            strides[1] <= std::numeric_limits<uint32_t>::max();
+    }
+    std::shared_ptr<mlx::core::Primitive> copy_;
 };
 
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
@@ -1465,6 +1572,312 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
         convolution_eps, norm_eps, output_gate_silu, tiled_heads, output_dtype, transposed_state, round_fp16).front();
 }
 
+MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
+    const std::vector<array>& projections, std::span<const MlxGatedDeltaTreeLane> lanes,
+    const array& convolution_weight, const array& dt_bias, const array& decay_scale,
+    const array& norm_weight, int key_heads, int value_heads,
+    float norm_eps, bool silu_gate, bool tiled_heads, Dtype output_dtype) {
+    constexpr int dimension = 128;
+    if (lanes.empty() || lanes.size() > 4 || projections.size() != 5 ||
+        key_heads < 1 || value_heads < 1 || value_heads % key_heads)
+        throw std::invalid_argument("invalid GDN verification tree geometry");
+    const int key_width = key_heads * dimension, value_width = value_heads * dimension;
+    const int channels = 2 * key_width + value_width;
+    const auto weight = normalize_conv_weight(convolution_weight, channels);
+    if (weight.kernel != 4) throw std::invalid_argument("GDN verification tree requires four convolution taps");
+
+    std::vector<std::uint32_t> paths, layout;
+    std::vector<int> taps;
+    paths.reserve(16 * lanes.size());
+    taps.reserve(64 * lanes.size());
+    layout.reserve(2 * lanes.size() + 1);
+    int longest = 0;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size());
+        if (rows < 1 || rows > 16 || lane.parents.front() != -1 ||
+            lane.convolution.shape() != Shape{1, 3, channels} ||
+            lane.recurrent.shape() != Shape{1, value_heads, dimension, dimension})
+            throw std::invalid_argument("invalid GDN verification tree geometry");
+        const auto begin = paths.size();
+        layout.push_back(static_cast<std::uint32_t>(begin));
+        layout.push_back(static_cast<std::uint32_t>(rows));
+        longest = std::max(longest, rows);
+        paths.push_back(1);
+        taps.resize(4 * (begin + rows));
+        for (int node = 0; node < rows; ++node) {
+            if (node) {
+                const int parent = lane.parents[node];
+                if (parent < 0 || parent >= node)
+                    throw std::invalid_argument("invalid GDN verification tree parent");
+                paths.push_back(paths[begin + parent] | (1u << node));
+            }
+            int parent = node;
+            int history = 2;
+            for (int tap = 3; tap >= 0; --tap) {
+                taps[4 * (begin + node) + tap] = parent >= 0 ? 3 + parent : history--;
+                if (parent >= 0) parent = lane.parents[parent];
+            }
+        }
+    }
+    const int total_rows = static_cast<int>(paths.size());
+    layout.push_back(static_cast<std::uint32_t>(total_rows));
+    if (projections[0].shape() != Shape{1, total_rows, 2 * key_width} ||
+        projections[1].shape() != Shape{1, total_rows, value_width} ||
+        projections[2].shape() != projections[1].shape() ||
+        projections[3].shape() != Shape{1, total_rows, value_heads} ||
+        projections[4].shape() != projections[3].shape())
+        throw std::invalid_argument("invalid GDN verification tree projections");
+    const char* gates_setting = std::getenv("TYLOINFER_METAL_GDN_GATES");
+    const bool fuse_gates = lanes.size() > 1 && (!gates_setting || std::string_view(gates_setting) != "0");
+    auto gates = fuse_gates
+        ? MlxGatedDeltaGates{real_contiguous(projections[3]), real_contiguous(projections[4])}
+        : gated_delta_gates(projections[3], projections[4], dt_bias, decay_scale);
+    auto decay = fuse_gates ? gates.gate : mlx::core::exp(gates.gate);
+    // As in Splash, a threadgroup verifies one value head of one request.
+    // Keep its projected key/value and gate rows for the accepted-path fold.
+    static const auto kernels = [] {
+        const auto make_decode = [](bool wide) {
+            std::vector<std::string> inputs{"qk", "value", "history0", "state0", "history1", "state1"};
+            if (wide) inputs.insert(inputs.end(), {"history2", "state2", "history3", "state3"});
+            inputs.insert(inputs.end(), {"weight", "taps", "paths", "alpha", "beta", "gate", "norm", "eps", "layout", "bias", "scale"});
+            const auto state_select = wide ? R"METAL(const device float* history = request < 2u ? (request == 0u ? history0 : history1)
+    : (request == 2u ? history2 : history3);
+const device float* state = request < 2u ? (request == 0u ? state0 : state1)
+    : (request == 2u ? state2 : state3);
+)METAL" : R"METAL(const device float* history = request == 0u ? history0 : history1;
+const device float* state = request == 0u ? state0 : state1;
+)METAL";
+            const auto source = std::string(R"METAL(
+const uint lane = thread_index_in_simdgroup, group = simdgroup_index_in_threadgroup;
+const uint request = threadgroup_position_in_grid.y;
+const uint begin = layout[2u * request], rows = layout[2u * request + 1u];
+const uint head = threadgroup_position_in_grid.x, total = layout[2u * LANES];
+)METAL") + state_select + R"METAL(const uint kh = TILED ? head % uint(HK) : head / uint(HV / HK);
+const bool key_writer = TILED ? head < uint(HK) : head % uint(HV / HK) == 0u;
+constexpr uint QK = uint(2 * HK * 128), V = uint(HV * 128), C = QK + V;
+threadgroup float query[CAP * 128], key[CAP * 128], val[CAP * 128], coef[CAP * CAP];
+threadgroup float decay_cache[CAP], beta_cache[CAP];
+for (uint row = group; row < rows; row += 8u) {
+    if (lane == 0u) {
+        if (FUSE_GATES) {
+            // Match gated_delta_gates' FP32 softplus and sigmoid.
+            const uint src = (begin + row) * uint(HV) + head;
+            const float x = float(alpha[src]) + bias[head];
+            const float exp_term = metal::precise::exp(-abs(x));
+            const float plus_one = 1.f + exp_term;
+            const float log_term = plus_one == 1.f ? exp_term :
+                exp_term * (metal::precise::log(plus_one) / (plus_one - 1.f));
+            const float log_decay = scale[head] * (max(x, 0.f) + log_term);
+            const float b = float(beta[src]), tail = 1.f / (1.f + metal::precise::exp(abs(b)));
+            decay_cache[row] = metal::precise::exp(log_decay);
+            beta_cache[row] = b < 0.f ? tail : 1.f - tail;
+            const uint dst = begin * uint(HV) + head * rows + row;
+            decays[dst] = decay_cache[row];
+            betas[dst] = beta_cache[row];
+        } else {
+            decay_cache[row] = float(alpha[head * total + begin + row]);
+            beta_cache[row] = float(beta[head * total + begin + row]);
+        }
+    }
+    float vector[3][4], square[2] = {0.f, 0.f};
+    for (uint component = 0; component < 3; ++component) {
+        const uint base = component == 0u ? kh * 128u : component == 1u ? (uint(HK) + kh) * 128u : QK + head * 128u;
+        for (uint i = 0; i < 4; ++i) {
+            const uint c = base + lane + i * 32u;
+            float sum = 0.f;
+            for (uint tap = 0; tap < 4; ++tap) {
+                const uint src = uint(taps[(begin + row) * 4u + tap]);
+                const float x = src < 3u ? history[src * C + c] : c < QK ?
+                    float(qk[(begin + src - 3u) * QK + c]) : float(value[(begin + src - 3u) * V + c - QK]);
+                sum += x * weight[c * 4u + tap];
+            }
+            vector[component][i] = sum / (1.f + exp(-sum));
+            if (component < 2u) square[component] += vector[component][i] * vector[component][i];
+        }
+    }
+    const float q_norm = 1.f / max(sqrt(simd_sum(square[0])), 1.e-6f);
+    const float k_norm = 1.f / max(sqrt(simd_sum(square[1])), 1.e-6f);
+    for (uint i = 0; i < 4; ++i) {
+        const uint dim = lane + i * 32u, at = row * 128u + dim;
+        query[at] = vector[0][i] * q_norm;
+        key[at] = vector[1][i] * k_norm;
+        val[at] = vector[2][i];
+        if (key_writer) keys[(begin * uint(HK) + kh * rows + row) * 128u + dim] = key[at];
+        values[(begin * uint(HV) + head * rows + row) * 128u + dim] = val[at];
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint row = group; row < rows; row += 8u) {
+    const uint at = row * 128u + lane * 4u;
+    float z[4], a = 0.f;
+    for (uint i = 0; i < 4; ++i) z[i] = query[at + i];
+    for (uint up = paths[begin + row]; up;) {
+        const uint parent = 31 - clz(up);
+        up &= ~(1u << parent);
+        const uint from = parent * 128u + lane * 4u;
+        float sum = 0.f;
+        for (uint i = 0; i < 4; ++i) sum += key[from + i] * z[i];
+        const float c = beta_cache[parent] * simd_sum(sum);
+        const float d = decay_cache[parent];
+        for (uint i = 0; i < 4; ++i) z[i] = d * (z[i] - c * key[from + i]);
+        if (lane == parent) a = c;
+    }
+    for (uint i = 0; i < 4; ++i) query[at + i] = z[i];
+    if (lane < uint(CAP)) coef[row * uint(CAP) + lane] = a;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint base = group * 16u; base < (group + 1u) * 16u; base += 4u) {
+    float committed[4][4];
+    for (uint c = 0; c < 4; ++c)
+        for (uint i = 0; i < 4; ++i)
+            committed[c][i] = state[(head * 128u + base + c) * 128u + lane * 4u + i];
+    for (uint row = 0; row < rows; ++row) {
+        const float a = lane < rows ? coef[row * uint(CAP) + lane] : 0.f;
+        for (uint c = 0; c < 4; ++c) {
+            float sum = lane < rows ? a * val[lane * 128u + base + c] : 0.f;
+            for (uint i = 0; i < 4; ++i) sum += committed[c][i] * query[row * 128u + lane * 4u + i];
+            sum = simd_sum(sum);
+            if (lane == 0u) key[row * 128u + base + c] = sum * rsqrt(128.f);
+        }
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint row = group; row < rows; row += 8u) {
+    float normalized[4], square = 0.f;
+    for (uint i = 0; i < 4; ++i) {
+        normalized[i] = key[row * 128u + lane + i * 32u];
+        square += normalized[i] * normalized[i];
+    }
+    const float inv = metal::precise::rsqrt(simd_sum(square) / 128.f + eps[0]);
+    for (uint i = 0; i < 4; ++i) {
+        const uint c = lane + i * 32u, out = (begin + row) * V + head * 128u + c;
+        const float z = float(gate[out]), tail = 1.f / (1.f + metal::precise::exp(abs(z)));
+        const float sigmoid = z < 0.f ? tail : 1.f - tail;
+        output[out] = T(normalized[i] * inv * norm[c] * (SILU ? z * sigmoid : sigmoid));
+    }
+}
+)METAL";
+            return cached_metal_kernel("tyloinfer_gdn_tree_decode", inputs,
+                {"output", "keys", "values", "decays", "betas"}, source);
+        };
+        return std::array{make_decode(false), make_decode(true)};
+    }();
+    const bool wide = lanes.size() > 2;
+    const Shape gate_tape{fuse_gates ? total_rows * value_heads : 1};
+    std::vector<array> inputs{real_contiguous(projections[0]), real_contiguous(projections[1])};
+    inputs.reserve(wide ? 21 : 17);
+    for (std::size_t i = 0; i < (wide ? 4u : 2u); ++i) {
+        const auto& lane = lanes[std::min(i, lanes.size() - 1)];
+        inputs.push_back(float32_contiguous(lane.convolution));
+        inputs.push_back(float32_contiguous(lane.recurrent));
+    }
+    inputs.insert(inputs.end(), {weight.values, array(taps.begin(), {total_rows, 4}, mlx::core::int32),
+        array(paths.begin(), {total_rows}, mlx::core::uint32), decay, gates.beta,
+        real_contiguous(projections[2]), float32_contiguous(norm_weight), array({norm_eps}),
+        array(layout.begin(), {static_cast<int>(layout.size())}, mlx::core::uint32),
+        float32_contiguous(dt_bias), float32_contiguous(decay_scale)});
+    auto result = kernels[wide](inputs,
+        {projections[2].shape(), {total_rows * key_width}, {total_rows * value_width}, gate_tape, gate_tape},
+        {output_dtype, mlx::core::float32, mlx::core::float32, mlx::core::float32, mlx::core::float32},
+        {value_heads * 256, static_cast<int>(lanes.size()), 1}, {256, 1, 1},
+        {{"HK", key_heads}, {"HV", value_heads}, {"TILED", static_cast<int>(tiled_heads)},
+         {"CAP", longest <= 8 ? 8 : 16}, {"SILU", static_cast<int>(silu_gate)}, {"LANES", static_cast<int>(lanes.size())},
+         {"FUSE_GATES", static_cast<int>(fuse_gates)}, {"T", output_dtype}},
+        std::nullopt, false, {});
+    std::vector<MlxGatedDeltaTreeResult> tapes;
+    tapes.reserve(lanes.size());
+    int begin = 0;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size()), end = begin + rows;
+        const auto kv = [&](const array& tape, int heads, int width) {
+            return mlx::core::reshape(mlx::core::slice(tape, {begin * width}, {end * width}),
+                {1, heads, rows, dimension});
+        };
+        const auto gate = [&](const array& tape) {
+            return projection_contiguous(mlx::core::slice(tape, {0, 0, begin}, {1, value_heads, end}));
+        };
+        const auto gate_rows = [&](const array& fused, const array& separate) {
+            return fuse_gates
+                ? mlx::core::reshape(mlx::core::slice(fused, {begin * value_heads}, {end * value_heads}),
+                    {1, value_heads, rows})
+                : gate(separate);
+        };
+        tapes.push_back({mlx::core::slice(result[0], {0, begin, 0}, {1, end, value_width}),
+            kv(result[1], key_heads, key_width), kv(result[2], value_heads, value_width),
+            gate_rows(result[3], decay), gate_rows(result[4], gates.beta)});
+        begin = end;
+    }
+    return {std::move(result[0]), std::move(tapes)};
+}
+
+MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& input,
+    std::span<const int> parents, const array& convolution_weight, const array& dt_bias,
+    const array& decay_scale, const array& norm_weight, int key_heads, int value_heads,
+    float norm_eps, bool silu_gate, bool tiled_heads, Dtype output_dtype) {
+    const MlxGatedDeltaTreeLane lane{parents, input.convolution_state, input.recurrent_state};
+    return std::move(gated_delta_decode_packed_trees(
+        {input.qk, input.value, input.output_gate, input.alpha, input.beta}, std::span(&lane, 1),
+        convolution_weight, dt_bias, decay_scale, norm_weight, key_heads, value_heads,
+        norm_eps, silu_gate, tiled_heads, output_dtype).tapes.front());
+}
+
+MlxGatedDeltaDecodeState fold_gated_delta_tree(const MlxGatedDeltaDecodeState& state,
+    const array& qk, const array& value, const array& keys, const array& values,
+    const array& decay, const array& beta, const array& retained, bool tiled_heads) {
+    const int rows = qk.shape(1), key_heads = keys.shape(1), value_heads = values.shape(1);
+    const int count = static_cast<int>(retained.size());
+    // The accepted path folds the normalized tape in order and copies the
+    // last three raw convolution rows. The rejected siblings are never read.
+    static const auto fold = cached_metal_kernel("tyloinfer_gdn_tree_fold",
+        {"history", "state", "qk", "value", "keys", "values", "decay", "beta", "retained", "width"},
+        {"history_out", "state_out"}, R"METAL(
+const uint lane = thread_index_in_simdgroup, group = simdgroup_index_in_threadgroup;
+const uint head = threadgroup_position_in_grid.x, rows = width[0], count = width[1];
+const uint kh = TILED ? head % uint(HK) : head / uint(HV / HK);
+constexpr uint QK = uint(2 * HK * 128), V = uint(HV * 128), C = QK + V;
+if (group < 3u) {
+    const uint src = count + group;
+    const uint row = src < 3u ? 0u : uint(retained[src - 3u]);
+    const bool writer = TILED ? head < uint(HK) : head % uint(HV / HK) == 0u;
+    for (uint i = 0; i < 4; ++i) {
+        const uint d = lane + i * 32u, q = kh * 128u + d, k = q + uint(HK) * 128u, v = head * 128u + d;
+        if (writer) {
+            history_out[group * C + q] = src < 3u ? history[src * C + q] : float(qk[row * QK + q]);
+            history_out[group * C + k] = src < 3u ? history[src * C + k] : float(qk[row * QK + k]);
+        }
+        history_out[group * C + QK + v] = src < 3u ? history[src * C + QK + v] : float(value[row * V + v]);
+    }
+}
+for (uint base = group * 16u; base < (group + 1u) * 16u; base += 4u) {
+    float carry[4][4];
+    for (uint v = 0; v < 4; ++v)
+        for (uint i = 0; i < 4; ++i)
+            carry[v][i] = state[(head * 128u + base + v) * 128u + lane * 4u + i];
+    for (uint t = 0; t < count; ++t) {
+        const uint row = uint(retained[t]), key = (kh * rows + row) * 128u + lane * 4u;
+        const uint at = head * rows + row;
+        const float d = decay[at], b = beta[at];
+        for (uint v = 0; v < 4; ++v) {
+            float memory = 0.f;
+            for (uint i = 0; i < 4; ++i) { carry[v][i] *= d; memory += carry[v][i] * keys[key + i]; }
+            const float delta = (values[at * 128u + base + v] - simd_sum(memory)) * b;
+            for (uint i = 0; i < 4; ++i) carry[v][i] += keys[key + i] * delta;
+        }
+    }
+    for (uint v = 0; v < 4; ++v)
+        for (uint i = 0; i < 4; ++i)
+            state_out[(head * 128u + base + v) * 128u + lane * 4u + i] = carry[v][i];
+}
+)METAL");
+    auto result = fold({float32_contiguous(state.convolution), float32_contiguous(state.recurrent),
+        real_contiguous(qk), real_contiguous(value), keys, values, decay, beta, retained,
+        array({static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(count)})},
+        {state.convolution.shape(), state.recurrent.shape()}, {mlx::core::float32, mlx::core::float32},
+        {value_heads * 256, 1, 1}, {256, 1, 1},
+        {{"HK", key_heads}, {"HV", value_heads}, {"TILED", static_cast<int>(tiled_heads)}}, std::nullopt, false, {});
+    return {std::move(result[0]), std::move(result[1])};
+}
+
 std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     const std::vector<MlxGatedDeltaDecodeInput>& requests,
     const array& convolution_weight, const array& dt_bias,
@@ -1504,15 +1917,11 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     std::vector<array> inputs{packed_weight.values, bias_values, decay_values, norm_values};
     inputs.reserve(4 + requests.size() * 7);
     std::vector<Shape> shapes;
-    const int tokens = requests.front().qk.ndim() == 3 ? requests.front().qk.shape(1) : 0;
-    if (tokens < 1 || tokens > 8)
-        throw std::invalid_argument("Gated DeltaNet fused decode requires one to eight tokens");
-    const bool sequence = tokens > 1;
+    const bool sequence = std::any_of(requests.begin(), requests.end(), [](const auto& request) {
+        return request.qk.ndim() == 3 && request.qk.shape(1) > 1;
+    });
     const int fields = sequence ? 5 : 3;
     shapes.reserve(requests.size() * fields);
-    const std::array<Shape, 7> expected{Shape{1, tokens, qk_width}, Shape{1, tokens, value_width},
-        Shape{1, tokens, value_width}, Shape{1, tokens, value_heads}, Shape{1, tokens, value_heads},
-        Shape{1, 3, channels}, Shape{1, value_heads, dimension, dimension}};
     GdnStepConfig config{{mlx::core::float32, mlx::core::float32, mlx::core::float32,
         mlx::core::float32, mlx::core::float32}, key_heads, value_heads, output_gate_silu,
         {convolution_eps, norm_eps}, sequence, tiled_heads, output_dtype, transposed_state};
@@ -1521,6 +1930,12 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
     if (sequence && !transposed_state && cores > 0 && value_heads < cores * 2) config.head_splits = 4;
     for (std::size_t row = 0; row < requests.size(); ++row) {
         const auto& request = requests[row];
+        const int tokens = request.qk.ndim() == 3 ? request.qk.shape(1) : 0;
+        if (tokens < 1 || tokens > 8)
+            throw std::invalid_argument("Gated DeltaNet fused decode requires one to eight tokens per request");
+        const std::array<Shape, 7> expected{Shape{1, tokens, qk_width}, Shape{1, tokens, value_width},
+            Shape{1, tokens, value_width}, Shape{1, tokens, value_heads}, Shape{1, tokens, value_heads},
+            Shape{1, 3, channels}, Shape{1, value_heads, dimension, dimension}};
         std::array<array, 7> values{real_contiguous(request.qk), real_contiguous(request.value),
             real_contiguous(request.output_gate), real_contiguous(request.alpha),
             real_contiguous(request.beta), float32_contiguous(request.convolution_state),
@@ -1548,6 +1963,65 @@ std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
             std::move(outputs[row * fields + 2]),
             sequence ? std::optional<array>(std::move(outputs[row * fields + 3])) : std::nullopt,
             sequence ? std::optional<array>(std::move(outputs[row * fields + 4])) : std::nullopt});
+    return result;
+}
+
+MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
+    const std::vector<array>& projections, const std::vector<MlxGatedDeltaDecodeState>& states,
+    const array& convolution_weight, const array& dt_bias, const array& decay_scale, const array& norm_weight,
+    int key_heads, int value_heads, float convolution_eps, float norm_eps,
+    bool output_gate_silu, bool tiled_heads, Dtype output_dtype) {
+    if (states.size() < 2 || states.size() > 8 || projections.size() != 5 ||
+        key_heads <= 0 || value_heads <= 0 || value_heads % key_heads ||
+        !std::isfinite(convolution_eps) || convolution_eps <= 0.f || !std::isfinite(norm_eps) || norm_eps <= 0.f ||
+        (output_dtype != mlx::core::float16 && output_dtype != mlx::core::bfloat16 && output_dtype != mlx::core::float32))
+        throw std::invalid_argument("invalid Gated DeltaNet decode batch geometry");
+    constexpr int dimension = 128;
+    const int rows = static_cast<int>(states.size());
+    const int qk_width = 2 * key_heads * dimension, value_width = value_heads * dimension;
+    const int channels = qk_width + value_width;
+    auto bias = float32_contiguous(dt_bias);
+    auto decay = float32_contiguous(decay_scale);
+    auto norm = float32_contiguous(norm_weight);
+    const auto weight = normalize_conv_weight(convolution_weight, channels);
+    if (bias.shape() != Shape{value_heads} || decay.shape() != Shape{value_heads} ||
+        norm.shape() != Shape{dimension} || weight.kernel != 4)
+        throw std::invalid_argument("invalid Gated DeltaNet decode batch weights");
+
+    GdnStepConfig config{{mlx::core::float32, mlx::core::float32, mlx::core::float32,
+        mlx::core::float32, mlx::core::float32}, key_heads, value_heads, output_gate_silu, {convolution_eps, norm_eps},
+        false, tiled_heads, output_dtype, true};
+    config.batch_size = rows;
+    std::vector<array> inputs{weight.values, std::move(bias), std::move(decay), std::move(norm)};
+    inputs.reserve(9 + 2 * rows);
+    const std::array widths{qk_width, value_width, value_width, value_heads, value_heads};
+    const auto stream = mlx::core::default_stream(mlx::core::default_device());
+    for (int index = 0; index < 5; ++index) {
+        auto value = floating_strided(projections[index]);
+        if (value.shape() != Shape{1, rows, widths[index]})
+            throw std::invalid_argument("invalid Gated DeltaNet decode batch projection");
+        config.projection_types[index] = value.dtype();
+        inputs.emplace_back(value.shape(), value.dtype(), std::make_shared<GdnProjectionRows>(value, stream),
+            std::vector<array>{value});
+    }
+    const Shape convolution{1, 3, channels}, recurrent{1, value_heads, dimension, dimension};
+    std::vector<Shape> shapes{{1, rows, value_width}};
+    shapes.reserve(1 + 2 * rows);
+    for (const auto& state : states) {
+        if (state.convolution.shape() != convolution || state.recurrent.shape() != recurrent)
+            throw std::invalid_argument("invalid Gated DeltaNet decode batch state");
+        inputs.push_back(float32_contiguous(state.convolution));
+        inputs.push_back(float32_contiguous(state.recurrent));
+        shapes.insert(shapes.end(), {convolution, recurrent});
+    }
+    std::vector<Dtype> dtypes(shapes.size(), mlx::core::float32);
+    dtypes.front() = output_dtype;
+    auto outputs = array::make_arrays(shapes, dtypes,
+        std::make_shared<GdnStepPrimitive>(stream, config), std::move(inputs));
+    MlxGatedDeltaBatchDecodeResult result{std::move(outputs[0]), {}};
+    result.states.reserve(rows);
+    for (int row = 0; row < rows; ++row)
+        result.states.push_back({std::move(outputs[1 + 2 * row]), std::move(outputs[2 + 2 * row])});
     return result;
 }
 
@@ -1911,6 +2385,34 @@ MlxCachedDepthwiseConvResult cached_depthwise_conv_silu(
         mlx::core::astype(output, source.dtype()),
         mlx::core::contiguous(next_state),
     };
+}
+
+array tree_depthwise_conv_silu(const array& input, const array& weight,
+    const array& history, const array& taps) {
+    const int channels = input.shape(2), rows = input.shape(1);
+    const auto packed = normalize_cached_conv_weight(weight, channels);
+    if (taps.shape() != Shape{rows, packed.kernel} || history.shape(2) != channels)
+        throw std::invalid_argument("Qwen4 PLE tree convolution geometry disagrees");
+    // Adapted from Splash's dilated ancestor convolution in ngram_embedding.metal.
+    static const auto kernel = cached_metal_kernel("tyloinfer_ple_tree_conv",
+        {"input", "weight", "history", "taps", "count"}, {"output"}, R"METAL(
+const uint i = thread_position_in_grid.x;
+if (i >= count[0]) return;
+const uint node = i / uint(C), channel = i % uint(C);
+float sum = 0.0f;
+for (uint tap = 0; tap < uint(K); ++tap) {
+    const int row = taps[node * uint(K) + tap];
+    const float value = row < 0 ? float(history[uint(-1 - row) * uint(C) + channel])
+                                 : float(input[uint(row) * uint(C) + channel]);
+    sum += value * float(weight[channel * uint(K) + tap]);
+}
+output[i] = T(sum / (1.0f + exp(-sum)));
+)METAL");
+    const auto count = checked_int(static_cast<std::int64_t>(rows) * channels, "Qwen4 PLE tree grid");
+    return kernel({real_contiguous(input), packed.values, real_contiguous(history), taps,
+        array({static_cast<std::uint32_t>(count)})}, {input.shape()}, {input.dtype()},
+        {count, 1, 1}, {std::min(256, count), 1, 1}, {{"C", channels}, {"K", packed.kernel}, {"T", input.dtype()}},
+        std::nullopt, false, {})[0];
 }
 
 MlxLinearConvQkvResult linear_conv_qkv(

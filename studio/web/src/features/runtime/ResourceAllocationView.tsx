@@ -22,7 +22,7 @@ export function ResourceAllocationView({ runtime, instances, connectionRevision,
         : runtime?.runtime_memory_budget_mode === 'explicit' ? tr('受手动上限与当前可用量限制', 'Limited by manual ceiling and current availability')
           : separate ? tr('扣除其它占用后的显存预算', 'VRAM budget excluding other allocations') : tr('扣除其它占用后的内存预算', 'Memory budget excluding other allocations') },
     { label: tr('已计入预算', 'Budget committed'), value: bytes(runtime?.runtime_memory_committed_bytes),
-      detail: separate ? tr('显存权重、缓冲区、活跃 KV 与前缀显存', 'VRAM weights, buffers, active KV, and prefix VRAM') : tr('权重、活跃 KV 与前缀 RAM', 'Weights, active KV, and prefix RAM') },
+      detail: separate ? runtime?.prefix_cache_hot_tier === 'ram' ? tr('显存权重、缓冲区和活跃 KV', 'VRAM weights, buffers and active KV') : tr('显存权重、缓冲区、活跃 KV 与前缀显存', 'VRAM weights, buffers, active KV, and prefix VRAM') : tr('权重、活跃 KV 与前缀 RAM', 'Weights, active KV, and prefix RAM') },
     { label: tr('当前剩余可用', 'Available headroom'), value: bytes(available),
       detail: separate ? tr('受显存预算与可用显存共同约束', 'Limited by VRAM budget and available VRAM') : tr('受预算与系统可用内存共同约束', 'Limited by budget and available system memory') },
     { label: tr('已加载模型', 'Loaded models'), value: String(loaded.length),

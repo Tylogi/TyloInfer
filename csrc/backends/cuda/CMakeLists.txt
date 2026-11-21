@@ -526,6 +526,8 @@ set(TYLOINFER_CUDA_RUNTIME_OP_SOURCES
     ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/core/vmm.cpp
     ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/core/pinned.cpp
     ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/platform/memory.cpp
+    ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/platform/direct_file.cpp
+    ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/ngram/ple_reader.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/cuda_execution.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/format.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/moe_routes.cpp

@@ -68,11 +68,12 @@ std::optional<array> load_optional_dense_vector(
 
 std::optional<MlxLinear> load_optional_linear(
     const MfqContainer& model,
-    const std::optional<std::string>& name) {
+    const std::optional<std::string>& name,
+    MlxLinear::GgufAccess gguf_access) {
     if (!name.has_value() || !model.contains(*name)) {
         return std::nullopt;
     }
-    return MlxLinear::load(model, *name);
+    return MlxLinear::load(model, *name, gguf_access);
 }
 
 bool is_conv_weight_shape(
@@ -118,7 +119,8 @@ MlxQwen35LinearAttentionBlock::load(
     const MfqContainer& model,
     const Qwen35Config& config,
     const Qwen35TensorNames& names,
-    std::size_t layer_index) {
+    std::size_t layer_index,
+    MlxLinear::GgufAccess gguf_access) {
     if (layer_index >=
         static_cast<std::size_t>(config.num_hidden_layers)) {
         throw std::runtime_error(
@@ -132,9 +134,9 @@ MlxQwen35LinearAttentionBlock::load(
 
     const auto resolved = names.layer(layer_index);
     auto split_qk =
-        load_optional_linear(model, resolved.linear_qk);
+        load_optional_linear(model, resolved.linear_qk, gguf_access);
     auto split_value =
-        load_optional_linear(model, resolved.linear_value);
+        load_optional_linear(model, resolved.linear_value, gguf_access);
     const bool split_input =
         split_qk.has_value() && split_value.has_value();
     if (split_qk.has_value() != split_value.has_value()) {
@@ -145,7 +147,7 @@ MlxQwen35LinearAttentionBlock::load(
     std::optional<MlxLinear> combined_qkv;
     if (!split_input) {
         combined_qkv =
-            MlxLinear::load(model, resolved.linear_qkv);
+            MlxLinear::load(model, resolved.linear_qkv, gguf_access);
     }
 
     auto convolution_weight =
@@ -165,9 +167,9 @@ MlxQwen35LinearAttentionBlock::load(
         std::move(combined_qkv),
         std::move(split_qk),
         std::move(split_value),
-        MlxLinear::load(model, resolved.linear_z),
-        MlxLinear::load(model, resolved.linear_alpha),
-        MlxLinear::load(model, resolved.linear_beta),
+        MlxLinear::load(model, resolved.linear_z, gguf_access),
+        MlxLinear::load(model, resolved.linear_alpha, gguf_access),
+        MlxLinear::load(model, resolved.linear_beta, gguf_access),
         std::move(convolution_weight),
         std::move(convolution_bias),
         load_dense_vector(model, resolved.linear_dt_bias),
@@ -175,13 +177,13 @@ MlxQwen35LinearAttentionBlock::load(
         MlxRmsNorm(
             load_dense_vector(model, resolved.linear_norm),
             static_cast<float>(config.rms_norm_eps)),
-        MlxLinear::load(model, resolved.linear_output),
+        MlxLinear::load(model, resolved.linear_output, gguf_access),
         load_qwen35_rms_norm(
             model,
             resolved.ffn_norm,
             config.rms_norm_eps,
             config.norm_weight_offset),
-        MlxQwen35DenseSwiGlu::load(model, resolved));
+        MlxQwen35DenseSwiGlu::load(model, resolved, gguf_access));
 }
 
 MlxQwen35LinearAttentionBlock::MlxQwen35LinearAttentionBlock(

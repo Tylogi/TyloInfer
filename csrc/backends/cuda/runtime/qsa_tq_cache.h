@@ -17,6 +17,7 @@ class QsaTqCache {
 public:
     using Tensor=mfq_tensor_backend::Tensor;
     using Pool=std::function<Tensor(const Tensor&,const Tensor&)>;
+    using CompletePool=std::function<Tensor(const Tensor&,const Tensor&,const Tensor&)>;
     QsaTqCache(int64_t maximum,int heads,int kv_heads,int width,int index_heads,int index_width,int budget,
                const mfq_tensor_backend::TensorOptions& options,bool ssd_cache=false,bool prefer_host_indexer=false,
                bool prefer_host_metadata=false,bool use_spare_vram=false);
@@ -65,7 +66,7 @@ public:
     // An empty output appends history without index search or attention.
     Tensor forward_pending_graph(const Tensor& query,const Tensor& key,const Tensor& value,const Tensor& iq,
         const Tensor& raw_index,const Tensor& cache_positions,const Tensor& gate,Tensor output,
-        const Pool& pool={},const Tensor& absolute_positions={});
+        const Pool& pool={},const Tensor& absolute_positions={},const CompletePool& complete_pool={});
     Tensor forward(const Tensor& query,const Tensor& keys,const Tensor& values,const Tensor& iq,
                    const Tensor& raw_index,const Tensor& positions,const Pool& pool,bool history_only=false,
                    const Tensor& gate={},Tensor output={},bool fp16_math=true,CudaProfiler* profiler=nullptr);

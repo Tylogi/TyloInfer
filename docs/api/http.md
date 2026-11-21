@@ -214,6 +214,7 @@ jobs.
 | `POST` | `/api/v1/models/load` | `ModelLoadRequest` | `202 OperationAccepted` |
 | `POST` | `/api/v1/models/unload` | `ModelUnloadRequest` | `202 OperationAccepted` |
 | `GET` | `/api/v1/hub/official` | — | `200 OfficialModelList` |
+| `GET` | `/api/v1/hub/official/local` | — | `200 OfficialModelList` |
 | `POST` | `/api/v1/hub/resolve` | `HubReferenceRequest` | `200 HubModelInfo` |
 | `GET` | `/api/v1/hub/download-directory` | — | `200 Object` |
 | `PUT` | `/api/v1/hub/download-directory` | `ConfigureDownloadDirectoryRequest` | `200 Object` |
@@ -226,6 +227,8 @@ jobs.
 | `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` |
 | `GET` | `/api/v1/models/{model_id}/cache-profile` | — | `200 ModelCacheProfile` or `200 null` |
 | `GET` | `/api/v1/models/{model_id}/directory` | — | `200 ModelDirectoryList` |
+| `GET` | `/api/v1/models/{model_id}/companion-reference` | — | `200 Object` |
+| `GET` | `/api/v1/models/{model_id}/load-plan` | — | `200 ModelLoadPlan` |
 
 Hub providers are `huggingface` and `modelscope`. Artifact removal accepts only
 restricted `workspace://` URIs; it does not delete arbitrary host paths or
@@ -342,26 +345,6 @@ Status merges the local component state with runtime state (`active`,
 `supported_model_loaded`). Install queues a `component.voice_output.install`
 job. Activation enables the realtime voice path and returns `501` when no
 managed runtime or component manager is configured.
-
-### 2.11 Agent workbench
-
-| Method | Path | Request | Success |
-|---|---|---|---|
-| `GET` | `/api/v1/agent/capabilities` | — | `200 Object` |
-| `GET` | `/api/v1/agent/settings` | — | `200 Object` |
-| `PATCH` | `/api/v1/agent/settings/{namespace}` | `UpdateAgentSettingsRequest` | `200 Object` |
-| `GET` | `/api/v1/agent/sessions` | — | `200 Object` |
-| `POST` | `/api/v1/agent/sessions` | `CreateAgentSessionRequest` | `201 Object` |
-| `GET` | `/api/v1/agent/sessions/{session_id}` | — | `200 Object` |
-| `POST` | `/api/v1/agent/sessions/{session_id}/runs` | `CreateAgentRunRequest` | `202 Object` |
-| `GET` | `/api/v1/agent/runs/{run_id}` | — | `200 Object` |
-| `POST` | `/api/v1/agent/runs/{run_id}/cancel` | — | `200 Object` |
-| `GET` | `/api/v1/agent/runs/{run_id}/events` | — | `200` SSE |
-
-These routes require the `admin` scope when authentication is enabled. Agent
-sessions and events use separate storage; existing inference sessions and APIs
-are unchanged. The optional DSH runtime must be available before starting a run.
-See the [Agent workbench guide](agent.md) for execution, replay, and cancellation.
 
 ## 3. Session and response workflow
 
@@ -718,9 +701,11 @@ compatible weights, backend support and scheduling are still required.
 
 `POST /v1/systemone` returns one JSON decision result, not a chat completion or
 SSE stream. It requires a model with a supported native decision implementation.
-A model appearing in `/v1/models`, or this route being present, does not by itself
-establish decision capability. The CUDA d1 text adapter uses this same route and
-the existing managed model lifecycle; see [the serving guide](../cli/serve.md).
+The CUDA and Metal runtimes serve D3 text and JSON decisions on this route
+from Qwen3.5 checkpoints with a trained HF decision head or D3 GGUF metadata.
+Metal keeps D3 weights resident. D3 image and video decisions, Box, and Track
+are outside the text API. The CUDA and Metal d1 text adapters share this
+route and the managed model lifecycle. See [the serving guide](../cli/serve.md).
 
 The managed runtime must be ready and idle. Readiness is checked first: a runtime
 in `BUSY` state (including an active chat request) or otherwise not `READY`

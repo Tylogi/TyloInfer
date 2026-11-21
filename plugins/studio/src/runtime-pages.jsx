@@ -2,7 +2,7 @@ import { RuntimeCache } from './runtime-cache.jsx';
 import { useLogHistory } from './log-history.jsx';
 import { OverviewModels, OverviewEndpoints } from '../../../studio/web/src/features/runtime/OverviewPanels.tsx';
 import { runtimeModelNames } from '../../../studio/web/src/features/runtime/modelSelection.ts';
-import { Dialog } from './shared-primitives.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
 import { terminalStates } from './model-api.js';
 import React, { useEffect, useRef, useState } from 'react';
 import { ReadOnlyJobDetails, ReadOnlyLogDetails } from './log-details.jsx';
@@ -18,17 +18,23 @@ import { ServingStatisticsPanel, ServingTotalsPanel } from '../../../studio/web/
 import { residentMemoryCapacity } from '../../../studio/web/src/features/runtime/memoryArchitecture.ts';
 
 export function OverviewContent({ values, inventory, api, tr, go, refreshKey, selectedModel, selectModel, loading }) {
-  const runtime = values.status?.value;
+  const instances = values.instances?.value?.data ?? inventory?.instances ?? [];
+  const status = values.status?.value;
+  const runtime = status?.instance_id && values.instances?.value &&
+    !instances.some(item => item.id === status.instance_id)
+    ? { ...status, instance_id: null, model: null, runtime_state: 'idle', max_context: null } : status;
+  const currentModel = instances.some(item => item.model === selectedModel && ['ready', 'busy'].includes(item.state)) ? selectedModel : '';
   const [scope, setScope] = useState('session');
   const [history, setHistory] = useState({});
   useEffect(() => {
     if (scope !== 'alltime') return;
     const controller = new AbortController();
     setHistory({});
-    void api.read('serving', { scope }, controller.signal).then(value => { if (!controller.signal.aborted) setHistory({ value }); }).catch(error => { if (!controller.signal.aborted) setHistory({ error }); });
+    void api.read('serving', { scope, ...(currentModel ? { model: currentModel } : {}) }, controller.signal)
+      .then(value => { if (!controller.signal.aborted) setHistory({ value }); }).catch(error => { if (!controller.signal.aborted) setHistory({ error }); });
     return () => controller.abort();
-  }, [scope, api, refreshKey]);
-  const statistics = scope === 'session' ? values.serving : history;
+  }, [scope, api, refreshKey, currentModel]);
+  const statistics = selectedModel && !currentModel ? undefined : scope === 'session' ? values.serving : history;
   const [connection, setConnection] = useState(null);
   const [connectionError, setConnectionError] = useState(null);
   const [copied, setCopied] = useState(null);
@@ -45,18 +51,17 @@ export function OverviewContent({ values, inventory, api, tr, go, refreshKey, se
   ];
   async function copyEndpoint(id, url) { try { await navigator.clipboard.writeText(url); setCopyError(null); setCopied(id); clearTimeout(timer.current); timer.current = setTimeout(() => setCopied(null), 1600); } catch (error) { setCopyError(error); } }
   const jobs = (values.jobs?.value?.data || []).map(job => ({ ...job, payload: { ...job.payload, model: inventory?.models.find(item => item.id === job.payload?.model)?.name || job.payload?.model } }));
-  const modelHero = resolveRuntimeHero(runtime, inventory?.instances || [], jobs);
+  const modelHero = resolveRuntimeHero(runtime, instances, jobs);
   const heroState = modelHero.state;
   return <>
     <RuntimeHeroView runtime={runtime} modelHero={modelHero} endpoint={endpoints[0].url} modelHeroStatus={tr({ idle: '空闲', loading: '加载中', ready: '运行中', failed: modelHero.interrupted ? '加载中断' : '加载失败' }[heroState], { idle: 'Idle', loading: 'Loading', ready: 'Running', failed: modelHero.interrupted ? 'Interrupted' : 'Failed' }[heroState])} onModels={() => go('models')} tr={tr} />
-    <OverviewModels names={runtimeModelNames(inventory?.loadedModels || [], inventory?.instances || [])} instances={inventory?.instances || []} runtime={runtime} selectedModel={selectedModel} busy={loading} selectModel={selectModel} tr={tr} />
+    <OverviewModels names={runtimeModelNames([], instances)} instances={instances} runtime={runtime} selectedModel={currentModel} busy={loading} selectModel={selectModel} tr={tr} />
     {values.status?.error && <CoreError error={values.status.error} />}
-    <ServingStatisticsPanel data={statistics?.value || null} error={statistics?.error?.message || null} scope={scope} onScopeChange={setScope} />
-    <SectionLabel title={tr('资源概览', 'Resource overview')} />
-    <MemoryHierarchy runtime={runtime} instances={inventory?.instances || []} memoryCapacityBytes={residentMemoryCapacity(runtime)} />
+    <ServingStatisticsPanel data={statistics?.value || null} error={statistics?.error?.message || null} scope={scope} onScopeChange={setScope} model={currentModel} />
+    {runtime && <MemoryHierarchy runtime={runtime} instances={instances} memoryCapacityBytes={residentMemoryCapacity(runtime)} compact />}
     {connectionError && <CoreError error={connectionError} />}
     {copyError && <CoreError error={copyError} />}
-    <div className="overview-footer-grid"><OverviewEndpoints endpoints={endpoints} copied={copied} copyEndpoint={(id, url) => void copyEndpoint(id, url)} tr={tr} /><ServingTotalsPanel data={statistics?.value || null} scope={scope} runtime={runtime || null} /></div>
+    <div className="overview-footer-grid"><OverviewEndpoints endpoints={endpoints} copied={copied} copyEndpoint={(id, url) => void copyEndpoint(id, url)} tr={tr} /><ServingTotalsPanel data={statistics?.value || null} scope={scope} runtime={runtime || null} model={currentModel} /></div>
   </>;
 }
 export function HardwareContent({ entry, runtime, tr }) {
@@ -144,5 +149,16 @@ export function LogsContent({ values, tr, api, refreshKey, inventory, logsPaused
         </div>;
       })}
     </div><footer className="logs-footer"><span>{tr('每 4 秒刷新 · 服务事件 / 请求快照各保留最近 500 条', 'Refreshes every 4 seconds · latest 500 service events / request snapshots')}</span><span>{history.updatedAt ? `${tr('最近读取', 'Last retrieved')} ${new Date(history.updatedAt).toLocaleTimeString()}` : '—'}</span></footer>
-  </TMPanel><Dialog open={exportOpen} onOpenChange={setExportOpen} title={tr('导出日志', 'Export logs')} closeLabel={tr('关闭', 'Close')}><div className="tylo-model-confirm"><p>{tr('仅将当前筛选出的记录保存到本机。记录可能包含请求信息、服务路径或错误详情；请自行审查后再分享，不会自动上传。', 'Save only the currently filtered records locally. Records may include request information, service paths or error details. Review before sharing; nothing is uploaded automatically.')}</p><p>{number(filtered?.length)} {tr('条记录', 'records')}</p><div className="tylo-model-confirm-actions"><button type="button" onClick={() => setExportOpen(false)}>{tr('取消', 'Cancel')}</button><button type="button" disabled={!filtered?.length} onClick={exportRecords}>{tr('保存到本机', 'Save locally')}</button></div></div></Dialog><Dialog open={Boolean(archiveTarget)} onOpenChange={open => { if (!open) setArchiveTarget(null); }} title={tr('清理任务记录', 'Archive job records')} closeLabel={tr('关闭', 'Close')}><div className="tylo-model-confirm"><p>{archiveTarget?.job ? tr('归档这条已结束的任务记录？不会删除模型或下载文件，也不取消任何任务。', 'Archive this finished job record? Model and download files are kept; no job is cancelled.') : tr('归档全部已结束任务记录，包括非下载作业及未显示在当前列表中的终态记录。不会删除模型或下载文件，也不取消活动任务。', 'Archive all finished job records, including non-download jobs and terminal records outside the current list. Model and download files are kept; active jobs are not cancelled.')}</p>{archiveTarget?.job && <p>{jobLabel(archiveTarget.job.kind)} · {archiveTarget.job.id}</p>}<div className="tylo-model-confirm-actions"><button type="button" onClick={() => setArchiveTarget(null)}>{tr('取消', 'Cancel')}</button><button type="button" className="danger" disabled={writeBlocked} onClick={() => void archiveRecords()}>{tr('确认归档', 'Confirm archive')}</button></div></div></Dialog></>;
+  </TMPanel>
+    <ConfirmationDialog open={exportOpen} tr={tr} title={tr('导出日志', 'Export logs')}
+      description={tr('将筛选结果保存到本机。记录可能包含请求信息、服务路径或错误详情。', 'Save the filtered records locally. They may contain request information, service paths, or error details.')}
+      confirmLabel={tr('保存到本机', 'Save locally')} onCancel={() => setExportOpen(false)} onConfirm={exportRecords} disabled={!filtered.length}>
+      <div className="tylo-action-summary"><strong>{number(filtered.length)} {tr('条记录', filtered.length === 1 ? 'record' : 'records')}</strong></div>
+    </ConfirmationDialog>
+    <ConfirmationDialog open={Boolean(archiveTarget)} tr={tr} title={tr('清理任务记录', 'Archive job records')}
+      description={archiveTarget?.job ? tr('归档选中的已结束任务，保留模型和下载文件。', 'Archive the selected finished job and keep its model and download files.') : tr('归档全部已结束的任务，包括筛选范围以外的记录。活动任务会继续运行。', 'Archive all finished jobs, including records outside the current filter. Active jobs keep running.')}
+      confirmLabel={tr('确认归档', 'Confirm archive')} onCancel={() => setArchiveTarget(null)} onConfirm={archiveRecords} disabled={writeBlocked} danger>
+      {archiveTarget?.job && <div className="tylo-action-summary"><strong>{jobLabel(archiveTarget.job.kind)}</strong><span>{archiveTarget.job.id}</span></div>}
+    </ConfirmationDialog>
+  </>;
 }

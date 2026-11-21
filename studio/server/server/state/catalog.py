@@ -312,8 +312,10 @@ class ModelCatalog:
         *,
         directory_id: str | None = None,
         path: str | Path | None = None,
+        allow_empty: bool = False,
+        file_name: str | None = None,
     ) -> ModelArtifactList:
-        """Register every MFQ container below one server-side directory."""
+        """Register a single model file or the models below one directory."""
 
         if (directory_id is None) == (path is None):
             raise ModelRegistrationError("exactly one directory source is required")
@@ -332,11 +334,13 @@ class ModelCatalog:
             raise ModelRegistrationError("the server has no writable model catalog")
 
         async with self._registration_lock:
-            registration_paths = await asyncio.to_thread(
-                self._registration_paths,
-                selected,
-            )
+            if file_name is None:
+                registration_paths = await asyncio.to_thread(self._registration_paths, selected)
+            else:
+                registration_paths = [await asyncio.to_thread(self._registration_file, selected, file_name)]
             if not registration_paths:
+                if allow_empty:
+                    return ModelArtifactList(data=[])
                 raise ModelRegistrationError("selected directory contains no supported models")
             index_path = self.roots[0] / MODEL_FILE_INDEX
             previous = index_path.read_bytes() if index_path.is_file() else None
@@ -348,11 +352,11 @@ class ModelCatalog:
                 await self._snapshot(refresh=True)
                 raise
 
-        selected_models = [
-            item.resource
-            for item in models.values()
-            if item.path.resolve().is_relative_to(selected)
-        ]
+        if file_name is None:
+            selected_models = [item.resource for item in models.values() if item.path.resolve().is_relative_to(selected)]
+        else:
+            registered = registration_paths[0]
+            selected_models = [item.resource for item in models.values() if registered in item.file_paths]
         return ModelArtifactList(
             data=sorted(selected_models, key=lambda item: (item.name.casefold(), item.id))
         )
@@ -363,20 +367,25 @@ class ModelCatalog:
         self._directory_ids[identifier] = resolved
         return identifier
 
-    def _browse_roots(self) -> list[Path]:
-        candidates = (
-            [*self.roots, Path.home(), Path(Path.home().anchor or os.sep)]
-            if self.browse_roots is None
-            else list(self.browse_roots)
-        )
+    @staticmethod
+    def _system_browse_roots() -> list[Path]:
+        if os.name != "nt":
+            return [Path(os.sep)]
+        from ctypes import windll
+
+        drives = windll.kernel32.GetLogicalDrives()
+        return [Path(f"{chr(ord('A') + index)}:\\") for index in range(26) if drives & (1 << index)]
+
+    @staticmethod
+    def _available_directories(candidates: list[Path]) -> list[Path]:
         result: list[Path] = []
         seen: set[Path] = set()
         for candidate in candidates:
             try:
                 resolved = candidate.expanduser().resolve(strict=True)
-            except OSError:
-                continue
-            if not resolved.is_dir() or resolved in seen:
+                if not resolved.is_dir() or resolved in seen:
+                    continue
+            except (OSError, RuntimeError):
                 continue
             seen.add(resolved)
             result.append(resolved)
@@ -409,11 +418,11 @@ class ModelCatalog:
         except OSError:
             return 0
 
-    def _directory_entry(self, path: Path) -> ModelDirectoryEntry:
+    def _directory_entry(self, path: Path, *, count_models: bool = True) -> ModelDirectoryEntry:
         return ModelDirectoryEntry(
             id=self._directory_id(path),
             name=self._directory_name(path),
-            model_file_count=self._immediate_model_count(path),
+            model_file_count=self._immediate_model_count(path) if count_models else 0,
         )
 
     def _browse_directories(
@@ -422,13 +431,20 @@ class ModelCatalog:
         path: str | Path | None,
     ) -> ModelDirectoryList:
         if directory_id is None and path is None:
+            if self.browse_roots is not None:
+                return ModelDirectoryList(data=[
+                    self._directory_entry(folder) for folder in self._available_directories(list(self.browse_roots))
+                ])
+            roots = self._available_directories(self._system_browse_roots())
+            shortcuts = self._available_directories([*self.roots, Path.home()])
             return ModelDirectoryList(
-                data=[self._directory_entry(path) for path in self._browse_roots()]
+                data=[self._directory_entry(folder, count_models=False) for folder in roots],
+                shortcuts=[self._directory_entry(folder, count_models=False) for folder in shortcuts if folder not in roots],
             )
         if path is not None:
             try:
                 current = Path(path).expanduser().resolve(strict=True)
-            except OSError as error:
+            except (OSError, RuntimeError) as error:
                 raise ModelDirectoryNotFoundError(str(path)) from error
         else:
             current = self._directory_ids.get(directory_id or "")
@@ -436,12 +452,9 @@ class ModelCatalog:
             raise ModelDirectoryNotFoundError(str(path) if path is not None else directory_id)
         try:
             entries = list(current.iterdir())
-            children = sorted(
-                (item.resolve() for item in entries if item.is_dir()),
-                key=lambda item: (item.name.casefold(), item.name),
-            )
         except OSError as error:
             raise ModelDirectoryNotFoundError(self._directory_name(current)) from error
+        children = sorted(self._available_directories(entries), key=lambda item: (item.name.casefold(), item.name))
         files = []
         for item in entries:
             with contextlib.suppress(OSError):
@@ -458,8 +471,20 @@ class ModelCatalog:
             files=files,
             can_open_directory=directory_opener() is not None,
             can_open_in_finder=sys.platform == "darwin",
-            data=[self._directory_entry(path) for path in children],
+            data=[self._directory_entry(path, count_models=parent is not None) for path in children],
         )
+
+    @staticmethod
+    def _registration_file(directory: Path, name: str) -> Path:
+        if any(char in name for char in ('/', '\\', ':', '\0')) or name in ('.', '..'):
+            raise ModelRegistrationError("select a model file in the current directory")
+        try:
+            path = (directory / name).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ModelRegistrationError("selected model file is unavailable") from error
+        if path.parent != directory.resolve() or not path.is_file() or not _is_model_path(path):
+            raise ModelRegistrationError("selected file is not a supported model in the current directory")
+        return path
 
     @staticmethod
     def _registration_paths(directory: Path) -> list[Path]:
@@ -816,6 +841,8 @@ class ModelCatalog:
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
         if not is_gguf_path(path):
             artifact = self._inspect(root, path)
+            if is_d1_config(artifact.source_config):
+                return artifact
             decision = artifact.resource.structured_decisions
             if (artifact.resource.format != 'hf' or not artifact.resource.complete
                     or 'U32' not in artifact.resource.dtypes and not decision):

@@ -35,6 +35,20 @@ for (const baseURL of ['http://name:password@core.invalid/v1', 'http://core.inva
     assert.equal(h.calls.length, 0);
   });
 }
+test('takes explicit Engram companion paths only on model load', async () => {
+  const path = '/models/fixture-tables';
+  const h = harness((url, init) => {
+    assert.equal(url.pathname, '/prefix/api/v1/models/load');
+    assert.deepEqual(JSON.parse(init.body), { model: 'fixture', gguf_companions: [path] });
+    return Response.json({ operation_id: id, status: 'accepted' }, { status: 202 });
+  });
+  assert.equal((await h.call('models/load', { request: { model: 'fixture' }, companion_paths: [path] })).ok, true);
+  for (const companion_paths of [['relative.gguf'], ['https://fixture.invalid/table'], ['//network/share']]) {
+    const reply = await h.call('models/load', { request: { model: 'fixture' }, companion_paths });
+    assert.equal(reply.error.code, 'tyloinfer/bad-request');
+  }
+  assert.equal((await h.call('models/load', { request: { model: 'fixture' }, companion_ids: [artifact], companion_paths: [path] })).error.code, 'tyloinfer/bad-request');
+});
 test('connection metadata refuses credential values embedded in a path', async () => {
   const h = harness(() => assert.fail('listener'), { baseURL: 'http://core.invalid/fixture-core-credential/v1', apiKeyEnv: 'FIXTURE' });
   const result = await h.call('connection/info', {});

@@ -138,6 +138,53 @@ void check_prefill_graph() {
  assert_graph_equal(ea,read_graph_output(first));assert_graph_history(ha,first);
  std::cout<<"QSA graph exact parity PASS cases="<<cases<<"; shape/pointer updates, observer topology changes, in-flight updates and outer capture PASS"<<std::endl;
 }
+void check_resident_prefill() {
+    GraphFixture f(67,260,2,6,256,16);
+    auto a=f.args();a.resident_kv=true;a.output=a.temporary;a.output_half=false;
+    a.gate=nullptr;a.key_signs=a.value_signs=nullptr;
+    a.hits=a.mass=a.logmass=a.norm=nullptr;
+    ck(cudaError_t(tq::tq_sparse_attention_prefill(a)));
+    const auto read=[]<class T>(const Device<T>& source,std::size_t count) {
+        std::vector<T> host(count);
+        ck(cudaMemcpy(host.data(),source.p,host.size()*sizeof(T),cudaMemcpyDeviceToHost));
+        return host;
+    };
+    const auto q=read(f.query,std::size_t(f.queries)*f.heads*f.width);
+    const auto actual=read(f.temporary,q.size());
+    const auto k=read(f.keys,std::size_t(f.rows)*f.kvheads*f.width),v=read(f.values,k.size());
+    const auto selected=read(f.selected,std::size_t(f.queries)*f.count);
+    const auto positions=read(f.positions,f.queries);
+    double error=0.,energy=0.;
+    for(int t=0;t<f.queries;++t)for(int h=0;h<f.heads;++h) {
+        const auto row=(std::size_t(t)*f.heads+h)*f.width;
+        const auto kv=std::size_t(h/(f.heads/f.kvheads))*f.rows;
+        std::vector<std::pair<int,double>> scores;
+        double maximum=-INFINITY;
+        for(int slot=0;slot<f.count;++slot) {
+            auto block=selected[std::size_t(t)*f.count+slot];
+            if(block.id<0)continue;
+            for(int i=0;i<4;++i) {
+                const int index=4*block.id+i;
+                if(!(block.token_mask&(1u<<i)) || index>positions[t])continue;
+                double dot=0.;for(int d=0;d<f.width;++d)dot+=double(q[row+d])*__half2float(k[(kv+index)*f.width+d]);
+                const auto score=dot/16.;maximum=std::max(maximum,score);scores.emplace_back(index,score);
+            }
+        }
+        std::vector<double> output(f.width);double normalizer=0.;
+        for(auto [index,score]:scores) {
+            const auto weight=std::exp(score-maximum);normalizer+=weight;
+            for(int d=0;d<f.width;++d)output[d]+=weight*__half2float(v[(kv+index)*f.width+d]);
+        }
+        for(int d=0;d<f.width;++d) {
+            const auto expected=normalizer>0?output[d]/normalizer:0.;
+            const auto delta=actual[row+d]-expected;
+            error+=delta*delta;energy+=expected*expected;
+        }
+    }
+    const auto relative=std::sqrt(error/std::max(energy,1.e-30));
+    if(!std::isfinite(relative) || relative>.002)throw std::runtime_error("Resident sparse prefill differs from CPU attention");
+    std::cout<<"Resident sparse prefill CPU reference PASS relative="<<relative<<std::endl;
+}
 int main()try {
     check_materialized_gate();
     constexpr int queries=33,kvheads=2,count=16,padded=256;
@@ -191,5 +238,6 @@ int main()try {
     }
     }
     check_prefill_graph();
+    check_resident_prefill();
     std::cout<<"Generic GQA tails, packed KV/masks, signs/RHT, FP16/FP32, sigmoid gate and empty query tile PASS cases="<<cases<<" max_rel="<<maxrel<<" history_rel="<<maxmass<<std::endl;return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

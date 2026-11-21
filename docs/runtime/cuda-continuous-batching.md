@@ -1,8 +1,9 @@
 # Flash-Next CUDA continuous batching
 
-Enable an explicit request capacity with `python -m server.serve --max-requests-per-runtime N`
-or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
-from 1 to 32 on one CUDA device. The managed server's default remains one request.
+The managed CUDA server accepts eight requests per worker by default. Set a
+different limit with `python -m server.serve --max-requests-per-runtime N`. The native
+runtime exposes `mfq-runtime --continuous-batching N`. Flash-Next supports
+capacities from 1 to 32 on one CUDA device.
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded
@@ -45,8 +46,7 @@ Batched requests do not use MTP. Explicit session IDs and multimodal requests
 remain exclusive. The default single-request path retains MTP and prefix caching.
 Configured QSA KV offload uses the eager batch path.
 
-The shared execution test also
-injects prefill and decode-capacity failures to verify surviving requests, and
+The shared execution test alsoinjects prefill and decode-capacity failures to verify surviving requests, and
 checks staggered request scheduling. The stdio chat-client integration test
 compares simultaneous generations with serial output and verifies that the
 decoder actually processes multiple tokens per batch.

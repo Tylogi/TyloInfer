@@ -37,7 +37,8 @@ export function ModelsPage() {
           </>
         }
       />
-      <ModelLibrarySummary artifacts={artifacts} instances={catalog.instances || []} folderPath={modelFolderPath} tr={tr} />
+      <ModelLibrarySummary artifacts={artifacts} instances={catalog.instances || []} folderPath={modelFolderPath} busy={busy}
+        onChooseFolder={() => void chooseModelDirectory()} tr={tr} />
       <section id="local-checkpoints" ref={checkpoints}>
         <LocalCheckpoints catalog={catalog} />
       </section>

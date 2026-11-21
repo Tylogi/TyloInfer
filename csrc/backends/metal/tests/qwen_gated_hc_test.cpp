@@ -301,6 +301,93 @@ void test_qsa_dense_attention_causal_boundaries() {
     }
 }
 
+void test_qsa_grouped_decode() {
+    using namespace mlx::core;
+    constexpr int heads = 24, kv_heads = 2, dimension = 256, capacity = 1056;
+    for (int rows = 2; rows <= 8; ++rows) {
+        const auto query = patterned_bfloat(static_cast<std::size_t>(heads) * rows * dimension,
+            {1, heads, rows, dimension}, 37, 1.0f / 257.0f);
+        std::vector<array> keys, values, reference;
+        for (int row = 0; row < rows; ++row) {
+            const int length = row == 0 ? mfq::metal::kQsaGroupedDecodeMaxKeys : 128 + 51 * row;
+            const auto tensor = [&](int seed) {
+                return astype(patterned_bfloat(static_cast<std::size_t>(kv_heads) * capacity * dimension,
+                    {1, kv_heads, capacity, dimension}, seed, 1.0f / 257.0f), float16);
+            };
+            keys.push_back(slice(tensor(43 + row), {0, 0, 0, 0}, {1, kv_heads, length, dimension}));
+            values.push_back(slice(tensor(53 + row), {0, 0, 0, 0}, {1, kv_heads, length, dimension}));
+            const auto one_query = slice(query, {0, 0, row, 0}, {1, heads, row + 1, dimension});
+            reference.push_back(mfq::metal::qwen4_dense_gqa_attention(one_query, keys.back(), values.back(), length - 1));
+        }
+        const auto actual = mfq::metal::qwen4_dense_gqa_decode_batch(query, keys, values);
+        require_close(actual, concatenate(reference, 1), 0.0f, "QSA grouped decode with ragged KV views");
+        const auto gate = patterned_bfloat(static_cast<std::size_t>(rows) * heads * dimension,
+            {1, rows, heads * dimension}, 71, 1.0f / 97.0f);
+        const auto gated = mfq::metal::qwen4_dense_gqa_decode_batch(query, keys, values, &gate);
+        require_close(gated, mfq::metal::qwen4_qsa_output_gate(actual, reshape(gate, actual.shape()), bfloat16),
+            0.0f, "QSA grouped decode rounds before applying the output gate");
+    }
+}
+
+void test_qsa_half_history_join() {
+    using namespace mlx::core;
+    const auto half_values = [](int rows, float frequency) {
+        auto index = reshape(arange(2 * rows * 256, float32), {1, 2, rows, 256});
+        return astype(sin(index * frequency), float16);
+    };
+    auto history_key = slice(half_values(47, .051f), {0, 0, 3, 0}, {1, 2, 36, 256});
+    auto history_value = slice(half_values(64, .093f), {0, 0, 2, 0}, {1, 2, 35, 256});
+    auto proposal_key = slice(half_values(10, .037f), {0, 0, 1, 0}, {1, 2, 8, 256});
+    auto proposal_value = half_values(7, .023f);
+    const auto [keys, values] = mfq::metal::qwen4_qsa_join_half_history(
+        history_key, history_value, proposal_key, proposal_value);
+    require_close(keys, astype(concatenate({history_key, proposal_key}, 2), bfloat16),
+        0.0f, "QSA half-history join preserves strided keys");
+    require_close(values, astype(concatenate({history_value, proposal_value}, 2), bfloat16),
+        0.0f, "QSA half-history join preserves strided values");
+}
+
+void test_qsa_batched_tree_attention() {
+    using namespace mlx::core;
+    using mfq::metal::MlxQsaTreeAttentionLane;
+    constexpr int heads = 24, kv_heads = 2, dim = 256, total_rows = 23;
+    const std::array history_lengths{129, 193, 257, 389};
+    const std::array row_counts{3, 5, 7, 8};
+    const std::array parents{-1, 0, 0, 2, 0, 4, 3, 5};
+    const auto query = transpose(patterned_bfloat(total_rows * heads * dim,
+        {1, total_rows, heads, dim}, 37, .001f), {0, 2, 1, 3});
+    std::vector<MlxQsaTreeAttentionLane> lanes;
+    std::vector<array> reference;
+    int start = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        const int history = history_lengths[lane], rows = row_counts[lane];
+        const auto values = [](int length, int frequency) {
+            auto full = patterned_bfloat((length + 7) * kv_heads * dim,
+                {1, length + 7, kv_heads, dim}, frequency, .002f);
+            return transpose(astype(slice(full, {0, 3, 0, 0}, {1, length + 3, kv_heads, dim}), float16),
+                {0, 2, 1, 3});
+        };
+        const auto& inputs = lanes.emplace_back(MlxQsaTreeAttentionLane{
+            values(history, 11 + lane), values(history, 19 + lane), values(rows, 23 + lane),
+            values(rows, 31 + lane), std::span(parents).first(rows)});
+        const auto [key, value] = mfq::metal::qwen4_qsa_join_half_history(
+            inputs.history_keys, inputs.history_values, inputs.tree_keys, inputs.tree_values);
+        std::vector<std::uint8_t> valid(rows * (history + rows));
+        for (int row = 0; row < rows; ++row) {
+            auto first = valid.begin() + row * (history + rows);
+            std::fill_n(first, history, 1);
+            for (int node = row; node >= 0; node = parents[node]) first[history + node] = 1;
+        }
+        const auto mask = astype(array(valid.begin(), {1, 1, rows, history + rows}, uint8), bool_);
+        const auto one_lane = slice(query, {0, 0, start, 0}, {1, heads, start + rows, dim});
+        reference.push_back(transpose(fast::scaled_dot_product_attention(one_lane, key, value, 1.f / 16.f, "", mask),
+            {0, 2, 1, 3}));
+        start += rows;
+    }
+    require_close(mfq::metal::qwen4_qsa_batched_tree_attention(query, lanes), concatenate(reference, 1),
+        .003f, "QSA batched tree respects each lane's history and ancestor mask");
+}
+
 void test_qsa_canonical_prefill_prefix() {
     using namespace mlx::core;
     constexpr int heads = 24, kv_heads = 2, dimension = 256;
@@ -1344,6 +1431,9 @@ int main(int argc, char** argv) {
         test_qsa_block_scores();
         test_qsa_prefill_output_gate();
         test_qsa_dense_attention_causal_boundaries();
+        test_qsa_grouped_decode();
+        test_qsa_half_history_join();
+        test_qsa_batched_tree_attention();
         test_qsa_canonical_prefill_prefix();
         for (auto dtype : {mlx::core::float16, mlx::core::bfloat16,
                            mlx::core::float32}) {

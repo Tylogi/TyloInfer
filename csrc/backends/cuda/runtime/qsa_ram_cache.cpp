@@ -124,6 +124,7 @@ struct RamAccount {
     QsaRamCache* owner=nullptr;
     bool can_spill=false;
     bool fixed_ram_only=false;
+    std::size_t stage_capacity_bytes=SIZE_MAX;
     std::size_t charged_ram() const {
         const auto bytes=logical.load();
         return bytes-std::min(bytes,shared_prefix_ram.load());
@@ -245,6 +246,15 @@ struct RamWorker {
     std::shared_ptr<RamPinnedPool> pinned_pool;
     std::shared_ptr<PrefillTransfer> prefill_transfer;
     std::shared_ptr<SharedRamStageCache> stage_cache;
+    std::size_t stage_capacity_bytes() {
+        std::lock_guard lock(mutex);
+        std::size_t bytes=0;
+        for(const auto& weak:accounts)if(const auto account=weak.lock()) {
+            if(account->stage_capacity_bytes>SIZE_MAX-bytes)return SIZE_MAX;
+            bytes+=account->stage_capacity_bytes;
+        }
+        return bytes;
+    }
     mfq::HostParallelPool cpu_codecs;
     // Cache calls are serialized on their owning model thread. Collect all
     // layers' finished publications instead of retaining a previous layer's
@@ -1023,6 +1033,18 @@ struct QsaRamCache::Impl {
             worker->pinned_pool->pageable_pool=std::move(fallback);
         }
         pool=worker->pinned_pool;
+        const auto tq4=tq4_bytes(rows);
+        cache_stride=((b==16?2*fp16_bytes:b==8?2*affine_bytes:2*tq4)+31)&~std::size_t(15);
+        spill_stride=(2*tq4+31)&~std::size_t(15);
+        if(account->fixed_ram_only) {
+            // Restored requests can mix FP16 and quantized blocks. Count the
+            // largest image and metadata in each layer's bounded address space.
+            const auto slots=(2*fp16_bytes+spill_stride-1)/spill_stride;
+            const auto slot_bytes=spill_stride+sizeof(tq::RamCacheSlot)+sizeof(std::uint32_t);
+            const auto block_bytes=slots*slot_bytes;
+            if(std::size_t(capacity)<=SIZE_MAX/block_bytes)
+                account->stage_capacity_bytes=std::size_t(capacity)*block_bytes;
+        }
         {std::lock_guard<std::mutex> lock(worker->mutex);worker->accounts.push_back(account);}
         tq::RamKvStoreConfig config;config.pressure.canonical_tier=b==16?tq::RamKvTier::Fp16:b==8?tq::RamKvTier::Affine8:tq::RamKvTier::Tq4;
         config.pressure.ssd_enabled=ssd;config.pressure.adaptive_precision=adaptive_precision;
@@ -1043,9 +1065,6 @@ struct QsaRamCache::Impl {
                 return result;
             });
         if(live.defined())sources=qsa_descriptor_table(capacity,sizeof(tq::RamBlockView),options,host_metadata);
-        const auto tq4=tq4_bytes(rows);
-        cache_stride=((b==16?2*fp16_bytes:b==8?2*affine_bytes:2*tq4)+31)&~std::size_t(15);
-        spill_stride=(2*tq4+31)&~std::size_t(15);
         const auto* private_cache=std::getenv("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES");
         const auto cache_bytes=setting("TYLOINFER_QSA_RAM_VRAM_CACHE_BYTES");
         const auto sets=std::min<std::size_t>(INT_MAX/tq::ram_cache_ways,cache_bytes/cache_stride/tq::ram_cache_ways);
@@ -1118,7 +1137,8 @@ struct QsaRamCache::Impl {
                 if(!worker->stage_cache) {
                     const auto context=default_context(device);
                     const auto available=context->available_memory();
-                    const auto wanted=use_spare_vram?available:
+                    const auto set_bytes=tq::ram_cache_ways*(spill_stride+sizeof(tq::RamCacheSlot))+sizeof(std::uint32_t);
+                    const auto wanted=use_spare_vram?std::min(available,std::max(set_bytes+8,worker->stage_capacity_bytes())):
                         setting("TYLOINFER_QSA_RAM_SHARED_VRAM_CACHE_BYTES",qsa_shared_vram_cache_default);
                     auto bytes=std::min(wanted,available);
                     while(!worker->stage_cache) {
@@ -1130,7 +1150,6 @@ struct QsaRamCache::Impl {
                             }
                             worker->stage_cache=std::move(cache);
                         } catch(const CudaMemoryLimitExceeded& failure) {
-                            const auto set_bytes=tq::ram_cache_ways*(spill_stride+sizeof(tq::RamCacheSlot))+sizeof(std::uint32_t);
                             bytes-=std::min(bytes,std::max(failure.shortfall(),set_bytes));
                             context->reclaim_idle_memory();
                         } catch(const MfqResourceExhausted&) {

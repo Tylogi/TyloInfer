@@ -1,20 +1,15 @@
 import { getApiBaseUrl } from '../../shared/api/client';
-import type { KvQuantizationSettings } from '../../shared/api/resources/runtime';
 
 export interface LoadContextDefaults {
   context_size: number | null;
-  automatic: boolean;
+  reserve_percent: 5 | 10 | 20;
+  precision: number | null;
   jev_weights?: 'stream' | 'vram';
-  ssd_kv: boolean;
-  ram_preallocated: boolean;
   vram_preallocated: boolean;
-  kv_quantization: KvQuantizationSettings;
 }
 
 export const DEFAULT_LOAD_CONTEXT: LoadContextDefaults = {
-  context_size: null, automatic: true, jev_weights: 'stream', ssd_kv: false,
-  ram_preallocated: true, vram_preallocated: true,
-  kv_quantization: { enabled: false, bits: 4, algorithm: 'turboquant' },
+  context_size: null, reserve_percent: 10, precision: null, jev_weights: 'stream', vram_preallocated: true,
 };
 
 function key(model?: string) {
@@ -28,12 +23,14 @@ export function readLoadContext(model?: string): LoadContextDefaults {
     const result = structuredClone(DEFAULT_LOAD_CONTEXT);
     if (Number.isSafeInteger(value.context_size) && value.context_size >= 512 && value.context_size <= 2147483647)
       result.context_size = value.context_size;
-    for (const field of ['automatic', 'ssd_kv', 'ram_preallocated', 'vram_preallocated'] as const)
-      if (typeof value[field] === 'boolean') result[field] = value[field];
-    if (typeof value.kv_quantization?.enabled === 'boolean' && [2, 2.5, 3, 3.5, 4, 6, 8].includes(value.kv_quantization.bits))
-      result.kv_quantization = { enabled: value.kv_quantization.enabled, bits: value.kv_quantization.bits, algorithm: 'turboquant' };
+    if ([5, 10, 20].includes(value.reserve_percent)) result.reserve_percent = value.reserve_percent;
+    if ([2, 2.5, 3, 3.5, 4, 6, 8].includes(value.precision)) result.precision = value.precision;
+    if (typeof value.vram_preallocated === 'boolean' && (Object.hasOwn(value, 'reserve_percent') || value.automatic === false))
+      result.vram_preallocated = value.vram_preallocated;
+    if (!Object.hasOwn(value, 'precision') && value.automatic === false && value.kv_quantization?.enabled === true
+        && [2, 2.5, 3, 3.5, 4, 6, 8].includes(value.kv_quantization.bits))
+      result.precision = value.kv_quantization.bits;
     if (value.jev_weights === 'stream' || value.jev_weights === 'vram') result.jev_weights = value.jev_weights;
-    if (!result.ssd_kv) result.ram_preallocated = true;
     return result;
   } catch { return structuredClone(DEFAULT_LOAD_CONTEXT); }
 }

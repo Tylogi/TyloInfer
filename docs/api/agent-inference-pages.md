@@ -8,7 +8,7 @@
 |---|---|---|
 | 概览 | `health/status/loaded_models/instances/resources/serving` | 显示核心连接、模型、请求统计与资源；未加载模型时提供模型页入口，不自动加载。 |
 | 模型 | `models/loaded_models/instances`，`models/analysis` | 已登记工件与运行实例分开；既有加载、卸载、票据与取消见[模型桥](agent-model-bridge.md)。 |
-| 服务 | `listener/memory_policy/inference_policy/context_policy/model_aliases/authentication_policy` | 显示实际监听与策略；`service/configure` 只允许下述四类策略。连接和凭据复用官方 provider 设置，凭据不由 Client 读取。 |
+| 服务 | `listener/memory_policy/inference_policy/context_policy/model_aliases/authentication_policy` | 编辑监听、鉴权及推理策略，管理远程节点，按全局上下文上限重载实例。Host 保存连接和凭据。 |
 | 资源 | `resources/status/metrics/prefix_cache/memory_policy` | 不把未上报的 null 当零；缓存读取失败需保留错误，不冒充空缓存。清除、裁剪与磁盘删除不属于读取。 |
 | 下载 | `download_directory/job_kinds/jobs` | 队列只把 `download.huggingface` 和 `download.modelscope` 当模型下载；无对应执行器时明确说明，不触发网络探测或自动下载。 |
 | 分析 | `models`，`models/analysis` | 使用核心工件 ID 读取模型元数据，无需加载权重；无工件时引导登记模型，不能显示虚构分析。 |
@@ -85,10 +85,16 @@ refreshing仅反映读取时已有的刷新任务，true不表示该读取启动
 | `hub/search` | `{provider,query,formats?,sort?,direction?,cursor?,limit?}` | GET `/api/v1/hub/models`；固定 `browse=true`。provider 仅 huggingface/modelscope；formats 为 tq/gguf/mlx 数组，空数组省略；sort 为 relevance/downloads/likes/updated；direction 为 asc/desc；limit 1–100；query 最多255字符；cursor 为原生16–64字符标识。返回原生搜索页。 |
 | `hub/info` | `{provider,repo_id,revision?}` | GET `/api/v1/hub/models/{provider}/{owner}/{name}`；repo_id 仅 owner/name，不接受URL、相对路径或其它站点。返回原生元数据。 |
 | `hub/official` | `{refresh?}` | GET `/api/v1/hub/official`；refresh仅boolean。省略或false不等于local-only：首次／过期会启动后台联网刷新，未过期也可能补取缺失详情。当前没有保证只读本地官方清单的参数，不得用作挂载／轮询自动读取。返回原生清单，包括 `refreshing`；不能将仍刷新中的空清单当成最终不存在。 |
-| `models/register` | `{directory_id}` | POST `/api/v1/models/directories/register`；只用核心已提供的32位hex目录ID，不接收本地path。返回原生 `ModelArtifactList`；登记不加载模型。 |
+| `models/browse-directory` | `{path}` | 文件夹选择器手动跳转时，按用户输入的服务器绝对路径 GET `/api/v1/models/directories`。返回目录信息和用于后续选择的核心目录 ID。 |
+| `models/register` | `{directory_id,file_name?}` | POST `/api/v1/models/directories/register?allow_empty=true`。可导入目录中的单个模型文件，分片按完整模型识别。省略文件名则导入目录，空目录返回空列表。 |
+| `models/open-directory` | `{directory_id}` | POST `/api/v1/models/directories/open`。在核心所在设备的文件管理器打开已浏览的目录。 |
 | `downloads/create` | `{provider,request:{repo_id,destination,revision?,include?,expected_bytes?,max_workers?,download_directory?}}` | 先读核心 `job_kinds` 确认执行器；仅POST `/api/v1/jobs`，kind固定为 `download.huggingface` 或 `download.modelscope`，payload为原生request。核心202返回原生 `JobResource`，`id` 为真实票据，不伪造成 `OperationAccepted`。 |
 | `downloads/get` / `downloads/cancel` | `{operation_id}` | GET `/api/v1/jobs/{id}`；取消先读再按原生状态POST `/api/v1/jobs/{id}/cancel`，只接受上述两类下载作业。 |
 | `service/configure` | `{resource,request}` | 固定PUT对应策略路由，白名单见下表。同步策略仅原生200和有效策略字段算保存成功；memory_policy仅原生202 accepted算受理。 |
+| `service/configure-listener` | `{protocol,port}` | 修改 OpenAI 端口或启用、修改 Anthropic 端口。OpenAI 改端口时，Host 同步更新直连地址。 |
+| `service/configure-authentication` | `{enabled,api_key?}` | 修改核心鉴权。新密钥写入 Host 凭据库，返回启用状态和是否已设置密钥。 |
+| `service/remote-nodes` / `service/add-remote-node` / `service/delete-remote-node` | `{refresh}` / `{name,url,api_key_env?,enabled}` / `{id}` | 对应核心节点列表、创建和删除。用户可主动刷新节点状态。 |
+| `context/configure` | `{request:{apply_global_cap:true},confirmed:true}` | 提交核心上下文重载作业，使用 `context/get` 跟踪。 |
 | `service/get` / `service/cancel` | `{operation_id}` | 固定作业读取／取消，仅 `runtime.memory.configure`；不开放模型重载、测速或任意作业。 |
 
 下载 request 保留调用方字段，不补写下载并发、revision或文件选择。destination 必须为相对路径，禁止上级跳转；include 为原生文件选择数组，expected_bytes 可为null或非负安全整数，max_workers为原生1–16。可选 download_directory 仍由核心下载目录管理器核实；不接受API密钥、任意job kind、dataset/space类型或自定义下载URL。未安装下载执行器时在发送POST前失败，不能为显示成功而创建空作业。

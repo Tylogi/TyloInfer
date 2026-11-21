@@ -1853,6 +1853,7 @@ public:
             if (configured_batch_capacity > 1) {
                 mfq::metal::MlxQwen4BatchOperations::Hooks hooks;
                 hooks.block_size = session_cache->block_size_tokens();
+                hooks.dflash2 = runtime_components.dflash2;
                 hooks.restore = [this](auto& request) {
                     request.prefix = session_cache->normalize_stable_prefix_tokens(std::min(
                         request.cache_plan.stable_prefix_tokens, request.prompt.size()));
@@ -1877,9 +1878,13 @@ public:
 
     std::size_t request_capacity() const override { return batching_capacity; }
     bool can_batch(const mfq::engine::EngineRequest& request) const override {
-        return batching && !request.input.media &&
-            !(runtime_components.speculative_generate && request.input.sampling.enable_mtp) &&
-            !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
+        if (!batching || request.input.media) return false;
+        if (runtime_components.dflash2 && mfq::metal::mlx_dflash2_sampling_supported(request.input.sampling, {})) {
+            if (!request.input.chat_input) return true;
+            const auto& chat = request.input.chat_input->template_inputs;
+            if (chat.grammar.empty() && chat.json_schema.empty() && chat.tools.empty()) return true;
+        }
+        return !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
     }
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
@@ -2268,6 +2273,18 @@ public:
         return std::visit([&](auto value) -> mfq::engine::ControlResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, mfq::engine::RuntimeMetrics>) return metrics();
+            else if constexpr (std::is_same_v<T, mfq::engine::DecisionTokens>) {
+                if constexpr (requires(Runtime& runtime) { runtime.decide(value); }) {
+                    std::lock_guard<std::mutex> lock(*runtime_mutex);
+                    if (!runtime_holder->has_value()) throw std::runtime_error("model runtime is unavailable");
+                    mlx::core::set_default_device(mlx::core::Device::gpu);
+                    mlx::core::set_default_stream(runtime_stream);
+                    mfq::metal::MlxResidentBudgetScope budget_scope(
+                        [this](std::size_t bytes) { enforce_memory_budget(bytes); },
+                        [this](std::size_t bytes) { return optional_memory_fits(bytes); });
+                    return runtime_holder->value().decide(value);
+                } else throw std::invalid_argument("decision reads are unavailable for this model");
+            }
             else if constexpr (std::is_same_v<T, mfq::engine::ScoreTokens>) {
                 if constexpr (requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); }) {
                     std::lock_guard<std::mutex> lock(*runtime_mutex);
@@ -2768,6 +2785,9 @@ private:
 
     void warm_runtime() {
         if (!generation_warmup) return;
+        if constexpr (requires(const Runtime& runtime) { runtime.supports_decisions(); }) {
+            if (runtime_holder->value().supports_decisions()) return;
+        }
         mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
             enforce_memory_budget(bytes);
         }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -2959,7 +2979,7 @@ int run_loaded_runtime(
             std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) {
             mfq::metal::configure_mlx_dflash2(runtime_components, runtime_holder, arguments.dflash2_draft, preparation_sampling);
             runtime_components.prepare_speculative();
-            std::cout << "DFlash2 experimental: unconstrained text without penalties; DFlash2 requests bypass prefix reuse and batching"
+            std::cout << "DFlash2 experimental: unconstrained text without penalties; Flash-Next supports continuous batching"
                       << std::endl;
         } else throw std::invalid_argument("DFlash2 currently requires a supported Qwen target");
     }
@@ -2986,7 +3006,13 @@ int run_loaded_runtime(
             static_cast<bool>(runtime_components.duplex);
         transport_config.model_capabilities = std::move(capabilities);
     }
-    auto text = container.contains(tokenizer_asset)
+    bool decisions = false;
+    if constexpr (requires(const Runtime& value) { value.supports_decisions(); })
+        decisions = runtime_holder->value().supports_decisions();
+    auto text = decisions
+        ? mfq::engine::TextProcessor::load(*container.native_source(), arguments.tokenizer_gguf.string(),
+              static_cast<std::int32_t>(vocabulary_size), transport_config.model_type)
+        : container.contains(tokenizer_asset)
         ? std::make_unique<mfq::engine::TextProcessor>(container.read(tokenizer_asset),
               static_cast<std::int32_t>(vocabulary_size), transport_config.model_type)
         : std::make_unique<mfq::engine::TextProcessor>(arguments.tokenizer_gguf.string(),
@@ -2999,8 +3025,10 @@ int run_loaded_runtime(
     info.capabilities = *transport_config.model_capabilities;
     info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
     info.duplex = static_cast<bool>(runtime_components.duplex);
+    info.decisions = decisions;
     info.reload = true;
-    info.probability = requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); };
+    info.probability = !decisions &&
+        requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); };
     auto reload_runtime = [&container, loader = std::move(load_runtime)](std::int64_t context) {
         container.observe_load_records([](std::size_t completed, std::size_t total) {
             std::cerr << "mfq_load_progress completed=" << completed
@@ -3415,6 +3443,8 @@ int main(int argc, char** argv) {
         if (arguments.inspect_model_json) {
             nlohmann::json result{{"architecture", model.header().architecture},
                 {"paths", model.source_paths()}, {"tensors", nlohmann::json::object()}};
+            if (const auto* source = model.native_source())
+                result["structured_decisions"] = bool(mfq::decision_model_spec(*source));
             nlohmann::json shapes = nlohmann::json::object();
             if (const auto found = model.header().extra_json.find("tensor_shapes"); found != model.header().extra_json.end())
                 shapes = nlohmann::json::parse(found->second);

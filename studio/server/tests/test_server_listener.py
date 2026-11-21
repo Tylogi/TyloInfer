@@ -230,6 +230,37 @@ def test_saved_listener_port_ignores_invalid_configuration(tmp_path: Path) -> No
         assert saved_service_port(path) == 8090
 
 
+def test_enabling_anthropic_keeps_the_openai_listener(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = tmp_path / "listener.json"
+        server = RuntimeServer(uvicorn.Config(create_app(), host="127.0.0.1", port=0, log_level="error"), settings)
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            assert server.started
+            openai = server.config.port
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                anthropic = probe.getsockname()[1]
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.put(
+                    f"http://127.0.0.1:{openai}/api/v1/runtime/listener",
+                    json={"port": anthropic, "protocol": "anthropic"},
+                )
+                assert response.status_code == 200
+                assert response.json()["anthropic_port"] == anthropic
+                assert (await client.get(f"http://127.0.0.1:{openai}/v1")).json()["endpoints"][-1] == "/v1/chat/completions"
+                assert (await client.get(f"http://127.0.0.1:{anthropic}/v1")).json()["endpoints"][-1] == "/v1/messages"
+                assert saved_service_port(settings, "anthropic") == anthropic
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+    asyncio.run(run())
+
+
 def test_independent_listeners_keep_live_requests_and_shared_service(tmp_path: Path) -> None:
     async def run() -> None:
         app = create_app()

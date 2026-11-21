@@ -337,7 +337,7 @@ bool RotaryEmbedding::pool_normalized_into(const Tensor& index,const Tensor& wei
 }
 
 Tensor RotaryEmbedding::pool_normalized(const Tensor& index,const Tensor& weight,
-        const Tensor& positions,int64_t pool,double eps) const {
+        const Tensor& positions,int64_t pool,double eps,const Tensor& completion_position) const {
     // The shared pooling workspace holds at most 256 coordinates. Wider or
     // unsupported inputs keep the existing composition at the caller.
     if(!fused_ || index.dim()!=3 || index.size(0)!=1 || index.size(2)-(index.scalar_type()==tb::kInt16?2:0)>256 || index.size(2)-(index.scalar_type()==tb::kInt16?2:0)<dimension_ ||
@@ -348,7 +348,7 @@ Tensor RotaryEmbedding::pool_normalized(const Tensor& index,const Tensor& weight
     const auto prepared=prepare_parameters(index);
     auto output=tb::empty({1,index.size(1)/pool,index.size(2)},index.options());
     qsa_pool_rotary_cuda(index,weight.to(tb::kFloat32).contiguous(),positions.contiguous(),
-        prepared.frequencies,prepared.axes,output,pool,maximum_,eps,yarn_.attention_factor());
+        prepared.frequencies,prepared.axes,output,pool,maximum_,eps,yarn_.attention_factor(),completion_position);
     return output;
 }
 

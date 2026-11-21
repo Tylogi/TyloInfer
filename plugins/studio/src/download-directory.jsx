@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { DownloadDirectoryView } from '../../../studio/web/src/features/models/DownloadDirectoryView.tsx';
 import { ModelDirectoryDialog } from '../../../studio/web/src/features/models/ModelDirectoryDialog.tsx';
-import { Dialog } from './shared-primitives.jsx';
-import { CoreError } from './page-kit.jsx';
+import { ConfirmationDialog } from './shared-primitives.jsx';
+import { CoreError, Facts } from './page-kit.jsx';
 
 export function DownloadDirectory({ entry, api, mutation, tr, refreshKey }) {
   const [open, setOpen] = useState(false);
@@ -43,10 +43,11 @@ export function DownloadDirectory({ entry, api, mutation, tr, refreshKey }) {
       modelDirectoryPath: browser.value?.current_path || browser.value?.current_name || '', setModelDirectoryPath() {},
       registerCurrentModelDirectory: choose, openCurrentDirectory() {},
     }} />
-    <Dialog open={Boolean(confirm)} onOpenChange={value => { if (!value) setConfirm(null); }} title={tr('保存下载设置', 'Save download settings')} closeLabel={tr('关闭', 'Close')} returnFocusRef={trigger}>
-      <div className="tylo-model-confirm"><strong>{confirm?.path}</strong><p>{confirm?.reclaim ? tr('允许后续下载在同盘空间不足时回收 SSD 前缀缓存，可能缩减前缀预算并删除离线块。保存时不立即清理或下载。', 'Allow later downloads to reclaim SSD prefix caches when space is low. This can reduce prefix budgets and remove offline blocks. Saving does not immediately purge or download.') : tr('后续下载不自动回收 SSD 前缀缓存。', 'Later downloads will not automatically reclaim SSD prefix caches.')}</p><p>{tr('不迁移已有文件或已排队任务；新下载固定使用确认时的目录。', 'Existing files and queued jobs are not moved. New downloads use their confirmed directory.')}</p>
-        <div className="tylo-model-confirm-actions"><button type="button" onClick={() => setConfirm(null)}>{tr('取消', 'Cancel')}</button><button type="button" className="primary" disabled={busy} onClick={() => void save()}>{tr('保存', 'Save')}</button></div>
-      </div>
-    </Dialog>
+    <ConfirmationDialog open={Boolean(confirm)} tr={tr} title={tr('保存下载设置', 'Save download settings')}
+      description={tr('设置适用于新下载。已有文件和排队中的任务保留原目录。', 'These settings apply to new downloads. Existing files and queued jobs keep their current locations.')}
+      confirmLabel={tr('保存', 'Save')} onCancel={() => setConfirm(null)} onConfirm={save} disabled={busy} returnFocusRef={trigger}>
+      <Facts entries={[[tr('下载目录', 'Download folder'), confirm?.path], [tr('回收 SSD 前缀缓存', 'Reclaim SSD prefix caches'), confirm?.reclaim ? tr('允许', 'Allowed') : tr('关闭', 'Off')]]} />
+      {confirm?.reclaim && <p>{tr('同一磁盘空间不足时，后续下载可缩减前缀预算并清理 SSD 缓存块。', 'Later downloads may reduce prefix budgets and clear SSD blocks when disk space is low.')}</p>}
+    </ConfirmationDialog>
   </>;
 }

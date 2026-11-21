@@ -19,6 +19,8 @@
 
 namespace mfq::metal {
 
+class MlxDFlash2;
+
 // Native payload translation is private to the Metal engine. The scheduler
 // receives owned values from the generation job, never these device functions.
 struct MlxDuplexComponent {
@@ -28,6 +30,7 @@ struct MlxDuplexComponent {
     explicit operator bool() const { return bool(start) && bool(step) && bool(stop); }
 };
 struct MlxEngineComponents {
+    std::shared_ptr<MlxDFlash2> dflash2;
     std::function<bool(const std::vector<std::int64_t>&, const MfqSamplingParams&,
         MlxGenerationJob&, const MfqTokenConstraintPtr&, int)> speculative_generate;
     std::function<void()> prepare_speculative;

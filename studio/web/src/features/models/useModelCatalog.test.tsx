@@ -503,6 +503,7 @@ describe('useModelCatalog', () => {
       pin: true,
       idle_ttl_seconds: 300,
       device_ids: ['2'],
+      context_management: DEFAULT_LOAD_CONTEXT,
     });
     expect(state.refreshRuntime).toHaveBeenCalledWith(false);
     expect(state.setSelectedModel).toHaveBeenCalledWith('Local Model');
@@ -519,7 +520,7 @@ describe('useModelCatalog', () => {
     act(() => result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, jev_weights: 'vram' }));
     await act(async () => result.current.loadArtifact(artifact.name));
     expect(load).toHaveBeenCalledWith(artifact.name, null, 'auto', expect.objectContaining({ jev_weights: 'vram' }));
-    expect(load.mock.calls[0][3]).not.toHaveProperty('context_management');
+    expect(load.mock.calls[0][3]?.context_management?.reserve_percent).toBe(10);
   });
 
   it('isolates context, devices and residency choices by model and connection', async () => {
@@ -529,17 +530,19 @@ describe('useModelCatalog', () => {
     act(() => {
       result.current.setLoadPinned(true);
       result.current.setLoadDeviceIds(['2']);
-      result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, automatic: false, context_size: 8192 });
+      result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, context_size: 8192 });
     });
     act(() => result.current.openModelSettings('Model B'));
     expect(result.current.loadPinned).toBe(false);
     expect(result.current.loadDeviceIds).toEqual([]);
     expect(result.current.loadContext.context_size).toBeNull();
     await act(async () => result.current.loadArtifact('Model B'));
-    expect(load).toHaveBeenLastCalledWith('Model B', null, 'auto', { pin: false, device_ids: [], idle_ttl_seconds: null });
+    expect(load).toHaveBeenLastCalledWith('Model B', null, 'auto', {
+      pin: false, device_ids: [], idle_ttl_seconds: null, context_management: DEFAULT_LOAD_CONTEXT,
+    });
     await act(async () => result.current.loadArtifact('Model A'));
     expect(load).toHaveBeenLastCalledWith('Model A', 8192, 'auto', expect.objectContaining({ pin: true, device_ids: ['2'],
-      context_management: expect.objectContaining({ automatic: false, context_size: 8192 }) }));
+      context_management: expect.objectContaining({ reserve_percent: 10, context_size: 8192 }) }));
     act(() => result.current.openModelSettings('Model A'));
     setApiBaseUrl('https://another.invalid'); state.connectionRevision++;
     rerender();

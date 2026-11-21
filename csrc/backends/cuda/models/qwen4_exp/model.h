@@ -20,6 +20,8 @@
 #include "runtime/qsa_tq_cache.h"
 #include "runtime/qsa_indexer.h"
 #include "runtime/qsa_tq_session.h"
+#include "runtime/prefill_projection_plan.h"
+#include "kernels/qsa_tq_fa.h"
 #include "runtime/decode_window.h"
 #include "runtime/recurrent_copy_batch.h"
 #include "mfq_cuda_kv_quantization.h"
@@ -1656,7 +1658,10 @@ class Qsa {
                 auto buffer=history_only?Tensor{}:tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
                     hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
                 auto output=adaptive_->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,buffer,
-                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions);
+                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions,
+                    [this](const Tensor& raw,const Tensor& absolute,const Tensor& physical) {
+                        return rotary_->pool_normalized(raw,w_.index_key_norm,absolute,4,c_.eps,physical);
+                    });
                 if(history_only)return {};
                 output=output.to(hidden.scalar_type());
                 return project_output?w_.output(execution,output):output;
@@ -1728,7 +1733,8 @@ class Qsa {
             graph_values_.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
         if(managed_memory() && !exclusive && !streamed)memory_->hot.publish(graph_keys_,graph_values_,cache_positions);
-        if(!index_written)index_.append_fixed(qsa_indexer::encode(p.raw),cache_positions);
+        if(!index_written && !qsa_indexer::pack_at(p.raw,index_.storage(),cache_positions,index_.position()))
+            index_.append_fixed(qsa_indexer::encode(p.raw),cache_positions);
         mark("qsa_cache_end");
         if(history_only && streamed) {
             auto* window=DecodeWindow::recording();
@@ -1917,14 +1923,27 @@ class Qsa {
                 return project_output?w_.output(execution,gated):gated;
             }catch(...){adaptive_->truncate(start);if(temporary)adaptive_->release_prefill_workspace();throw;}
         }
-        if(use_cache && hidden.size(1)>8 && !selection_trace && !history_only) {
+        const auto b=hidden.size(0),t=hidden.size(1),offset=use_cache?position():0,length=offset+t;
+        const auto select_fused=mfq::cuda::runtime_options::qsa_select_fused();
+        const auto* live_setting=std::getenv("TYLOINFER_QSA_LIVE_TOPK");
+        const auto live_count=std::min(c_.budget/c_.pool,length/c_.pool);
+        // One selector grid row per query must fit CUDA's grid.y.
+        const bool live_prefill=b==1 && t>=32 && t<=65535 && !offload_ && !selection_trace && !history_only &&
+            length>c_.budget && live_count<=1024 && (!select_fused || *select_fused) && (!live_setting || live_setting[0]!='0');
+        if(use_cache && t>8 && !selection_trace && !history_only) {
             // Index scores grow with both query rows and the accumulated
             // context. Bound that workspace independently of the FFN tile.
-            // Keep per-head products, reduction and top-k scratch below the
-            // same budget even at the final chunk of a long prompt.
-            const auto offset=position(),length=offset+hidden.size(1);
             const auto pools=std::max<int64_t>(1,length/c_.pool);
-            const auto row_bytes=std::size_t(hidden.size(0))*pools*(c_.index_heads+4)*sizeof(float);
+            auto row_bytes=std::size_t(b)*pools*(c_.index_heads+4)*sizeof(float);
+            if(live_prefill) {
+                // Native affine scoring reduces heads in the kernel. Single
+                // selector tiles write indices directly to the final output.
+                row_bytes=std::size_t(pools)*sizeof(float);
+                for(auto columns=pools;columns>4096;) {
+                    columns=((columns+4095)/4096)*live_count;
+                    row_bytes+=std::size_t(columns)*(sizeof(float)+sizeof(int64_t));
+                }
+            }
             const auto rows=std::max<int64_t>(32,int64_t((128ULL<<20)/row_bytes)/32*32);
             if(hidden.size(1)>rows) {
                 std::vector<Tensor> outputs;
@@ -1944,7 +1963,6 @@ class Qsa {
             return forward_offloaded(execution, hidden, current_positions, full_positions, selection_trace,
                                      std::move(projections),project_output,history_only);
         }
-        const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
         const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
         // Scalar decode and verification use the same grouped projections and
         // normalization/RoPE preparation as captured execution. Keeping short
@@ -2012,6 +2030,8 @@ class Qsa {
         const bool short_gate=prepared_inputs && fused_projection_ && rotary_->fused() &&
             t<=8 && !quantization_.enabled() &&
             (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32);
+        const auto live_positions=live_prefill?
+            tb::arange(offset,offset+t,hidden.options().dtype(tb::kInt64)):Tensor{};
         const auto attend_projected=[&](const Projection& p,const Tensor& selected) {
             auto key=p.key.permute({0,2,1,3}),value=p.value.permute({0,2,1,3});
             if(!short_gate)return attend(p.query,key,value,selected,offset);
@@ -2036,16 +2056,30 @@ class Qsa {
                 auto starts=tb::arange(pools,p.raw.options().dtype(tb::kInt64))*c_.pool;
                 return pool_index(p.raw.narrow(1,0,pools*c_.pool),full_positions.index_select(-1,starts));
             },
-            [](const Projection &p,const Tensor &pooled) {return qsa_indexer::scores(p.iq,pooled);},
+            [&](const Projection &p,const Tensor &pooled) {
+                return execution.profiler.measure("prefill.qsa.indexer",[&] {
+                    return qsa_indexer::scores(p.iq,pooled,live_positions,c_.pool);
+                });
+            },
             [&](const Tensor &scores, const Projection &p, const Tensor &pooled) {
-                auto ids =
-                    select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget, true);
+                auto ids = execution.profiler.measure(live_prefill?"prefill.qsa.live_selection":"prefill.qsa.selection",[&] {
+                    if(live_prefill) {
+                        return mfq_qwen4_exp::live_topk_selected_tokens(scores,live_positions,c_.pool,live_count,c_.budget);
+                    }
+                    return select_pooled_blocks(scores,offset,offset+t,c_.pool,c_.budget,true);
+                });
                 if (selection_trace)
                     *selection_trace = {scores, ids, p.iq, qsa_indexer::decode(pooled)};
                 return ids;
             },
             [&](const Projection &p, Tensor ids) {
-                return attend_projected(p,ids);
+                return execution.profiler.measure("prefill.qsa.selected_attention",[&] {
+                    if(live_prefill) {
+                        auto grouped=resident_prefill_attention(p,ids,live_positions);
+                        if(grouped.defined())return grouped;
+                    }
+                    return attend_projected(p,ids);
+                });
             },
             [&](Tensor attended, const Projection &p) {
                 auto gated = short_gate?std::move(attended):
@@ -2057,6 +2091,55 @@ class Qsa {
     }
 
   private:
+    Tensor resident_prefill_attention(const Projection& p,const Tensor& ids,const Tensor& positions) const {
+        namespace tq=tyloinfer::qsa;
+        const auto* setting=std::getenv("TYLOINFER_QSA_PREFILL_FA");
+        if((setting && setting[0]=='0') || c_.pool!=4 || c_.width!=256 || quantization_.enabled() ||
+                (managed_memory() && memory_->hot.defined()))return {};
+        const auto rows=p.query.size(2),length=p.key.size(1),heads=c_.heads;
+        const auto padded=(length+3)/4*4;
+        if(padded>INT_MAX/512 || rows>INT_MAX/heads || p.query.stride(3)!=1 ||
+                (p.query.scalar_type()!=tb::kFloat16 && p.query.scalar_type()!=tb::kFloat32) ||
+                p.key.scalar_type()!=tb::kFloat16 || p.value.scalar_type()!=tb::kFloat16)return {};
+        const auto count=(ids.size(2)+3)/4,elements=rows*heads*256;
+        const auto work=tq::tq_prefill_attention_scratch(int(rows),int(heads),int(padded));
+        auto keys=p.key.permute({0,2,1,3}),values=p.value.permute({0,2,1,3});
+        const auto cache_bytes=std::size_t(padded)*c_.kv_heads*256*sizeof(std::uint16_t);
+        const auto required=work+std::size_t(elements)*sizeof(float)+std::size_t(rows*count)*sizeof(tq::SelectedBlock)+
+            (padded==length && keys.is_contiguous()?0:cache_bytes)+(padded==length && values.is_contiguous()?0:cache_bytes);
+        if(required>available_prefill_workspace(*default_context(p.query.get_device())))return {};
+        try {
+            const auto options=p.query.options().dtype(tb::kFloat32);
+            const auto complete_blocks=[&](const Tensor& input) {
+                if(padded==length)return input.contiguous();
+                // The gather fetches whole microblocks, even the masked tail.
+                auto copy=tb::empty({1,c_.kv_heads,padded,256},input.options());
+                copy.narrow(2,0,length).copy_(input);
+                copy.narrow(2,length,padded-length).zero_();
+                return copy;
+            };
+            keys=complete_blocks(keys);values=complete_blocks(values);
+            auto query=tb::empty({elements},options),scratch=tb::empty({int64_t((work+3)/4)},options);
+            auto blocks=tb::empty({int64_t(rows*count*sizeof(tq::SelectedBlock))},options.dtype(tb::kUInt8));
+            tq::TqPrefillAttention a;
+            a.keys=static_cast<const std::uint16_t*>(keys.data_ptr());
+            a.values=static_cast<const std::uint16_t*>(values.data_ptr());
+            a.query=p.query.data_ptr();a.query_half=p.query.scalar_type()==tb::kFloat16;
+            a.query_token_stride=p.query.stride(2);a.query_head_stride=p.query.stride(1);
+            a.positions=positions.data_ptr<int64_t>();a.selected=blocks.data_ptr<tq::SelectedBlock>();
+            a.rotated=query.data_ptr<float>();a.temporary=scratch.data_ptr<float>();a.output=a.temporary;
+            a.temporary_bytes=scratch.nbytes();a.queries=int(rows);a.heads=int(heads);a.kv_heads=int(c_.kv_heads);
+            a.width=256;a.kv_rows=int(padded);a.count=int(count);a.stream=mfq_current_cuda_stream();a.resident_kv=true;
+            qsa_indexer::check(tq::tq_group_selected(ids.data_ptr<int32_t>(),blocks.data_ptr<tq::SelectedBlock>(),
+                int(rows),int(ids.size(2)),a.stream));
+            const auto status=tq::tq_sparse_attention_prefill(a);
+            if(status==int(cudaErrorNotSupported))return {};
+            TYLOINFER_NATIVE_CUDA_CHECK(static_cast<cudaError_t>(status));
+            return scratch.narrow(0,0,elements).reshape({1,rows,heads,256});
+        } catch(const MfqResourceExhausted&) {
+            return {};
+        }
+    }
     Tensor pool_index(const Tensor& raw,const Tensor& starts) {
         const auto input=raw.scalar_type()==tb::kInt16?raw:raw.to(tb::kFloat32);
         auto fused=rotary_->pool_normalized(input,w_.index_key_norm,starts,c_.pool,c_.eps);

@@ -10,6 +10,7 @@
 #include "generation_policy.h"
 #include "inference.h"
 #include "mfq_cuda_sampling_ops.h"
+#include "mfq_cuda_process_memory.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"
@@ -66,7 +67,7 @@ template <class Model> struct CudaMtpOps {
   // Destroy after local/result tensors, including cancellation of priming.
   std::unique_ptr<mfq::cuda::RoutedPrefillWorkspaceLoan> predictor_loan;
   std::shared_ptr<mfq::cuda::qwen35::MtpTargetGraphs> dense_target_graphs;
-  int64_t target_planned_kv_length=0;
+  bool dense_graph_resource_limited=false;
   const mfq_tensor_backend::TensorOptions options =
       mfq_tensor_backend::TensorOptions()
           .device(mfq_tensor_backend::kCUDA)
@@ -332,12 +333,6 @@ template <class Model> struct CudaMtpOps {
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
-      const auto capacity=model.max_position_embeddings();
-      const auto requested=std::min<int64_t>(capacity,
-          int64_t(prompt.size())+std::max<int64_t>(0,sampling.max_tokens));
-      target_planned_kv_length=decode_graph_bucket(requested,capacity);
-    }
     sampler_.emplace(sampling);
     penalties = sampler().has_penalties();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
@@ -400,8 +395,16 @@ template <class Model> struct CudaMtpOps {
       for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]=costs_after[i]-costs_before[i];
     };
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
-      if(!transformed_prompt && ids.dim()==2 && ids.size(1)<=1+mfq::engine::mtp::kMaximumReportedDraftDepth &&
+      if(!transformed_prompt && !dense_graph_resource_limited && ids.dim()==2 &&
+          ids.size(1)<=1+mfq::engine::mtp::kMaximumReportedDraftDepth &&
           mfq::cuda::qwen35::MtpTargetGraphs::eligible(model,ids)) {
+        const auto length=mfq::cuda::qwen35::mtp_attention_capacity(model.cache_pos+ids.size(1),
+            model.max_position_embeddings());
+        if(dense_target_graphs && dense_target_graphs->holds_other_plan(length)) {
+          dense_target_graphs.reset();
+          qwen35_release_mtp_graphs(model,&mtp);
+          mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+        }
         if(!dense_target_graphs || !dense_target_graphs->compatible(model)) {
           if(auto* predictor=dynamic_cast<Qwen35Mtp*>(&mtp)) {
             if(!predictor->target_graphs || !predictor->target_graphs->compatible(model))
@@ -415,11 +418,23 @@ template <class Model> struct CudaMtpOps {
           } else dense_target_graphs=std::make_shared<mfq::cuda::qwen35::MtpTargetGraphs>(model);
         }
         bool initialized=false;Tensor logits,packet;
-        if(auto hidden=dense_target_graphs->run(ids,confirmed,raw,&logits,&initialized,target_planned_kv_length,
-            sampler().greedy() && !penalties?&packet:nullptr)) {
+        std::size_t shortfall=0;
+        if(auto hidden=dense_target_graphs->run(ids,confirmed,raw,&logits,&initialized,length,
+            sampler().greedy() && !penalties?&packet:nullptr,&dense_graph_resource_limited,&shortfall)) {
           projected_target_hidden=*hidden;projected_target_logits=std::move(logits);
           projected_target_packet=std::move(packet);
           target_maintenance=target_maintenance || initialized;finish_profile();return std::move(*hidden);
+        }
+        if(dense_graph_resource_limited) {
+          // No replay was submitted. Capture has restored the target state,
+          // so the same verification window can run without building a graph.
+          dense_target_graphs.reset();
+          qwen35_release_mtp_graphs(model,&mtp);
+          const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+          context->reclaim_idle_memory();
+          if(shortfall && model.reclaim_decode_workspace)
+            model.reclaim_decode_workspace(shortfall);
+          std::cerr<<"runtime_qwen35_mtp_graph action=skip_capture reason=workspace_pressure\n";
         }
       }
     }
@@ -853,6 +868,9 @@ template <class Model> struct CudaMtpOps {
     if(predictor_loan){predictor_loan->finish();predictor_loan.reset();}
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
       if(model.restore_decode_workspace)model.restore_decode_workspace();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>)
+      if(!model.execution->borrowed_prefill_weights.empty() && model.restore_decode_workspace)
+        model.restore_decode_workspace();
     // Every predictor tile has already synchronized its compute-end event.
     // Returning the expert loan is TTFT maintenance, not prompt computation.
     return 0;

@@ -16,6 +16,8 @@ export interface ToastItemProps {
   toast: ToastItemData;
 
   onDismiss: (id: string, revision?: number) => void;
+
+  dismissLabel?: string;
 }
 
 
@@ -23,7 +25,7 @@ export interface ToastItemProps {
 
 
 
-export function ToastItem({ toast, onDismiss }: ToastItemProps) {
+export function ToastItem({ toast, onDismiss, dismissLabel = '关闭通知' }: ToastItemProps) {
   const { id, revision, type, message, title, duration } = toast;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remainingTimeRef = useRef<number>(duration ?? 0);
@@ -93,7 +95,7 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
         type="button"
         className="studio-toast-close"
         onClick={() => onDismiss(id, revision)}
-        aria-label="关闭通知"
+        aria-label={dismissLabel}
       >
         <XIcon size={14} aria-hidden="true" />
       </button>

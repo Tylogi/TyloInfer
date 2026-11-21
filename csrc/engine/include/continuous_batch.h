@@ -161,7 +161,10 @@ template <class Ops> class ContinuousBatch {
         }
         if constexpr (requires { operations.prefix_tokens(work->request); })
             prefix = operations.prefix_tokens(work->request);
-        auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);
+        auto span=prefill_chunk_size;
+        if constexpr (requires { operations.solo_prefill_span(work->request,prefill_chunk_size); })
+            if(requests.size()==1)span=operations.solo_prefill_span(work->request,prefill_chunk_size);
+        auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, span);
         while (auto step = sequence.next()) {
             if constexpr(requires { operations.commit_prefix(work->request); })
                 if(step.value && std::holds_alternative<PrefillProgress>(*step.value) && !output.stopped())
@@ -205,6 +208,9 @@ template <class Ops> class ContinuousBatch {
                 auto decoded = operations.decode(state);
                 decoding_operation = false;
                 for (const auto& request : state.active) if (request->eligible) {
+                    if constexpr (requires { operations.decode_completed(request, decoded); }) {
+                        if (!operations.decode_completed(request, decoded)) continue;
+                    }
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
                     if constexpr (requires { operations.cache_length(request); })

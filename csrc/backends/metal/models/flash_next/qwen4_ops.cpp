@@ -33,6 +33,215 @@ using mlx::core::MathMode;
 constexpr int kGatedHcProjectionThreads = 256;
 constexpr int kGatedHcUpThreads = 320;
 
+// The online softmax reduction order follows MLX vector SDPA.
+// Copyright © 2024 Apple Inc. See LICENSES/MLX-MIT.txt.
+class QsaDenseDecodeBatch final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    QsaDenseDecodeBatch(mlx::core::Stream stream, bool gate) : Primitive(stream), gate_(gate) {}
+
+    std::string preparation_key() const override {
+        return gate_ ? "mfq_qsa_dense_decode_batch_gated" : "mfq_qsa_dense_decode_batch";
+    }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+    const char* name() const override { return "QsaDenseDecodeBatch"; }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [&] {
+            std::string source = "#include <metal_stdlib>\nusing namespace metal;\n";
+            source += "[[kernel, max_total_threads_per_threadgroup(1024)]] void " + name + R"METAL((
+                device const bfloat *query [[buffer(0)]],
+                device bfloat *output [[buffer(1)]],
+                constant ulong *params [[buffer(2)]],
+            )METAL";
+            for (int row = 0; row < 8; ++row) {
+                const auto suffix = std::to_string(row);
+                source += "device const half *key" + suffix + " [[buffer(" + std::to_string(3 + row * 2) + ")]],";
+                source += "device const half *value" + suffix + " [[buffer(" + std::to_string(4 + row * 2) + ")]],";
+            }
+            if (gate_) source += "device const bfloat* gate [[buffer(19)]],";
+            source += R"METAL(
+                uint2 group [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+                const uint row = group.y, head = group.x;
+            )METAL";
+            for (const auto* name : {"key", "value"}) {
+                source += "device const half *" + std::string(name) + " = ";
+                for (int row = 0; row < 7; ++row)
+                    source += "row == " + std::to_string(row) + "u ? " + name + std::to_string(row) + " : ";
+                source += std::string(name) + "7;\n";
+            }
+            // Match MLX vector SDPA's ordering. Convert FP16 cache elements to
+            // BF16 at the load instead of materializing the converted prefix.
+            source += R"METAL(
+                constexpr uint HD = 256, E = HD / 32;
+                constant ulong *info = params + 1 + row * 5;
+                const uint count = uint(info[0]), kv_head = head / 12;
+                const uint rows = uint(params[0]);
+                query += (head * rows + row) * HD + lane * E;
+                key += kv_head * info[1] + simdgroup * info[2] + lane * E;
+                value += kv_head * info[3] + simdgroup * info[4] + lane * E;
+                output += (row * 24 + head) * HD + simdgroup * E;
+                float q[E], k[E], sums[E];
+                for (uint i = 0; i < E; ++i) {
+                    q[i] = float(query[i]) * (1.0f / 16.0f);
+                    sums[i] = 0.f;
+                }
+                float maximum = -3.402823466e+38f, total = 0.f;
+                for (uint i = simdgroup; i < count; i += 32) {
+                    for (uint j = 0; j < E; ++j) k[j] = float(bfloat(float(key[j])));
+                    float score = 0.f;
+                    for (uint j = 0; j < E; ++j) score += q[j] * k[j];
+                    score = simd_sum(score);
+                    const float next = max(maximum, score);
+                    const float rescale = fast::exp(maximum - next), weight = fast::exp(score - next);
+                    maximum = next;
+                    total = total * rescale + weight;
+                    for (uint j = 0; j < E; ++j)
+                        sums[j] = sums[j] * rescale + weight * float(bfloat(float(value[j])));
+                    key += 32 * info[2];
+                    value += 32 * info[4];
+                }
+                threadgroup float maxima[32], totals[32];
+                constexpr uint Pitch = 33, Pack = 4;
+                threadgroup float partials[Pack][32 * Pitch];
+                if (lane == 0) {
+                    maxima[simdgroup] = maximum;
+                    totals[simdgroup] = total;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maximum = maxima[lane];
+                const float scale = fast::exp(maximum - simd_max(maximum));
+                total = simd_sum(totals[lane] * scale);
+                // Transpose the partials in groups of four to share the
+                // barriers while keeping the per-feature reduction order.
+                for (uint base = 0; base < E; base += Pack) {
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j)
+                        partials[j][lane * Pitch + simdgroup] = sums[base + j];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j) {
+                        const float sum = simd_sum(partials[j][simdgroup * Pitch + lane] * scale);
+                        sums[base + j] = total == 0.f ? sum : sum / total;
+                    }
+                    if (base + Pack < E) threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            )METAL";
+            if (gate_) source += R"METAL(
+                if (lane < E) {
+                    float reduced = 0.f;
+#pragma unroll
+                    for (uint j = 0; j < E; ++j)
+                        if (lane == j) reduced = sums[j];
+                    const float z = float(gate[(row * 24 + head) * HD + simdgroup * E + lane]);
+                    const float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+                    const float probability = z < 0.0f ? tail : 1.0f - tail;
+                    output[lane] = bfloat(float(bfloat(reduced)) * probability);
+                }
+            )METAL";
+            else source += "if (lane == 0) for (uint j = 0; j < E; ++j) output[j] = bfloat(sums[j]);\n";
+            source += "}\n";
+            return source;
+        });
+        return device.get_kernel(name, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA dense decode batch requires Metal");
+    }
+
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(prepared_kernel());
+        encoder.set_input_array(inputs.front(), 0);
+        encoder.set_output_array(output, 1);
+        const int rows = output.shape(1);
+        std::array<std::uint64_t, 1 + 5 * 8> params{};
+        params[0] = rows;
+        for (int row = 0; row < 8; ++row) {
+            const int index = std::min(row, rows - 1) * 2 + 1;
+            const auto& key = inputs[index];
+            const auto& value = inputs[index + 1];
+            encoder.set_input_array(key, 3 + row * 2);
+            encoder.set_input_array(value, 4 + row * 2);
+            const int offset = 1 + row * 5;
+            params[offset] = key.shape(2);
+            params[offset+1] = key.strides(1);
+            params[offset+2] = key.strides(2);
+            params[offset+3] = value.strides(1);
+            params[offset+4] = value.strides(2);
+        }
+        encoder.set_bytes(params, 2);
+        if (gate_) encoder.set_input_array(inputs.back(), 19);
+        encoder.dispatch_threadgroups(MTL::Size(24, rows, 1), MTL::Size(1024, 1, 1));
+    }
+private:
+    bool gate_;
+};
+
+class QsaJoinHalfHistory final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    explicit QsaJoinHalfHistory(mlx::core::Stream stream) : Primitive(stream) {}
+    std::string preparation_key() const override { return "mfq_qsa_join_half_history"; }
+    const char* name() const override { return "QsaJoinHalfHistory"; }
+    void prepare_gpu() override { (void)kernel(); }
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA half-history join requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel());
+        std::array<std::uint64_t, 10> params{
+            std::uint64_t(inputs[0].shape(2)), std::uint64_t(output.shape(2))};
+        for (unsigned i = 0; i < inputs.size(); ++i) {
+            encoder.set_input_array(inputs[i], i);
+            params[2 + i * 2] = inputs[i].strides(1);
+            params[3 + i * 2] = inputs[i].strides(2);
+        }
+        encoder.set_output_array(output, 4);
+        encoder.set_bytes(params, 5);
+        encoder.dispatch_threads(MTL::Size(output.size() / 8, 1, 1), MTL::Size(256, 1, 1));
+    }
+private:
+    MTL::ComputePipelineState* kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [] {
+            return std::string(R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void mfq_qsa_join_half_history(
+    device const half* history_key [[buffer(0)]], device const half* history_value [[buffer(1)]],
+    device const half* proposal_key [[buffer(2)]], device const half* proposal_value [[buffer(3)]],
+    device bfloat* output [[buffer(4)]], constant ulong* params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint Chunks = 32;
+    const uint rows = uint(params[1]), prefix = uint(params[0]);
+    const uint column = tid % Chunks * 8, row = tid / Chunks % rows;
+    const uint head = tid / (Chunks * rows) % 2, part = tid / (Chunks * rows * 2);
+    const bool proposal = row >= prefix;
+    const uint field = part + 2 * uint(proposal);
+    device const half* input = part
+        ? (proposal ? proposal_value : history_value)
+        : (proposal ? proposal_key : history_key);
+    const ulong index = head * params[2 + 2 * field] +
+        (proposal ? row - prefix : row) * params[3 + 2 * field] + column;
+#pragma unroll
+    for (uint i = 0; i < 8; ++i) output[ulong(tid) * 8 + i] = bfloat(float(input[index + i]));
+}
+)METAL");
+        });
+        return device.get_kernel(name, library);
+    }
+};
+
 class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     QsaOutputGatePrimitive(mlx::core::Stream stream, std::array<mlx::core::Dtype, 3> types,
@@ -2482,7 +2691,7 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
         rotary_dimension > std::min(head_dimension, index_dimension) ||
         !std::isfinite(rope_theta) || rope_theta <= 0.0f ||
         !std::isfinite(eps) || eps <= 0.0f ||
-        rows < 1 || rows > 8 ||
+        rows < 1 ||
         query_gate.shape() != Shape{1, rows, query_heads * (separate_gate ? 1 : 2) * head_dimension} ||
         key.shape() != Shape{1, rows, key_heads * head_dimension} ||
         index_query_key.shape() !=
@@ -2626,6 +2835,60 @@ array qwen4_qsa_select_blocks(
         qsa_head_scores(query, pooled_keys), query_offset, block_size);
 }
 
+array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,
+    const std::vector<array>& values, const array* gate) {
+    const int rows = static_cast<int>(keys.size());
+    if (rows < 2 || rows > 8 || keys.size() != values.size() ||
+        query.dtype() != mlx::core::bfloat16 || query.shape() != Shape{1, 24, rows, 256} ||
+        (gate && (gate->dtype() != mlx::core::bfloat16 || gate->shape() != Shape{1, rows, 24 * 256})))
+        throw std::invalid_argument("invalid grouped QSA decode query");
+    std::vector<array> inputs{mlx::core::contiguous(query)};
+    inputs.reserve(1 + 2 * rows + int(gate != nullptr));
+    const auto with_contiguous_features = [](const array& input) {
+        return input.strides(3) == 1 && input.strides(1) >= 0 && input.strides(2) >= 0
+            ? input : mlx::core::contiguous(input);
+    };
+    for (int row = 0; row < rows; ++row) {
+        const auto& key = keys[row];
+        const auto& value = values[row];
+        if (key.ndim() != 4 || key.shape(0) != 1 || key.shape(1) != 2 || key.shape(2) <= 0 ||
+            key.shape(2) > kQsaGroupedDecodeMaxKeys || key.shape(3) != 256 ||
+            key.shape() != value.shape() || key.dtype() != mlx::core::float16 || value.dtype() != mlx::core::float16)
+            throw std::invalid_argument("invalid grouped QSA decode KV state");
+        inputs.push_back(with_contiguous_features(key));
+        inputs.push_back(with_contiguous_features(value));
+    }
+    if (gate) inputs.push_back(mlx::core::contiguous(*gate));
+    const auto shape = gate ? Shape{1, rows, 24 * 256} : Shape{1, rows, 24, 256};
+    return array(shape, mlx::core::bfloat16,
+        std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu), gate != nullptr),
+        std::move(inputs));
+}
+
+std::pair<mlx::core::array, mlx::core::array> qwen4_qsa_join_half_history(
+    const mlx::core::array& history_key, const mlx::core::array& history_value,
+    const mlx::core::array& proposal_key, const mlx::core::array& proposal_value) {
+    const auto supported = [](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == 2 &&
+            value.shape(2) > 0 && value.shape(3) == 256 && value.dtype() == mlx::core::float16 &&
+            value.strides(1) >= 0 && value.strides(2) >= 0 && value.strides(3) == 1;
+    };
+    if (!supported(history_key) || !supported(history_value) || !supported(proposal_key) ||
+        !supported(proposal_value) || history_key.shape() != history_value.shape() ||
+        proposal_key.shape() != proposal_value.shape())
+        throw std::invalid_argument("invalid QSA half-history join");
+    const auto length = std::int64_t(history_key.shape(2)) + proposal_key.shape(2);
+    if (length > std::numeric_limits<int>::max() / 128)
+        throw std::invalid_argument("QSA history exceeds Metal dispatch size");
+    const int rows = static_cast<int>(length);
+    // The attention kernel consumes two views of the joined BF16 allocation.
+    auto joined = array(Shape{2, 2, rows, 256}, mlx::core::bfloat16,
+        std::make_shared<QsaJoinHalfHistory>(mlx::core::default_stream(mlx::core::Device::gpu)),
+        {history_key, history_value, proposal_key, proposal_value});
+    return {mlx::core::slice(joined, {0, 0, 0, 0}, {1, 2, rows, 256}),
+        mlx::core::slice(joined, {1, 0, 0, 0}, {2, 2, rows, 256})};
+}
+
 array qwen4_dense_gqa_attention(
     const array& query,
     const array& key,
@@ -2662,6 +2925,141 @@ array qwen4_dense_gqa_attention(
         query, key, value, false,
         1.0f / std::sqrt(static_cast<float>(query.shape(3))), mask);
     return mlx::core::transpose(output, {0, 2, 1, 3});
+}
+
+namespace {
+class QsaTreeCacheLayout final : public mlx::core::UnaryPrimitive {
+public:
+    QsaTreeCacheLayout(mlx::core::Stream stream, std::vector<std::uint32_t> geometry)
+        : UnaryPrimitive(stream), geometry_(std::move(geometry)) {}
+    const char* name() const override { return "QsaTreeCacheLayout"; }
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("QSA tree cache layout requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, array& output) override { fill(inputs, output); }
+
+private:
+    void fill(const std::vector<array>& inputs, array& output) const {
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        // Lazy cache views only expose their physical strides after evaluation.
+        auto* values = output.data<std::uint32_t>();
+        std::copy(geometry_.begin(), geometry_.end(), values);
+        constexpr std::size_t Words = 19;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& kv = inputs[i];
+            if (kv.strides(1) < 0 || kv.strides(2) < 0 || kv.strides(3) != 1)
+                throw std::invalid_argument("invalid QSA tree cache stride");
+            const std::size_t offset = (i / 4) * Words + 3 + 2 * (i % 4);
+            values[offset] = static_cast<std::uint32_t>(kv.strides(1));
+            values[offset + 1] = static_cast<std::uint32_t>(kv.strides(2));
+        }
+    }
+    std::vector<std::uint32_t> geometry_;
+};
+}
+
+array qwen4_qsa_batched_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    using namespace mlx::core;
+    constexpr int Heads = 24, KvHeads = 2, Dim = 256, Words = 19;
+    const int width = static_cast<int>(lanes.size()), total = query.shape(2);
+    if (width < 2 || width > 4 || query.shape() != Shape{1, Heads, total, Dim} || query.dtype() != bfloat16)
+        throw std::invalid_argument("invalid batched QSA verification query");
+    const auto valid_cache = [&](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == KvHeads && value.shape(2) > 0 &&
+            value.shape(3) == Dim && value.dtype() == float16;
+    };
+    int first = 0, max_rows = 0, max_keys = 0;
+    std::vector<std::uint32_t> geometry;
+    std::vector<array> backing;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size()), history = lane.history_keys.shape(2);
+        if (!valid_cache(lane.history_keys) || !valid_cache(lane.history_values) ||
+            !valid_cache(lane.tree_keys) || !valid_cache(lane.tree_values) ||
+            lane.history_keys.shape() != lane.history_values.shape() || lane.tree_keys.shape() != lane.tree_values.shape() ||
+            lane.tree_keys.shape(2) != rows || rows < 3 || rows > 8 || history + rows > kQsaGroupedDecodeMaxKeys)
+            throw std::invalid_argument("invalid batched QSA verification cache");
+        geometry.insert(geometry.end(), {std::uint32_t(first), std::uint32_t(rows), std::uint32_t(history)});
+        geometry.insert(geometry.end(), 8, 0);
+        std::array<std::uint32_t, 8> mask{};
+        for (int row = 0; row < rows; ++row) {
+            const int parent=lane.parents[row];
+            if (parent < (row == 0 ? -1 : 0) || parent >= row)
+                throw std::invalid_argument("invalid QSA parent");
+            mask[row] = (1u << row) | (parent < 0 ? 0u : mask[parent]);
+        }
+        geometry.insert(geometry.end(),mask.begin(),mask.end());
+        backing.insert(backing.end(),{lane.history_keys, lane.history_values, lane.tree_keys, lane.tree_values});
+        first += rows;
+        max_rows = std::max(max_rows, rows);
+        max_keys = std::max(max_keys, history + rows);
+    }
+    if (first != total) throw std::invalid_argument("invalid QSA verification layout");
+    const auto layout = array(Shape{width, Words}, uint32,
+        std::make_shared<QsaTreeCacheLayout>(default_stream(Device::gpu), std::move(geometry)), std::move(backing));
+    static const auto pack = cached_metal_kernel("tylo_qsa_pack_for_mlx_attention",
+        {"query","layout","sizes","hk0","hk1","hk2","hk3","hv0","hv1","hv2","hv3",
+        "pk0","pk1","pk2","pk3","pv0","pv1","pv2","pv3"}, {"q","k","v","mask"}, R"METAL(
+constexpr uint D=256u, QH=24u, KH=2u, P=19u;
+const uint2 g=thread_position_in_grid.xy;
+const uint i=g.x, lane=g.y, Q=sizes[0], K=sizes[1];
+const device uint* p=layout+lane*P;
+const uint anchor=p[0], rows=p[1], history=p[2];
+if (i<QH*Q*D) {
+    const uint head=i/(Q*D), row=(i/D)%Q, dim=i%D;
+    const long from=long(head)*query_strides[1]+long(anchor+row)*query_strides[2]+long(dim)*query_strides[3];
+    q[lane*QH*Q*D+i]=row<rows?query[from]:bfloat(0);
+}
+if (i<KH*K*D) {
+    const uint head=i/(K*D), token=(i/D)%K, dim=i%D;
+    bfloat key=bfloat(0), value=bfloat(0);
+    if (token<history) {
+        const device half* hk=lane==0?hk0:lane==1?hk1:lane==2?hk2:hk3;
+        const device half* hv=lane==0?hv0:lane==1?hv1:lane==2?hv2:hv3;
+        key=bfloat(float(hk[head*p[3]+token*p[4]+dim]));
+        value=bfloat(float(hv[head*p[5]+token*p[6]+dim]));
+    } else if (token<history+rows) {
+        const device half* pk=lane==0?pk0:lane==1?pk1:lane==2?pk2:pk3;
+        const device half* pv=lane==0?pv0:lane==1?pv1:lane==2?pv2:pv3;
+        key=bfloat(float(pk[head*p[7]+(token-history)*p[8]+dim]));
+        value=bfloat(float(pv[head*p[9]+(token-history)*p[10]+dim]));
+    }
+    k[lane*KH*K*D+i]=key;
+    v[lane*KH*K*D+i]=value;
+}
+if (i<Q*K) {
+    const uint row=i/K, token=i%K;
+    mask[lane*Q*K+i]=token<history || (row<rows && token<history+rows && ((p[11u+row]>>(token-history))&1u));
+}
+)METAL", "", false);
+    std::vector<array> inputs{query, layout, array({std::uint32_t(max_rows), std::uint32_t(max_keys)})};
+    for (const auto member : {&MlxQsaTreeAttentionLane::history_keys, &MlxQsaTreeAttentionLane::history_values,
+            &MlxQsaTreeAttentionLane::tree_keys, &MlxQsaTreeAttentionLane::tree_values}) {
+        for (int lane = 0; lane < 4; ++lane)
+            inputs.push_back(lanes[lane < width ? lane : 0].*member);
+    }
+    const int columns = std::max(Heads * max_rows, KvHeads * max_keys) * Dim;
+    const auto packed = pack(inputs, {{width, Heads, max_rows, Dim}, {width, KvHeads, max_keys, Dim},
+        {width, KvHeads, max_keys, Dim}, {width, 1, max_rows, max_keys}},
+        {bfloat16, bfloat16, bfloat16, bool_}, {columns, width, 1}, {256, 1, 1}, {}, std::nullopt, false, {});
+    const auto attended = fast::scaled_dot_product_attention(packed[0], packed[1], packed[2], 1.f / 16.f, "", packed[3]);
+    std::vector<array> rows;
+    for (int lane = 0; lane < width; ++lane) {
+        const int count = static_cast<int>(lanes[lane].parents.size());
+        rows.push_back(transpose(slice(attended, {lane, 0, 0, 0}, {lane + 1, Heads, count, Dim}), {0, 2, 1, 3}));
+    }
+    return concatenate(rows, 1);
+}
+
+void qwen4_qsa_prepare_batched_tree() {
+    using namespace mlx::core;
+    if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
+        const auto history = zeros({1, 2, 320, 256}, float16);
+        const auto kv = zeros({1, 2, 8, 256}, float16);
+        const std::array parents{-1, 0, 1, 0, 3, 2, 2, 4};
+        const MlxQsaTreeAttentionLane lane{history, history, kv, kv, parents};
+        const std::array lanes{lane, lane, lane, lane};
+        preparation->add(qwen4_qsa_batched_tree_attention(zeros({1, 24, 32, 256}, bfloat16), lanes));
+    });
 }
 
 } // namespace mfq::metal

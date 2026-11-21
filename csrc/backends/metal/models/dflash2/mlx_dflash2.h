@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 #include <mlx/mlx.h>
@@ -43,6 +44,18 @@ struct MlxDFlash2Proposal {
     mlx::core::array confidence;
 };
 
+struct MlxDFlash2TreeInput {
+    int depth, rows;
+    std::vector<std::int32_t> lookup;
+    std::vector<std::array<float, 4>> lookup_rates;
+};
+
+struct MlxDFlash2Tree {
+    std::vector<std::int64_t> tokens;
+    std::vector<int> parents;
+    std::vector<float> reach;
+};
+
 struct MlxDFlash2GenerationStats {
     std::size_t cycles = 0, proposed = 0, verified = 0, accepted = 0;
     std::array<std::uint64_t, 8> depth_cycles{};
@@ -59,14 +72,32 @@ public:
     const MlxDFlash2Config& config() const noexcept;
     std::size_t weight_bytes() const noexcept;
     void track_weights() const;
-    void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head) const;
+    void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        bool tree_batch = false) const;
     void reset(MlxDFlash2Context& context) const;
     void append_context(MlxDFlash2Context& context, const mlx::core::array& target_hidden,
         int start_position) const;
+    struct ContextCommit {
+        MlxDFlash2Context* context;
+        mlx::core::array features;
+        int position;
+    };
+    void append_context_batch(std::span<const ContextCommit> commits) const;
     MlxDFlash2Proposal propose(const MlxDFlash2Context& context, int anchor,
         const mlx::core::array& embeddings,
         const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
         const std::function<void(std::string_view, const mlx::core::array&)>& trace = {}) const;
+    // Returns [lanes, max_depth] with only the requested prefix valid in each lane.
+    // With no explicit depths, returns a full proposal for every lane.
+    MlxDFlash2Proposal propose_batch(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const int> depths = {},
+        const std::function<void(std::string_view, const mlx::core::array&)>& trace = {}) const;
+    std::vector<MlxDFlash2Tree> propose_tree_batch(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const MlxDFlash2TreeInput> inputs) const;
     std::int32_t generate(MlxQwen4CausalLm& target,
         const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
         const std::function<bool(std::int64_t)>& callback = {},
@@ -87,6 +118,17 @@ public:
         MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7) const;
 
 private:
+    struct TreeProposals;
+    TreeProposals tree_proposals(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const MlxDFlash2TreeInput> inputs) const;
+    struct ProposalLattice;
+    ProposalLattice proposal_lattice(std::span<const MlxDFlash2Context* const> contexts,
+        std::span<const std::int32_t> anchors, const mlx::core::array& embeddings,
+        const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
+        std::span<const int> depths,
+        const std::function<void(std::string_view, const mlx::core::array&)>& trace) const;
     struct Impl;
     explicit MlxDFlash2(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
     std::shared_ptr<Impl> impl_;

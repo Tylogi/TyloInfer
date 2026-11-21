@@ -2,6 +2,7 @@
 #include "runtime/qsa_tq_cache.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_attention_ops.h"
 #include "kernels/qsa_tq.h"
 #include "studio/server/kernels/cuda/qwen4_exp.h"
 #include <algorithm>
@@ -14,6 +15,34 @@
 #include <memory>
 
 namespace tb=mfq_tensor_backend;
+void check_completed_index_pool() {
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    constexpr int pool=4,width=128;
+    auto input=tb::arange(pool*width,options).reshape({1,pool,width})*.001f;
+    auto weight=tb::ones({width},options),frequency=tb::full({width/2},.001,options);
+    auto axes=tb::arange(width/2,options.dtype(tb::kInt32)).remainder(3);
+    auto output=tb::empty({1,1,width},options),expected=tb::empty_like(output);
+    for(bool narrow:{false,true}) {
+        auto absolute=tb::arange(15,18,options.dtype(narrow?tb::kInt32:tb::kInt64)).reshape({3,1,1});
+        auto starts=absolute-(pool-1);
+        qsa_pool_rotary_cuda(input,weight,starts,frequency,axes,expected,pool,128,1e-6);
+        const auto reference=expected.cpu().contiguous();
+        for(int position:{4,5,6,7}) {
+            auto physical=tb::full({1},position,options.dtype(tb::kInt64));
+            output.fill_(0.);
+            qsa_pool_rotary_cuda(input,weight,absolute,frequency,axes,output,pool,128,1e-6,1.,physical);
+            const auto actual=output.cpu().contiguous();
+            const auto* x=actual.data_ptr<float>();
+            if(position%pool==pool-1) {
+                if(std::memcmp(actual.data_ptr(),reference.data_ptr(),reference.nbytes()))
+                    throw std::runtime_error("QSA complete index pooling changed rotary values");
+            } else if(std::any_of(x,x+width,[](float value){return value!=0.f;}))
+                throw std::runtime_error("QSA pooling published an incomplete index block");
+        }
+    }
+    std::cerr<<"QSA completed index pool parity PASS\n";
+}
+
 void check_affine8_pending() {
     namespace tq=tyloinfer::qsa;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
@@ -422,6 +451,8 @@ void check_batch_graph(int heads,int width,int bits,bool int32_positions=false) 
     };
     append(3,0,false);
     for(int i=0;i<48;++i) {
+        // Trim a partial block to a shorter tail and then to a block boundary.
+        if(i==2 || i==5){--position;cache.truncate(position);reference.truncate(position);}
         if(i==17){position-=5;cache.truncate(position);reference.truncate(position);}
         if(i==32){position=0;cache.reset();reference.reset();}
         append(i%8+1,i+1,true);
@@ -627,6 +658,7 @@ int main(int argc,char** argv)try {
         return 0;
     }
     check_affine8_pending();
+    check_completed_index_pool();
     check_attention_partitions();check_mass_observation();check_selected_blocks();check_packed_decode_windows();
     check_async_history();
     check(6,17);check(10,257);check(10,257,true,true);check(24,256,true,true);

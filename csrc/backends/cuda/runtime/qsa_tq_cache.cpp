@@ -236,6 +236,8 @@ struct QsaTqCache::Impl {
     tb::Tensor seed_k,seed_v,seed_index,seed_rotated_k,seed_rotated_v;
     tb::Tensor graph_destination,graph_archive,graph_archive_host;
     std::uint8_t* graph_archive_mapped=nullptr;
+    int64_t graph_archive_first=-1;
+    int graph_archive_count=0;
     std::shared_ptr<ImageBatch> graph_image;
     tb::Tensor canonical_slab;
     int64_t canonical_cycle=-1;
@@ -284,7 +286,6 @@ struct QsaTqCache::Impl {
     std::vector<std::shared_ptr<ImageBatch>> owners;
     std::vector<Retired> retired;
     std::vector<Upload> uploads;
-    tq::TqBlockView pending_view;
     std::mutex queue_mutex;std::vector<tq::BlockReplacement> queued;
     std::size_t resident_append_begin=0,resident_append_end=0;
     struct ResidentAppendScope {
@@ -426,6 +427,8 @@ struct QsaTqCache::Impl {
     }
     void ensure_descriptors() {
         if(views.defined())return;
+        // These tables remain live throughout decode, after prefill returns its workspace.
+        const ResidentAllocationScope resident;
         auto table=qsa_descriptor_table(capacity,sizeof(tq::TqBlockView),options,host_metadata);
         auto new_hits=tb::zeros({capacity},options.dtype(tb::kFloat32));
         ram->bind_descriptors(table);
@@ -872,8 +875,8 @@ struct QsaTqCache::Impl {
     }
     void publish_pending(const tb::Tensor& k,const tb::Tensor& v,int64_t id) {
         pending_k=k;pending_v=v;
-        pending_view={k.data_ptr<std::uint8_t>(),v.data_ptr<std::uint8_t>(),0,0};
-        check(cudaMemcpyAsync(views.data_ptr<std::uint8_t>()+id*sizeof(pending_view),&pending_view,sizeof(pending_view),cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
+        check(tq::tq_publish_contiguous_views({k.data_ptr<std::uint8_t>(),v.data_ptr<std::uint8_t>(),0,0},
+            views.data_ptr<tq::TqBlockView>()+id,int(k.nbytes()),1,mfq_current_cuda_stream()));
     }
     bool graph_host_boundary=false,graph_ssd_task=false;
     tb::Tensor stage_pending(const tb::Tensor& selected,int queries,int count,const tb::Tensor& positions) {
@@ -974,7 +977,7 @@ struct QsaTqCache::Impl {
     }
     tb::Tensor forward_pending_graph(const tb::Tensor& query,const tb::Tensor& key,const tb::Tensor& value,const tb::Tensor& iq,
         const tb::Tensor& raw,const tb::Tensor& positions,const tb::Tensor& gate,tb::Tensor output,
-        const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions) {
+        const QsaTqCache::Pool& pool,const tb::Tensor& absolute_positions,const QsaTqCache::CompletePool& complete_pool) {
         if(key.size(1)>1)return forward_pending_batch(query,key,value,iq,raw,positions,gate,std::move(output),pool,absolute_positions);
         if(!pending_graph || key.size(1)!=1)throw std::logic_error("QSA device graph was not prepared");
         const auto mark=[](const char* phase){if(auto* window=DecodeWindow::recording())window->mark_current(phase);};
@@ -1004,9 +1007,20 @@ struct QsaTqCache::Impl {
                 graph_destination_slots(),mfq_current_cuda_stream(),true));
             auto starts=absolute_positions.defined()?absolute_positions:positions;
             if(starts.dim()==1)starts=starts.reshape({1,1});
-            // All rotary axes share the cache position within this microblock.
-            starts=starts-positions.remainder(4);
-            auto pooled=pool(tail_storage_index,starts).to(tb::kFloat32).contiguous();
+            auto pooled=complete_pool?complete_pool(tail_storage_index,starts,positions):tb::Tensor{};
+            if(pooled.defined() && std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH")) {
+                static thread_local bool reported=false;
+                if(!reported) {
+                    reported=true;
+                    std::fprintf(stderr,"native_qsa_indexer_pool_complete actual_match=1 position_offset_in_kernel=1\n");
+                }
+            }
+            if(!pooled.defined()) {
+                // All rotary axes share the cache position within this microblock.
+                starts=starts-positions.remainder(4);
+                pooled=pool(tail_storage_index,starts);
+            }
+            pooled=pooled.to(tb::kFloat32).contiguous();
             check(tq::indexer_affine16_append(pooled.data_ptr<float>(),device_index.codes,device_index.scales,
                 device_index.zero,positions.data_ptr<int64_t>(),index_width,mfq_current_cuda_stream(),true));
             if(ram)check(tq::tq_archive_indexer(device_index.codes,device_index.scales,device_index.zero,
@@ -1530,24 +1544,31 @@ struct QsaTqCache::Impl {
         cancel_batch_warmup();
         if(keep<0 || keep>tokens)throw std::invalid_argument("invalid adaptive QSA truncation");
         if(keep==tokens)return;
+        const auto complete=keep/4,remainder=keep%4;
+        const bool local_tail=keep && ram && !ssd_cache && pending_graph && complete==tokens/4 &&
+            (!remainder || tail_k.defined());
+        const bool archived_tail=remainder && complete<tokens/4 && complete>=graph_archive_first &&
+            complete<graph_archive_first+graph_archive_count;
         if(!keep && host_index_calls) {
             std::fprintf(stderr,"native_qsa_cpu_indexer calls=%llu score_ms=%.3f transfer_ms=%.3f\n",
                 static_cast<unsigned long long>(host_index_calls),host_index_ms,host_index_transfer_ms);
             host_index_calls=0;host_index_ms=host_index_transfer_ms=0;
         }
-        if(keep || !ram) {
+        if(!local_tail && (keep || !ram)) {
             finish_history();
             if(ram)ram->wait();else cache->wait();
             drain();
-        } else if(history_transfer.pending) {
+        } else if(!keep && history_transfer.pending) {
             // Retire the transfer without scheduling work on discarded KV.
             check(cudaEventSynchronize(history_transfer.done));
             history_transfer.pending=false;
         }
-        // Empty reset only retires owners and enqueues zeroes on this stream.
-        // Reconstruction retains the existing completion barrier.
-        if(keep)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
-        const auto complete=keep/4,remainder=keep%4;
+        // Trimming within the pending block touches only stream-ordered
+        // buffers and leaves the published archive and its readers intact.
+        // The completed graph already published this archive. Rebuilding its
+        // tail only reads the graph's own image and writes stream-ordered KV.
+        // Waiting here would serialize rollback with the preceding layer.
+        if(keep && !local_tail && !archived_tail)check(cudaStreamSynchronize(mfq_current_cuda_stream()));
         if(remainder && keep==append_input_position && append_k.defined() && append_v.defined() && append_index.defined()) {
             // The input stage retains the original partial block even if the
             // append failed before writing its completed archive entry.
@@ -1558,6 +1579,25 @@ struct QsaTqCache::Impl {
             tail_index=tail_storage_index.narrow(1,0,remainder);
         }else if(remainder && keep/4==tokens/4 && tail_k.defined()) {
             tail_k=tail_k.narrow(1,0,remainder).contiguous();tail_v=tail_v.narrow(1,0,remainder).contiguous();tail_index=tail_index.narrow(1,0,remainder).contiguous();
+        }else if(archived_tail) {
+            const auto stream=mfq_current_cuda_stream();
+            const auto* view=graph_destination.data_ptr<tq::TqBlockView>()+complete%graph_destination_slots();
+            const auto* archive_data=graph_archive_mapped?graph_archive_mapped:graph_archive.data_ptr<std::uint8_t>();
+            const auto stride=2*canonical_bytes+index_archive_bytes();
+            const auto* raw=archive_data+(complete-graph_archive_first)*stride+2*canonical_bytes;
+            const tq::RestoreTailIndex index{reinterpret_cast<const std::uint16_t*>(raw),
+                tail_storage_index.data_ptr<float>(),int(remainder)*index_width};
+            check(tq::tq_decode_modes(view,pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),
+                relative.data_ptr<std::uint16_t>(),1,kv_heads,padded,stream));
+            check(tq::tq_restore_modes(pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),
+                ks.data_ptr<float>(),vs.data_ptr<float>(),tail_storage_k.data_ptr<float>(),tail_storage_v.data_ptr<float>(),
+                1,kv_heads,width,padded,stream,&index));
+            tail_k=tail_storage_k.narrow(1,0,remainder);tail_v=tail_storage_v.narrow(1,0,remainder);
+            tail_index=tail_storage_index.narrow(1,0,remainder);
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true))std::fprintf(stderr,"native_qsa_ram_rollback actual_match=1 graph_archive_reuse=1\n");
+            }
         }else if(remainder) {
             const auto image=ram?ram->reconstruction_image(complete):cache->reconstruction_image(complete);
             std::vector<std::uint8_t> data=image.key;data.insert(data.end(),image.value.begin(),image.value.end());
@@ -1575,16 +1615,23 @@ struct QsaTqCache::Impl {
             if(index->size()!=index_archive_bytes())throw std::runtime_error("QSA raw index archive length changed");
             std::memcpy(host.data_ptr(),index->data(),8*index_width);tail_index=host.to(options.dtype(tb::kFloat32)).narrow(1,0,remainder).contiguous();
         }else {tail_k={};tail_v={};tail_index={};}
-        if(ram)ram->truncate(complete);else cache->truncate(complete);
-        index_archive.resize(complete);
-        {std::lock_guard<std::mutex> lock(queue_mutex);queued.clear();resident_append_begin=resident_append_end=0;}
-        for(std::size_t i=std::size_t(complete);i<owners.size();++i)owners[i].reset();
+        if(!local_tail) {
+            graph_archive_count=0;
+            if(ram)ram->truncate(complete);else cache->truncate(complete);
+            index_archive.resize(complete);
+            {std::lock_guard<std::mutex> lock(queue_mutex);queued.clear();resident_append_begin=resident_append_end=0;}
+            for(std::size_t i=std::size_t(complete);i<owners.size();++i)owners[i].reset();
+        }
         tokens=keep;append_input_position=-1;hits.zero_();if(mass.defined())mass.zero_();
         if(!keep){canonical_slab={};graph_image.reset();}
         if(remainder) {
             check(tq::tq_prepare_modes(tail_k.data_ptr(),tail_v.data_ptr(),false,ks.data_ptr<float>(),vs.data_ptr<float>(),pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),
                 pending_k.data_ptr<std::uint16_t>(),pending_v.data_ptr<std::uint16_t>(),int(remainder),kv_heads,width,padded,mfq_current_cuda_stream(),
                 rotated_tail_k.data_ptr<float>(),rotated_tail_v.data_ptr<float>()));publish_pending(pending_k,pending_v,complete);
+        }
+        if(const auto* trace=local_tail?std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH"):nullptr;trace && trace[0]=='1') {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true))std::fprintf(stderr,"native_qsa_ram_rollback actual_match=1 pending_block_only=1\n");
         }
     }
 };
@@ -1870,6 +1917,8 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
         else impl_->ram->prepare(int(queries),true,!QsaRamDecodeBudgetScope::defer_shared_cache(impl_->device));
     }
     impl_->graph_complete=impl_->graph_blocks!=0;
+    // A warmup can overwrite the publication buffer before it commits tokens.
+    if(impl_->graph_complete)impl_->graph_archive_count=0;
     if(impl_->pending_graph) {
         ResidentAllocationScope resident;
         impl_->allocate_indexer();
@@ -1963,7 +2012,14 @@ void QsaTqCache::advance_graph(int64_t tokens){
     if(tokens!=impl_->graph_queries || (tokens==1?impl_->graph_complete!=(impl_->tokens%4==3):impl_->graph_phase!=impl_->tokens%4))
         throw std::logic_error("QSA graph replay changed block phase");
     const auto start=impl_->tokens;
-    if(impl_->graph_complete){if(tokens==1)impl_->append_graph_image();else impl_->append_graph_batch();}
+    if(impl_->graph_complete) {
+        if(tokens==1)impl_->append_graph_image();else impl_->append_graph_batch();
+        // Fixed Affine8 and FP16 store the graph image without requantization.
+        if(impl_->ram && !impl_->ssd_cache && !impl_->adaptive_precision && (impl_->ram_bits==8 || impl_->ram_bits==16)) {
+            impl_->graph_archive_first=start/4;
+            impl_->graph_archive_count=impl_->graph_blocks;
+        }
+    }
     impl_->batch_prepared=false;
     impl_->tokens+=tokens;const auto remainder=impl_->tokens%4;
     impl_->tail_k=remainder?impl_->tail_storage_k.narrow(1,0,remainder):Tensor{};
@@ -1972,8 +2028,8 @@ void QsaTqCache::advance_graph(int64_t tokens){
     impl_->update_history(start);
 }
 QsaTqCache::Tensor QsaTqCache::forward_pending_graph(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
-    const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute){
-    return impl_->forward_pending_graph(q,k,v,iq,raw,positions,gate,std::move(output),pool,absolute);}
+    const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute,const CompletePool& complete_pool){
+    return impl_->forward_pending_graph(q,k,v,iq,raw,positions,gate,std::move(output),pool,absolute,complete_pool);}
 QsaTqCache::Tensor QsaTqCache::forward(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
     const Tensor& positions,const Pool& pool,bool history_only,const Tensor& gate,Tensor output,bool fp16_math,CudaProfiler* profiler) {
     return impl_->forward(q,k,v,iq,raw,positions,pool,history_only,gate,std::move(output),fp16_math,profiler);

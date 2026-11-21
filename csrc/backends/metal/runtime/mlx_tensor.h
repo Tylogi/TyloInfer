@@ -42,16 +42,49 @@ mlx::core::array load_dense_array(
     const std::string& dtype,
     std::span<const std::uint8_t> blob);
 
+class MlxChannelFp8Weight {
+public:
+    static MlxChannelFp8Weight from_blob(std::span<const std::uint8_t> blob);
+
+    int input_size() const noexcept { return values_.shape(1) * 4; }
+    int output_size() const noexcept { return values_.shape(0); }
+    struct Activation {
+        mlx::core::array values;
+        mlx::core::array scales;
+    };
+    bool dynamic_activations() const noexcept { return dynamic_activations_; }
+    static Activation quantize(const mlx::core::array& input);
+    mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul(const mlx::core::array& input, const Activation& activation) const;
+    std::optional<mlx::core::array> fused_swiglu(
+        const MlxChannelFp8Weight& up, const mlx::core::array& input) const;
+    mlx::core::array embedding(const mlx::core::array& rows, mlx::core::Dtype dtype) const;
+
+private:
+    mlx::core::array product(const mlx::core::array& source) const;
+    MlxChannelFp8Weight(mlx::core::array values, mlx::core::array unit_scales,
+        mlx::core::array channel_scales, bool dynamic_activations);
+
+    mlx::core::array values_;
+    mlx::core::array unit_scales_;
+    mlx::core::array channel_scales_;
+    bool dynamic_activations_;
+};
+
 class MlxLinear {
 public:
+    enum class GgufAccess { general, projection_only, row_lookup };
+
     static MlxLinear load(
         const MfqContainer& model,
-        const std::string& name);
+        const std::string& name,
+        GgufAccess gguf_access = GgufAccess::general);
 
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(MlxTqWeight weight);
     explicit MlxLinear(MlxGgufWeight weight);
     explicit MlxLinear(MlxAffineWeight weight);
+    explicit MlxLinear(MlxChannelFp8Weight weight);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     explicit MlxLinear(MlxNintWeight weight);
     explicit MlxLinear(MlxNint8ZeroWeight weight);
@@ -114,6 +147,7 @@ public:
     const MlxTqWeight* tq_weight_ref() const noexcept;
     const MlxAffineWeight* affine_weight_ref() const noexcept;
     const MlxGgufWeight* gguf_weight_ref() const noexcept;
+    const MlxChannelFp8Weight* channel_fp8_weight_ref() const noexcept;
     void prepare_grouped_gguf();
     const mlx::core::array* dense_weight_ref() const noexcept;
 
@@ -132,6 +166,7 @@ private:
         MlxTqWeight,
         MlxGgufWeight,
         MlxAffineWeight,
+        MlxChannelFp8Weight,
         mlx::core::array> weight_;
     int input_size_ = 0;
     int output_size_ = 0;

@@ -257,6 +257,35 @@ int integer_pooling_cases() {
     }
     return cases;
 }
+void pack_at_case(bool half_input,bool wide_positions) {
+    constexpr int width=131,stride=143,capacity=12,rows=3,record=width+2;
+    const std::vector<int32_t> positions{7,1,9};
+    const std::vector<int64_t> positions64(positions.begin(),positions.end());
+    std::vector<float> source(rows*stride),packed_input(rows*width);
+    std::vector<half> half_source(source.size());
+    for(int row=0;row<rows;++row)for(int col=0;col<stride;++col) {
+        const auto value=std::sin(float(row*stride+col)*.32f)*float(row+1)*.007f;
+        source[row*stride+col]=value;
+        half_source[row*stride+col]=__float2half_rn(value);
+        if(col<width)packed_input[row*width+col]=half_input?__half2float(half_source[row*stride+col]):value;
+    }
+    const auto input_bytes=source.size()*(half_input?2:4);
+    const auto position_bytes=positions.size()*(wide_positions?8:4);
+    Buffer input(input_bytes),indices(position_bytes),compact(packed_input.size()*4);
+    Buffer output(capacity*record*2),expected(rows*record*2);
+    check(cudaMemcpy(input.data,half_input?static_cast<const void*>(half_source.data()):source.data(),input_bytes,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(indices.data,wide_positions?static_cast<const void*>(positions64.data()):positions.data(),position_bytes,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(compact.data,packed_input.data(),packed_input.size()*4,cudaMemcpyHostToDevice));
+    check(cudaMemset(output.data,0,capacity*record*2));
+    check(tyloinfer::qsa::indexer_affine16_pack(compact.as<float>(),expected.as<int16_t>(),rows,width,nullptr));
+    check(tyloinfer::qsa::indexer_affine16_pack_at(input.data,half_input,stride,output.as<int16_t>(),indices.data,
+        wide_positions,rows,width,capacity,nullptr));
+    std::vector<int16_t> actual(capacity*record),encoded(rows*record),reference(capacity*record);
+    check(cudaMemcpy(actual.data(),output.data,actual.size()*2,cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(encoded.data(),expected.data,encoded.size()*2,cudaMemcpyDeviceToHost));
+    for(int row=0;row<rows;++row)std::copy_n(encoded.begin()+row*record,record,reference.begin()+positions[row]*record);
+    if(actual!=reference)throw std::runtime_error("Direct Indexer append differs from packed and scattered records");
+}
 } // namespace
 int main()try {
     int devices=0;const auto available=cudaGetDeviceCount(&devices);
@@ -281,6 +310,7 @@ int main()try {
     cases+=paired_layout_cases();
     cases+=integer_workspace_cases();
     cases+=integer_pooling_cases();
+    for(const bool half_input:{false,true})for(const bool wide_positions:{false,true})pack_at_case(half_input,wide_positions);
     graph_case();
     graph_case(true);
     std::cout<<"QSA affine INT16 Indexer: "<<cases<<" CPU-reference cases, wide rows and 3 graph replays PASS\n";

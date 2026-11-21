@@ -1,10 +1,10 @@
-constant uint tinfer_gu_gr [[function_constant(0)]];
 constant uint tinfer_gu_gs [[function_constant(1)]];
 constant uint tinfer_gu_ur [[function_constant(2)]];
 constant uint tinfer_gu_us [[function_constant(3)]];
 
 inline uint4 moe_native_gu_formats(constant MoeGgufGateUpParams& p) {
-    return uint4(is_function_constant_defined(tinfer_gu_gr) ? tinfer_gu_gr : p.gate_routed_format,
+    return uint4(is_function_constant_defined(moe_gate_routed_format) ?
+        moe_gate_routed_format : p.gate_routed_format,
         is_function_constant_defined(tinfer_gu_gs) ? tinfer_gu_gs : p.gate_shared_format,
         is_function_constant_defined(tinfer_gu_ur) ? tinfer_gu_ur : p.up_routed_format,
         is_function_constant_defined(tinfer_gu_us) ? tinfer_gu_us : p.up_shared_format);

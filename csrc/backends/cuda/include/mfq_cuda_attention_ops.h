@@ -34,12 +34,14 @@ void qsa_pool_rotary_cache_cuda(
     const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps,
     double attention_factor = 1.0);
 
-// Compact consecutive pools with their absolute RoPE start positions.
+// Compact consecutive pools with their absolute RoPE start positions. With a
+// completion position, the input is one pool and positions are its last token.
 void qsa_pool_rotary_cuda(
     const mfq_tensor_backend::Tensor& index, const mfq_tensor_backend::Tensor& weight,
     const mfq_tensor_backend::Tensor& positions, const mfq_tensor_backend::Tensor& frequencies,
     const mfq_tensor_backend::Tensor& axes, const mfq_tensor_backend::Tensor& output,
-    int64_t pool, int64_t rotary_maximum, double eps,double attention_factor = 1.0);
+    int64_t pool, int64_t rotary_maximum, double eps,double attention_factor = 1.0,
+    const mfq_tensor_backend::Tensor& completion_position = {});
 
 mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor positions,
@@ -88,6 +90,8 @@ mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
 mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor mfq_attention_mma256_prefix_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor mfq_attention_mma128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda(
     mfq_tensor_backend::Tensor q);

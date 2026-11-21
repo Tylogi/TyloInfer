@@ -21,6 +21,20 @@ function harness(route, options = {}) {
   return { calls, call: (endpoint, payload, signal = new AbortController().signal, peer = owner) => bridge(endpoint, payload, signal, peer) };
 }
 
+test('large expert analysis keeps its full response while other reads retain the shared limit', async () => {
+  const artifact = 'a'.repeat(32);
+  const expert = { layer: 0, expert: 0, projection: 'gate', parameters: 1638400, stored_bytes: 602112,
+    bpw: 2.94, format: 'IQ3_XXS', granularity: 'tensor' };
+  const count = 48 * 512 * 3;
+  const h = harness(() => json({ experts: Array(count).fill(expert) }));
+
+  const analysis = await h.call('models/analysis', { model_id: artifact });
+  assert.equal(analysis.ok, true);
+  assert.equal(analysis.value.experts.length, count);
+  const ordinary = await h.call('core/read', { resource: 'models' });
+  assert.equal(ordinary.error.code, 'tyloinfer/core-invalid-response');
+});
+
 for (const endpoint of ['core/read', 'models/load', 'models/unload', 'operations/get', 'operations/cancel']) {
   test(endpoint + ' requires owner before any network request', async () => {
     const h = harness(() => assert.fail('network'));

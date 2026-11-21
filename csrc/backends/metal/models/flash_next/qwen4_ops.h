@@ -5,6 +5,8 @@
 #include "mlx_tensor.h"
 
 #include <optional>
+#include <span>
+#include <utility>
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
@@ -131,10 +133,32 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
     bool half_query = false,
     const mlx::core::array* separate_gate = nullptr);
 
+// MLX can select two-pass vector SDPA from 1024 keys on larger Apple GPUs.
+inline constexpr int kQsaGroupedDecodeMaxKeys = 1023;
+
+mlx::core::array qwen4_dense_gqa_decode_batch(
+    const mlx::core::array& query,
+    const std::vector<mlx::core::array>& keys,
+    const std::vector<mlx::core::array>& values,
+    const mlx::core::array* gate = nullptr);
+
+std::pair<mlx::core::array, mlx::core::array> qwen4_qsa_join_half_history(
+    const mlx::core::array& history_key, const mlx::core::array& history_value,
+    const mlx::core::array& proposal_key, const mlx::core::array& proposal_value);
+
 mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& query,
     const mlx::core::array& key,
     const mlx::core::array& value,
     int query_offset);
+
+struct MlxQsaTreeAttentionLane {
+    mlx::core::array history_keys, history_values, tree_keys, tree_values;
+    std::span<const int> parents;
+};
+
+mlx::core::array qwen4_qsa_batched_tree_attention(const mlx::core::array& query,
+    std::span<const MlxQsaTreeAttentionLane> lanes);
+void qwen4_qsa_prepare_batched_tree();
 
 } // namespace mfq::metal

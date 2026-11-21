@@ -264,7 +264,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
       ['ContextManagementPanel', 'features/connections/ContextManagementPanel.tsx', 'Context defaults'],
       ['PrefixCacheSettingsPanel', 'features/connections/PrefixCacheSettingsPanel.tsx', 'Persistent prefix cache'],
       ['InferencePolicyPanel', 'features/connections/InferencePolicyView.tsx', 'Inference controls'],
-      ['RemoteRoutingPanel', 'features/connections/RemoteRoutingPanel.tsx', 'Remote routing'],
+      ['RemoteRoutingPanel', 'features/connections/RemoteRoutingView.tsx', 'Remote routing'],
     ]) {
       expect(connection).toContain(`<${component} />`);
       expect(readSources(path)).toContain(label);

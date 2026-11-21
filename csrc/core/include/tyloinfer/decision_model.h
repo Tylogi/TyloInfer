@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <optional>
+#include <span>
 #include <unordered_set>
 
 namespace mfq {
@@ -23,9 +25,15 @@ struct DecisionModelSpec {
     double temperature = 1;
     std::optional<std::size_t> max_tokens;
     bool vocabulary_readout = false;
+    bool question_header = false;
     std::array<double,3> primitive_temperatures{1,1,1};
-    double temperature_for(const std::string& primitive) const {
-        return temperature*primitive_temperatures[primitive=="noul"?2:primitive=="score"?1:0];
+    std::vector<std::size_t> temperature_limits;
+    std::vector<double> question_temperatures;
+    double temperature_for(const std::string& primitive, std::size_t questions) const {
+        const auto bucket = std::lower_bound(temperature_limits.begin(), temperature_limits.end(), questions);
+        const auto base = question_temperatures.empty() ? temperature
+            : question_temperatures.at(bucket - temperature_limits.begin());
+        return base * primitive_temperatures[primitive=="noul"?2:primitive=="score"?1:0];
     }
 };
 
@@ -52,6 +60,29 @@ inline DecisionModelSpec parse_decision_model(const std::string& text) {
     result.temperature = config.value("temperature", 1.0);
     if (!std::isfinite(result.temperature) || result.temperature <= 0)
         throw std::invalid_argument("decision temperature must be finite and positive");
+    if (const auto layout = config.find("prompt_layout"); layout != config.end() && !layout->is_null()) {
+        if (*layout != "header-v1") throw std::invalid_argument("unsupported decision prompt layout");
+        result.question_header = true;
+    }
+    if (const auto table = config.find("temperature_by_questions"); table != config.end() && !table->is_null()) {
+        const auto& limits = table->at("max_questions");
+        const auto& temperatures = table->at("temperature");
+        if (!table->is_object() || table->size() != 2 || !limits.is_array() || !temperatures.is_array() ||
+                temperatures.size() != limits.size() + 1)
+            throw std::invalid_argument("invalid decision question temperature table");
+        for (const auto& limit : limits) {
+            if (!limit.is_number_integer() || limit.get<std::int64_t>() <= 0 ||
+                    (!result.temperature_limits.empty() && limit.get<std::size_t>() <= result.temperature_limits.back()))
+                throw std::invalid_argument("decision question temperature limits must increase");
+            result.temperature_limits.push_back(limit.get<std::size_t>());
+        }
+        for (const auto& temperature : temperatures) {
+            const double value = temperature.get<double>();
+            if (!std::isfinite(value) || value <= 0)
+                throw std::invalid_argument("decision question temperatures must be finite and positive");
+            result.question_temperatures.push_back(value);
+        }
+    }
     const auto mode = config.value("attention_mode", std::string("causal"));
     if (mode == "noncausal_full_attention") result.attention = DecisionAttention::bidirectional;
     else if (mode == "prefix_bidir") result.attention = DecisionAttention::prefix_bidirectional;
@@ -65,6 +96,37 @@ inline DecisionModelSpec parse_decision_model(const std::string& text) {
         result.max_tokens = result.max_tokens ? std::min(*result.max_tokens, limit) : limit;
     }
     return result;
+}
+
+struct DecisionReadout {
+    std::string dtype;
+    std::span<const std::byte> values;
+};
+
+inline DecisionReadout parse_decision_readout(std::span<const std::byte> bytes, std::int64_t hidden) {
+    if (hidden <= 0 || bytes.size() < 8 || bytes.size() > (256u << 20))
+        throw std::invalid_argument("decision readout size is invalid");
+    std::uint64_t header_size = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        header_size |= std::uint64_t(std::to_integer<unsigned char>(bytes[i])) << (8 * i);
+    if (!header_size || header_size > (1u << 20) || header_size > bytes.size() - 8)
+        throw std::invalid_argument("decision readout header is invalid");
+    const auto header = nlohmann::json::parse(reinterpret_cast<const char*>(bytes.data() + 8),
+        reinterpret_cast<const char*>(bytes.data() + 8 + header_size));
+    const auto& weight = header.at("weight");
+    if (weight.at("shape").get<std::vector<std::int64_t>>() != std::vector<std::int64_t>{255, hidden})
+        throw std::invalid_argument("decision readout must have shape [255, hidden_size]");
+    auto dtype = weight.at("dtype").get<std::string>();
+    if (dtype != "F32" && dtype != "BF16" && dtype != "F16")
+        throw std::invalid_argument("unsupported decision readout dtype");
+    const auto offsets = weight.at("data_offsets").get<std::vector<std::uint64_t>>();
+    const auto data = bytes.subspan(8 + header_size);
+    const std::size_t row_bytes = 255 * (dtype == "F32" ? 4 : 2);
+    if (offsets.size() != 2 || offsets[0] > offsets[1] || offsets[1] > data.size() ||
+            std::uint64_t(hidden) > data.size() / row_bytes ||
+            offsets[1] - offsets[0] != std::uint64_t(hidden) * row_bytes)
+        throw std::invalid_argument("decision readout tensor range is invalid");
+    return {std::move(dtype), data.subspan(offsets[0], offsets[1] - offsets[0])};
 }
 
 inline std::optional<DecisionModelSpec> decision_model_spec(const ModelSource& source) {

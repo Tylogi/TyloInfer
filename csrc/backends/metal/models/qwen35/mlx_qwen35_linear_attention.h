@@ -37,7 +37,8 @@ public:
         const MfqContainer& model,
         const Qwen35Config& config,
         const Qwen35TensorNames& names,
-        std::size_t layer_index);
+        std::size_t layer_index,
+        MlxLinear::GgufAccess gguf_access = MlxLinear::GgufAccess::general);
 
     MlxQwen35LinearAttentionBlock(
         Qwen35Config config,

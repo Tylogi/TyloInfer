@@ -2,6 +2,7 @@
 #include "../kernels/qsa_tq.h"
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_context.h"
+#include <algorithm>
 #include <climits>
 
 namespace mfq::cuda::qsa_indexer {
@@ -17,6 +18,21 @@ inline tb::Tensor encode(const tb::Tensor& source) {
     auto output=tb::empty(shape,source.options().dtype(tb::kInt16));
     check(tyloinfer::qsa::indexer_affine16_pack(input.data_ptr<float>(),output.data_ptr<int16_t>(),int(rows),int(width),mfq_current_cuda_stream()));
     return output;
+}
+inline bool pack_at(const tb::Tensor& source,const tb::Tensor& cache,const tb::Tensor& positions,int64_t size) {
+    if(!source.is_cuda() || !cache.defined() || !positions.defined() || source.device()!=cache.device() || source.device()!=positions.device() ||
+            source.dim()!=3 || source.size(0)!=1 || source.stride(2)!=1 ||
+            (source.scalar_type()!=tb::kFloat16 && source.scalar_type()!=tb::kFloat32) ||
+            cache.dim()!=3 || cache.size(0)!=1 || !cache.is_contiguous() || cache.scalar_type()!=tb::kInt16 ||
+            positions.dim()!=1 || !positions.is_contiguous() || positions.numel()!=source.size(1) ||
+            (positions.scalar_type()!=tb::kInt64 && positions.scalar_type()!=tb::kInt32))return false;
+    const auto rows=source.size(1),width=source.size(2),capacity=cache.size(1);
+    if(rows<=0 || rows>capacity-size || capacity>INT_MAX || width<=0 || width>INT_MAX-2 ||
+            cache.size(2)!=width+2 || (rows>1 && source.stride(1)<width))return false;
+    check(tyloinfer::qsa::indexer_affine16_pack_at(source.data_ptr(),source.scalar_type()==tb::kFloat16,
+        std::max(width,source.stride(1)),cache.data_ptr<int16_t>(),positions.data_ptr(),positions.scalar_type()==tb::kInt64,
+        int(rows),int(width),int(capacity),mfq_current_cuda_stream()));
+    return true;
 }
 inline tb::Tensor decode(const tb::Tensor& source) {
     if(source.scalar_type()!=tb::kInt16)return source.to(tb::kFloat32);

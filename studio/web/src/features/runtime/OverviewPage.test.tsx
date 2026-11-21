@@ -60,22 +60,24 @@ it('switches session and all-time and displays weighted completed statistics', a
   expect(footer.querySelector('.overview-endpoint-panel')).not.toBeNull();
   const summary = footer.querySelector('.overview-session-panel') as HTMLElement;
   expect(within(summary).getByRole('heading', { name: 'Session' })).toBeInTheDocument();
-  expect(within(summary).getByText('Completed').previousElementSibling).toHaveTextContent('4');
-  expect(within(summary).getByText('Input').previousElementSibling).toHaveTextContent('400');
-  expect(within(summary).getByText('Output').previousElementSibling).toHaveTextContent('80');
+  expect(within(summary).getByText('Completed').nextElementSibling).toHaveTextContent('4');
+  expect(within(summary).getByText('Input tokens').nextElementSibling).toHaveTextContent('400');
+  expect(within(summary).getByText('Output tokens').nextElementSibling).toHaveTextContent('80');
   expect(within(summary).getByTitle('Session uptime')).toHaveTextContent('2m 5s');
-  expect(summary.querySelector('p')).toHaveTextContent('3 failed requests · 0 active');
+  expect(within(summary).getByText('3 failed')).toBeInTheDocument();
+  expect(within(summary).getByText('0 active')).toBeInTheDocument();
   state.data = { ...state.data!, scope: 'alltime', totals: { ...state.data!.totals,
     completed_requests: 10, prompt_tokens: 800, completion_tokens: 200 } };
   fireEvent.click(screen.getByRole('button', { name: 'All time' }));
   expect(state.scope).toBe('alltime');
   expect(screen.getByRole('button', { name: 'All time' })).toHaveAttribute('aria-pressed', 'true');
   expect(within(summary).getByRole('heading', { name: 'All time' })).toBeInTheDocument();
-  expect(within(summary).getByText('Completed').previousElementSibling).toHaveTextContent('10');
-  expect(within(summary).getByText('Input').previousElementSibling).toHaveTextContent('800');
-  expect(within(summary).getByText('Output').previousElementSibling).toHaveTextContent('200');
+  expect(within(summary).getByText('Completed').nextElementSibling).toHaveTextContent('10');
+  expect(within(summary).getByText('Input tokens').nextElementSibling).toHaveTextContent('800');
+  expect(within(summary).getByText('Output tokens').nextElementSibling).toHaveTextContent('200');
   expect(within(summary).getByTitle('Session uptime')).toHaveTextContent('2m 5s');
-  expect(summary.querySelector('p')).toHaveTextContent('3 failed requests · 0 active');
+  expect(within(summary).getByText('3 failed')).toBeInTheDocument();
+  expect(within(summary).getByText('0 active')).toBeInTheDocument();
   expect(screen.getByText('Concurrency').closest('.metric-tile')?.querySelector('strong')).toHaveTextContent(/^0$/);
 });
 
@@ -97,5 +99,6 @@ it('shows each current request separately from aggregate speed', async () => {
   expect(screen.getByText('Concurrency').closest('.metric-tile')).toHaveTextContent('1 queued');
   expect(screen.getByText('Prefilling').closest('.serving-request')).toHaveTextContent('2,400 tok/s');
   expect(screen.getByText('Decode').closest('.metric-tile')).toHaveTextContent('--');
-  expect(screen.getByText('0 failed requests · 2 active')).toBeInTheDocument();
+  expect(screen.getByText('0 failed')).toBeInTheDocument();
+  expect(screen.getAllByText('2 active').some(item => item.closest('.overview-session-status'))).toBe(true);
 });

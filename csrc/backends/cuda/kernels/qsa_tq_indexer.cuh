@@ -32,6 +32,13 @@ __device__ __forceinline__ float indexer_tensor_round(float x) {
     return x;
 #endif
 }
+template<bool Accumulate> __device__ __forceinline__ void store_affine_indexer_scores(float* output,
+        const int64_t* positions,int pooling,int blocks,int query,int key,float scale,float score0,float score1) {
+    const auto limit=positions?(positions[query]+1)/pooling:std::int64_t(blocks);
+    const auto at=std::int64_t(query)*blocks+key;
+    if(key<blocks)output[at]=key<limit?(Accumulate?output[at]:0.f)+score0*scale:-CUDART_INF_F;
+    if(key+1<blocks)output[at+1]=key+1<limit?(Accumulate?output[at+1]:0.f)+score1*scale:-CUDART_INF_F;
+}
 template<bool Records,int Columns=2,int Rows=1> __global__ void affine_scores_tensor(const float* query,const std::int16_t* keys,
         const std::uint16_t* scales,const std::int16_t* zero,const std::int64_t* positions,
         float* output,int queries,int heads,int width,int blocks,int pooling) {
@@ -98,6 +105,31 @@ template<bool Records,int Columns=2,int Rows=1> __global__ void affine_scores_te
         #pragma unroll
         for(int col=0;col<Columns;++col) {
         const auto& c=accum[row_fragment][col];
+        const int first_query=qbase+row_fragment*per_fragment;
+        const int key_pair=key_base+8*col+2*sub;
+        const float factor=Records?rsqrtf(float(width)):1.f;
+        // Assign query groups within a warp when each half fragment holds
+        // several complete heads. Keep each query's head sum in input order.
+        if(heads<=4 && (8%heads)==0) {
+            const int local=group/heads,first=local*heads,upper=first_query+8/heads;
+            float score0=0.f,score1=0.f,upper0=0.f,upper1=0.f;
+            for(int h=0;h<heads;++h) {
+                const int source=(first+h)*4+sub;
+                score0+=fmaxf(__shfl_sync(0xffffffffu,c[0],source),0.f);
+                score1+=fmaxf(__shfl_sync(0xffffffffu,c[1],source),0.f);
+                if(upper<queries) {
+                    upper0+=fmaxf(__shfl_sync(0xffffffffu,c[2],source),0.f);
+                    upper1+=fmaxf(__shfl_sync(0xffffffffu,c[3],source),0.f);
+                }
+            }
+            if(group==first) {
+                if(first_query+local<queries)store_affine_indexer_scores<false>(output,positions,pooling,blocks,
+                    first_query+local,key_pair,factor,score0,score1);
+                if(upper+local<queries)store_affine_indexer_scores<false>(output,positions,pooling,blocks,
+                    upper+local,key_pair,factor,upper0,upper1);
+            }
+            continue;
+        }
         for(int local=0;local<per_fragment && qbase+row_fragment*per_fragment+local<queries;++local) {
             const int first=heads<=16?local*heads:0;
             const int count=heads<=16?heads:min(16,heads-hbase);
@@ -109,17 +141,10 @@ template<bool Records,int Columns=2,int Rows=1> __global__ void affine_scores_te
                 score1+=fmaxf(__shfl_sync(0xffffffffu,y,source),0.f);
             }
             if(!group) {
-                const int q=qbase+row_fragment*per_fragment+local,k0=key_base+8*col+2*sub,k1=k0+1;
-                const auto limit=positions?(positions[q]+1)/pooling:std::int64_t(blocks);
-                const float factor=Records?rsqrtf(float(width)):1.f;
-                if(k0<blocks) {
-                    const auto at=std::int64_t(q)*blocks+k0;
-                    output[at]=k0<limit?(hbase?output[at]:0.f)+score0*factor:-CUDART_INF_F;
-                }
-                if(k1<blocks) {
-                    const auto at=std::int64_t(q)*blocks+k1;
-                    output[at]=k1<limit?(hbase?output[at]:0.f)+score1*factor:-CUDART_INF_F;
-                }
+                if(hbase)store_affine_indexer_scores<true>(output,positions,pooling,blocks,
+                    first_query+local,key_pair,factor,score0,score1);
+                else store_affine_indexer_scores<false>(output,positions,pooling,blocks,
+                    first_query+local,key_pair,factor,score0,score1);
             }
         }
         }

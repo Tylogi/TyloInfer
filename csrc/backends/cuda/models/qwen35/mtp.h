@@ -441,3 +441,17 @@ struct Qwen35Mtp final : MtpModule {
     bool preserve_output_dtype() const noexcept override { return false; }
     bool retains_partial_target_prefix() const noexcept override { return true; }
 };
+
+inline void qwen35_release_mtp_graphs(mfq::cuda::Qwen35CausalLm& model,MtpModule* mtp) {
+    if(auto* predictor=dynamic_cast<Qwen35Mtp*>(mtp)) {
+        predictor->target_graphs.reset();
+        predictor->predictor_graphs.reset();
+    }
+    if(model.hidden_capture)model.hidden_capture->target_graphs.reset();
+}
+
+inline void qwen35_release_decode_graphs(mfq::cuda::Qwen35CausalLm& model,MtpModule* mtp,
+                                       DecodeGraphCache& graph) {
+    graph.invalidate();
+    qwen35_release_mtp_graphs(model,mtp);
+}

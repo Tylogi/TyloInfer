@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::cuda::d1 {
+namespace mfq::models::lfm3::d1 {
 struct HostWeight {
     std::vector<std::uint16_t> values;
     std::vector<std::uint8_t> packed;
