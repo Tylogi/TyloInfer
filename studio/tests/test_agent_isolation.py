@@ -59,7 +59,7 @@ async def check():
 
 asyncio.run(check())
 '''
-    environment = {**os.environ, "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
+    environment = {**os.environ, "PYTHONPATH": str(root / "studio"), "PYTHONDONTWRITEBYTECODE": "1"}
     subprocess.run(
         [sys.executable, "-B", "-c", program, str(tmp_path)],
         cwd=root,
