@@ -3948,7 +3948,14 @@ class RuntimePool:
             return request.device_ids[:1]
         # Without explicit model parallelism the worker only uses visible GPU 0.
         visible = self.runtime_environment.get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
-        return [visible.split(",")[0].strip()]
+        selected = visible.split(",", 1)[0].strip()
+        if selected.startswith("GPU-"):
+            matches = [device.device_id or str(index)
+                for index, device in enumerate(hardware_identity().gpu_memory)
+                if device.device_uuid and device.device_uuid.lower().startswith(selected.lower())]
+            if len(matches) == 1:
+                selected = matches[0]
+        return [selected]
 
     def _cuda_discrete_device_capacity(self, request: ModelLoadRequest) -> int | None:
         hardware = hardware_identity()
