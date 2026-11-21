@@ -683,6 +683,12 @@ int main() {
         if (sequence_view.shape() != Shape{1, 3, 2}) {
             throw std::runtime_error("sequence cache view mismatch");
         }
+        mfq::metal::MlxSequenceCache packed_cache(8, 2, uint32);
+        packed_cache.reset(1, 1);
+        const auto packed_rows = array({0xfe123456u, 0u, 0x80000000u, 0xffffffffu}, {1, 2, 2}, uint32);
+        packed_cache.append(packed_rows);
+        if (packed_cache.view().dtype() != uint32 || !all(packed_cache.view() == packed_rows).item<bool>())
+            throw std::runtime_error("packed sequence-cache growth changed its bits");
         sequence_cache.trim(1);
         auto trimmed_sequence = sequence_cache.view();
         trimmed_sequence.eval();

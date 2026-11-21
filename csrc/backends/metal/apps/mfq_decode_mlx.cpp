@@ -802,7 +802,8 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();
         config.compatibility_key = metal_prefix_cache_compatibility_key(
             container, Codec::name, context_size);
-        if constexpr (recurrent) config.compatibility_key += mfq::metal::mlx_kv_quantization_tag();
+        if constexpr (recurrent || std::is_same_v<Runtime, mfq::metal::MlxHy4Runtime>)
+            config.compatibility_key += mfq::metal::mlx_kv_quantization_tag();
         if constexpr (recurrent) {
             const auto native_context = [&] {
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
@@ -2567,6 +2568,9 @@ private:
             }
         } else if constexpr (requires(const Runtime& value) { value.qsa_kv_offload_stats(); })
             qsa_offload_supported = 1;
+        constexpr bool kv_quantization_supported = std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
+            std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
+            std::is_same_v<Runtime, mfq::metal::MlxHy4Runtime>;
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -2578,10 +2582,8 @@ private:
             {"ssd_expert_pooled_staging_count", static_cast<double>(mfq::metal::MlxMfeWeight::pooled_staging_count())},
 #endif
             {"qsa_kv_offload_supported", qsa_offload_supported},
-            {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
-            {"kv_quantization_bits", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? mfq::metal::mlx_kv_quantization().bits : 0.0},
+            {"kv_quantization_supported", kv_quantization_supported ? 1.0 : 0.0},
+            {"kv_quantization_bits", kv_quantization_supported ? mfq::metal::mlx_kv_quantization().bits : 0.0},
             {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},

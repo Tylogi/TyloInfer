@@ -141,3 +141,26 @@ def test_planned_precision_is_applied_to_the_existing_native_configuration():
     sparse = apply_load_context(request, 'qwen4_exp', 'cuda', fixed_qsa=True)
     assert sparse.kv_memory.qsa_mode == 'affine8' and sparse.kv_memory.placement == 'auto_ssd'
     assert not sparse.kv_memory.ram_preallocated
+
+
+def test_hy4_load_plan_accounts_for_packed_latent_and_rotary_coordinates():
+    config = {'model_type': 'hy_v4_flash', 'max_position_embeddings': 16384,
+        'num_hidden_layers': 42, 'layer_types': ['sliding_attention'] * 30 + ['full_attention'] * 12,
+        'head_dim': 576, 'kv_lora_rank': 512, 'num_key_value_heads': 1, 'sliding_window': 512,
+        'indexer_compress_ratio': 4, 'indexer_head_dim': 128, 'indexer_budget': 2048}
+    weights = 4 << 30
+    artifact = SimpleNamespace(resource=SimpleNamespace(complete=True, architecture=config['model_type'],
+        estimated_resident_weight_bytes=weights, estimated_weight_bytes_by_role={}, structured_decisions=False),
+        routed_expert_bytes=0, source_config=config)
+    status = {'backend': 'metal', 'runtime_memory_headroom_bytes': weights + (110 << 20)}
+
+    def plan(precision):
+        return plan_model_load(artifact, status, maximum=16384, requested=8192, reserve=0, precision=precision,
+            preallocate=True, device_id='0', streamed_jev=False)
+
+    raw, packed = plan(None), plan(8)
+    assert raw.precision == 16 and not raw.usable
+    assert packed.precision == 8 and packed.usable and packed.max_context > raw.max_context
+    request = ModelLoadRequest(model='hy4', context_management={'reserve_percent': 10, 'precision': 8})
+    assert apply_load_context(request, 'hy_v4_flash', 'metal').kv_quantization.enabled
+    assert not apply_load_context(request, 'hy_v4_flash', 'cuda').kv_quantization.enabled

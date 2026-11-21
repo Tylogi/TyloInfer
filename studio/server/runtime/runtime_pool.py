@@ -722,7 +722,7 @@ class RuntimePool:
             planned_vram_limit = plan.gpu_budget_bytes
             request = request.model_copy(update={"context_size": plan.context_size,
                 "context_management": defaults.model_copy(update={"precision": plan.precision})})
-        from server.runtime.load_context import apply_load_context
+        from server.runtime.load_context import apply_load_context, supports_kv_quantization
         try:
             request = apply_load_context(request, artifact.resource.architecture, self.backend, fixed_qsa=fixed_qsa)
         except ValueError as error:
@@ -747,8 +747,7 @@ class RuntimePool:
             elif not cuda_qsa and self.backend in {"cuda", "metal"} and artifact.resource.architecture.casefold().startswith(
                     ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35")):
                 request = request.model_copy(update={"kv_quantization": KvQuantizationSettings(enabled=True, bits=8)})
-        if request.kv_quantization.enabled and (self.backend not in {"cuda", "metal"} or not artifact.resource.architecture.casefold().startswith(
-            ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35"))):
+        if request.kv_quantization.enabled and not supports_kv_quantization(artifact.resource.architecture, self.backend):
             raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
         if request.yarn_enabled and (self.backend not in {"cuda", "metal"} or artifact.resource.yarn_context_capacity is None):
             raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")

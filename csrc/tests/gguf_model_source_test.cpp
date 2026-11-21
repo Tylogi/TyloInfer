@@ -1013,6 +1013,7 @@ void hy4_model_source(const std::filesystem::path& directory) {
     gguf_set_val_u32(file.get(), "hy_v4_flash.block_count", 3);
     gguf_set_val_u32(file.get(), "hy_v4_flash.nextn_predict_layers", 1);
     gguf_set_val_u32(file.get(), "hy_v4_flash.attention.key_length", 576);
+    gguf_set_val_u32(file.get(), "hy_v4_flash.attention.kv_lora_rank", 512);
     gguf_set_val_u32(file.get(), "hy_v4_flash.attention.sliding_window", 512);
     gguf_set_val_u32(file.get(), "hy_v4_flash.attention.indexer.key_length", 128);
     gguf_set_val_u32(file.get(), "hy_v4_flash.attention.indexer.kpool", 4);
@@ -1035,7 +1036,7 @@ void hy4_model_source(const std::filesystem::path& directory) {
     require(gguf_write_to_file(file.get(), path.string().c_str(), false), "Hy4 GGUF write failed");
     const mfq::GgufModelSource source(path);
     const auto config = nlohmann::json::parse(source.model_config_json());
-    require(config.at("num_hidden_layers") == 2 && config.at("head_dim") == 576 &&
+    require(config.at("num_hidden_layers") == 2 && config.at("head_dim") == 576 && config.at("kv_lora_rank") == 512 &&
         config.at("layer_types") == std::vector<std::string>{"full_attention", "sliding_attention"} &&
         config.at("indexer_compress_ratio") == 4, "Hy4 GGUF IndexPool geometry mismatch");
     require(source.find_tensor("model.block.0.attention.post_norm.weight") &&

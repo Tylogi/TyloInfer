@@ -416,6 +416,10 @@ to the native worker. The worker reads Engram rows from the CPU-mapped second
 shard. Set `TYLOINFER_QSA_KV_BUDGET_BYTES` to enable the shared RAM/SSD store for
 IndexPool and latent KV.
 
+The TurboQuant KV setting compresses the indexed MLA cache in GPU memory and
+in the RAM/SSD store. Set `TYLOINFER_KV_TURBOQUANT_BITS` when launching the
+native worker directly.
+
 To enable DFly2, keep the official BF16 draft shard and its `config.json` in the
 same directory. The per-request `enable_mtp` and `mtp_max_draft_tokens` settings
 control draft use and depth.

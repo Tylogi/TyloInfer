@@ -1440,6 +1440,7 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
     state.tokens = tokens;
     state.bytes = position * sizeof(tokens.front());
     const auto store = mlx_qsa_kv_offload_store();
+    std::optional<Dtype> indexed_dtype;
     struct LayerRows {
         bool sliding = false;
         Hy4PrefixRows latent, groups;
@@ -1493,8 +1494,12 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
                 }
                 continue;
             }
-            layer.latent.append(reader.tensor(), start, 0, end - start, position,
-                mlx::core::float16, 1, store);
+            const auto latent = reader.tensor();
+            if ((latent.dtype != mlx::core::float16 && latent.dtype != mlx::core::uint32) ||
+                (indexed_dtype && *indexed_dtype != latent.dtype))
+                throw std::runtime_error("Hy4 prefix latent KV dtype changed");
+            indexed_dtype = latent.dtype;
+            layer.latent.append(latent, start, 0, end - start, position, *indexed_dtype, 1, store);
             const auto first_group = start / ratio, groups = end / ratio - first_group;
             if (groups) layer.groups.append(reader.tensor(), first_group, 0, groups, position / ratio,
                 mlx::core::float32, kMlxQsaIndexPriority, store);
@@ -1527,7 +1532,7 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
             output.window = layer.latent.finish(std::min(position, static_cast<std::size_t>(state.window)),
                 mlx::core::float16, state.bytes).resident;
         } else {
-            output.latent = layer.latent.finish(position, mlx::core::float16, state.bytes);
+            output.latent = layer.latent.finish(position, *indexed_dtype, state.bytes);
             output.groups = layer.groups.finish(position / state.group_size, mlx::core::float32, state.bytes);
         }
     }

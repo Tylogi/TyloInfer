@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 
 from server.protocol.models import KvMemorySettings, KvQuantizationSettings, ModelLoadPlan
+from server.runtime.load_context import supports_kv_quantization
 from server.runtime.qsa_cache_policy import qsa_cache_budget, resolve_qsa_cache_mode
 from server.services.model_memory import checkpoint_cache_profile
 
@@ -11,7 +12,12 @@ STANDARD_PRECISIONS = (8, 6, 4, 3.5, 3, 2.5, 2)
 PREFILL_TILE_ALIGNMENT = 256
 
 
-def _cache_bytes(profile, tokens: int, precision: float, *, contiguous: bool) -> int:
+def _packed_words(dimension: int, bits: int) -> int:
+    rotated = 1 << (dimension - 1).bit_length()
+    return 1 + (rotated * bits + 31) // 32
+
+
+def _cache_bytes(profile, tokens: int, precision: float, *, contiguous: bool, mla_rank: int = 0) -> int:
     total = 0
     for item in profile.components:
         rows = 0 if tokens <= item.active_after else tokens / item.tokens_per_row
@@ -21,9 +27,13 @@ def _cache_bytes(profile, tokens: int, precision: float, *, contiguous: bool) ->
             rows = 1 << (rows - 1).bit_length()
         width = item.bytes_per_row
         if precision != 16 and item.name == 'raw_kv':
-            dim = 1 << (item.head_dimension - 1).bit_length()
-            words = 2 + math.ceil(dim * math.floor(precision) / 32) + math.ceil(dim * math.ceil(precision) / 32)
+            words = (_packed_words(item.head_dimension, math.floor(precision)) +
+                     _packed_words(item.head_dimension, math.ceil(precision)))
             width = item.layers * item.kv_heads * words * 4
+        if precision != 16 and mla_rank and item.name == 'latent_kv':
+            words = (_packed_words(mla_rank, math.ceil(precision)) +
+                     _packed_words(item.head_dimension - mla_rank, math.floor(precision)))
+            width = item.layers * words * 4
         total += rows * width
     return total
 
@@ -47,9 +57,16 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
                  and resolve_qsa_cache_mode(artifact, KvMemorySettings(), KvQuantizationSettings(), {}) != 'legacy'
                  and getattr(artifact, 'source_cache_layout', None))
     raw = [item for item in components if item.name == 'raw_kv']
-    quantized = (backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35'))
-                 and raw and all(item.head_dimension and item.kv_heads and item.layers for item in raw))
-    precisions = (8, 4) if fixed_qsa else STANDARD_PRECISIONS if quantized else (16,)
+    config = getattr(artifact, 'source_config', None) or {}
+    text = config.get('text_config', config)
+    if not isinstance(text, dict):
+        text = {}
+    rank = text.get('kv_lora_rank')
+    mla_rank = rank if kind == 'hy_v4_flash' and backend == 'metal' and type(rank) is int and any(
+        item.name == 'latent_kv' and item.head_dimension and 0 < rank < item.head_dimension for item in components) else 0
+    quantized = supports_kv_quantization(kind, backend) and raw and all(
+        item.head_dimension and item.kv_heads and item.layers for item in raw)
+    precisions = (8, 4) if fixed_qsa else (16, *STANDARD_PRECISIONS) if mla_rank else STANDARD_PRECISIONS if quantized else (16,)
     default = precisions[0]
     selected = precision if precision is not None else default
     separate = status.get('memory_architecture') == 'discrete'
@@ -92,8 +109,7 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
     # CUDA can shrink its auto tile to the same 256-row alignment used by
     # select_prefill_chunk. The KV plan needs room for one tile.
     workspace = 1 << 30 if cuda else 0
-    config = getattr(artifact, 'source_config', None) or {}
-    hidden = config.get('text_config', config).get('hidden_size', 0)
+    hidden = text.get('hidden_size', 0)
     gqa = any(item.group == 'GQA' for item in raw)
     if cuda and gqa:
         workspace += min(maximum, PREFILL_TILE_ALIGNMENT) * hidden * 8 * 4
@@ -122,7 +138,7 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
             if separate:
                 return tier.gpu_budget_bytes <= room_gpu and tier.ram_required_bytes <= room_ram
             return tier.gpu_budget_bytes + tier.ram_required_bytes <= room_gpu
-        return profile is None or _cache_bytes(profile, tokens, bits, contiguous=cuda) <= room_gpu
+        return profile is None or _cache_bytes(profile, tokens, bits, contiguous=cuda, mla_rank=mla_rank) <= room_gpu
 
     lo, hi = 0, maximum
     while lo < hi:

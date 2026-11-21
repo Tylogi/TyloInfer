@@ -1075,7 +1075,8 @@ MlxSequenceCache::MlxSequenceCache(
     if (maximum_sequence_ <= 0 || width_ <= 0 ||
         (dtype_ != mlx::core::float16 &&
          dtype_ != mlx::core::bfloat16 &&
-         dtype_ != mlx::core::float32)) {
+         dtype_ != mlx::core::float32 &&
+         dtype_ != mlx::core::uint32)) {
         throw std::invalid_argument("invalid MLX sequence cache geometry");
     }
 }
@@ -1099,7 +1100,8 @@ void MlxSequenceCache::reset(
 std::pair<array, int> MlxSequenceCache::append(
     const array& value) {
     if (value.ndim() != 3 || value.shape(0) <= 0 ||
-        value.shape(1) <= 0 || value.shape(2) != width_) {
+        value.shape(1) <= 0 || value.shape(2) != width_ ||
+        (dtype_ == mlx::core::uint32 && value.dtype() != dtype_)) {
         throw std::runtime_error("MLX sequence-cache append mismatch");
     }
     if (!values_ || batch_ != value.shape(0)) {

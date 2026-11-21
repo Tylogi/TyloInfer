@@ -443,6 +443,7 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         config["num_hidden_layers"] = records - nextn;
         config["num_nextn_predict_layers"] = nextn;
         config["head_dim"] = number("attention.key_length");
+        config["kv_lora_rank"] = number("attention.kv_lora_rank");
         config["indexer_head_dim"] = number("attention.indexer.key_length");
         config["indexer_compress_ratio"] = number("attention.indexer.kpool");
         config["indexer_budget"] = number("attention.indexer.top_k");

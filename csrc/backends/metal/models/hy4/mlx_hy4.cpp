@@ -53,6 +53,7 @@ struct Geometry {
     std::vector<int> heads;
     std::vector<bool> sliding;
     std::vector<float> clamp;
+    MlxMlaKvFormat indexed_kv;
 };
 
 Geometry geometry(const json& metadata, int context) {
@@ -74,7 +75,8 @@ Geometry geometry(const json& metadata, int context) {
         number("hyper_connection.magnitude"), number("rope.freq_base"), number("rope.freq_base_swa"),
         number("expert_weights_scale"), field("attention.head_count").get<std::vector<int>>(),
         field("attention.sliding_window_pattern").get<std::vector<bool>>(),
-        field("swiglu_clamp_exp").get<std::vector<float>>()};
+        field("swiglu_clamp_exp").get<std::vector<float>>(),
+        {integer("attention.kv_lora_rank"), integer("rope.dimension_count"), mlx_kv_quantization()}};
     if (context <= 0 || context > integer("context_length") || g.hidden <= 0 || g.vocab <= 0 ||
         g.layers <= 0 || g.layers > 4096 || g.dense_layers < 0 || g.dense_layers > g.layers ||
         g.streams < 2 || g.streams > 8 || g.q_rank <= 0 || g.kv_rank <= 0 ||
@@ -433,25 +435,26 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     const array& positions, const array& sinks, int position, float scale,
     const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
     const int count = latent.shape(1), end = position + count;
+    const auto stored = g.indexed_kv.pack(latent);
     if (!cache.latent && !cache.offloaded_latent) {
         if (offload) {
-            cache.offloaded_latent.emplace(offload, latent.shape(-1), latent.dtype(), 1);
+            cache.offloaded_latent.emplace(offload, stored.shape(-1), stored.dtype(), 1);
             cache.offloaded_groups.emplace(offload, g.index_width, float32, kMlxQsaIndexPriority);
         } else {
-            cache.latent.emplace(g.context, latent.shape(-1), latent.dtype());
+            cache.latent.emplace(g.context, stored.shape(-1), stored.dtype());
             cache.groups.emplace(std::max(1, g.context / g.group_size), g.index_width, float32);
         }
     }
-    if (cache.offloaded_latent) cache.offloaded_latent->append(latent);
-    else cache.latent->append(latent);
+    if (cache.offloaded_latent) cache.offloaded_latent->append(stored);
+    else cache.latent->append(stored);
     append_index_pool(cache, index, g, input, position, verified);
 
     if (end <= g.index_budget) {
         cache.last_indices = reshape(arange(0, end, 1, int32), {1, 1, end});
         const auto rows = cache.offloaded_latent
-            ? reshape(cache.offloaded_latent->gather(*cache.last_indices), {1, end, latent.shape(-1)})
+            ? reshape(cache.offloaded_latent->gather(*cache.last_indices), {1, end, stored.shape(-1)})
             : cache.latent->view();
-        return as_dense_attention(query, rows, sinks, position, 0, 0, scale, g.kv_rank);
+        return as_dense_attention(query, g.indexed_kv.unpack(rows), sinks, position, 0, 0, scale, g.kv_rank);
     }
 
     const float weight_scale = 1.0f / std::sqrt(float(g.index_heads * g.index_width));
@@ -462,6 +465,9 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     if (cache.latent) resident = cache.latent->view();
     else if (!verified && count >= 4 && end <= 2 * g.index_budget)
         resident = cache.offloaded_latent->try_view();
+    std::optional<array> dense_rows;
+    if (resident && count >= 4 && end <= 2 * g.index_budget)
+        dense_rows = g.indexed_kv.unpack(*resident);
     const auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
     std::vector<array> output;
     for (int start = 0; start < count; start += selected_query_tile) {
@@ -473,25 +479,34 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
         const auto ids = token_selection(groups, g, position + start);
         if (verified) verified->selections = ids;
         const auto queries = axis_slice(query, 2, start, stop);
-        if (resident && end <= 2 * g.index_budget && stop - start >= 4) {
+        if (dense_rows && stop - start >= 4) {
             // At short contexts a dense boolean mask costs less than staging
             // a separate copy of the selected latent rows for each query.
             const auto selected = where(ids >= 0, ids, array(end, int32));
             auto visible = put_along_axis(zeros({1, stop - start, end + 1}, bool_), selected, ids >= 0, -1);
-            output.push_back(latent_attention(queries, *resident, sinks, scale, g.kv_rank,
+            output.push_back(latent_attention(queries, *dense_rows, sinks, scale, g.kv_rank,
                 expand_dims(axis_slice(visible, -1, 0, end), 1)));
         } else if (cache.offloaded_latent) {
             const auto staged = verified ? std::nullopt : cache.offloaded_latent->gather_union(ids);
             if (staged) {
-                output.push_back(latent_attention(queries, staged->rows, sinks, scale, g.kv_rank, staged->mask));
+                output.push_back(latent_attention(queries, g.indexed_kv.unpack(staged->rows), sinks,
+                    scale, g.kv_rank, staged->mask));
             } else {
                 const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
                 const auto gathered = cache.offloaded_latent->gather(ids);
-                output.push_back(mlx_gathered_mla_attention(queries, gathered, mask, sinks, scale, g.kv_rank));
+                output.push_back(mlx_gathered_mla_attention(queries, g.indexed_kv.unpack(gathered),
+                    mask, sinks, scale, g.kv_rank));
             }
         } else {
             const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
-            output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
+            if (g.indexed_kv.quantization.enabled()) {
+                const auto safe = reshape(maximum(ids, array(0, int32)), {-1});
+                const auto packed = reshape(take(*resident, safe, 1), {1, ids.shape(1), ids.shape(2), stored.shape(-1)});
+                output.push_back(mlx_gathered_mla_attention(queries, g.indexed_kv.unpack(packed),
+                    mask, sinks, scale, g.kv_rank));
+            } else {
+                output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
+            }
         }
         if (stop == count) cache.last_indices = axis_slice(ids, 1, stop - start - 1, stop - start);
     }
@@ -683,11 +698,11 @@ struct DflyDraft {
                 const auto local = reshape(arange(begin, position, 1, int32), {1, 1, position - begin});
                 selected = concatenate({selected, local}, -1);
             }
-            const auto shape = Shape{1, selected.shape(-1), g.kv_rank + g.rotary};
+            const auto shape = Shape{1, selected.shape(-1), g.indexed_kv.width()};
             auto history = cached.offloaded_latent ? reshape(cached.offloaded_latent->gather(selected), shape)
                 : take(cached.latent->view(), reshape(maximum(selected, array(0, int32)), {-1}), 1);
             auto valid = reshape(selected >= array(0, int32), {1, selected.shape(-1)});
-            hidden = layers[i](g, hidden, positions, history, valid);
+            hidden = layers[i](g, hidden, positions, g.indexed_kv.unpack(history), valid);
         }
         hidden = output_norm(hidden);
         for (int i = 1; i <= depth; ++i) {
@@ -1035,7 +1050,7 @@ MlxHy4Cache MlxHy4Model::restore(const TextSessionState& state) const {
                 bool(source.index_tail) != bool(owed) || (source.index_tail &&
                     (source.index_tail->shape() != Shape{1, owed, 2 * g.index_width} || source.index_tail->dtype() != float32)))
                 throw std::invalid_argument("Hy4 prefix IndexPool state mismatch");
-            restore_rows(source.latent, position, g.context, width, float16, 1, w.offload,
+            restore_rows(source.latent, position, g.context, g.indexed_kv.width(), g.indexed_kv.dtype(), 1, w.offload,
                 layer.latent, layer.offloaded_latent);
             restore_rows(source.groups, position / g.group_size, std::max(1, g.context / g.group_size),
                 g.index_width, float32, kMlxQsaIndexPriority, w.offload, layer.groups, layer.offloaded_groups);
