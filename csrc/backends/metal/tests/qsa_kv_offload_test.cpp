@@ -220,6 +220,13 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     require(all(slice(early, Shape{0, 0, 0}, Shape{1, 4, 31}) == array(-1, int32)).item<bool>() &&
             all(slice(early, Shape{0, 0, 31}, Shape{1, 4, 32}) == array(0, int32)).item<bool>(),
         "weighted streamed index selected invisible history at the start of the sequence");
+
+    const auto wide_queries = values({1, 3, 16, 128}, 59);
+    const auto wide_keys = values({1, 517, 128}, 47, float32);
+    const auto wide_weights = values({1, 3, 16}, 97, float32);
+    const auto reference_scores = sum(maximum(mlx_sparse_indexer_head_scores(wide_queries, wide_keys), array(0.f)) *
+        expand_dims(wide_weights, -1), -2);
+    near(mlx_sparse_indexer_weighted_scores(wide_queries, wide_keys, wide_weights), reference_scores);
 }
 
 void test_quantized_attention(double bits, int queries, std::size_t buffer) {

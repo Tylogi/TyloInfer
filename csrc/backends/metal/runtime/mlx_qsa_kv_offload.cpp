@@ -362,10 +362,38 @@ array MlxQsaIndexOffload::gather(const array& indices) const {
         throw std::invalid_argument("offloaded indexed row allocation is too large");
     const auto max_read = std::max<std::size_t>(1, state.store->config().buffer_bytes / 2 / state.row_bytes);
     const auto size = ids.size() * state.row_bytes;
+    MlxResidentBudgetScope::reserve(size);
     auto result = array(mlx::core::allocator::malloc(size),
         Shape{1, ids.shape(1), ids.shape(2), width_}, dtype_);
     auto* output = result.data<std::uint8_t>();
     const auto* values = ids.data<std::int32_t>();
+    if (ids.shape(1) > 1) {
+        // Keep one copy of a recalled block while filling every query that
+        // selected it. Nearby queries commonly share most of their history.
+        std::vector<std::size_t> slots;
+        slots.reserve(ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (values[i] < 0) std::memset(output + i * state.row_bytes, 0, state.row_bytes);
+            else if (values[i] >= position()) throw std::invalid_argument("selected offloaded row is outside the cache");
+            else slots.push_back(i);
+        }
+        std::sort(slots.begin(), slots.end(), [&](std::size_t a, std::size_t b) { return values[a] < values[b]; });
+        std::vector<std::uint8_t> block(state.block_rows * state.row_bytes);
+        for (std::size_t begin = 0; begin < slots.size();) {
+            const auto start = static_cast<std::size_t>(values[slots[begin]]);
+            const auto end_of_block = (start / state.block_rows + 1) * state.block_rows;
+            auto end = begin + 1;
+            while (end < slots.size() && static_cast<std::size_t>(values[slots[end]]) < end_of_block) ++end;
+            state.read_rows(start, values[slots[end - 1]] - start + 1, block.data());
+            for (auto i = begin; i < end; ++i) {
+                const auto slot = slots[i];
+                std::memcpy(output + slot * state.row_bytes, block.data() + (values[slot] - start) * state.row_bytes,
+                    state.row_bytes);
+            }
+            begin = end;
+        }
+        return result;
+    }
     for (std::size_t begin = 0; begin < ids.size();) {
         const auto row = values[begin];
         if (row < 0) {
@@ -415,9 +443,9 @@ array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int 
             array(ratio, mlx::core::int32)), Shape{1, take, 1});
         std::optional<array> weights;
         if (head_weights)
-            weights = mlx::core::expand_dims(mlx::core::astype(mlx::core::slice(
+            weights = mlx::core::astype(mlx::core::slice(
                 *head_weights, Shape{0, token, 0}, Shape{1, token + take, query.shape(2)}),
-                mlx::core::float32), -1);
+                mlx::core::float32);
         std::optional<array> scores, indices;
         for (int start = 0; start < complete; start += key_chunk) {
             const int length = std::min(key_chunk, complete - start);
@@ -425,8 +453,7 @@ array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int 
                 mlx::core::arange(start, start + length, 1, mlx::core::int32), Shape{1, 1, length}),
                 Shape{1, take, length});
             const auto keys = view(start, length);
-            auto values = weights ? mlx::core::sum(
-                mlx::core::maximum(mlx_sparse_indexer_head_scores(queries, keys), array(0.0f)) * *weights, -2)
+            auto values = weights ? mlx_sparse_indexer_weighted_scores(queries, keys, *weights)
                 : qwen4_qsa_block_scores(queries, keys);
             values = mlx::core::where(ids < visible, values, array(-std::numeric_limits<float>::infinity()));
             if (scores) {

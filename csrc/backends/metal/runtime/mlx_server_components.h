@@ -45,9 +45,9 @@ struct MlxEngineComponents {
 template <class Model>
 MlxEngineComponents make_mlx_engine_components(const MfqModelGraph*,
     std::shared_ptr<std::mutex>,
-    std::shared_ptr<std::optional<MlxTextBackboneRuntime<Model>>>,
+    std::shared_ptr<std::optional<MlxTextBackboneRuntime<Model>>> runtime,
     mlx::core::Stream) {
-    return {};
+    return {.mtp_available = runtime && *runtime && (*runtime)->supports_mtp()};
 }
 
 std::vector<MlxDeepseekV41ImageInput> prepare_deepseek_v41_images(

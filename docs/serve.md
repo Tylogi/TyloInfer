@@ -402,6 +402,22 @@ curl -fsS http://127.0.0.1:8080/runtime/generate \
   }'
 ```
 
+### Hy4 Flash on Metal
+
+Keep the two numbered GGUF shards in the same directory and pass the first shard
+to the native worker. The worker reads Engram rows from the CPU-mapped second
+shard. Set `TYLOINFER_QSA_KV_BUDGET_BYTES` to enable the shared RAM/SSD store for
+IndexPool and latent KV.
+
+To enable DFly2, keep the official BF16 draft shard and its `config.json` in the
+same directory. The per-request `enable_mtp` and `mtp_max_draft_tokens` settings
+control draft use and depth.
+
+```shell
+mfq-decode-metal --server --model /models/Hy4-flash-IQ2_AH-00001-of-00002.gguf \
+  --dfly2-draft /models/hy4-bf16/model-00148-of-00148.safetensors
+```
+
 ## Jev decision-model weight placement
 
 For supported CUDA decision models, `--jev-weights stream` is the default.

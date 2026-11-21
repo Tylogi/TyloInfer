@@ -29,8 +29,23 @@ public:
         return std::min(512, requested);
     }
 
-    static MlxTextBackboneRuntime load(const MfqContainer& model, int context) {
-        return MlxTextBackboneRuntime(Model::load(model, context));
+    template <class... Args>
+    static MlxTextBackboneRuntime load(const MfqContainer& model, int context, Args&&... args) {
+        return MlxTextBackboneRuntime(Model::load(model, context, std::forward<Args>(args)...));
+    }
+
+    bool supports_mtp() const noexcept {
+        if constexpr (requires { model_.supports_mtp(); }) return model_.supports_mtp();
+        return false;
+    }
+    const MlxMtpGenerationStats& last_mtp_stats() const noexcept { return mtp_stats_; }
+    auto qsa_kv_offload_stats() const
+        requires requires(const Model& model) { model.qsa_kv_offload_stats(); } {
+        return model_.qsa_kv_offload_stats();
+    }
+    std::size_t kv_cache_bytes() const
+        requires requires(const Model& model, const typename Model::Cache& cache) { model.kv_cache_bytes(cache); } {
+        return model_.kv_cache_bytes(cache_);
     }
 
     bool supports_text_session_state() const noexcept { return true; }
@@ -69,6 +84,7 @@ public:
         int chunk_size, const MlxPrefixCacheHooks& prefix = {}) {
         using namespace mlx::core;
         if (sampling.warmup) reset_cache();
+        mtp_stats_ = {.available = supports_mtp()};
         const int vocab = model_.vocabulary();
         if (prompt.empty() || prompt.size() > static_cast<std::size_t>(model_.context()) ||
             max_tokens < 0 || chunk_size <= 0 || cache_.position > static_cast<int>(prompt.size()))
@@ -94,9 +110,16 @@ public:
                 std::chrono::steady_clock::now() - started).count());
         if (!last_logits_) throw std::runtime_error("Metal text runtime has no logits for the prompt");
 
-        MlxSampler sampler(sampling);
         auto counts = mlx_generation_token_counts(sampling, ids, vocab);
         const int limit = std::min(max_tokens, model_.context() - prompt_count);
+        if constexpr (requires { model_.supports_mtp(); }) {
+            if (sampling.enable_mtp && supports_mtp() && limit > 1) {
+                auto request = MlxMtpEngineRequest{vocab, limit, model_.context(), *last_logits_, sampling,
+                    std::move(counts), {}, callback, 0, constraint};
+                return model_.generate_speculative(cache_, std::move(request), prefix, mtp_stats_, last_logits_);
+            }
+        }
+        MlxSampler sampler(sampling);
         int generated = 0;
         while (generated < limit) {
             auto logits = *last_logits_;
@@ -131,6 +154,7 @@ private:
     Model model_;
     typename Model::Cache cache_;
     std::optional<mlx::core::array> last_logits_;
+    MlxMtpGenerationStats mtp_stats_;
 };
 
 }  // namespace mfq::metal

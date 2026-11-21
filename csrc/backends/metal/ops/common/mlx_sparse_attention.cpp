@@ -1334,6 +1334,42 @@ array mlx_sparse_indexer_head_scores(const array& query, const array& pooled_key
         Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
 }
 
+array mlx_sparse_indexer_weighted_scores(const array& query, const array& pooled_keys, const array& weights) {
+    using namespace mlx::core;
+    if (query.ndim() != 4 || pooled_keys.ndim() != 3 || query.shape(0) != pooled_keys.shape(0) ||
+        query.shape(3) != pooled_keys.shape(2) || weights.shape() != Shape{query.shape(0), query.shape(1), query.shape(2)})
+        throw std::invalid_argument("sparse index weights do not match query heads");
+    const auto head_weights = contiguous(astype(weights, float32));
+    const int count = pooled_keys.shape(1), rows = query.shape(1), heads = query.shape(2);
+    if (default_device() != Device::gpu || count < 256 || rows < 1 || rows > 8 || heads != 16 ||
+        query.shape(3) != 128 || pooled_keys.dtype() != float32) {
+        return sum(maximum(mlx_sparse_indexer_head_scores(query, pooled_keys), array(0.0f)) *
+            expand_dims(head_weights, -1), -2);
+    }
+    static const auto kernel = fast::metal_kernel("tyloinfer_weighted_sparse_indexer16",
+        {"query", "keys", "weights"}, {"scores"}, R"METAL(
+        const uint lane = thread_index_in_simdgroup;
+        const uint key = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
+        const uint rows = uint(query_shape[1]), count = uint(keys_shape[1]);
+        if (key >= count) return;
+        const uint batch = threadgroup_position_in_grid.y / rows;
+        const uint query_row = threadgroup_position_in_grid.y;
+        const uint first = lane * 4;
+        const auto input = keys + (ulong(batch) * count + key) * 128 + first;
+        const float4 k(input[0], input[1], input[2], input[3]);
+        float score = 0.f;
+        for (uint h = 0; h < 16u; ++h) {
+            const auto q = query + (ulong(query_row) * 16 + h) * 128 + first;
+            const float dot_product = simd_sum(dot(k, float4(q[0], q[1], q[2], q[3])));
+            score += max(dot_product, 0.f) * weights[query_row * 16 + h];
+        }
+        if (!lane) scores[ulong(query_row) * count + key] = score;
+        )METAL");
+    const Shape shape{query.shape(0), rows, count};
+    return kernel({contiguous(query), contiguous(pooled_keys), head_weights}, {shape}, {float32},
+        {((count + 3) / 4) * 128, query.shape(0) * rows, 1}, {128, 1, 1}, {}, std::nullopt, false, {}).front();
+}
+
 array mlx_qsa_prefill_attention(
     const array& query,
     const array& key,

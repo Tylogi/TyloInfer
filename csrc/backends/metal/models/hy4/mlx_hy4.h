@@ -48,7 +48,7 @@ class MlxHy4Model {
 public:
     using Cache = MlxHy4Cache;
     using TextSessionState = MlxHy4TextSessionState;
-    static MlxHy4Model load(const MfqContainer& model, int context);
+    static MlxHy4Model load(const MfqContainer& model, int context, const std::string& draft_path = {});
 
     mlx::core::array forward(const mlx::core::array& tokens, MlxHy4Cache& cache,
         bool last_logit_only = false) const;
@@ -56,9 +56,18 @@ public:
     int vocabulary() const noexcept;
     TextSessionState capture(const Cache& cache, const std::vector<std::int64_t>& tokens, bool detached) const;
     Cache restore(const TextSessionState& state) const;
+    std::optional<QsaKvStoreStats> qsa_kv_offload_stats() const;
+    std::size_t kv_cache_bytes(const Cache& cache) const noexcept;
+    bool supports_mtp() const noexcept;
+    int generate_speculative(Cache& cache, MlxMtpEngineRequest request,
+        const MlxPrefixCacheHooks& prefix, MlxMtpGenerationStats& stats,
+        std::optional<mlx::core::array>& last_logits) const;
 
 private:
     struct Weights;
+    struct Verification;
+    mlx::core::array forward_impl(const mlx::core::array& tokens, Cache& cache,
+        bool last_logit_only, Verification* verification) const;
     explicit MlxHy4Model(std::shared_ptr<const Weights> weights) : weights_(std::move(weights)) {}
     std::shared_ptr<const Weights> weights_;
 };

@@ -121,6 +121,7 @@ struct Arguments {
     std::vector<std::filesystem::path> gguf_companions;
     std::filesystem::path sampling_profile;
     std::filesystem::path dflash2_draft;
+    std::filesystem::path dfly2_draft;
     bool help = false;
 };
 
@@ -305,6 +306,8 @@ Arguments parse_arguments(int argc, char** argv) {
                 require_value("--sampling-profile");
         } else if (value == "--dflash2-draft") {
             result.dflash2_draft = require_value("--dflash2-draft");
+        } else if (value == "--dfly2-draft") {
+            result.dfly2_draft = require_value("--dfly2-draft");
         } else if (value == "--no-generation-warmup") {
             result.generation_warmup = false;
         } else if (value == "--help" || value == "-h") {
@@ -370,6 +373,7 @@ void print_help() {
         << "  --tokenizer PATH       external tokenizer GGUF when not embedded\n"
         << "  --sampling-profile P  explicit runtime sampling profile JSON\n"
         << "  --dflash2-draft PATH  experimental DFlash2 checkpoint for supported Qwen text models\n"
+        << "  --dfly2-draft PATH    Hy4 Flash BF16 drafter shard with config.json in the same directory\n"
         << "  --no-generation-warmup  skip model-executing load warmup; retain kernel preparation\n";
 }
 
@@ -2064,6 +2068,8 @@ public:
                     if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>)
                         if (request.vision && restored == 0) loaded_runtime.reset_cache(1);
                 }
+                if constexpr (requires { Runtime::prefix_checkpoints; })
+                    if (restored == 0) loaded_runtime.reset_cache(1);
                 auto effective_cache_plan = cache_plan;
                 effective_cache_plan.stable_prefix_tokens = cache_enabled
                     ? stable_prefix_tokens
@@ -2557,7 +2563,8 @@ private:
                 qsa_offload_supported = config.mtp_num_hidden_layers > 0 ||
                     std::find(config.layer_types.begin(), config.layer_types.end(), "full_attention") != config.layer_types.end();
             }
-        }
+        } else if constexpr (requires(const Runtime& value) { value.qsa_kv_offload_stats(); })
+            qsa_offload_supported = 1;
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -3287,10 +3294,10 @@ int run_native_runtime(
     if (backbone == "inkling2_loop" || backbone == "hy_v4_flash") {
         const auto config = nlohmann::json::parse(container.read_text("__mfq_asset__/model_config.json"));
         const auto context = config.at("max_position_embeddings").get<int>();
-        const auto run = [&]<class Runtime>() {
-            auto load = [&container, context](std::int64_t requested) {
+        const auto run = [&]<class Runtime>(auto... options) {
+            auto load = [&container, context, options...](std::int64_t requested) {
                 if (requested < 1) throw std::invalid_argument("invalid Metal text context");
-                return Runtime::load(container, static_cast<int>(std::min<std::int64_t>(requested, context)));
+                return Runtime::load(container, static_cast<int>(std::min<std::int64_t>(requested, context)), options...);
             };
             auto runtime = load(arguments.context_size);
             const int vocab = runtime.vocabulary();
@@ -3299,7 +3306,7 @@ int run_native_runtime(
                 backbone, context, vocab, runtime_stream);
         };
         if (backbone == "inkling2_loop") return run.template operator()<mfq::metal::MlxInkling2Runtime>();
-        return run.template operator()<mfq::metal::MlxHy4Runtime>();
+        return run.template operator()<mfq::metal::MlxHy4Runtime>(arguments.dfly2_draft.string());
     }
 
     if (backbone == "nemotron_h") {

@@ -3,14 +3,19 @@
 #include "mlx_gguf_layer_tensors.h"
 #include "mlx_hyper_connection.h"
 #include "mlx_sparse_attention.h"
+#include "mlx_weight_residency.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <mlx/io.h>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace mfq::metal {
 namespace {
@@ -276,6 +281,10 @@ struct Layer {
 namespace {
 constexpr int selected_query_tile = 16;
 
+struct VerifiedLayerRows {
+    std::optional<array> old_window, new_window, index_pairs, selections;
+};
+
 array trailing_rope(const array& values, const array& positions, int rotary, float base) {
     const int unrotated = values.shape(-1) - rotary;
     if (unrotated == 0) return rotate(values, positions, base);
@@ -331,11 +340,12 @@ array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const ar
 }
 
 void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
-    const array& input, int position) {
+    const array& input, int position, VerifiedLayerRows* verified) {
     const int width = g.index_width;
     const auto key = index.key_norm(index.key(input));
     auto pairs = concatenate({astype(index.value(key), float32), astype(index.gate(key), float32)}, -1);
     if (cache.index_tail) pairs = concatenate({*cache.index_tail, pairs}, 1);
+    if (verified) verified->index_pairs = pairs;
     const int complete = pairs.shape(1) / g.group_size;
     const int split = complete * g.group_size;
     if (split < pairs.shape(1)) {
@@ -364,8 +374,7 @@ array choose_resident_groups(const MlxSequenceCache& groups, const Geometry& g,
     const auto current = reshape(floor_divide(arange(position, position + take, 1, int32),
         array(g.group_size)), {1, take, 1});
     const auto history = reshape(arange(0, available, 1, int32), {1, 1, available});
-    auto scores = sum(maximum(mlx_sparse_indexer_head_scores(query, groups.view()), array(0.0f)) *
-        expand_dims(weights, -1), -2);
+    auto scores = mlx_sparse_indexer_weighted_scores(query, groups.view(), weights);
     scores = where(history < current, scores, array(-std::numeric_limits<float>::infinity()));
     auto ids = sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1);
     const auto all_visible = reshape(arange(0, budget, 1, int32), {1, 1, budget});
@@ -388,7 +397,7 @@ array token_selection(const array& groups, const Geometry& g, int position) {
 array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
     const array& query, const array& latent, const array& input, const array& query_low,
     const array& positions, const array& sinks, int position, float scale,
-    const std::shared_ptr<QsaKvStore>& offload) {
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
     const int count = latent.shape(1), end = position + count;
     if (!cache.latent && !cache.offloaded_latent) {
         if (offload) {
@@ -401,7 +410,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     }
     if (cache.offloaded_latent) cache.offloaded_latent->append(latent);
     else cache.latent->append(latent);
-    append_index_pool(cache, index, g, input, position);
+    append_index_pool(cache, index, g, input, position, verified);
 
     if (end <= g.index_budget) {
         cache.last_indices = reshape(arange(0, end, 1, int32), {1, 1, end});
@@ -426,6 +435,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
             ? cache.offloaded_groups->select(q, position + start, g.group_size, g.index_budget, weights, true)
             : choose_resident_groups(*cache.groups, g, q, weights, position + start);
         const auto ids = token_selection(groups, g, position + start);
+        if (verified) verified->selections = ids;
         const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
         const auto queries = axis_slice(query, 2, start, stop);
         if (cache.offloaded_latent) {
@@ -439,38 +449,207 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     return output.size() == 1 ? output.front() : concatenate(output, 1);
 }
 
-array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
-    const std::optional<array>& engram, const array& positions, int offset,
-    const std::shared_ptr<QsaKvStore>& offload) {
-    const int count = streams.shape(1), plain = g.q_dim - g.rotary;
-    if (engram) streams = (*layer.engram)(streams, *engram, g);
-    const auto mix = layer.attention_hc.collapse(streams);
-    const auto in = layer.attention_norm(mix.branch);
+struct MlaRows {
+    array query, latent, query_low, gate;
+};
+
+template <class Attention>
+MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const array& positions, float base) {
+    const int count = in.shape(1), plain = g.q_dim - g.rotary;
     const auto projected = layer.projections(in);
-    const auto low = layer.query_norm(projected[0]);
-    const auto base = layer.sliding ? g.window_rotary_base : g.rotary_base;
+    auto low = layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
     const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
     const auto absorbed = matmul(astype(no_rope, float32), layer.key_absorption);
     const auto rope_q = transpose(rotate(axis_slice(q, -1, plain, g.q_dim), positions, base), {0, 2, 1, 3});
-    const auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
+    auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
     const auto latent = concatenate({layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
         astype(rotate(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary), positions, base), float32)}, -1);
-    const auto cached = astype(latent, float16);
-    const float scale = 1.0f / std::sqrt(float(g.q_dim));
-    const auto attention = layer.sliding ? sliding_attention(cache, g, query, cached, layer.sinks, offset, scale)
-        : run_indexed_attention(cache, *layer.index, g, query, cached, in, low, positions, layer.sinks,
-            offset, scale, offload);
+    return {std::move(query), astype(latent, float16), std::move(low), projected[2]};
+}
+
+template <class Attention>
+array expand_mla(const Attention& layer, const Geometry& g, const array& attention, const array& gate, Dtype dtype) {
     const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), float32), layer.value_expansion);
-    const auto gated = reshape(transpose(expanded, {0, 2, 1, 3}), {1, count, layer.heads * g.v_dim}) *
-        sigmoid(astype(projected[2], float32));
-    const auto attn_out = layer.post_attention_norm(layer.output(astype(gated, in.dtype())));
+    const auto gated = reshape(transpose(expanded, {0, 2, 1, 3}),
+        {1, attention.shape(1), layer.heads * g.v_dim}) * sigmoid(astype(gate, float32));
+    return layer.post_attention_norm(layer.output(astype(gated, dtype)));
+}
+
+array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
+    const std::optional<array>& engram, const array& positions, int offset,
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
+    if (engram) streams = (*layer.engram)(streams, *engram, g);
+    const auto mix = layer.attention_hc.collapse(streams);
+    const auto in = layer.attention_norm(mix.branch);
+    const auto rows = project_mla(layer, g, in, positions, layer.sliding ? g.window_rotary_base : g.rotary_base);
+    if (verified && layer.sliding) {
+        verified->old_window = cache.window;
+        verified->new_window = rows.latent;
+    }
+    const float scale = 1.0f / std::sqrt(float(g.q_dim));
+    const auto attention = layer.sliding ? sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale)
+        : run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent, in, rows.query_low, positions, layer.sinks,
+            offset, scale, offload, verified);
+    const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
     streams = MlxHyperConnection::expand(streams, attn_out, mix);
     const auto ffn_mix = layer.ffn_hc.collapse(streams);
     const auto ffn_in = layer.ffn_norm(ffn_mix.branch);
     const auto ffn = layer.dense ? (*layer.dense)(ffn_in) : (*layer.moe)(ffn_in, g);
     return MlxHyperConnection::expand(streams, layer.post_ffn_norm(ffn), ffn_mix);
 }
+
+using DraftTensors = std::unordered_map<std::string, array>;
+
+class DraftWeights {
+public:
+    DraftWeights(const DraftTensors& tensors, std::string prefix)
+        : tensors_(tensors), prefix_(std::move(prefix)) {}
+    array tensor(const std::string& name) const {
+        const auto found = tensors_.find("model.dfly_layers." + prefix_ + name);
+        if (found == tensors_.end() || found->second.dtype() != bfloat16)
+            throw std::runtime_error("missing BF16 DFly2 tensor " + prefix_ + name);
+        return found->second;
+    }
+    MlxLinear linear(const std::string& name) const { return MlxLinear(tensor(name + ".weight")); }
+    MlxRmsNorm norm(const std::string& name, float eps) const { return MlxRmsNorm(tensor(name + ".weight"), eps); }
+    FeedForward ffn() const {
+        return FeedForward(linear("gate_proj"), linear("up_proj"), linear("down_proj"));
+    }
+
+private:
+    const DraftTensors& tensors_;
+    std::string prefix_;
+};
+
+struct DflyLayer {
+    int heads;
+    MlxRmsNorm attention_norm, post_attention_norm, query_norm, latent_norm, ffn_norm;
+    MlxLinear query_a, query_b, latent, gate, output;
+    array key_absorption, value_expansion, sinks;
+    FeedForward ffn;
+    MlxProjectionBatch projections;
+
+    DflyLayer(const DraftWeights& t, const Geometry& g, const int head_count)
+        : heads(head_count),
+          attention_norm(t.norm("input_layernorm", g.eps)),
+          post_attention_norm(t.norm("self_attn.post_proj_norm", g.eps)),
+          query_norm(t.norm("self_attn.q_a_layernorm", g.eps)),
+          latent_norm(t.norm("self_attn.kv_a_layernorm", g.eps)),
+          ffn_norm(t.norm("post_attention_layernorm", g.eps)),
+          query_a(t.linear("self_attn.q_a_proj")), query_b(t.linear("self_attn.q_b_proj")),
+          latent(t.linear("self_attn.kv_a_proj_with_mqa")), gate(t.linear("self_attn.linear_gate")),
+          output(t.linear("self_attn.o_proj")),
+          key_absorption(partition_kv(t, g, heads, false)), value_expansion(partition_kv(t, g, heads, true)),
+          sinks(t.tensor("self_attn.learnable_sink_param")),
+          ffn(FeedForward(t.linear("mlp.gate_proj"), t.linear("mlp.up_proj"), t.linear("mlp.down_proj"))),
+          projections({&query_a, &latent, &gate}) {}
+
+    static array partition_kv(const DraftWeights& t, const Geometry& g, int heads, bool value) {
+        const int no_rotary = g.q_dim - g.rotary;
+        auto weight = reshape(t.tensor("self_attn.kv_b_proj.weight"), {heads, no_rotary + g.v_dim, g.kv_rank});
+        weight = value ? transpose(axis_slice(weight, 1, no_rotary, no_rotary + g.v_dim), {0, 2, 1})
+            : axis_slice(weight, 1, 0, no_rotary);
+        return contiguous(astype(weight, float32));
+    }
+
+    array operator()(const Geometry& g, const array& input, const array& positions,
+        const array& history, const array& valid) const {
+        const auto rows = project_mla(*this, g, attention_norm(input), positions, g.rotary_base);
+        const auto keys = expand_dims(concatenate({history, rows.latent}, 1), 1);
+        const int count = input.shape(1);
+        auto relative = arange(0, count, 1, int32);
+        auto causal = relative <= expand_dims(relative, 1);
+        const auto mask = concatenate({broadcast_to(valid, {count, history.shape(1)}), causal}, 1);
+        const float scale = 1.0f / std::sqrt(float(g.q_dim));
+        auto weights = fast::scaled_dot_product_attention(astype(rows.query, keys.dtype()),
+            keys, keys, scale, "", mask, astype(sinks, keys.dtype()));
+        auto attention = transpose(axis_slice(weights, -1, 0, g.kv_rank), {0, 2, 1, 3});
+        auto residual = input + expand_mla(*this, g, attention, rows.gate, input.dtype());
+        return residual + ffn(ffn_norm(residual));
+    }
+};
+
+struct DflyDraft {
+    MlxRmsNorm embedding_norm, target_norm, correction_hidden_norm, correction_embedding_norm, output_norm;
+    MlxLinear fuse;
+    array fuse_gate;
+    FeedForward correction;
+    int max_depth, mask_id, local_window;
+    std::vector<int> target_layers, index_layers;
+    std::vector<DflyLayer> layers;
+
+    DflyDraft(const DraftTensors& tensors, const json& config, const Geometry& g)
+        : embedding_norm(DraftWeights(tensors, "mtp_fusion.").norm("enorm", g.eps)),
+          target_norm(DraftWeights(tensors, "mtp_fusion.").norm("hnorm", g.eps)),
+          correction_hidden_norm(DraftWeights(tensors, "hidden_correction.").norm("hidden_norm", g.eps)),
+          correction_embedding_norm(DraftWeights(tensors, "hidden_correction.").norm("embed_norm", g.eps)),
+          output_norm(DraftWeights(tensors, "").norm("final_norm", g.eps)),
+          fuse(DraftWeights(tensors, "mtp_fusion.").linear("eh_proj")),
+          fuse_gate(DraftWeights(tensors, "mtp_fusion.").tensor("gate")),
+          correction(DraftWeights(tensors, "hidden_correction.").ffn()),
+          max_depth(config.at("speculative_config").at("num_speculative_tokens").get<int>()),
+          mask_id(config.at("dfly_mask_token_id").get<int>()),
+          local_window(config.at("dfly_context_local_window").is_null() ? 0 : config.at("dfly_context_local_window").get<int>()),
+          target_layers(config.at("dfly_target_kv_layers").get<std::vector<int>>()),
+          index_layers(config.at("dfly_target_index_layer").get<std::vector<int>>()) {
+        const int count = config.at("dfly_num_hidden_layers").get<int>();
+        if (config.at("dfly_mtp_fusion") != "slot0" || !config.at("dfly_enable_hidden_correction").get<bool>() ||
+            config.at("dfly_target_index_topk") != g.index_budget ||
+            max_depth < 1 || max_depth > kMlxMtpEngineMaximumDraftDepth ||
+            mask_id < 0 || mask_id >= g.vocab || local_window < 0 || local_window > g.context ||
+            count < 1 || count > 64 || target_layers.size() != std::size_t(count) || index_layers.size() != std::size_t(count))
+            throw std::invalid_argument("unsupported DFly2 configuration");
+        layers.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            const int target = target_layers[i], index = index_layers[i];
+            if (target < 0 || target >= g.layers || g.sliding[target] ||
+                index < 0 || index >= g.layers || g.sliding[index])
+                throw std::invalid_argument("DFly2 reuse layer must be a sparse Hy4 target layer");
+            const auto t = DraftWeights(tensors, std::to_string(i) + ".");
+            const auto head_count = t.tensor("self_attn.learnable_sink_param").size();
+            if (head_count == 0 || head_count > 256) throw std::invalid_argument("invalid DFly2 head count");
+            layers.emplace_back(t, g, static_cast<int>(head_count));
+        }
+    }
+
+    void propose(const Geometry& g, const MlxHy4Cache& cache, const MlxEmbedding& embedding,
+        const MlxLinear& output, std::int32_t pending, int depth, const MlxMtpTokenSelector& select) const {
+        std::vector<std::int32_t> proposal(1 + depth, mask_id);
+        proposal.front() = pending;
+        const auto ids = array(proposal.begin(), {1, 1 + depth}, int32);
+        auto previous = axis_slice(ids, 1, 0, 1);
+        const auto embeds = embedding(ids, bfloat16);
+        const auto anchor = axis_slice(embeds, 1, 0, 1);
+        auto corrected_anchor = anchor + fuse_gate *
+            fuse(concatenate({embedding_norm(anchor), target_norm(*cache.last_hidden)}, -1));
+        auto hidden = concatenate({corrected_anchor, axis_slice(embeds, 1, 1, depth + 1)}, 1);
+        const int position = cache.position;
+        const auto positions = arange(position, position + 1 + depth, 1, int32);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& cached = cache.layers[target_layers[i]];
+            auto selected = *cache.layers[index_layers[i]].last_indices;
+            if (local_window) {
+                const int begin = std::max(0, position - local_window);
+                selected = where(selected < begin, selected, array(-1, int32));
+                const auto local = reshape(arange(begin, position, 1, int32), {1, 1, position - begin});
+                selected = concatenate({selected, local}, -1);
+            }
+            const auto shape = Shape{1, selected.shape(-1), g.kv_rank + g.rotary};
+            auto history = cached.offloaded_latent ? reshape(cached.offloaded_latent->gather(selected), shape)
+                : take(cached.latent->view(), reshape(maximum(selected, array(0, int32)), {-1}), 1);
+            auto valid = reshape(selected >= array(0, int32), {1, selected.shape(-1)});
+            hidden = layers[i](g, hidden, positions, history, valid);
+        }
+        hidden = output_norm(hidden);
+        for (int i = 1; i <= depth; ++i) {
+            const auto row = axis_slice(hidden, 1, i, i + 1);
+            const auto prior = correction_embedding_norm(embedding(previous, bfloat16));
+            const auto corrected = row + correction(concatenate({correction_hidden_norm(row), prior}, -1));
+            previous = reshape(select(mlx_last_token_logits(output(corrected), g.vocab)), {1, 1});
+        }
+    }
+};
 
 array dense_weight(const MfqContainer& model, const std::string& key) {
     return astype(load_dense_array(model.record(key).dtype, model.read(key)), float32);
@@ -539,8 +718,10 @@ struct MlxHy4Model::Weights {
     std::optional<EngramTable> engram;
     std::vector<Layer> layers;
     std::shared_ptr<QsaKvStore> offload;
+    std::optional<DflyDraft> draft;
 
-    Weights(const MfqContainer& model, const GgufModelSource& source, const json& meta, Geometry config)
+    Weights(const MfqContainer& model, const GgufModelSource& source, const json& meta,
+        Geometry config, const std::string& draft_path)
         : g(std::move(config)), token_embedding(MlxEmbedding::load(model, "model.token_embedding.weight")),
           output(MlxLinear::load(model, "model.output.weight")),
           output_norm(dense_weight(model, "model.output_norm.weight"), g.eps),
@@ -554,29 +735,60 @@ struct MlxHy4Model::Weights {
             const bool has_engram = engram && std::find(engram->layers.begin(), engram->layers.end(), layer) != engram->layers.end();
             layers.emplace_back(MlxGgufLayerTensors(model, source, layer), g, layer, has_engram);
         }
+        if (!draft_path.empty()) {
+            auto path = std::filesystem::path(draft_path);
+            std::ifstream config_file(path.parent_path() / "config.json");
+            if (!config_file) throw std::runtime_error("DFly2 requires config.json beside its BF16 safetensors shard");
+            const auto config = json::parse(config_file);
+            const auto tensors = load_safetensors(draft_path).first;
+            std::vector<array> loaded;
+            loaded.reserve(tensors.size());
+            for (const auto& [name, tensor] : tensors) loaded.push_back(tensor);
+            // Deferred safetensors reads use the loader thread's CPU stream.
+            // Finish them before the serving worker can build a proposal.
+            eval(loaded);
+            draft.emplace(tensors, config, g);
+            for (const auto& tensor : loaded) MlxWeightResidency::track(tensor);
+        }
     }
 };
 
-MlxHy4Model MlxHy4Model::load(const MfqContainer& model, int context) {
+struct MlxHy4Model::Verification {
+    int position = 0;
+    std::vector<VerifiedLayerRows> layers;
+    std::vector<std::int32_t> engram_tokens;
+    std::optional<array> hidden;
+};
+
+MlxHy4Model MlxHy4Model::load(const MfqContainer& model, int context, const std::string& draft_path) {
     const auto* source = dynamic_cast<const GgufModelSource*>(model.native_source());
     if (!source || source->architecture() != "hy_v4_flash")
         throw std::invalid_argument("Hy4 Flash runtime requires a hy_v4_flash GGUF");
     const auto meta = json::parse(source->metadata().at("gguf_metadata"));
-    return MlxHy4Model(std::make_shared<Weights>(model, *source, meta, geometry(meta, context)));
+    return MlxHy4Model(std::make_shared<Weights>(model, *source, meta, geometry(meta, context), draft_path));
 }
 
 array MlxHy4Model::forward(const array& tokens, MlxHy4Cache& cache, bool last_logit_only) const {
+    return forward_impl(tokens, cache, last_logit_only, nullptr);
+}
+
+array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool last_logit_only,
+    Verification* verification) const {
     const auto& w = *weights_;
     const auto& g = w.g;
     if (tokens.ndim() != 2 || tokens.shape(0) != 1 || tokens.shape(1) <= 0 ||
         cache.position < 0 || tokens.shape(1) > g.context - cache.position ||
-        (cache.position && cache.layers.size() != std::size_t(g.layers)))
+        (!cache.layers.empty() && cache.layers.size() != std::size_t(g.layers)))
         throw std::invalid_argument("invalid Hy4 tokens or layer cache");
     const int count = tokens.shape(1), offset = cache.position;
     if (cache.layers.empty()) cache.layers.resize(g.layers);
     const auto positions = arange(offset, offset + count, 1, int32);
     auto hidden = w.token_embedding(tokens, bfloat16);
     auto streams = broadcast_to(expand_dims(hidden, 2), {1, count, g.streams, g.hidden});
+    if (verification) {
+        verification->position = offset;
+        verification->layers.resize(g.layers);
+    }
 
     std::vector<std::int32_t> history = cache.engram_tail;
     const auto first = history.size();
@@ -585,12 +797,13 @@ array MlxHy4Model::forward(const array& tokens, MlxHy4Cache& cache, bool last_lo
         ids.eval();
         const auto* data = ids.data<std::int32_t>();
         history.insert(history.end(), data, data + count);
+        if (verification) verification->engram_tokens = history;
     }
     for (int layer = 0; layer < g.layers; ++layer) {
         std::optional<array> rows;
         if (w.layers[layer].engram) rows = w.engram->gather(layer, history, first);
         streams = run_layer(w.layers[layer], g, cache.layers[layer], std::move(streams), rows,
-            positions, offset, w.offload);
+            positions, offset, w.offload, verification ? &verification->layers[layer] : nullptr);
     }
     if (w.engram) {
         const auto keep = std::min(history.size(), std::size_t(w.engram->grams - 1));
@@ -601,6 +814,7 @@ array MlxHy4Model::forward(const array& tokens, MlxHy4Cache& cache, bool last_lo
     const auto flattened = reshape(float_streams, {1, streams.shape(1), g.streams * g.hidden});
     const auto gates = sigmoid(matmul(rms(flattened, g.eps), w.head_weight) * w.head_scale + w.head_bias) + g.gate_eps;
     hidden = w.output_norm(sum(float_streams * expand_dims(gates, -1), 2), bfloat16);
+    if (verification) verification->hidden = hidden;
     cache.last_hidden = axis_slice(hidden, 1, hidden.shape(1) - 1, hidden.shape(1));
     cache.position += count;
     return astype(w.output(hidden), float32);
@@ -608,6 +822,111 @@ array MlxHy4Model::forward(const array& tokens, MlxHy4Cache& cache, bool last_lo
 
 int MlxHy4Model::context() const noexcept { return weights_->g.context; }
 int MlxHy4Model::vocabulary() const noexcept { return weights_->g.vocab; }
+bool MlxHy4Model::supports_mtp() const noexcept { return weights_->draft.has_value(); }
+
+std::optional<QsaKvStoreStats> MlxHy4Model::qsa_kv_offload_stats() const {
+    if (weights_->offload) return weights_->offload->stats();
+    return std::nullopt;
+}
+
+std::size_t MlxHy4Model::kv_cache_bytes(const Cache& cache) const noexcept {
+    std::size_t bytes = cache.engram_tail.size() * sizeof(std::int32_t);
+    if (cache.last_hidden) bytes += cache.last_hidden->nbytes();
+    for (const auto& layer : cache.layers) {
+        if (layer.window) bytes += layer.window->nbytes();
+        if (layer.index_tail) bytes += layer.index_tail->nbytes();
+        if (layer.last_indices) bytes += layer.last_indices->nbytes();
+        if (layer.latent) bytes += layer.latent->storage_bytes();
+        if (layer.groups) bytes += layer.groups->storage_bytes();
+    }
+    return bytes;
+}
+
+int MlxHy4Model::generate_speculative(Cache& cache, MlxMtpEngineRequest request,
+    const MlxPrefixCacheHooks& prefix, MlxMtpGenerationStats& stats, std::optional<array>& last_logits) const {
+    const auto& w = *weights_;
+    const auto& draft = *w.draft;
+    const auto& g = w.g;
+    std::optional<Verification> verification;
+    std::optional<array> logits;
+    const int input_end = cache.position;
+    std::optional<std::int32_t> last_emitted;
+    request.callback = [callback = std::move(request.callback), &last_emitted](std::int64_t token) {
+        last_emitted = static_cast<std::int32_t>(token);
+        return !callback || callback(token);
+    };
+    MlxMtpEngineCallbacks callbacks;
+    callbacks.predictor = MlxMtpPredictorDescriptor::recurrent(draft.max_depth);
+    callbacks.target_cache_position = [&] { return cache.position; };
+    callbacks.prepare_draft = [&](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
+        if (context.requested_depth)
+            draft.propose(g, cache, w.token_embedding, w.output, context.pending_token,
+                context.requested_depth, select);
+    };
+    callbacks.verify_target = [&](std::int32_t pending, const array& drafts, int count) {
+        auto ids = mlx_mtp_verification_ids(pending, drafts, count);
+        if (count) verification.emplace();
+        auto target = reshape(forward_impl(ids, cache, false, verification ? &*verification : nullptr),
+            {count + 1, g.vocab});
+        if (count) logits = target;
+        else last_logits = target;
+        return MlxMtpTargetBatch{std::move(target), verification ? *verification->hidden : *cache.last_hidden};
+    };
+    callbacks.resolve_target = [&](int accepted, int proposed) {
+        if (!proposed) return;
+        const auto& trace = *verification;
+        const int keep = accepted + 1, position = trace.position + keep;
+        if (accepted != proposed) {
+            for (int i = 0; i < g.layers; ++i) {
+                auto& layer = cache.layers[i];
+                const auto& saved = trace.layers[i];
+                if (g.sliding[i]) {
+                    const auto new_rows = axis_slice(*saved.new_window, 1, 0, keep);
+                    layer.window = mlx_circular_cache_append(*saved.old_window, new_rows, trace.position);
+                    continue;
+                }
+                if (layer.offloaded_latent) {
+                    layer.offloaded_latent->trim(position);
+                    layer.offloaded_groups->trim(position / g.group_size);
+                } else {
+                    layer.latent->trim(proposed - accepted);
+                    layer.groups->trim(layer.groups->position() - position / g.group_size);
+                }
+                const int owed = position % g.group_size;
+                if (owed) {
+                    const int end = trace.position % g.group_size + keep;
+                    layer.index_tail = axis_slice(*saved.index_pairs, 1, end - owed, end);
+                } else {
+                    layer.index_tail.reset();
+                }
+                layer.last_indices = saved.selections
+                    ? axis_slice(*saved.selections, 1, accepted, keep)
+                    : reshape(arange(0, position, 1, int32), {1, 1, position});
+            }
+            if (w.engram) {
+                const auto end = trace.engram_tokens.end() - (proposed - accepted);
+                const int length = std::min(position, w.engram->grams - 1);
+                cache.engram_tail.assign(end - length, end);
+            }
+            cache.last_hidden = axis_slice(*trace.hidden, 1, accepted, keep);
+            cache.position = position;
+        }
+        last_logits = axis_slice(*logits, 0, accepted, keep);
+        verification.reset();
+        logits.reset();
+    };
+    if (prefix) {
+        callbacks.draft_limit = [&](int position, int depth) { return prefix.draft_limit(position, depth); };
+        callbacks.committed_target = [&](const MlxMtpDraftContext&) { prefix.checkpoint(cache.position); };
+    }
+    const int generated = run_mlx_mtp_generation(std::move(request), callbacks, stats);
+    if (last_emitted && cache.position < input_end + generated && prefix.wants(cache.position + 1, true)) {
+        last_logits = mlx_last_token_logits(forward(array({*last_emitted}, {1, 1}, int32), cache, true), g.vocab);
+        last_logits->eval();
+    }
+    prefix.checkpoint(cache.position, true);
+    return generated;
+}
 
 MlxHy4TextSessionState MlxHy4Model::capture(const Cache& cache,
     const std::vector<std::int64_t>& tokens, bool detached) const {
