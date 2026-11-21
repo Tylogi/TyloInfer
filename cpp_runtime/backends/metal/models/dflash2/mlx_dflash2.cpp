@@ -34,26 +34,29 @@ array rotated(const array& value, int dimension, float theta, int offset) {
 
 array draft_ring_attention(const array& query, const array& key, const array& value,
     const std::vector<array>& past_keys, const std::vector<array>& past_values, const array& positions) {
-    constexpr int blocks = 128;
-    // Keep the round-robin split and reduction order of MLX's padded
-    // two-pass vector SDPA. Skip masked entries and read the ring and
-    // proposal rows directly in the same four-token order. See NOTICE.
+    const int lanes = query.shape(0);
+    const int blocks = lanes > 4 ? 32 : 128;
+    // Read the ring and proposal rows directly in four-token order. The
+    // wider path uses fewer splits for short contexts. See NOTICE.
     static const auto options = [] {
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Safe;
         return compile_options;
     }();
-    static const auto split = cached_metal_kernel("tinfer_draft_vector_ring_split",
-        {"query", "key", "value", "key0", "key1", "key2", "key3",
-         "value0", "value1", "value2", "value3", "positions"}, {"parts", "sums", "maxima"}, R"METAL(
+    static const auto splits = [&] {
+        const auto make = [&](int slots) {
+            std::vector<std::string> names{"query", "key", "value"};
+            for (const auto* prefix : {"key", "value"})
+                for (int slot = 0; slot < slots; ++slot) names.push_back(prefix + std::to_string(slot));
+            names.push_back("positions");
+            std::string source = R"METAL(
       const uint3 group = threadgroup_position_in_grid;
       const uint3 local = thread_position_in_threadgroup;
       constexpr uint D = 128, KV = 8, Q = 32, Rows = 8, Window = 2048;
       const uint h = group.x, b = group.y, block = group.z, lane = thread_index_in_simdgroup;
       const uint row = local.z, qhead = h * 4 + local.y;
       const ulong q_offset = (ulong(b * Q + qhead) * Rows + row) * D + lane * 4;
-      device const bfloat* old_k = b == 0 ? key0 : (b == 1 ? key1 : (b == 2 ? key2 : key3));
-      device const bfloat* old_v = b == 0 ? value0 : (b == 1 ? value1 : (b == 2 ? value2 : value3));
+      RING_POINTERS
       old_k += ulong(h) * Window * D + lane * 4;
       old_v += ulong(h) * Window * D + lane * 4;
       const ulong new_base = ulong(b * KV + h) * Rows * D + lane * 4;
@@ -102,7 +105,22 @@ array draft_ring_attention(const array& query, const array& key, const array& va
       const ulong result = (ulong(b * Q + qhead) * Rows + row) * Blocks + block;
       if (lane == 0) { sums[result] = denominator; maxima[result] = maximum; }
       for (uint j = 0; j < 4; ++j) parts[result * D + lane * 4 + j] = bfloat(o[j]);
-)METAL", "", true, false, options);
+)METAL";
+            std::string pointers;
+            for (const auto* prefix : {"key", "value"}) {
+                pointers += prefix[0] == 'k' ? "device const bfloat* old_k = " : "device const bfloat* old_v = ";
+                for (int slot = 0; slot + 1 < slots; ++slot) {
+                    const auto index = std::to_string(slot);
+                    pointers += "b == " + index + " ? " + prefix + index + " : ";
+                }
+                pointers += prefix + std::to_string(slots - 1) + ";\n";
+            }
+            source.replace(source.find("RING_POINTERS"), std::string_view("RING_POINTERS").size(), pointers);
+            return cached_metal_kernel(slots == 4 ? "tinfer_draft_vector_ring_split" : "tinfer_draft_vector_ring_split_wide",
+                names, {"parts", "sums", "maxima"}, source, "", true, false, options);
+        };
+        return std::array{make(4), make(8)};
+    }();
     static const auto reduce = cached_metal_kernel("tinfer_draft_vector_ring_reduce",
         {"partials", "sums", "maxs"}, {"out"}, R"METAL(
       constexpr uint D = 128, Rows = 8, Q = 32, BN = 32;
@@ -135,17 +153,18 @@ array draft_ring_attention(const array& query, const array& key, const array& va
           for (uint j = 0; j < 4; ++j) out[base + j] = bfloat(o[j]);
       }
 )METAL", "", true, false, options);
-    const int lanes = query.shape(0);
+    const bool wide = lanes > 4;
+    const int slots = wide ? 8 : 4;
     std::vector<array> inputs{query, key, value};
-    inputs.reserve(12);
+    inputs.reserve(4 + 2 * slots);
     for (const auto* ring : {&past_keys, &past_values})
-        for (int lane = 0; lane < 4; ++lane)
+        for (int lane = 0; lane < slots; ++lane)
             inputs.push_back((*ring)[lane < lanes ? lane : 0]);
     inputs.push_back(positions);
     const Shape partial_shape{lanes, 32, 8, blocks, 128};
     const Shape statistics_shape{lanes, 32, 8, blocks};
     const std::vector<std::pair<std::string, fast::TemplateArg>> parameters{{"Blocks", blocks}};
-    const auto partials = split(inputs, {partial_shape, statistics_shape, statistics_shape},
+    const auto partials = splits[wide](inputs, {partial_shape, statistics_shape, statistics_shape},
         {bfloat16, float32, float32}, {8 * 32, lanes * 4, blocks * 8}, {32, 4, 8},
         parameters, std::nullopt, false, {});
     return reduce(partials, {{lanes, 8, 4096}}, {bfloat16}, {lanes * 32 * 1024, 8, 1},
@@ -521,11 +540,11 @@ MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFla
     std::vector<int> positions;
     std::vector<int> row_offsets{0};
     int maximum_depth = 0;
-    const bool direct_ring = batch >= 2 && batch <= 4 && c.block_size == 8 && c.window == 2048 &&
+    const bool direct_ring = batch >= 2 && batch <= 8 && c.block_size == 8 && c.window == 2048 &&
         c.query_heads == 32 && c.kv_heads == 8 && c.head_dimension == 128 &&
         mlx_apple_chip_is("Apple M5 Max") && !std::getenv("MLX_SDPA_BLOCKS") &&
         std::all_of(contexts.begin(), contexts.end(), [&](const auto* context) {
-            return context && context->position < c.window;
+            return context && (batch <= 4 ? context->position < c.window : context->position <= 512);
         });
     for (int lane = 0; lane < batch; ++lane) {
         if (!contexts[lane] || anchors[lane] < 0 || anchors[lane] >= c.vocabulary)
@@ -793,6 +812,15 @@ void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head, 
         auto proposal = propose(context, 0, zeros({1, c.block_size, c.hidden}, bfloat16), output_head);
         preparation->add(proposal.tokens); preparation->add(proposal.confidence);
         if (tree_batch) {
+            if (c.block_size == 8 && c.window == 2048 &&
+                c.query_heads == 32 && c.kv_heads == 8 && c.head_dimension == 128 &&
+                mlx_apple_chip_is("Apple M5 Max") && !std::getenv("MLX_SDPA_BLOCKS")) {
+                const auto ring = zeros({1, 8, 2048, 128}, bfloat16);
+                const std::vector<array> past(8, ring);
+                const auto kv = zeros({8, 8, 8, 128}, bfloat16);
+                preparation->add(draft_ring_attention(zeros({8, 32, 8, 128}, bfloat16), kv, kv,
+                    past, past, zeros({8}, int32)));
+            }
             MlxDFlash2Context second;
             reset(second);
             const auto features = zeros({1, c.block_size, c.hidden * int(c.target_layers.size())}, bfloat16);
