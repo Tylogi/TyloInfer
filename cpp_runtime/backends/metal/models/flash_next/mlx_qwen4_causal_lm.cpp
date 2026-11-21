@@ -3331,18 +3331,20 @@ private:
                     for (const auto& output : {decoded.output, decoded.convolution_state,
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
                     if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
-                        const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6};
+                        const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6, 7, 8};
                         const MlxGatedDeltaTreeLane full_lane{parents, conv, state};
                         const int key_heads = static_cast<int>(config_.linear_num_key_heads);
                         const int value_heads = static_cast<int>(config_.linear_num_value_heads);
                         // Dispatch signatures differ as a cohort drains and its metadata fits in constant memory.
                         constexpr std::array<std::pair<int, int>, 9> layouts{{
                             {1, 1}, {1, 3}, {1, 8}, {2, 1}, {2, 8}, {3, 1}, {3, 8}, {4, 1}, {4, 8}}};
-                        for (const auto& [count, rows] : layouts) {
+                        const auto prepare_tree = [&](int count, int rows, int last_rows) {
                             std::vector<MlxGatedDeltaTreeLane> lanes(count, full_lane);
                             for (auto& lane : lanes) lane.parents = lane.parents.first(rows);
+                            lanes.back().parents = full_lane.parents.first(last_rows);
                             const auto packed = mlx::core::zeros(
-                                {1, count * rows, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
+                                {1, (count - 1) * rows + last_rows, static_cast<int>(config_.hidden_size)},
+                                preparation->activation_dtype());
                             const auto projected = project_inputs(packed);
                             auto result = gated_delta_decode_packed_trees(projected, lanes,
                                 convolution_weight_, dt_bias_, decay_scale_, output_norm_.weight(),
@@ -3357,6 +3359,13 @@ private:
                             auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
                                 tape.keys, tape.values, tape.decay, tape.beta, retained, config_.linear_tiled_heads);
                             preparation->add(folded.recurrent);
+                        };
+                        for (const auto& [count, rows] : layouts) prepare_tree(count, rows, rows);
+                        if (config_.hidden_size == 2560 && config_.hc_count == 4 && !config_.ple_layer_ids.empty() &&
+                            mlx_apple_chip_is("Apple M5 Max") &&
+                            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", true)) {
+                            // A three-request group can spend most of its 16 rows on one lane.
+                            prepare_tree(3, 3, 10);
                         }
                     }
                     for (const int lanes : {2, 3, 4}) {
