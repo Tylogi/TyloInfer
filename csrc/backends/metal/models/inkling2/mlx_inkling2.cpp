@@ -131,24 +131,26 @@ struct Controller {
 };
 
 array short_convolution(const array& input, const array& weight,
-    std::optional<array>& state, const std::optional<array>& dynamic = std::nullopt) {
+    std::optional<array>& state, const std::optional<array>& dynamic = std::nullopt,
+    const array* residual = nullptr) {
     const int batch = input.shape(0), tokens = input.shape(1), channels = input.shape(2);
     if (weight.ndim() != 2 || weight.shape(0) != channels || weight.shape(1) <= 0)
         throw std::invalid_argument("Inkling short convolution filter dimensions disagree");
     const int taps = weight.shape(1);
     const Shape state_shape{batch, taps - 1, channels};
     const int groups = dynamic ? dynamic->shape(-1) / taps : 1;
-    if ((state && state->shape() != state_shape) || (dynamic && (groups < 1 || channels % groups ||
+    if ((state && state->shape() != state_shape) || (residual && residual->shape() != input.shape()) ||
+        (dynamic && (groups < 1 || channels % groups ||
         dynamic->shape() != Shape{batch, tokens, groups * taps})))
         throw std::invalid_argument("Inkling short convolution state or group dimensions disagree");
     const auto previous = state ? *state : zeros(state_shape, input.dtype());
     if (default_device() == Device::gpu && taps >= 2 && taps <= 16 &&
-        (input.dtype() == float16 || input.dtype() == bfloat16)) {
+        (input.dtype() == float16 || input.dtype() == bfloat16 || input.dtype() == float32)) {
         static const auto kernel = [] {
             CompileOptions options;
             options.math_mode = MathMode::Safe;
             return fast::metal_kernel("tyloinfer_inkling_short_convolution",
-                {"source", "filter", "previous", "adjust"}, {"output", "next_state"}, R"MSL(
+                {"source", "filter", "previous", "adjust", "residual"}, {"output", "next_state"}, R"MSL(
                 const uint channel = thread_position_in_grid.x;
                 const uint tokens = uint(source_shape[1]);
                 const uint channels = uint(source_shape[2]);
@@ -172,8 +174,10 @@ array short_convolution(const array& input, const array& weight,
                             value += sample * float(adjust[offset + (TAPS - 1 - tap)]);
                         }
                     }
-                    output[source_base + ulong(row) * channels] =
-                        T(value / metal::precise::sqrt(float((DYNAMIC ? 2 : 1) * TAPS + 1)));
+                    const ulong at = source_base + ulong(row) * channels;
+                    const T convolved = T(value / metal::precise::sqrt(float((DYNAMIC ? 2 : 1) * TAPS + 1)));
+                    if constexpr (ADD_RESIDUAL) output[at] = R(float(convolved) + float(residual[at]));
+                    else output[at] = R(convolved);
                 }
                 if (row < TAPS - 1) {
                     const uint at = tokens + row;
@@ -183,10 +187,12 @@ array short_convolution(const array& input, const array& weight,
                 }
                 )MSL", "", true, false, options);
         }();
-        auto outputs = kernel({input, weight, previous, dynamic ? *dynamic : zeros({2}, float32)},
-            {input.shape(), state_shape}, {input.dtype(), input.dtype()},
+        const auto output_dtype = residual ? promote_types(input.dtype(), residual->dtype()) : input.dtype();
+        auto outputs = kernel({input, weight, previous, dynamic ? *dynamic : zeros({2}, float32), residual ? *residual : input},
+            {input.shape(), state_shape}, {output_dtype, input.dtype()},
             {channels, batch * std::max(tokens, taps - 1), 1}, {std::min(channels, 256), 1, 1},
-            {{"T", input.dtype()}, {"TAPS", taps}, {"DYNAMIC", int(dynamic.has_value())}, {"GROUPS", groups}},
+            {{"T", input.dtype()}, {"R", output_dtype}, {"TAPS", taps}, {"DYNAMIC", int(dynamic.has_value())}, {"GROUPS", groups},
+                {"ADD_RESIDUAL", residual != nullptr}},
             std::nullopt, false, {});
         state = std::move(outputs.at(1));
         return std::move(outputs.at(0));
@@ -207,7 +213,8 @@ array short_convolution(const array& input, const array& weight,
         }
     }
     state = contiguous(time_slice(history, tokens, tokens + taps - 1));
-    return astype(output / std::sqrt(float((dynamic ? 2 : 1) * taps + 1)), input.dtype());
+    output = astype(output / std::sqrt(float((dynamic ? 2 : 1) * taps + 1)), input.dtype());
+    return residual ? *residual + output : output;
 }
 
 struct Geometry {
@@ -435,15 +442,17 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     }
     attended = reshape(transpose(attended, {0, 2, 1, 3}), {batch, rows, g.heads * g.dim});
     auto branch = layer.attention_out(attended * sigmoid(projections[3]));
-    branch = short_convolution(branch, layer.shortconv[2], cache.convolution[2]);
-    if (physical % g.block == 0) {
+    const bool starts_block = physical % g.block == 0;
+    branch = short_convolution(branch, layer.shortconv[2], cache.convolution[2], std::nullopt,
+        starts_block ? nullptr : &hidden);
+    if (starts_block) {
         auto block = expand_dims(rms(astype(hidden, float32)), -2);
         blocks = blocks.shape(2) ? concatenate({blocks, block}, -2) : block;
-    } else branch = branch + hidden;
+    }
     auto ffn = mix_stream(depth_mix(blocks, branch, layer.ffn_res_query), 0);
     if (messages) ffn = layer.controls[3](ffn, mix_stream(*messages, 3));
     ffn = layer.mixture(layer.ffn_norm(ffn), g);
-    return branch + short_convolution(ffn, layer.shortconv[3], cache.convolution[3]);
+    return short_convolution(ffn, layer.shortconv[3], cache.convolution[3], std::nullopt, &branch);
 }
 }  // namespace
 
