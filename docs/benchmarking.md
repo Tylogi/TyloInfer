@@ -4,15 +4,16 @@
 
 Use the first inference request after loading the model. Send it as soon as
 the model is ready, without an extra generation warm-up or an idle delay.
-Disable prefix reuse and use the same prompt, output limit and sampling
-settings for every engine. Set input lengths using token counts, not characters.
+Use a fresh test prompt with no cached prefix. For comparison, use that same
+prompt, output limit and sampling settings on every engine. Set input lengths
+using token counts, not characters.
 
 Start a single-model, single-request server:
 
 ```sh
 uv run --project studio python -m serve --model /models/model.gguf \
   --context-size 32768 --max-runtime-instances 1 \
-  --max-requests-per-runtime 1 --no-prefix-cache --no-web-ui
+  --max-requests-per-runtime 1 --no-web-ui
 ```
 
 Get the loaded model's ID from `/v1/models`. Save a public or synthetic test
@@ -60,8 +61,9 @@ from aggregate `decode_tps` alone. Service rates in `mfq_metrics` remain the
 API's own metrics. Streaming requests need
 `"stream_options":{"include_usage":true}` for final usage and metrics.
 
-For repeated samples, reload in a fresh process and measure its first request
-again. Keep later requests and prefix-hit measurements separate. Preserve each
+For repeated samples, reload in a fresh process with an empty prefix-cache
+directory and measure its first request again. Keep later requests and
+prefix-hit measurements separate. Preserve each
 sample and use a consistent summary, such as the median. Match expert residency,
 KV settings and concurrency across engines; measure
 [continuous batching](runtime/cuda-continuous-batching.md) separately.

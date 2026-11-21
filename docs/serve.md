@@ -296,9 +296,8 @@ uv run --project studio python -m serve \
 
 Persistent Session KV caching is configured with `--prefix-cache-dir`,
 `--prefix-cache-disk-size`, `--prefix-cache-hot-size`, and
-`--prefix-cache-block-tokens`; `--no-prefix-cache` disables it entirely. The
-cache survives restarts in the configured directory and its entries can be
-inspected and purged through the [runtime API](api/http.md).
+`--prefix-cache-block-tokens`. The cache survives restarts in the configured
+directory. You can inspect and purge entries through the [runtime API](api/http.md).
 
 Resident-model admission is capped by `--max-runtime-memory`, and
 `--moe-gpu-cache-gb` bounds the resident routed-expert cache (`0` keeps
@@ -462,7 +461,6 @@ For API loading, omit `jev_weights` to use d1 residency automatically, or select
 | `--prefix-cache-disk-size SIZE` | Maximum persistent Session KV cache size, such as `100G`. | None |
 | `--prefix-cache-hot-size SIZE` | Maximum hot prefix-cache size, such as `2G`; its memory tier depends on the backend. | None |
 | `--prefix-cache-block-tokens N` | Tokens per content-addressed Session KV block. | Runtime default |
-| `--no-prefix-cache` | Disable persistent Session KV caching. | Off |
 | `--runtime-idle-timeout SECONDS` | Default unload delay for an idle unpinned model. | Runtime default |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
 | `--backend {auto,cuda,hip,metal}` | Select or detect the native backend. | `auto` |
