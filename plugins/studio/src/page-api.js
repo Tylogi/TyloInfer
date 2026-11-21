@@ -3,7 +3,7 @@ import { validateConnectionInfo } from './connection-info.js';
 
 export const pageResources = {
   overview: ['health', 'status', 'serving', 'instances', 'jobs'],
-  models: ['status', 'instances', 'jobs'],
+  models: ['status', 'instances', 'jobs', 'job_kinds'],
   service: ['listener', 'memory_policy', 'inference_policy', 'context_policy', 'model_aliases', 'authentication_policy', 'status', 'jobs'],
   resources: ['status', 'resources', 'prefix_cache', 'instances'],
   downloads: ['download_directory', 'jobs', 'job_kinds'],

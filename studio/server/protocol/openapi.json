@@ -3936,7 +3936,8 @@
             "enum": [
               "model",
               "ple",
-              "engram"
+              "engram",
+              "dflash2"
             ],
             "title": "Asset Kind",
             "type": "string"
@@ -4869,6 +4870,23 @@
             "title": "Device Ids",
             "type": "array"
           },
+          "dflash2_artifact_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dflash2 Artifact Id"
+          },
+          "dflash2_enabled": {
+            "default": true,
+            "title": "Dflash2 Enabled",
+            "type": "boolean"
+          },
           "gguf_companions": {
             "items": {
               "minLength": 1,
@@ -5047,6 +5065,18 @@
           },
           "qsa_kv_offload": {
             "$ref": "#/components/schemas/QsaKvOffloadPolicy"
+          },
+          "replace_instance_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replace Instance Id"
           },
           "sampling_defaults": {
             "anyOf": [
@@ -7378,6 +7408,22 @@
             "title": "Devices",
             "type": "array"
           },
+          "dflash2_draft": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dflash2 Draft"
+          },
+          "dflash2_enabled": {
+            "default": false,
+            "title": "Dflash2 Enabled",
+            "type": "boolean"
+          },
           "error": {
             "anyOf": [
               {
@@ -9364,6 +9410,17 @@
       "UpdateRuntimeInstanceRequest": {
         "additionalProperties": false,
         "properties": {
+          "dflash2_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dflash2 Enabled"
+          },
           "idle_ttl_seconds": {
             "anyOf": [
               {

@@ -93,7 +93,7 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
                 || (companionMode === 'both' && /^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(companion))
                 || artifacts.some(candidate => candidate.id === companion && candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && isCompanionId)));
               const componentLabel = item.asset_kind === 'engram' ? tr('可独立使用的Engram', 'Independently usable Engram')
-                : tr('可独立使用的PLE', 'Independently usable PLE');
+                : item.asset_kind === 'dflash2' ? tr('DFlash2 草稿', 'DFlash2 draft') : tr('可独立使用的PLE', 'Independently usable PLE');
               const instance = activeInstances.get(item.name);
               const loaded = Boolean(instance);
               const placement = instance?.memory?.ram_weight_bytes != null

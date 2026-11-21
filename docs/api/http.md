@@ -711,6 +711,14 @@ This applies to streaming and non-streaming chat requests, not to
 `/v1/systemone`. It permits speculation rather than guaranteeing it runs;
 compatible weights, backend support and scheduling are still required.
 
+Managed Flash-Next loads on Metal and CUDA can select a registered DFlash2
+checkpoint using `dflash2_artifact_id` on `POST /api/v1/models/load`. To bind
+it to a running model, also provide `replace_instance_id` for the idle target.
+The job reloads the model with its current settings and attempts to restore
+the previous configuration if the new worker fails to start. The instance reports the loaded
+draft in `dflash2_draft`. A PATCH to `/api/v1/runtime/instances/{id}` can set
+`dflash2_enabled` for subsequent requests without reloading the model.
+
 ### 8.2 Structured decisions
 
 `POST /v1/systemone` returns one JSON decision result, not a chat completion or

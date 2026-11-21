@@ -183,7 +183,7 @@ export function useModelCatalog() {
       ),
     [artifacts, modelFilter],
   );
-  async function loadArtifact(name: string, companions?: string[]) {
+  async function loadArtifact(name: string, companions?: string[], draft?: { id: string; instanceId?: string }) {
     const current = connectionScope();
     if (busy) return;
     setBusy(true);
@@ -192,13 +192,15 @@ export function useModelCatalog() {
         throw new Error(tr('配套资产不能单独作为模型加载。', 'Companion assets cannot be loaded as standalone models.'));
       }
       const options = loadPreferences[name] ?? defaultPreferences(name);
-      await modelsApi.loadModel(name, options.context.context_size, 'auto', {
+      const artifact = artifacts.find(item => item.name === name && (!item.asset_kind || item.asset_kind === 'model'));
+      await modelsApi.loadModel(draft ? artifact?.id ?? name : name, options.context.context_size, 'auto', {
         ...(artifacts.find(item => item.name === name)?.structured_decisions ? { jev_weights: options.context.jev_weights } : {}),
         pin: options.pinned,
         device_ids: options.deviceIds,
         idle_ttl_seconds: options.idleTtl,
         context_management: options.context,
         ...(companions?.length ? { gguf_companions: companions } : {}),
+        ...(draft ? { dflash2_artifact_id: draft.id, replace_instance_id: draft.instanceId } : {}),
       });
       if (!current()) return;
       navigate(STUDIO_PATHS.models);

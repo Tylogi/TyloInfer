@@ -841,7 +841,7 @@ class ModelCatalog:
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
         if not is_gguf_path(path):
             artifact = self._inspect(root, path)
-            if is_d1_config(artifact.source_config):
+            if artifact.resource.asset_kind == "dflash2" or is_d1_config(artifact.source_config):
                 return artifact
             decision = artifact.resource.structured_decisions
             if (artifact.resource.format != 'hf' or not artifact.resource.complete
@@ -1132,6 +1132,7 @@ class ModelCatalog:
             model_type = config.get("model_type") if isinstance(config, dict) else None
             if not isinstance(model_type, str) or not model_type:
                 raise ValueError("HF config.json has no model_type")
+            is_dflash2 = isinstance(config.get("dflash_config"), dict)
             index_path = path / "model.safetensors.index.json"
             indexed_names: set[str] | None = None
             if index_path.is_file():
@@ -1144,6 +1145,8 @@ class ModelCatalog:
                     for key, value in weight_map.items()
                 ):
                     raise ValueError("invalid Safetensors weight_map entry")
+                if is_dflash2 and any(Path(value).name != value or not value.endswith(".safetensors") for value in weight_map.values()):
+                    raise ValueError("DFlash2 index must reference Safetensors files in the draft directory")
                 indexed_names = set(weight_map)
                 shard_paths = tuple(path / item for item in sorted(set(weight_map.values())))
             else:
@@ -1195,7 +1198,22 @@ class ModelCatalog:
                     ),
                 ]
             )
+            if is_dflash2:
+                fingerprint += "\0" + json.dumps(config, sort_keys=True, separators=(",", ":"))
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+            if is_dflash2:
+                resource = ModelArtifactResource(
+                    id=identifier, name=name, architecture="dflash2", format="hf",
+                    asset_kind="dflash2", shard_count=len(shard_paths),
+                    total_bytes=sum(stat.st_size for stat in stats),
+                    tensor_count=len(tensors), record_count=len(tensors) + 1,
+                    dtypes=sorted(dtypes), complete=True, loadable=False,
+                    modified_at=datetime.fromtimestamp(max(stat.st_mtime for stat in stats), timezone.utc),
+                )
+                files = (path / "config.json", *shard_paths)
+                if index_path.is_file():
+                    files += (index_path,)
+                return DiscoveredModel(resource, path, source_config=config, file_paths=files)
             if d1:
                 d1_assets(path)
             loadable = d1 or graph_spec_for_source_names(config, sorted(tensors)) is not None

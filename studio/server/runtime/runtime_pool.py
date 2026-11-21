@@ -190,6 +190,8 @@ class _Runtime(BaseModel):
     request_capacity: int = 1
     mtp_supported: bool = False
     mtp_available: bool = False
+    dflash2_path: Path | None = None
+    dflash2_enabled: bool = False
     qsa_kv_offload_supported: bool = False
     kv_quantization_supported: bool = False
     kv_memory_supported: bool = False
@@ -409,6 +411,8 @@ class RuntimePool:
         self._load_failures: dict[str, _CachedLoadFailure] = {}
         self._runtime_revival_at: dict[str, float] = {}
         self._loading_artifact_ids: dict[str, str] = {}
+        self._loading_dflash2_paths: dict[str, Path] = {}
+        self._dflash2_replacements: dict[str, asyncio.Task[Any] | None] = {}
         self._load_requests: dict[str, ModelLoadRequest] = {}
         self._reserved_ports: set[int] = set()
         self._load_ports: dict[str, int] = {}
@@ -564,6 +568,8 @@ class RuntimePool:
 
     async def load(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            if payload.get("replace_instance_id") is not None:
+                return await self._replace_dflash2(context, ModelLoadRequest.model_validate(payload))
             return await self._load(context, payload)
         finally:
             owner = asyncio.current_task()
@@ -572,6 +578,72 @@ class RuntimePool:
                     if self._resident_load_owners[name] is owner:
                         self._resident_load_limits.pop(name, None)
                         self._resident_load_owners.pop(name, None)
+
+    async def _dflash2_artifact(self, target: DiscoveredModel, draft_id: str) -> DiscoveredModel:
+        if self.backend not in {"metal", "cuda"} or not target.resource.architecture.casefold().startswith("qwen4_exp"):
+            raise _job_error("dflash2_unsupported", "Managed DFlash2 binding requires a Flash-Next target on Metal or CUDA")
+        try:
+            draft = await self.catalog.get(draft_id)
+        except ModelArtifactNotFoundError as error:
+            raise _job_error("dflash2_not_found", "The DFlash2 draft is no longer registered") from error
+        if draft.resource.asset_kind != "dflash2" or not draft.resource.complete or not draft.path.is_dir():
+            raise _job_error("dflash2_invalid", "Select a complete, registered DFlash2 checkpoint")
+        config = target.source_config or {}
+        if isinstance(config.get("text_config"), dict):
+            config = config["text_config"]
+        draft_config = draft.source_config or {}
+        for key in ("hidden_size", "vocab_size"):
+            if key in config and config[key] != draft_config.get(key):
+                raise _job_error("dflash2_incompatible", "DFlash2 draft geometry does not match the target")
+        layers = (draft_config.get("dflash_config") or {}).get("target_layer_ids")
+        if not isinstance(layers, list) or not layers or any(type(layer) is not int or layer < 0 for layer in layers):
+            raise _job_error("dflash2_invalid", "DFlash2 checkpoint has no valid capture layers")
+        target_layers = config.get("num_hidden_layers")
+        if type(target_layers) is int and max(layers) >= target_layers:
+            raise _job_error("dflash2_incompatible", "DFlash2 draft capture layers exceed the target")
+        return draft
+
+    async def _replace_dflash2(self, context: JobContext, request: ModelLoadRequest) -> dict[str, Any]:
+        async with self._lock:
+            instance = self._instances.get(request.replace_instance_id)
+            if instance is None or request.model not in {instance.artifact.resource.id, instance.artifact.resource.name}:
+                raise _job_error("runtime_instance_not_found", "Select the current model instance")
+        if request.dflash2_artifact_id is None:
+            raise _job_error("dflash2_invalid", "Select a DFlash2 draft to load")
+        draft = await self._dflash2_artifact(instance.artifact, request.dflash2_artifact_id)
+        name = instance.artifact.resource.name
+        async with self._lock:
+            if (self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY
+                    or instance.active_requests or instance.queued_requests or instance.control_leases
+                    or name in self._dflash2_replacements or draft.path.resolve() in self._deleting_model_paths):
+                raise _job_error("runtime_busy", "Wait for the model to become idle before loading a draft", retryable=True)
+            previous = self._load_requests[name].model_copy(deep=True)
+            updated = previous.model_copy(update={
+                "model": name, "artifact_uri": f"mfq://{instance.artifact.resource.id}",
+                "dflash2_artifact_id": draft.resource.id, "dflash2_enabled": True,
+            })
+            context.raise_if_cancelled()
+            self._dflash2_replacements[name] = asyncio.current_task()
+            self._mark_instance_unloading_locked(instance)
+        try:
+            await self._retire_instance(instance)
+            return await self._load(context, updated.model_dump(mode="json"))
+        except BaseException:
+            try:
+                await self._retire_instance(instance)
+                for item in list(self._instances.values()):
+                    if item.artifact.resource.name == name and item.state == RuntimeInstanceState.LOADING:
+                        await self._retire_instance(item)
+                async with self._lock:
+                    if event := self._load_events.get(name):
+                        self._finish_model_load_locked(name, event, None)
+                await self._load(_MemoryPlanContext(context, recovery=True), previous.model_dump(mode="json"))
+            except BaseException as error:
+                await context.log(f"Could not restore the previous model configuration: {type(error).__name__}")
+            raise
+        finally:
+            async with self._lock:
+                self._dflash2_replacements.pop(name, None)
 
     async def _load(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = ModelLoadRequest.model_validate(payload)
@@ -595,6 +667,9 @@ class RuntimePool:
         async with self._lock:
             if artifact.path.resolve() in self._deleting_model_paths:
                 raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
+            owner = self._dflash2_replacements.get(artifact.resource.name)
+            if owner is not None and owner is not asyncio.current_task():
+                raise _job_error("runtime_busy", "DFlash2 draft loading is in progress", retryable=True)
         if not artifact.resource.loadable:
             raise _job_error(
                 (
@@ -604,6 +679,12 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        draft = await self._dflash2_artifact(artifact, request.dflash2_artifact_id) if request.dflash2_artifact_id else None
+        configured_draft = self.runtime_environment.get("TYLOINFER_DFLASH2_DRAFT")
+        draft_path = draft.path if draft is not None else (
+            Path(configured_draft) if configured_draft and self.backend in {"cuda", "metal"} and not is_d1_config(artifact.source_config)
+            else None
+        )
         if is_d1_config(artifact.source_config):
             if self.backend not in {'cuda', 'metal'}:
                 raise _job_error('backend_unsupported', 'd1 native serving requires CUDA or Metal')
@@ -756,9 +837,13 @@ class RuntimePool:
             artifact,
             request,
         )
+        if draft is not None:
+            incoming_bytes += draft.resource.total_bytes
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
+            if draft_path is not None and draft_path.resolve() in self._deleting_model_paths:
+                raise _job_error("dflash2_busy", "The DFlash2 draft is being deleted", retryable=True)
             if (
                 self.max_runtime_memory_bytes is not None
                 and incoming_bytes > self.max_runtime_memory_bytes
@@ -795,6 +880,11 @@ class RuntimePool:
                 raise RuntimeManagementError("runtime pool is closed")
             if artifact.path.resolve() in self._deleting_model_paths:
                 raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
+            if draft_path is not None and draft_path.resolve() in self._deleting_model_paths:
+                raise _job_error("dflash2_busy", "The DFlash2 draft is being deleted", retryable=True)
+            owner = self._dflash2_replacements.get(model_name)
+            if owner is not None and owner is not asyncio.current_task():
+                raise _job_error("runtime_busy", "DFlash2 draft loading is in progress", retryable=True)
             existing = next(
                 (
                     item
@@ -911,6 +1001,8 @@ class RuntimePool:
             self._load_events[model_name] = load_event
             self._load_errors.pop(model_name, None)
             self._load_failures.pop(model_name, None)
+            if draft_path is not None:
+                self._loading_dflash2_paths[model_name] = draft_path.resolve()
             self._loading_artifact_ids[model_name] = artifact.resource.id
             if port:
                 self._load_ports[model_name] = port
@@ -944,6 +1036,7 @@ class RuntimePool:
                 artifact,
                 request,
                 port=port,
+                dflash2_path=draft_path,
             )
             if planned_vram_limit is not None:
                 process_environment["TYLOINFER_CUDA_VRAM_LIMIT_GIB"] = str(planned_vram_limit / (1 << 30))
@@ -1009,6 +1102,8 @@ class RuntimePool:
             context_size=request.context_size,
             device_ids=self._cuda_device_ids(request) if self.backend == "cuda" else [],
             sampling_defaults=request.sampling_defaults,
+            dflash2_path=draft_path,
+            dflash2_enabled=draft_path is not None and request.dflash2_enabled,
             idle_ttl_seconds=(
                 request.idle_ttl_seconds
                 if request.idle_ttl_seconds is not None
@@ -1889,6 +1984,8 @@ class RuntimePool:
                     pinned=item.pinned,
                     mtp_supported=item.mtp_supported,
                     mtp_available=item.mtp_available,
+                    dflash2_draft=item.dflash2_path.name if item.dflash2_path is not None else None,
+                    dflash2_enabled=item.dflash2_enabled,
                     qsa_kv_offload_supported=item.qsa_kv_offload_supported,
                     kv_quantization_supported=item.kv_quantization_supported,
                     kv_memory_supported=item.kv_memory_supported,
@@ -1925,6 +2022,11 @@ class RuntimePool:
                     status_code=409,
                 )
             updates: dict[str, Any] = {}
+            if request.dflash2_enabled is not None:
+                if instance.dflash2_path is None:
+                    raise BackendError("dflash2_not_loaded", "Load a DFlash2 draft first", status_code=409)
+                instance.dflash2_enabled = request.dflash2_enabled
+                updates["dflash2_enabled"] = request.dflash2_enabled
             if "pinned" in request.model_fields_set:
                 instance.pinned = bool(request.pinned)
                 updates["pin"] = instance.pinned
@@ -1959,6 +2061,8 @@ class RuntimePool:
                 pinned=instance.pinned,
                 mtp_supported=instance.mtp_supported,
                 mtp_available=instance.mtp_available,
+                dflash2_draft=instance.dflash2_path.name if instance.dflash2_path is not None else None,
+                dflash2_enabled=instance.dflash2_enabled,
                 qsa_kv_offload_supported=instance.qsa_kv_offload_supported,
                 kv_quantization_supported=instance.kv_quantization_supported,
                 kv_memory_supported=instance.kv_memory_supported,
@@ -2126,6 +2230,8 @@ class RuntimePool:
                     self._session_routes[session_id] = instance.id
                 self._last_instance_id = instance.id
             effective_sampling = self._apply_inference_policy(self._sampling_for_instance(instance, sampling))
+            if instance.dflash2_path is not None and not instance.dflash2_enabled and effective_sampling.enable_mtp:
+                effective_sampling = effective_sampling.model_copy(update={"enable_mtp": False})
             request_id = None
             performance = None
             usage = None
@@ -2201,11 +2307,14 @@ class RuntimePool:
     async def model_deletion_guard(self, artifact: DiscoveredModel) -> AsyncIterator[None]:
         path = artifact.path.resolve()
         async with self._lock:
-            if path in self._deleting_model_paths or artifact.resource.name in self._loading_model_names or any(
-                (item.artifact.path.resolve() == path or item.artifact.resource.name == artifact.resource.name)
+            if (path in self._deleting_model_paths or path in self._loading_dflash2_paths.values()
+                    or artifact.resource.name in self._loading_model_names
+                    or artifact.resource.name in self._dflash2_replacements or any(
+                (item.artifact.path.resolve() == path or item.artifact.resource.name == artifact.resource.name
+                 or (item.dflash2_path is not None and item.dflash2_path.resolve() == path))
                 and item.state != RuntimeInstanceState.FAILED
                 for item in self._instances.values()
-            ):
+            )):
                 raise BackendError("model_delete_busy", "Unload the model and wait for loading to finish before deleting it", status_code=409)
             self._deleting_model_paths.add(path)
         try:
@@ -2509,6 +2618,7 @@ class RuntimePool:
                 for item in self._instances.values()
                 if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
             ]
+            replacing = set(self._dflash2_replacements)
         data = []
         for instance in managed:
             data.append(
@@ -2520,6 +2630,9 @@ class RuntimePool:
                     "instance_id": str(instance.id),
                 }
             )
+        for model in sorted(replacing - {entry["id"] for entry in data}):
+            # Retain the provider ID while the replacement worker starts.
+            data.append({"id": model, "object": "model", "model": model, "state": "loading"})
         if not data and self.fallback is not None:
             return await self.fallback.runtime_models()
         return {"object": "list", "data": data}
@@ -3015,6 +3128,7 @@ class RuntimePool:
             self._load_events.clear()
             self._loading_model_names.clear()
             self._loading_artifact_ids.clear()
+            self._loading_dflash2_paths.clear()
             self._load_failures.clear()
             self._load_ports.clear()
             self._load_bytes.clear()
@@ -3603,6 +3717,7 @@ class RuntimePool:
             event.set()
             return
         artifact_id = self._loading_artifact_ids.pop(model, None)
+        self._loading_dflash2_paths.pop(model, None)
         if error is None:
             self._load_errors.pop(model, None)
             self._load_failures.pop(model, None)
@@ -4819,6 +4934,7 @@ class RuntimePool:
         request: ModelLoadRequest,
         *,
         port: int,
+        dflash2_path: Path | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         if is_d1_config(artifact.source_config):
             resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
@@ -4860,6 +4976,8 @@ class RuntimePool:
             )
         command.extend(native_tokenizer_arguments(artifact.path, self.backend))
         command.extend(native_gguf_companion_arguments(artifact.path, request.gguf_companions, self.backend))
+        if dflash2_path is not None:
+            command.extend(["--dflash2-draft", str(dflash2_path)])
         if request.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
 
@@ -4867,6 +4985,8 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        if request.dflash2_artifact_id:
+            process_environment.pop("TYLOINFER_MTP_NATIVE_GGUF", None)
         from server.runtime.disk_budget import DiskBudget
         process_environment['TYLOINFER_DISK_BUDGET_DIR'] = str(DiskBudget().root)
         if self.backend == "cuda":

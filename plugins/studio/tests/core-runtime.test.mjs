@@ -7,7 +7,7 @@ test('reads inventory through the native Connection with the caller signal', asy
   const calls = [];
   const connection = { rpc: { call: async (...args) => { calls.push(args); return { ok: true, value: { data: args[2].resource === 'models' ? [{ id: 'example' }] : [] } }; } } };
   assert.deepEqual(await describeCoreRuntime(connection, controller.signal), { models: [{ id: 'example' }], loadedModels: [], instances: [] });
-  assert.deepEqual(calls.map(call => call.slice(0, 3)), [['/tyloinfer', 'core/read', { resource: 'models' }], ['/tyloinfer', 'core/read', { resource: 'loaded_models' }], ['/tyloinfer', 'core/read', { resource: 'instances' }]]);
+  assert.deepEqual(calls.map(call => call.slice(0, 3)), [['/tyloinfer', 'core/read', { resource: 'models', params: { include_components: true } }], ['/tyloinfer', 'core/read', { resource: 'loaded_models' }], ['/tyloinfer', 'core/read', { resource: 'instances' }]]);
   assert.ok(calls.every(call => call[3] === controller.signal));
 });
 test('does not fabricate empty inventories after a core rejection', async () => {

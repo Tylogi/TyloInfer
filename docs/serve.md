@@ -312,8 +312,18 @@ unpinned models; instances may override it through the runtime API.
 ## Speculative decoding (MTP / DFlash2)
 
 Native MTP requires predictor weights compatible with the target graph.
-DFlash2 requires a matching draft checkpoint. The managed `python -m serve`
-CLI exposes the following explicit companion controls for CUDA.
+DFlash2 requires a matching draft checkpoint.
+
+For Flash-Next on Metal or CUDA, open the target model's settings under
+**Models** in Studio or **Inference engine → Models** in Agent or DS Bot.
+**Download DFlash2 draft** queues the matching Hugging Face checkpoint in the
+configured download directory. **Load DFlash2 draft** binds a registered draft
+to the target. If the target is already running, wait for its requests to finish
+and confirm the reload, which clears active KV state. After loading, **Enable
+DFlash2** controls the instance without reloading its weights. The service MTP
+switch also applies to DFlash2.
+
+The managed `python -m serve` CLI also exposes explicit companion controls.
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
@@ -326,13 +336,13 @@ uv run --project studio python -m serve --backend cuda --model /models/target.gg
 ```
 
 Replace the paths with compatible artifacts. The draft switches are mutually
-exclusive and require CUDA. The native companion must be an existing file;
-the DFlash2 path must be an existing directory.
+exclusive. The CUDA native MTP companion must be an existing file. DFlash2
+supports Metal and CUDA and takes an existing checkpoint directory.
 
 | Option | Effect | Default |
 | --- | --- | --- |
 | `--mtp-native-draft PATH` | Native MTP GGUF companion for a CUDA GGUF target. | No explicit override |
-| `--dflash2-draft PATH` | DFlash2 checkpoint directory for the supported CUDA path. | No explicit override |
+| `--dflash2-draft PATH` | DFlash2 checkpoint directory for compatible CUDA or Metal targets. | No explicit override |
 | `--spec-min-p P` / `--mtp-min-probability P` | CUDA greedy draft probability threshold, in `[0,1]`; `0` disables the threshold. | No CLI override |
 | `--draft-conf P` / `--dflash2-draft-confidence P` | CUDA greedy DFlash2 cumulative confidence, in `[0,1]`; nonzero overrides `--spec-min-p`. | No CLI override |
 | `--mtp-cost-aware` / `--no-mtp-cost-aware` | Select CUDA greedy native MTP depth using measured cost and calibrated probabilities. | No CLI override |
@@ -361,8 +371,7 @@ The native Metal HTTP server supports continuous batching on Flash-Next,
 including ordinary decode, native MTP with a compatible single-layer
 predictor without predictor LoRA, and DFlash2 with a matching draft checkpoint.
 `--continuous-batching N` sets the maximum concurrent requests for this worker.
-Values of `0` and `1` run serially. The managed CLI's explicit
-`--dflash2-draft` and `--mtp-native-draft` options are CUDA-only.
+Values of `0` and `1` run serially.
 
 To serve Flash-Next with DFlash2 directly, use the binary from the
 [Metal build](build.md#quick-start) and pass the draft directory to the worker.

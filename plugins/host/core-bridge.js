@@ -39,6 +39,10 @@ function parseCall(endpoint, payload) {
     if (!record(payload) || !Object.hasOwn(payload, 'request') || !Object.keys(payload).every(key => loadFields.includes(key)) || !record(payload.request)) throw badRequest();
     if (endpoint === 'models/load' && (typeof payload.request.model !== 'string' || !payload.request.model.trim()
       || Object.hasOwn(payload.request, 'gguf_companions'))) throw badRequest();
+    if (endpoint === 'models/load' && ((payload.request.dflash2_artifact_id != null
+      && (typeof payload.request.dflash2_artifact_id !== 'string' || !/^[0-9a-f]{32}$/.test(payload.request.dflash2_artifact_id)))
+      || (payload.request.replace_instance_id != null
+        && (!uuid(payload.request.replace_instance_id) || !payload.request.dflash2_artifact_id)))) throw badRequest();
     if (Object.hasOwn(payload, 'companion_ids') && (!Array.isArray(payload.companion_ids) || payload.companion_ids.length > 16
       || !Array.from(payload.companion_ids).every(value => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value))
       || new Set(payload.companion_ids).size !== payload.companion_ids.length)) throw badRequest();
