@@ -323,9 +323,10 @@ array trailing_rope(const array& values, const array& positions, int rotary, flo
 array latent_attention(const array& query, const array& rows, const array& sinks,
     float scale, int value_dim, const std::optional<array>& mask) {
     const auto keys = expand_dims(rows, 1);
+    const auto values = axis_slice(keys, -1, 0, value_dim);
     const auto q = astype(query, rows.dtype());
-    auto result = fast::scaled_dot_product_attention(q, keys, keys, scale, "", mask, astype(sinks, q.dtype()));
-    return transpose(axis_slice(result, -1, 0, value_dim), {0, 2, 1, 3});
+    auto result = fast::scaled_dot_product_attention(q, keys, values, scale, "", mask, astype(sinks, q.dtype()));
+    return transpose(result, {0, 2, 1, 3});
 }
 
 array as_dense_attention(const array& query, const array& rows, const array& sinks,
