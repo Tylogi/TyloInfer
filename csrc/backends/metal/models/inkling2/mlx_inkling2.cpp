@@ -33,21 +33,19 @@ array rms(const array& x, float eps = 1e-6f) {
     return fast::rms_norm(x, std::nullopt, eps);
 }
 
-array depth_mix(const std::vector<array>& normalized_history, const array& current, const array& query) {
-    auto states = normalized_history;
-    states.push_back(rms(astype(current, float32)));
-    auto values = stack(states, -2);
-    const int hidden = values.shape(-1);
+array depth_mix(const array& history, const array& current, const array& query) {
+    const auto normalized = rms(astype(current, float32));
+    const int hidden = current.shape(-1), depth = history.shape(2) + 1;
     auto rows = reshape(astype(query, float32), {-1, hidden});
-    const auto threads = std::int64_t(values.shape(0)) * values.shape(1) * rows.shape(0) * 256;
-    if (default_device() == Device::gpu && values.shape(1) <= 8 && values.shape(2) <= 16 &&
+    const auto threads = std::int64_t(current.shape(0)) * current.shape(1) * rows.shape(0) * 256;
+    if (default_device() == Device::gpu && current.shape(1) <= 8 && depth <= 16 &&
         threads <= std::numeric_limits<int>::max() &&
         (current.dtype() == float16 || current.dtype() == bfloat16)) {
         static const auto kernel = [] {
             CompileOptions options;
             options.math_mode = MathMode::Safe;
             return fast::metal_kernel("tyloinfer_inkling_depth_mix",
-                {"values", "queries"}, {"mixed"}, R"MSL(
+                {"history", "current", "queries"}, {"mixed"}, R"MSL(
                 const uint row = threadgroup_position_in_grid.x;
                 const uint token = row / QUERIES;
                 const uint query = row % QUERIES;
@@ -56,9 +54,13 @@ array depth_mix(const std::vector<array>& normalized_history, const array& curre
                 const uint group = simdgroup_index_in_threadgroup;
                 threadgroup float partial[DEPTH][8];
                 threadgroup float weights[DEPTH];
+                const auto state = [&](uint depth) {
+                    return depth == DEPTH - 1 ? current + ulong(token) * WIDTH
+                        : history + (ulong(token) * (DEPTH - 1) + depth) * WIDTH;
+                };
                 for (uint depth = 0; depth < DEPTH; ++depth) {
                     float sum = 0.f;
-                    const auto v = values + (ulong(token) * DEPTH + depth) * WIDTH;
+                    const auto v = state(depth);
                     const auto q = queries + query * WIDTH;
                     for (uint i = tid; i < WIDTH; i += 256)
                         sum = metal::fma(q[i], v[i], sum);
@@ -85,17 +87,19 @@ array depth_mix(const std::vector<array>& normalized_history, const array& curre
                 for (uint i = tid; i < WIDTH; i += 256) {
                     float value = 0.f;
                     for (uint depth = 0; depth < DEPTH; ++depth)
-                        value = metal::fma(weights[depth], values[(ulong(token) * DEPTH + depth) * WIDTH + i], value);
+                        value = metal::fma(weights[depth], state(depth)[i], value);
                     mixed[ulong(row) * WIDTH + i] = T(value);
                 }
                 )MSL", "", true, false, options);
         }();
-        const Shape shape{values.shape(0), values.shape(1), rows.shape(0), hidden};
-        return kernel({values, rows}, {shape}, {current.dtype()},
+        const Shape shape{current.shape(0), current.shape(1), rows.shape(0), hidden};
+        return kernel({depth > 1 ? history : normalized, normalized, rows}, {shape}, {current.dtype()},
             {static_cast<int>(threads), 1, 1}, {256, 1, 1},
-            {{"T", current.dtype()}, {"DEPTH", values.shape(2)}, {"WIDTH", hidden}, {"QUERIES", rows.shape(0)}},
+            {{"T", current.dtype()}, {"DEPTH", depth}, {"WIDTH", hidden}, {"QUERIES", rows.shape(0)}},
             std::nullopt, false, {}).front();
     }
+    const auto last = expand_dims(normalized, -2);
+    const auto values = depth > 1 ? concatenate({history, last}, -2) : last;
     auto score = matmul(rows, transpose(values, {0, 1, 3, 2})) / std::sqrt(float(hidden));
     return astype(matmul(softmax(score, -1, true), values), current.dtype());
 }
@@ -351,7 +355,7 @@ array attention_rows(const array& query, const array& key, const array& value,
 }
 
 array apply_layer(const Layer& layer, const Geometry& g, int physical, int offset,
-    const array& hidden, std::vector<array>& blocks, const std::optional<array>& messages,
+    const array& hidden, array& blocks, const std::optional<array>& messages,
     MlxInkling2VisitCache& cache) {
     const int batch = hidden.shape(0), rows = hidden.shape(1);
     const auto dtype = hidden.dtype();
@@ -432,8 +436,10 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     attended = reshape(transpose(attended, {0, 2, 1, 3}), {batch, rows, g.heads * g.dim});
     auto branch = layer.attention_out(attended * sigmoid(projections[3]));
     branch = short_convolution(branch, layer.shortconv[2], cache.convolution[2]);
-    if (physical % g.block == 0) blocks.push_back(rms(astype(hidden, float32)));
-    else branch = branch + hidden;
+    if (physical % g.block == 0) {
+        auto block = expand_dims(rms(astype(hidden, float32)), -2);
+        blocks = blocks.shape(2) ? concatenate({blocks, block}, -2) : block;
+    } else branch = branch + hidden;
     auto ffn = mix_stream(depth_mix(blocks, branch, layer.ffn_res_query), 0);
     if (messages) ffn = layer.controls[3](ffn, mix_stream(*messages, 3));
     ffn = layer.mixture(layer.ffn_norm(ffn), g);
@@ -485,7 +491,8 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
     cache.visits.resize(g.loop.visits());
     auto hidden = weights_->embedding_norm(weights_->embedding(tokens, bfloat16));
     std::optional<array> prelude, previous_output;
-    std::vector<array> blocks, prelude_blocks, previous_blocks;
+    auto blocks = zeros({tokens.shape(0), count, 0, g.hidden}, float32);
+    auto prelude_blocks = blocks, previous_blocks = blocks;
     for (int visit = 0; visit < g.loop.visits(); ++visit) {
         const int physical = g.loop.weight_layer(visit);
         if (physical == g.loop_start) {
@@ -493,7 +500,7 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
                 prelude = hidden;
                 prelude_blocks = blocks;
             } else {
-                previous_blocks.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
+                previous_blocks = slice(blocks, {0, 0, prelude_blocks.shape(2) + 1, 0}, blocks.shape());
                 previous_output = hidden;
                 hidden = *prelude;
                 blocks = prelude_blocks;
@@ -506,7 +513,7 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
     }
     if (last_logit_only) {
         hidden = time_slice(hidden, count - 1, count);
-        for (auto& block : blocks) block = time_slice(block, count - 1, count);
+        blocks = time_slice(blocks, count - 1, count);
     }
     hidden = mix_stream(depth_mix(blocks, hidden, weights_->output_query), 0);
     auto logits = astype(weights_->output(weights_->output_norm(hidden)), float32);
