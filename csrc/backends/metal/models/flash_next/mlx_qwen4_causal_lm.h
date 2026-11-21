@@ -159,6 +159,10 @@ public:
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
         const std::vector<std::vector<std::int64_t>>& tokens,
         std::optional<mlx::core::array>* packed_logits = nullptr);
+    std::vector<std::pair<mlx::core::array, mlx::core::array>> forward_request_windows(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::vector<std::int64_t>>& tokens,
+        std::optional<mlx::core::array>* packed_logits, bool native_mtp);
     bool can_verify_request_tree(const MlxQwen4RequestCache& cache) const;
     mlx::core::array forward_request_trees(
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
@@ -244,6 +248,10 @@ public:
     std::vector<std::pair<std::string, double>> mtp_session_metrics() const;
 
 private:
+    mlx::core::array forward_request_trees_with_hidden(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
+        int tuned_dflash_width, std::optional<mlx::core::array>* packed_hidden);
     std::int32_t generate_prepared_impl(
         const MlxPreparedPrompt& prompt,
         const MlxSamplingParams& sampling,

@@ -76,7 +76,8 @@ private:
 
 class MlxDFlashTreeBudget {
 public:
-    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false, bool price_wide_rows = false) const {
+    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false, bool price_wide_rows = false,
+        std::span<const double> weights = {}) const {
         const int lanes = static_cast<int>(trees.size());
         if (lanes == 0 || lanes > static_cast<int>(costs_.size())) return;
         const auto& cost = costs_[lanes - 1];
@@ -92,17 +93,25 @@ public:
         kept.fill(1);
         best = kept;
         double tokens = lanes;
+        if (!weights.empty()) {
+            tokens = 0.;
+            for (double weight : weights) tokens += weight;
+        }
         double rate = tokens / step_cost(lanes);
         for (int rows = lanes + 1;; ++rows) {
             int next = -1;
+            double best_value = 0.;
             for (int lane = 0; lane < lanes; ++lane) {
                 if (kept[lane] >= trees[lane].reach.size()) continue;
-                const auto value = trees[lane].reach[kept[lane]];
-                if (next < 0 || value > trees[next].reach[kept[next]] ||
-                    (value == trees[next].reach[kept[next]] && kept[lane] < kept[next])) next = lane;
+                const double value = trees[lane].reach[kept[lane]] * (weights.empty() ? 1. : weights[lane]);
+                if (next < 0 || value > best_value || (value == best_value && kept[lane] < kept[next])) {
+                    next = lane;
+                    best_value = value;
+                }
             }
             if (next < 0) break;
-            tokens += trees[next].reach[kept[next]++];
+            ++kept[next];
+            tokens += best_value;
             const double candidate = tokens / step_cost(rows);
             if (candidate > rate) { rate = candidate; best = kept; }
         }
@@ -944,8 +953,28 @@ private:
         const bool four_way_buckets = four_way && width >= 3 && flash_next_on_m5_max;
         const bool price_wide_rows = width >= 5 && flash_next_on_m5_max && !runtime_.ssd_expert_payload_bytes();
         // Use full trees once a calibrated three-request group drains.
-        if (adaptive && (!calibrated || width == 3))
-            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets, price_wide_rows);
+        if (adaptive && (!calibrated || width == 3)) {
+            std::array<double, 8> weights;
+            std::span<const double> active_weights;
+            // A wide cohort loses throughput as lanes finish far apart. Nudge
+            // the row budget toward requests with more tokens left to generate.
+            const int limit = cohort.active.front()->generation_limit;
+            if (price_wide_rows && width <= weights.size() && limit > 0 &&
+                std::ranges::all_of(cohort.active, [limit](const auto& request) {
+                    return request->dflash_max_verify_width == 8 && request->generation_limit == limit;
+                })) {
+                double total_remaining = 0.;
+                for (const auto& request : cohort.active) total_remaining += limit - request->produced;
+                const double average = total_remaining / width;
+                if (average > 0.) {
+                    for (std::size_t lane = 0; lane < width; ++lane)
+                        weights[lane] = std::clamp((limit - cohort.active[lane]->produced) / average, .75, 1.25);
+                    const auto [low, high] = std::minmax_element(weights.begin(), weights.begin() + width);
+                    if (*high > *low) active_weights = std::span(weights).first(width);
+                }
+            }
+            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets, price_wide_rows, active_weights);
+        }
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
         const auto verification = std::chrono::steady_clock::now();
@@ -1093,7 +1122,7 @@ private:
             std::optional<mlx::core::array> packed_logits, joint_tokens;
             DFlashCapture capture(runtime_, capture_dflash ? hooks_.dflash2.get() : nullptr);
             auto target = runtime_.forward_request_windows(caches, windows,
-                joint_greedy ? &packed_logits : nullptr);
+                joint_greedy ? &packed_logits : nullptr, joint_greedy && !capture_dflash);
             auto features = capture.take();
             if (packed_logits) joint_tokens = sample_greedy(mlx::core::reshape(*packed_logits,
                 {packed_logits->shape(1), packed_logits->shape(2)}));
