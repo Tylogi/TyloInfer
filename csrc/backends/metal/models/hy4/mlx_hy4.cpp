@@ -470,9 +470,14 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     if (resident && count >= 4 && end <= 2 * g.index_budget)
         dense_rows = g.indexed_kv.unpack(*resident);
     const auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
+    const auto& quantization = g.indexed_kv.quantization;
+    // Packed recalls can share more SSD blocks across queries within one gather.
+    const int query_tile = cache.offloaded_latent && end > 2 * g.index_budget &&
+        quantization.enabled() && quantization.value_bits() <= 4
+        ? 32 : selected_query_tile;
     std::vector<array> output;
-    for (int start = 0; start < count; start += selected_query_tile) {
-        const int stop = std::min(count, start + selected_query_tile);
+    for (int start = 0; start < count; start += query_tile) {
+        const int stop = std::min(count, start + query_tile);
         const auto q = axis_slice(iq, 1, start, stop);
         const auto weights = axis_slice(head_weights, 1, start, stop);
         const auto groups = pooled ? choose_resident_groups(*pooled, g, q, weights, position + start)
