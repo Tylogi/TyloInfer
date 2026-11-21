@@ -34,13 +34,13 @@ array rms(const array& x, float eps = 1e-6f) {
 }
 
 array depth_mix(const array& history, const array& current, const array& query) {
-    const auto normalized = rms(astype(current, float32));
     const int hidden = current.shape(-1), depth = history.shape(2) + 1;
     auto rows = reshape(astype(query, float32), {-1, hidden});
     const auto threads = std::int64_t(current.shape(0)) * current.shape(1) * rows.shape(0) * 256;
     if (default_device() == Device::gpu && current.shape(1) <= 8 && depth <= 16 &&
         threads <= std::numeric_limits<int>::max() &&
-        (current.dtype() == float16 || current.dtype() == bfloat16)) {
+        (current.dtype() == float16 || current.dtype() == bfloat16 || current.dtype() == float32)) {
+        // History is already normalized. Reduce the active stream's RMS alongside its query score.
         static const auto kernel = [] {
             CompileOptions options;
             options.math_mode = MathMode::Safe;
@@ -53,26 +53,42 @@ array depth_mix(const array& history, const array& current, const array& query) 
                 const uint lane = thread_index_in_simdgroup;
                 const uint group = simdgroup_index_in_threadgroup;
                 threadgroup float partial[DEPTH][8];
+                threadgroup float squares[8];
                 threadgroup float weights[DEPTH];
-                const auto state = [&](uint depth) {
-                    return depth == DEPTH - 1 ? current + ulong(token) * WIDTH
-                        : history + (ulong(token) * (DEPTH - 1) + depth) * WIDTH;
-                };
-                for (uint depth = 0; depth < DEPTH; ++depth) {
+                threadgroup float current_scale;
+                const auto previous = history + ulong(token) * (DEPTH - 1) * WIDTH;
+                const auto active = current + ulong(token) * WIDTH;
+                const auto q = queries + query * WIDTH;
+                for (uint depth = 0; depth + 1 < DEPTH; ++depth) {
                     float sum = 0.f;
-                    const auto v = state(depth);
-                    const auto q = queries + query * WIDTH;
+                    const auto v = previous + depth * WIDTH;
                     for (uint i = tid; i < WIDTH; i += 256)
                         sum = metal::fma(q[i], v[i], sum);
                     sum = simd_sum(sum);
                     if (lane == 0) partial[depth][group] = sum;
                 }
+                float dot = 0.f, squared = 0.f;
+                for (uint i = tid; i < WIDTH; i += 256) {
+                    const float value = float(active[i]);
+                    dot = metal::fma(q[i], value, dot);
+                    squared = metal::fma(value, value, squared);
+                }
+                dot = simd_sum(dot);
+                squared = simd_sum(squared);
+                if (lane == 0) {
+                    partial[DEPTH - 1][group] = dot;
+                    squares[group] = squared;
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
+                    float square_sum = 0.f;
+                    for (uint group = 0; group < 8; ++group) square_sum += squares[group];
+                    current_scale = 1.f / metal::precise::sqrt(square_sum / float(WIDTH) + 1e-6f);
                     float maximum = -INFINITY;
                     for (uint depth = 0; depth < DEPTH; ++depth) {
                         float dot = 0.f;
                         for (uint group = 0; group < 8; ++group) dot += partial[depth][group];
+                        if (depth + 1 == DEPTH) dot *= current_scale;
                         weights[depth] = dot / metal::precise::sqrt(float(WIDTH));
                         maximum = max(maximum, weights[depth]);
                     }
@@ -86,18 +102,20 @@ array depth_mix(const array& history, const array& current, const array& query) 
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint i = tid; i < WIDTH; i += 256) {
                     float value = 0.f;
-                    for (uint depth = 0; depth < DEPTH; ++depth)
-                        value = metal::fma(weights[depth], state(depth)[i], value);
+                    for (uint depth = 0; depth + 1 < DEPTH; ++depth)
+                        value = metal::fma(weights[depth], previous[depth * WIDTH + i], value);
+                    value = metal::fma(weights[DEPTH - 1], float(active[i]) * current_scale, value);
                     mixed[ulong(row) * WIDTH + i] = T(value);
                 }
                 )MSL", "", true, false, options);
         }();
         const Shape shape{current.shape(0), current.shape(1), rows.shape(0), hidden};
-        return kernel({depth > 1 ? history : normalized, normalized, rows}, {shape}, {current.dtype()},
+        return kernel({depth > 1 ? history : zeros({1}, float32), current, rows}, {shape}, {current.dtype()},
             {static_cast<int>(threads), 1, 1}, {256, 1, 1},
             {{"T", current.dtype()}, {"DEPTH", depth}, {"WIDTH", hidden}, {"QUERIES", rows.shape(0)}},
             std::nullopt, false, {}).front();
     }
+    const auto normalized = rms(astype(current, float32));
     const auto last = expand_dims(normalized, -2);
     const auto values = depth > 1 ? concatenate({history, last}, -2) : last;
     auto score = matmul(rows, transpose(values, {0, 1, 3, 2})) / std::sqrt(float(hidden));
