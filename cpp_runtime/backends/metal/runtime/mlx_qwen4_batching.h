@@ -921,8 +921,9 @@ private:
         const bool adaptive = trees.size() == plans.size() &&
             mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
         const auto& target = runtime_.config();
-        const bool calibrated = three_way && target.hidden_size == 2560 && target.hc_count == 4 &&
+        const bool flash_next_on_m5_max = target.hidden_size == 2560 && target.hc_count == 4 &&
             !target.ple_layer_ids.empty() && mlx_apple_chip_is("Apple M5 Max");
+        const bool calibrated = three_way && flash_next_on_m5_max;
         // Use full trees once a calibrated three-request group drains.
         if (adaptive && (!calibrated || width == 3)) dflash_tree_budget_.choose(trees, calibrated);
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
@@ -930,7 +931,12 @@ private:
         const auto verification = std::chrono::steady_clock::now();
         dflash_tree_draft_ms_ += std::chrono::duration<double, std::milli>(verification - started).count();
         DFlashCapture capture(runtime_, &draft);
-        auto logits = runtime_.forward_request_trees(caches, plans, &dflash_tree_qsa_lanes_);
+        // Reuse Splash's one- and two-row expert kernels while the cohort drains.
+        const bool use_short_expert_tiles = flash_next_on_m5_max &&
+            std::ranges::any_of(cohort.active, [](const auto& request) {
+                return request->dflash_max_verify_width >= 3;
+            });
+        auto logits = runtime_.forward_request_trees(caches, plans, &dflash_tree_qsa_lanes_, use_short_expert_tiles);
         ++dflash_tree_batches_;
         for (std::size_t lane = 0; lane < plans.size(); ++lane) {
             auto& work = *cohort.active[lane];

@@ -145,6 +145,7 @@ struct Qwen4TreeRows {
     // then gather the recurrence output of each node from one of its paths.
     array expand, gather, positions, ple_taps;
     std::vector<Lane> lanes;
+    bool use_short_expert_tiles = false;
 };
 
 Qwen4RequestLayerCache fork_tree_layer(const Qwen4RequestLayerCache& source) {
@@ -1195,12 +1196,11 @@ public:
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
         bool batched_decode = false,
         Qwen4CachedRoute* deferred_route = nullptr,
-        bool verifying = false) const {
+        bool verifying = false, bool use_short_expert_tiles = false) const {
         if (native_moe_) {
             if (auto* lora = MlxMtpLora::current(); lora && lora->active())
                 throw std::invalid_argument("native GGUF routed weights do not support MTP LoRA training");
-            // Routes from later draft rows must not change the arithmetic of an earlier row.
-            return mlx_native_gguf_moe(*native_moe_, value, verifying);
+            return mlx_native_gguf_moe(*native_moe_, value, verifying, use_short_expert_tiles);
         }
         const auto source_dtype = (gate_up_ && gate_up_->uses_affine()) ||
             (native_expert_cache_ && native_expert_cache_->preserves_activation_dtype())
@@ -4708,7 +4708,8 @@ public:
         }();
         auto fv = ffn_gr_.pre_after(attention, av);
         detail::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
-        auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode, nullptr, confirmed > 0), fv);
+        auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode, nullptr, confirmed > 0,
+            tree && tree->use_short_expert_tiles), fv);
         detail::profile_eval("qwen4.ffn_mhc_post", result);
         return result;
     }
@@ -6489,7 +6490,8 @@ bool MlxQwen4CausalLm::can_verify_request_tree(const MlxQwen4RequestCache& cache
 
 array MlxQwen4CausalLm::forward_request_trees(
     const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
-    const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes) {
+    const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
+    bool use_short_expert_tiles) {
     if (caches.empty() || trees.size() != caches.size())
         throw std::invalid_argument("Qwen4 tree batch requires one tree per cache");
     std::unordered_set<const MlxQwen4RequestCache*> seen;
@@ -6576,7 +6578,7 @@ array MlxQwen4CausalLm::forward_request_trees(
     Qwen4TreeRows treerows{
         array(expand.begin(), {static_cast<int>(expand.size())}, int32),
         array(gather.begin(), {rows}, int32), array(rotary_positions.begin(), {rows}, int32),
-        array(ple_taps.begin(), {rows, taps}, int32), {}};
+        array(ple_taps.begin(), {rows, taps}, int32), {}, use_short_expert_tiles};
     for (std::size_t lane = 0; lane < caches.size(); ++lane)
         treerows.lanes.push_back({lane_begins[lane], caches[lane]->position, transactions[lane]->parents, transactions[lane]->depth});
     const array ids(tokens.begin(), {1, rows}, int32);

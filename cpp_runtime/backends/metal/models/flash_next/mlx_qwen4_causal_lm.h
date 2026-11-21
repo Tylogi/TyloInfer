@@ -162,7 +162,8 @@ public:
     bool can_verify_request_tree(const MlxQwen4RequestCache& cache) const;
     mlx::core::array forward_request_trees(
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
-        const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes = nullptr);
+        const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes = nullptr,
+        bool use_short_expert_tiles = false);
     void resolve_request_tree(MlxQwen4RequestCache& cache, int node);
     void resolve_request(MlxQwen4RequestCache& cache, int accepted_drafts);
     int request_cache_position(const MlxQwen4RequestCache& cache) const;

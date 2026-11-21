@@ -857,7 +857,8 @@ array mlx_native_gguf_ffn(const MlxNativeGgufWeight& gate, const MlxNativeGgufWe
     return astype(mlx_native_gguf_project(std::span(&down, 1), middle)[0], activation_dtype.value_or(input.dtype()));
 }
 
-array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input, bool uniform_expert_rows) {
+array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input,
+    bool uniform_expert_rows, bool use_short_expert_tiles) {
     const int width = weights.routed[0].width, actual = int(input.size() / width);
     if (input.ndim() < 2 || input.shape(-1) != width || actual < 1)
         throw std::invalid_argument("native GGUF MoE input shape differs");
@@ -870,6 +871,7 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input, b
                 uniform_expert_rows));
         return reshape(concatenate(chunks, 0), input.shape());
     }
+    const bool short_expert_tiles = uniform_expert_rows && use_short_expert_tiles && actual <= 32;
     const bool single = !uniform_expert_rows && single_row_moe(weights, actual);
     const bool vector = single && std::all_of(weights.routed.begin(), weights.routed.end(),
         [](const auto& weight) { return quant_affine_format(weight.format); }) &&
@@ -892,7 +894,7 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input, b
     key.insert(key.end(), shared_key.begin(), shared_key.end());
     key.insert(key.end(), {std::uint64_t(weights.top_k), std::uint64_t(weights.router.dtype() == bfloat16),
         weights.router.nbytes(), weights.scalar_gate.nbytes(), weights.slots.nbytes(), std::uint64_t(actual == 1),
-        std::uint64_t(uniform_expert_rows)});
+        std::uint64_t(uniform_expert_rows), std::uint64_t(short_expert_tiles)});
     auto graph = cached_graph(std::move(key), actual <= 32, [&] {
         const auto device = capabilities();
         Linear linear(device);
@@ -903,7 +905,7 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input, b
         const auto tile = moeGgufTile(gpuFamilyClass(device.appleGpuFamily), shape);
         const MoeConfig configuration{actual <= 32 || uniform_expert_rows
                 ? MoeExpertTile::M8 : moeGgufPrefillTile(shape, rows, tile),
-            tile, linear.ggufFloatTile(rows, shape.experts), uniform_expert_rows};
+            tile, linear.ggufFloatTile(rows, shape.experts), uniform_expert_rows && !short_expert_tiles};
         BlockMoeWeights block;
         block.router = QuantizedSegment::floats(shape.experts, width, {1, weights.router.nbytes()},
             weights.router.dtype() == bfloat16 ? QuantizedSegment::kBFloat16 : QuantizedSegment::kFloat32);
