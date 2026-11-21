@@ -380,27 +380,35 @@ array MlxQsaIndexOffload::gather(const array& indices) const {
     if (ids.shape(1) > 1) {
         // Keep one copy of a recalled block while filling every query that
         // selected it. Nearby queries commonly share most of their history.
-        std::vector<std::size_t> slots;
-        slots.reserve(ids.size());
+        struct BlockRecall {
+            std::size_t first, last;
+        };
+        const auto no_slot = ids.size();
+        const auto block_count = state.position / state.block_rows + (state.position % state.block_rows != 0);
+        std::vector<BlockRecall> recalls(block_count, {state.position, 0});
+        std::vector<std::size_t> row_slots(state.position, no_slot), next(ids.size());
         for (std::size_t i = 0; i < ids.size(); ++i) {
-            if (values[i] < 0) std::memset(output + i * state.row_bytes, 0, state.row_bytes);
-            else if (values[i] >= position()) throw std::invalid_argument("selected offloaded row is outside the cache");
-            else slots.push_back(i);
-        }
-        std::sort(slots.begin(), slots.end(), [&](std::size_t a, std::size_t b) { return values[a] < values[b]; });
-        std::vector<std::uint8_t> block(state.block_rows * state.row_bytes);
-        for (std::size_t begin = 0; begin < slots.size();) {
-            const auto start = static_cast<std::size_t>(values[slots[begin]]);
-            const auto end_of_block = (start / state.block_rows + 1) * state.block_rows;
-            auto end = begin + 1;
-            while (end < slots.size() && static_cast<std::size_t>(values[slots[end]]) < end_of_block) ++end;
-            state.read_rows(start, values[slots[end - 1]] - start + 1, block.data());
-            for (auto i = begin; i < end; ++i) {
-                const auto slot = slots[i];
-                std::memcpy(output + slot * state.row_bytes, block.data() + (values[slot] - start) * state.row_bytes,
-                    state.row_bytes);
+            if (values[i] < 0) {
+                std::memset(output + i * state.row_bytes, 0, state.row_bytes);
+                continue;
             }
-            begin = end;
+            const auto row = static_cast<std::size_t>(values[i]);
+            if (row >= state.position) throw std::invalid_argument("selected offloaded row is outside the cache");
+            auto& recall = recalls[row / state.block_rows];
+            recall.first = std::min(recall.first, row);
+            recall.last = std::max(recall.last, row);
+            next[i] = row_slots[row];
+            row_slots[row] = i;
+        }
+        std::vector<std::uint8_t> block(state.block_rows * state.row_bytes);
+        for (const auto& recall : recalls) {
+            if (recall.first > recall.last) continue;
+            state.read_rows(recall.first, recall.last - recall.first + 1, block.data());
+            for (auto row = recall.first; row <= recall.last; ++row) {
+                const auto* data = block.data() + (row - recall.first) * state.row_bytes;
+                for (auto slot = row_slots[row]; slot != no_slot; slot = next[slot])
+                    std::memcpy(output + slot * state.row_bytes, data, state.row_bytes);
+            }
         }
         return result;
     }
