@@ -182,7 +182,8 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     auto store = std::make_shared<QsaKvStore>(config);
     MlxQsaIndexOffload cache(store, 32, float32, 2);
     auto keys = values({1, 1024, 32}, 43, float32);
-    auto query = values({1, 6, 4, 32}, 29);
+    constexpr int rows = 17, offset = 4096 - rows;
+    auto query = values({1, rows, 4, 32}, 29);
     cache.append(keys);
     const auto full_view = cache.try_view();
     require(bool(full_view) == (keys.nbytes() <= buffer / 2), "offloaded index view exceeded the read buffer");
@@ -207,30 +208,30 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
         all(staged->mask == array({false, true, true, false, false, false, false, true, false, true,
             true, true, false, true, false, true, false, true, true, false}, Shape{1, 1, 4, 5}, bool_)).item<bool>(),
         "offloaded row union lost selected rows or per-query visibility");
-    auto selected = cache.select(query, 4090, 4, 128);
+    auto selected = cache.select(query, offset, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});
-    auto visible = reshape(floor_divide(arange(4091, 4097, 1, int32), array(4, int32)), Shape{1, 6, 1});
+    auto visible = reshape(floor_divide(arange(offset + 1, 4097, 1, int32), array(4, int32)), Shape{1, rows, 1});
     scores = where(positions < visible, scores, array(-1e30f));
-    auto reference = sort(slice(argpartition(-scores, 31, -1), Shape{0, 0, 0}, Shape{1, 6, 32}), -1);
+    auto reference = sort(slice(argpartition(-scores, 31, -1), Shape{0, 0, 0}, Shape{1, rows, 32}), -1);
     require(all(selected == reference).item<bool>(), "streamed indexer top-k differs from full resident scores");
-    auto tied = cache.select(zeros(query.shape(), float16), 4090, 4, 128);
+    auto tied = cache.select(zeros(query.shape(), float16), offset, 4, 128);
     require(all(tied >= array(0, int32)).item<bool>() && all(tied < visible).item<bool>() &&
         all(slice(tied, Shape{0, 0, 1}, tied.shape()) >
-            slice(tied, Shape{0, 0, 0}, Shape{1, 6, 31})).item<bool>(),
+            slice(tied, Shape{0, 0, 0}, Shape{1, rows, 31})).item<bool>(),
         "tied streamed top-k selected duplicate or invisible blocks");
 
-    const auto weights = values({1, 6, 4}, 113, float32);
-    const auto weighted = cache.select(query, 4090, 4, 128, weights, true);
+    const auto weights = values({1, rows, 4}, 113, float32);
+    const auto weighted = cache.select(query, offset, 4, 128, weights, true);
     const auto keys_transposed = transpose(keys, {0, 2, 1});
-    const auto dots = reshape(matmul(reshape(astype(query, float32), {1, 24, 32}),
-        keys_transposed), {1, 6, 4, 1024});
+    const auto dots = reshape(matmul(reshape(astype(query, float32), {1, rows * 4, 32}),
+        keys_transposed), {1, rows, 4, 1024});
     auto weighted_scores = sum(maximum(dots, array(0.0f)) * expand_dims(weights, -1), -2);
-    const auto current_group = reshape(floor_divide(arange(4090, 4096, 1, int32),
-        array(4, int32)), {1, 6, 1});
+    const auto current_group = reshape(floor_divide(arange(offset, 4096, 1, int32),
+        array(4, int32)), {1, rows, 1});
     weighted_scores = where(positions < current_group, weighted_scores, array(-1e30f));
     const auto history = sort(slice(argpartition(-weighted_scores, 30, -1),
-        Shape{0, 0, 0}, Shape{1, 6, 31}), -1);
+        Shape{0, 0, 0}, Shape{1, rows, 31}), -1);
     require(all(weighted == concatenate({history, current_group}, -1)).item<bool>(),
         "weighted streamed index selection disagrees with the reference or duplicates the current group");
 

@@ -526,9 +526,11 @@ array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int 
     const auto& state = rows_.view();
     const int key_chunk = static_cast<int>(std::max<std::size_t>(1,
         std::min<std::size_t>(complete, state.store->config().buffer_bytes / 8 / state.row_bytes)));
+    // Reuse each streamed key range across more queries for weighted indexes.
+    const int query_tile = head_weights ? 16 : 8;
     std::vector<array> results;
-    for (int token = 0; token < query.shape(1); token += 8) {
-        const int take = std::min(8, query.shape(1) - token);
+    for (int token = 0; token < query.shape(1); token += query_tile) {
+        const int take = std::min(query_tile, query.shape(1) - token);
         const int first_position = offset + token + int(!reserve_current_group);
         const auto visible = mlx::core::reshape(mlx::core::floor_divide(
             mlx::core::arange(first_position, first_position + take, 1, mlx::core::int32),
