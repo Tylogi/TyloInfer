@@ -32,13 +32,13 @@ pip install -e ".[metal,minicpmo45-realtime]"
 ## Load
 
 The legacy NINT/MFQ examples below require the corresponding reference path or
-an explicit [native compatibility build](../cli/build.md#native-format-profiles).
+an explicit [native compatibility build](../build.md#native-format-profiles).
 They are not the default GGUF/TQ quick-start recipe. Retained native executable
 names and the `MFQTNSR1` envelope are internal interfaces, not old public CLI
 aliases.
 
 ```python
-from server.runtime import load_minicpmo45
+from studio.runtime import load_minicpmo45
 
 runtime = load_minicpmo45(
     "/models/OpenBMB/MiniCPM-o-4_5",

@@ -500,7 +500,7 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     let mut command = Command::new(program);
     let instance_id = uuid::Uuid::new_v4().to_string();
     if python_module {
-        command.arg("-m").arg("server.serve");
+        command.arg("-m").arg("serve");
     }
     command
         .arg("--exit-on-stdin-close")

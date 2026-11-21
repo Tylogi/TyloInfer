@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cuda_execution.h"
-#include "studio/server/kernels/cuda/fp8_sq.h"
+#include "studio/kernels/cuda/fp8_sq.h"
 
 #include <cstdint>
 #include <string>

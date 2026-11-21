@@ -6,7 +6,7 @@ if(NOT TARGET mfq-runtime-communication)
 endif()
 
 set(TYLOINFER_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(TYLOINFER_CUDA_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/studio/server/kernels/cuda")
+set(TYLOINFER_CUDA_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/cuda")
 
 set(TYLOINFER_CUDA_ARCHITECTURES "" CACHE STRING
     "Optional CUDA architecture override; otherwise use CMAKE_CUDA_ARCHITECTURES, CUDAARCHS or native")
@@ -307,16 +307,6 @@ if(BUILD_TESTING)
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()
-
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
-
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
-
-
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
 
     mfq_add_cuda_test(mfq-cuda-context-test
         ${TYLOINFER_CUDA_ROOT}/tests/mfq_cuda_context_test.cu)
@@ -621,11 +611,6 @@ if(BUILD_TESTING)
     add_test(NAME tyloinfer-cuda-tq-arena-headroom COMMAND tyloinfer-cuda-tq-resource-test --arena-headroom)
     set_tests_properties(tyloinfer-cuda-tq-arena-headroom PROPERTIES SKIP_RETURN_CODE 77)
 
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
-
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     add_executable(tyloinfer-cuda-layer-weight-stream-test ${TYLOINFER_CUDA_ROOT}/tests/layer_weight_stream_test.cpp)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-layer-weight-stream-test)
     target_link_libraries(tyloinfer-cuda-layer-weight-stream-test PRIVATE mfq-cuda-runtime)
@@ -654,8 +639,6 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
     add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
     set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     add_executable(mfq-cuda-dma-batch-test ${TYLOINFER_CUDA_ROOT}/tests/dma_copy_batch_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-dma-batch-test)
     target_compile_definitions(mfq-cuda-dma-batch-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -668,8 +651,6 @@ if(BUILD_TESTING)
         CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared)
     add_test(NAME mfq-cuda-warp-multi-sum-test COMMAND mfq-cuda-warp-multi-sum-test)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     add_executable(mfq-window-segment-test ${TYLOINFER_CUDA_ROOT}/tests/decode_window_segment_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-window-segment-test)
     target_compile_definitions(mfq-window-segment-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -757,19 +738,13 @@ if(BUILD_TESTING)
         TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-host-expert-cache-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-host-expert-cache-test COMMAND mfq-host-expert-cache-test)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     if(MSVC)
         target_compile_options(mfq-host-expert-cache-test PRIVATE /EHsc)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
         # Cancellation checks must unwind CUDA stream guards before recovery.
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
         target_compile_options(mfq-nint-row-pipeline-test PRIVATE /EHsc)
     endif()
     # This fixture calls legacy NINT operators excluded by the compatibility switch.
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     endif()
 
     add_executable(mfq-deepseek-v41-ced-test ${TYLOINFER_CUDA_ROOT}/tests/deepseek_v41_ced_test.cpp)
@@ -1034,8 +1009,6 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-deepseek-v41-ced-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     add_test(NAME mfq-deepseek-v41-ced-test COMMAND mfq-deepseek-v41-ced-test)
     set_tests_properties(mfq-deepseek-v41-ced-test PROPERTIES SKIP_RETURN_CODE 77)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     add_executable(mfq-deepseek-v41-vision-test ${TYLOINFER_CUDA_ROOT}/tests/deepseek_v41_vision_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-deepseek-v41-vision-test)
     target_link_libraries(mfq-deepseek-v41-vision-test PRIVATE mfq-cuda-runtime)
@@ -1043,14 +1016,8 @@ if(BUILD_TESTING)
     add_test(NAME mfq-deepseek-v41-vision-test COMMAND mfq-deepseek-v41-vision-test)
     set_tests_properties(mfq-deepseek-v41-vision-test PROPERTIES SKIP_RETURN_CODE 77)
     if(MSVC)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
         target_compile_options(mfq-deepseek-v41-vision-test PRIVATE /EHsc)
         target_compile_options(mfq-deepseek-v41-ced-test PRIVATE /EHsc)
-    endif()
-    if(MSVC)
-    endif()
-    if(MSVC)
     endif()
     add_executable(mfq-cuda-deepseek-v41-axial-vision-test
         ${TYLOINFER_CUDA_ROOT}/tests/deepseek_v41_axial_vision_gpu_test.cpp)
@@ -1092,12 +1059,8 @@ set_target_properties(mfq-cuda-runtime PROPERTIES
 )
 
 if(BUILD_TESTING)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     target_link_libraries(mfq-flash-next-test PRIVATE
         mfq-cuda-runtime)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    endif()
     add_executable(mfq-cuda-runtime-state-test
         ${TYLOINFER_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)
@@ -1129,14 +1092,6 @@ if(BUILD_TESTING)
 
 endif()
 
-
-
-if(MSVC)
-    foreach(target mfq-cuda-diagnostics)
-        target_compile_options(${target} PRIVATE /utf-8 /EHsc /bigobj)
-    endforeach()
-endif()
-
 add_executable(mfq-runtime
     ${TYLOINFER_CUDA_ROOT}/apps/runtime_main.cpp
     ${TYLOINFER_CUDA_ROOT}/commands/runtime.cpp
@@ -1153,10 +1108,6 @@ target_compile_features(mfq-runtime PRIVATE cxx_std_20)
 set_target_properties(mfq-runtime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
-
-if(MSVC)
-endif()
-
 
 if(BUILD_TESTING)
     add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --transport stdio --continuous-batching 2 --help)
@@ -1252,6 +1203,4 @@ set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared.cu PROP
 
 set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_cached_reduce.cu PROPERTIES
     OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_cached_reduce.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_parity_read.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h")
-
-
 

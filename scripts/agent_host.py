@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plugins-root", type=Path, default=repo / "plugins")
     parser.add_argument("--state-root", type=Path, required=True, help="Private profile and workspace directory")
     parser.add_argument("--core-url", default="http://127.0.0.1:8090/v1", help="Initial endpoint for a new profile only")
-    parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--port", type=int, default=8092)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Check metadata and artifacts without writing or starting")
     mode.add_argument("--prepare-only", action="store_true", help="Prepare the private profile without starting services")

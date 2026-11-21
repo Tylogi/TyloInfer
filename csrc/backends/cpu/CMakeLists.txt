@@ -101,6 +101,3 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|i.86)$")
 endif()
 add_library(mfq::cpu-ops ALIAS mfq-cpu-ops)
 
-if(BUILD_TESTING AND TYLOINFER_ENABLE_MFQ_COMPAT)
-endif()
-

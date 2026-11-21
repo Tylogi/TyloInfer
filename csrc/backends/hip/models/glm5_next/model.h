@@ -3,7 +3,7 @@
 #include "../../include/mfq_hip_linear_attention_ops.h"
 #include "models/glm5_next/causal_lm.h"
 #include "core/attention.h"
-#include "studio/server/kernels/hip/glm5_next.h"
+#include "studio/kernels/hip/glm5_next.h"
 #include <array>
 
 namespace mfq::cuda::glm5_next {

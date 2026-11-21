@@ -133,7 +133,7 @@ void write_floats(
 
 int main(int argc, char** argv) try {
     if (argc == 1) {
-        std::cerr << "Run studio/server/tests/test_cuda_deepseek_v41_axial_vision_native.py with the native fixture bridge.\n";
+        std::cerr << "Run studio/tests/test_cuda_deepseek_v41_axial_vision_native.py with the native fixture bridge.\n";
         return 77;
     }
     int devices = 0;

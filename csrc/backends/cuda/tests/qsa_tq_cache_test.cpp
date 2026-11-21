@@ -4,7 +4,7 @@
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_attention_ops.h"
 #include "kernels/qsa_tq.h"
-#include "studio/server/kernels/cuda/qwen4_exp.h"
+#include "studio/kernels/cuda/qwen4_exp.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>

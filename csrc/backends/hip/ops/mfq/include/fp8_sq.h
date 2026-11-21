@@ -2,7 +2,7 @@
 #pragma once
 
 #include "../../common/include/hip_execution.h"
-#include "studio/server/kernels/hip/fp8_sq.h"
+#include "studio/kernels/hip/fp8_sq.h"
 
 #include <cstdint>
 #include <string>

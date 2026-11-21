@@ -2,7 +2,7 @@ import { build } from '../../studio/web/node_modules/vite/dist/node/index.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('.', import.meta.url));
-const versionSource = await readFile(new URL('../../studio/server/_version.py', import.meta.url), 'utf8');
+const versionSource = await readFile(new URL('../../studio/_version.py', import.meta.url), 'utf8');
 const productVersion = versionSource.match(/^__version__\s*=\s*["']([^"']+)["']/m)?.[1];
 if (!productVersion) throw new Error('TyloInfer product version is missing');
 const { default: postcss } = await import('../../studio/web/node_modules/postcss/lib/postcss.mjs');

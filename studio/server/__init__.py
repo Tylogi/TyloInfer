@@ -1,5 +1,5 @@
-"""TyloInfer: TQ inference and serving on CUDA and Apple Silicon."""
+"""MFQ inference server protocol and service components."""
 
-from server._version import __version__
+from server.protocol.models import PROTOCOL_VERSION
 
-__all__ = ["__version__"]
+__all__ = ["PROTOCOL_VERSION"]

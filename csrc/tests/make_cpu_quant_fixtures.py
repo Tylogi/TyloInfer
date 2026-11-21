@@ -6,17 +6,17 @@ import numpy as np
 
 SOURCE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SOURCE))
-from server.formats import io
-from server.formats.header import FileHeader
-from server.formats.mfe import MfePool, MfeTensor
-from server.formats.nint import NintSpec, NintTensor
-from server.formats.nvq import (NvqJscTensor, NVQ2_E8, NVQ2_E8_1024,
+from formats import io
+from formats.header import FileHeader
+from formats.mfe import MfePool, MfeTensor
+from formats.nint import NintSpec, NintTensor
+from formats.nvq import (NvqJscTensor, NVQ2_E8, NVQ2_E8_1024,
     NVQ2_E8_4096, NVQ3_D4, NVQ3_D4_512, NVQ3_D4_1024, codebook_for)
-from server.formats.nvq1_l import Nvq1LTensor, NVQ1_L_T8_S4
-from server.formats.nvq1_s import Nvq1STensor, Nvq1SSpec
-from server.quantize.nvq1_l_quant import dequantize as decode_l
-from server.quantize.nvq1_s_quant import dequantize as decode_s
-from server.quantize.nvq_jsc import dequantize_nvq_jsc
+from formats.nvq1_l import Nvq1LTensor, NVQ1_L_T8_S4
+from formats.nvq1_s import Nvq1STensor, Nvq1SSpec
+from quantize.nvq1_l_quant import dequantize as decode_l
+from quantize.nvq1_s_quant import dequantize as decode_s
+from quantize.nvq_jsc import dequantize_nvq_jsc
 
 if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != '--experts'):
     raise SystemExit('usage: make_cpu_quant_fixtures.py OUTPUT_DIRECTORY [--experts N]')

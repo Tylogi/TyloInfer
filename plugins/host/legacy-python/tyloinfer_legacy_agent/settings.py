@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import httpx
 
-from server.server.services.service import ServiceError
+from server.services.service import ServiceError
 
 from .dsh import DshRuntime
 

@@ -1,2 +1,2 @@
 #pragma once
-#include "studio/server/kernels/cuda/prefill_scale.cuh"
+#include "studio/kernels/cuda/prefill_scale.cuh"

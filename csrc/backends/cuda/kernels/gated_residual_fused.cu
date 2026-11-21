@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include "kernel_dispatch_trace.h"
-#include "../../../../studio/server/kernels/cuda/nint_whole_group_decode.cuh"
+#include "../../../../studio/kernels/cuda/nint_whole_group_decode.cuh"
 
 
 namespace {

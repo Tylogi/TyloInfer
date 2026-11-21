@@ -1,7 +1,7 @@
 # Flash-Next CUDA continuous batching
 
 The managed CUDA server accepts eight requests per worker by default. Set a
-different limit with `python -m server.serve --max-requests-per-runtime N`. The native
+different limit with `python -m serve --max-requests-per-runtime N`. The native
 runtime exposes `mfq-runtime --continuous-batching N`. Flash-Next supports
 capacities from 1 to 32 on one CUDA device.
 

@@ -33,7 +33,8 @@ import zipfile
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT = SCRIPT_DIR.parent
 STUDIO = PROJECT / "studio" / "web"
-SERVER_PROJECT = PROJECT / "studio" / "server"
+PYTHON_PROJECT = PROJECT / "studio"
+SERVER_ENTRY = PYTHON_PROJECT / "serve.py"
 SERVER_NAME = "tyloinfer-server"
 
 
@@ -58,7 +59,7 @@ def _flags(flag: str, values: tuple[str, ...]) -> list[str]:
 # server bundles the MLX runtime (mlx_lm pulls in transformers), the Windows
 # server has no MLX and leaves transformers and safetensors out.
 PYINSTALLER_ARGS = [
-    "--collect-data", "server",
+    *_flags("--collect-data", ("_gyro", "kernels", "server")),
     *_flags("--collect-all", (
         "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf", "pyarrow", "pandas",
         "sympy", "regex", "loguru", "antlr4", "yaml", "huggingface_hub",
@@ -227,7 +228,7 @@ def preflight(context: Context) -> None:
     if not context.windows:
         if sys.platform != "darwin" or platform.machine() != "arm64":
             fail("this release target requires native Apple Silicon macOS")
-        require_commands(environment, ("uv", "cmake", "ninja", "cargo", "npm", "codesign",
+        require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm", "codesign",
                                       "hdiutil", "install_name_tool", "lipo", "xcrun"))
         for shader in ("metal", "metallib"):
             if subprocess.run(["xcrun", "--find", shader], capture_output=True).returncode != 0:
@@ -246,7 +247,7 @@ def preflight(context: Context) -> None:
     environment["CUDA_PATH"] = str(context.cuda_root)
     add_to_path(environment, str(context.cuda_root / "bin"))
     add_to_path(environment, str(context.cuda_root / "lib" / "x64"))
-    require_commands(environment, ("uv", "cmake", "ninja", "cargo", "npm.cmd", "cl", "nvcc"))
+    require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm.cmd", "cl", "nvcc"))
 
 
 def clean(context: Context) -> None:
@@ -371,7 +372,7 @@ def create_release_environment(context: Context) -> None:
     run(["uv", "venv", "--clear", "--python",
          os.environ.get("TYLOINFER_RELEASE_PYTHON", "3.12"), context.venv],
         cwd=PROJECT, env=environment)
-    run(["uv", "sync", "--project", SERVER_PROJECT, "--locked", "--active",
+    run(["uv", "sync", "--project", PYTHON_PROJECT, "--locked", "--active",
          "--no-default-groups", "--no-editable", "--group", "release",
          *context.uv_extras], cwd=PROJECT, env=environment)
     for name in ("python", "pyinstaller"):
@@ -541,7 +542,7 @@ def build_server(context: Context) -> None:
                    "--specpath", context.spec]
     if not context.windows and context.signing_identity != "-":
         pyinstaller += ["--codesign-identity", context.signing_identity]
-    run(pyinstaller + [SERVER_PROJECT / "serve.py"], env=environment)
+    run(pyinstaller + [SERVER_ENTRY], env=environment)
 
     if not context.server.is_file():
         fail(f"PyInstaller did not create {context.server}")
@@ -559,14 +560,15 @@ def build_studio(context: Context) -> None:
     if not context.windows:
         environment["APPLE_SIGNING_IDENTITY"] = os.environ.get("APPLE_SIGNING_IDENTITY") or \
             context.signing_identity
-    command = ["npm", "run", "tauri", "--", "build",
+    command = ["tauri", "build",
                "--config", f"src-tauri/tauri.release-{'windows' if context.windows else 'macos'}.conf.json"]
     if not context.windows and context.signing_identity != "-":
         command += ["--config", '{"bundle":{"macOS":{"hardenedRuntime":true}}}']
-    npm = "npm.cmd" if context.windows else "npm"
-    run([npm, "ci"], cwd=STUDIO, env=environment)
-    run([npm, "run", "check"], cwd=STUDIO, env=environment)
-    run(command + ["--target", context.triple], cwd=STUDIO, env=environment)
+    # studio/web is pnpm-managed (pnpm-lock.yaml); npm ci cannot install from it.
+    pnpm = "pnpm.cmd" if context.windows else "pnpm"
+    run([pnpm, "install", "--frozen-lockfile"], cwd=STUDIO, env=environment)
+    run([pnpm, "run", "check"], cwd=STUDIO, env=environment)
+    run([pnpm, "exec"] + command + ["--target", context.triple], cwd=STUDIO, env=environment)
     if context.windows:
         # The PyInstaller workpath is rebuilt by --clean. Reclaim it before Tauri
         # copies the multi-GiB sidecars and runtime resources into NSIS staging.
@@ -770,7 +772,7 @@ def new_context(target: str, clean_requested: bool) -> Context:
         pyinstaller_extras=([
             *_flags("--collect-all", ("tokenizers",)),
             # No MLX runtime on Windows, so transformers and safetensors stay out.
-            *_flags("--exclude-module", ("transformers", "safetensors", "server.runtime")),
+            *_flags("--exclude-module", ("transformers", "safetensors")),
         ] if windows else [
             "--target-architecture", "arm64",
             # mlx_lm pulls in transformers, which the MLX-free target omits.

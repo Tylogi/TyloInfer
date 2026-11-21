@@ -1,5 +1,5 @@
 #include "mfq_cuda_context.h"
-#include "studio/server/kernels/cuda/mfe_ffn.h"
+#include "studio/kernels/cuda/mfe_ffn.h"
 #include "runtime/moe_pipeline.h"
 
 #include <array>

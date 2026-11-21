@@ -7,7 +7,7 @@
 #include "csrc/models/deepseek_v41/engram.h"
 #include "models/deepseek_v41/causal_lm.h"
 #include "quant_linear.h"
-#include "studio/server/kernels/cuda/deepseek_v41.h"
+#include "studio/kernels/cuda/deepseek_v41.h"
 
 #include <algorithm>
 #include <array>

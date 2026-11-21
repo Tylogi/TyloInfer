@@ -5,7 +5,7 @@ TyloInfer Studio desktop releases support macOS and Windows. One script,
 `packaging/dist/`.
 
 The packages include the server, Python environment, native runtime, and
-required runtime libraries. `python -m server.serve` or TyloInfer manages the native
+required runtime libraries. `python -m serve` or TyloInfer manages the native
 sidecars.
 
 ## macOS
@@ -46,7 +46,7 @@ uv run --no-project packaging/build_release.py --target windows
 ```
 
 The build host needs Visual Studio Build Tools with the C++ x64 workload, a CUDA
-Toolkit, `uv`, CMake, Ninja, Rust, Node.js/npm, and NSIS. The release script declares its supported CUDA architectures. Override release inputs when needed, and pass `--clean` to rebuild the native sidecar from scratch:
+Toolkit, `uv`, CMake, Ninja, Rust, Node.js/pnpm, and NSIS. The release script declares its supported CUDA architectures. Override release inputs when needed, and pass `--clean` to rebuild the native sidecar from scratch:
 
 ```shell
 TYLOINFER_RELEASE_CUDA_ARCHITECTURES=89 TYLOINFER_RELEASE_JOBS=2 \

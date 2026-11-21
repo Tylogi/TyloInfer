@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from server.server.services.service import ServiceError
+from server.services.service import ServiceError
 
 TERMINAL = frozenset({"completed", "cancelled", "failed", "interrupted"})
 MAX_OUTPUT_BYTES = 262144

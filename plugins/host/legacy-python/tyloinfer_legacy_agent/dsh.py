@@ -15,9 +15,9 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from uuid import UUID
 
-from server.server.api.openai_compat import parse_chat_request, stream_chat_completion
-from server.server.protocol.models import SamplingParams
-from server.server.runtime.backend import BackendError, closing_backend_stream
+from server.api.openai_compat import parse_chat_request, stream_chat_completion
+from server.protocol.models import SamplingParams
+from server.runtime.backend import BackendError, closing_backend_stream
 
 SDK_VERSION = "0.2.2rc2"
 TOOL_MODULE = """

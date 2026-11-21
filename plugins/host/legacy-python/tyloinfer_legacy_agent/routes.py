@@ -11,8 +11,8 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from server.server.api import create_app as create_core_app
-from server.server.services.service import ServiceError
+from server.api import create_app as create_core_app
+from server.services.service import ServiceError
 
 from .service import AgentService
 

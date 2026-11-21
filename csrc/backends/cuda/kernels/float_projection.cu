@@ -15,7 +15,7 @@
 #include <array>
 #include <cstdio>
 #include <cuda_bf16.h>
-#include "studio/server/kernels/cuda/gr_bf16_projection.cuh"
+#include "studio/kernels/cuda/gr_bf16_projection.cuh"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "gr_prefill_tf32.cuh"
 #include "gr_prefill_half2.cuh"

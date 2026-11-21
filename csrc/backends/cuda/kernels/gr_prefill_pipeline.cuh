@@ -1,5 +1,5 @@
 #pragma once
-#include "studio/server/kernels/cuda/async_copy.cuh"
+#include "studio/kernels/cuda/async_copy.cuh"
 
 namespace {
 bool gr_prefill_pipeline_supported(const mfq_tensor_backend::Tensor& input) {

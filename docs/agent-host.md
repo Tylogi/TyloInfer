@@ -4,7 +4,7 @@ TyloInfer 推理服务与完整 DSH Host 分别启动。产品启动器位于 `s
 
 ## 两种独立产品形态
 
-TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。Studio使用自己的 `studio/web/package.json` 构建入口：`npm run build` 只执行TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
+TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。Studio使用自己的 `studio/web/package.json` 构建入口：`pnpm run build` 只执行TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
 
 Agent产品使用完整DSH Host及外部插件；`plugins/studio/` 是Agent中的推理Client插件，不是独立Studio的替代安装。其 `node build.mjs` 单独生成插件产物，允许单向复用Studio的纯展示组件与样式，但不能让Studio反向导入DSH服务、插件运行时或Agent页面。当前插件构建还复用了Studio的Vite工具安装；共享构建工具和源码不等于Studio必须构建Agent。
 
@@ -33,7 +33,7 @@ python scripts/agent_host.py --state-root .tyloinfer/agent
 
 上述命令要求目标 runtime 已安装（先在 `dsh/` 下运行 `npm ci`）；仅有依赖清单时 `--check` 会失败。已有独立官方安装可通过 `--runtime-root <runtime-directory>` 显式选择。`--plugins-root` 可另行指定两个产品插件所在目录。启动器不会执行下载、安装或编译。
 
-默认 Agent 监听回环地址的 8091 端口，推理模型提供方初始连接 `http://127.0.0.1:8090/v1`。`--port` 仅选择 Agent 端口；`--core-url` 仅用于首次创建 profile，已有用户设置不覆盖。默认模型列表为空，启动不加载权重。实际模型选择、外部 API 与凭据继续由官方设置服务管理。
+默认 Agent 监听回环地址的 8092 端口，推理模型提供方初始连接 `http://127.0.0.1:8090/v1`。`--port` 仅选择 Agent 端口；`--core-url` 仅用于首次创建 profile，已有用户设置不覆盖。默认模型列表为空，启动不加载权重。实际模型选择、外部 API 与凭据继续由官方设置服务管理。Core 的 OpenAI 与 Anthropic 监听默认占用 8090 和 8091，选择 Agent 端口时避开它们。
 
 `--check` 校验版本、产物及既有profile的产品包绑定，不写文件、不启动进程。`--prepare-only` 创建完整默认profile和两个产品包的本地链接，但不启动服务；创建前先统一检查全部既有绑定，不因后一个插件冲突而先创建前一个链接或默认文件。已有profile、用户设置和正确链接保持不变；指向其他安装或断开的旧绑定明确拒绝，不自动覆盖或改绑。检查兼容性和保留私有状态的方法见[升级说明](agent-upgrade.md)。
 
@@ -42,7 +42,7 @@ python scripts/agent_host.py --state-root .tyloinfer/agent
 打开已经运行的 Host 使用独立模式：
 
 ```sh
-python scripts/agent_host.py --state-root .tyloinfer/agent --port 8091 --open-existing
+python scripts/agent_host.py --state-root .tyloinfer/agent --port 8092 --open-existing
 ```
 
 该模式仅校验并读取私有连接文件，将同一回环端口的认证入口交给本机默认浏览器；不打印 URL，不校验或启动新的运行包，不重启服务。它拒绝外部地址、不同端口、嵌入式用户名密码和非入口路径。输出 `AGENT_BROWSER_OPEN_REQUESTED; EXISTING_HOST_ONLY=true` 只表示本机浏览器接受了打开请求，不代表另一台设备上的浏览器已打开。

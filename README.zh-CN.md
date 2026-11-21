@@ -72,69 +72,67 @@ NVIDIA RTX 3090 Ti · 4K input · 256 output
 
 ### 源码构建与部署
 
-先安装 [uv](https://docs.astral.sh/uv/)、CMake 3.26 或更新版本与 C++ 编译工具链。CUDA 构建还需 NVIDIA CUDA Toolkit；浏览器界面需要 Node.js 和 npm。
+先安装 [uv](https://docs.astral.sh/uv/)、CMake 3.26 或更新版本与 C++ 编译工具链。CUDA 构建还需 NVIDIA CUDA Toolkit；浏览器界面需要 Node.js 和 pnpm。
 
 ```sh
 git clone https://github.com/Tylogi/TyloInfer.git
 cd TyloInfer
 
 # Apple Silicon
-uv sync --project studio/server --extra metal
+uv sync --project studio --extra metal
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release \
-  -DTYLOINFER_MLX_ROOT="$(uv run --project studio/server python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
+  -DTYLOINFER_MLX_ROOT="$(uv run --project studio python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
 cmake --build build --target mfq-decode-metal --parallel
 
 # 启动服务，从此目录发现模型
-uv run --project studio/server python -m server.serve --model-dir ./models \
-  --running-executable build/csrc/metal/mfq-decode-metal
+uv run --project studio python -m serve --model-dir ./models \
+  --running-executable build/metal/mfq-decode-metal
 ```
 
 NVIDIA 设备将构建步骤替换为：
 
 ```sh
-uv sync --project studio/server
+uv sync --project studio
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target mfq-runtime --parallel
 ```
 
-启动时改用 `--running-executable build/csrc/mfq-runtime`。CMake 会根据本机工具链选择 Metal、CUDA 或 HIP；各后端的依赖见[构建指南](docs/cli/build.md#backend-requirements)。
+启动时改用 `--running-executable build/mfq-runtime`。CMake 会根据本机工具链选择 Metal、CUDA 或 HIP；各后端的依赖见[构建指南](docs/build.md#backend-requirements)。
 
 打开 **http://127.0.0.1:8090/**，下载模型后在「模型」中加载。也可启动时直接加载已有模型：
 
 ```sh
-uv run --project studio/server python -m server.serve --model /models/model.gguf \
-  --running-executable build/csrc/mfq-runtime
+uv run --project studio python -m serve --model /models/model.gguf \
+  --running-executable build/mfq-runtime
 ```
 
 `.tq` 模型同样使用此命令。分片模型选择首个分片，并将完整分片放在同一目录。
 
-API 请求与鉴权配置见[服务部署指南](docs/cli/serve.md#first-api-request)。
+API 请求与鉴权配置见[服务部署指南](docs/serve.md#first-api-request)。
 
 ### 运行测试
 
 ```sh
 # Python 服务
-uv run --project studio/server --extra dev pytest studio/server/tests
-
-# 结构门（对 C++/CUDA/Metal 树的约定检查）
-uv run --project studio/server --extra dev pytest studio/server/tests_structure
+uv run --project studio --extra dev pytest studio/tests
 
 # 与钉住版本的参考实现对拍需要 PyTorch：
-uv run --project studio/server --extra dev --extra d1-reference \
-  pytest studio/server/tests/test_d1_reference.py
+uv run --project studio --extra dev --extra d1-reference \
+  pytest studio/tests/test_d1_reference.py
 
 # 原生运行时：按上文配置并构建后执行
 ctest --test-dir build
 
-# 浏览器界面（需先安装 studio/web 依赖）
-npm --prefix studio/web test
+# 浏览器界面（首次需安装 studio/web 依赖）
+pnpm --dir studio/web install --frozen-lockfile
+pnpm --dir studio/web test
 
 # DSH 插件
 node --test plugins/host/tests/*.test.mjs
 npm --prefix plugins/studio test
 ```
 
-`csrc/tests/` 下的 C++ 用例任意机器都能跑；CUDA 与 Metal 用例需要对应硬件。详见[构建指南](docs/cli/build.md#testing)。
+`csrc/tests/` 下的 C++ 用例任意机器都能跑；CUDA 与 Metal 用例需要对应硬件。详见[构建指南](docs/build.md#testing)。
 
 ### 接入 Agent 与客户端
 
@@ -164,6 +162,6 @@ TQ 模型由 [TyloQuant](https://github.com/Tylogi/TyloQuant) 生成，可为每
 
 ## 文档
 
-[构建](docs/cli/build.md) · [服务部署](docs/cli/serve.md) · [HTTP API](docs/api/http.md) · [TQ](docs/formats/tq.md) · [运行时支持](docs/runtime/support.md) · [打包](docs/packaging.md)
+[构建](docs/build.md) · [服务部署](docs/serve.md) · [HTTP API](docs/api/http.md) · [TQ](docs/formats/tq.md) · [运行时支持](docs/runtime/support.md) · [打包](docs/packaging.md)
 
 采用 [Apache 2.0](LICENSE) 许可；第三方声明见 [NOTICE](NOTICE) 与 [LICENSES](LICENSES)。

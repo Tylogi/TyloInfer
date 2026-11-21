@@ -152,7 +152,7 @@ fn write_icons(directory: &Path) {
 }
 
 fn main() {
-    let server_version_path = Path::new("../../../studio/server/_version.py");
+    let server_version_path = Path::new("../../../studio/_version.py");
     println!("cargo:rerun-if-changed={}", server_version_path.display());
     let server_source = fs::read_to_string(server_version_path).expect("missing TyloInfer server version");
     let server_version = server_source.lines().find_map(|line| line.strip_prefix("__version__ = "))

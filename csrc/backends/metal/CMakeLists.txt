@@ -255,8 +255,8 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_mfe_prefill_embedded.h"
     @ONLY)
 
-file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/server/kernels/metal/tq_decode.h" TYLOINFER_TQ_DECODE_SOURCE)
-file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/server/kernels/metal/tq_matmul.h" TYLOINFER_TQ_MATMUL_SOURCE)
+file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_decode.h" TYLOINFER_TQ_DECODE_SOURCE)
+file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_matmul.h" TYLOINFER_TQ_MATMUL_SOURCE)
 set(_TYLOINFER_NAX_FRAGMENT_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/tyloinfer_nax_fragment_entry.h")
 file(WRITE "${_TYLOINFER_NAX_FRAGMENT_ENTRY}"
     "#include \"mlx/backend/metal/kernels/steel/gemm/nax.h\"\n")
@@ -273,8 +273,8 @@ if(NOT _TYLOINFER_NAX_FRAGMENT_EXPAND_RESULT EQUAL 0)
     message(FATAL_ERROR "Failed to embed NAX fragment headers: ${_TYLOINFER_NAX_FRAGMENT_EXPAND_ERROR}")
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${TYLOINFER_REPOSITORY_ROOT}/studio/server/kernels/metal/tq_decode.h"
-    "${TYLOINFER_REPOSITORY_ROOT}/studio/server/kernels/metal/tq_matmul.h")
+    "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_decode.h"
+    "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_matmul.h")
 configure_file(kernels/tq/mfq_tq_embedded.h.in mfq_tq_embedded.h @ONLY)
 file(READ "${PROJECT_SOURCE_DIR}/components/ggml/src/ggml-common.h" TYLOINFER_GGUF_COMMON_SOURCE)
 function(tyloinfer_gguf_table type name count pattern output)
@@ -623,9 +623,6 @@ if(BUILD_TESTING)
     add_test(NAME tyloinfer-metal-tq-compact-reuse-test COMMAND mfq-metal-tq-test --compact-reuse)
 endif()
 
-if(TARGET mfq-paged-prefix-cache)
-endif()
-
 add_library(mfq-metal-engine STATIC
     runtime/mlx_engine.cpp
     runtime/mlx_generation_job.cpp
@@ -777,7 +774,6 @@ set_target_properties(tyloinfer-d1-native PROPERTIES
 add_dependencies(tyloinfer-d1-native mfq-metal-runtime-bundle)
 add_dependencies(mfq-decode-metal tyloinfer-d1-native)
 
-
 add_executable(tyloinfer-metal-native-projection-test tests/mlx_mx_test.cpp)
 target_link_libraries(tyloinfer-metal-native-projection-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-native-projection-test PRIVATE cxx_std_20)
@@ -901,10 +897,6 @@ add_test(
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mxfp4-sq3-test
     tests/mlx_mxfp4_sq3_test.cpp
 )
@@ -919,40 +911,6 @@ add_test(
     NAME mfq-metal-mxfp4-sq3-test
     COMMAND mfq-metal-mxfp4-sq3-test
 )
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-target_compile_features(
-    mfq-metal-dense-smallm-benchmark PRIVATE cxx_std_20)
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-target_compile_features(
-    mfq-metal-grouped-linear-benchmark PRIVATE cxx_std_20)
 
 endif()
 
@@ -1106,34 +1064,6 @@ add_test(
     NAME mfq-metal-quantized-row-store-test
     COMMAND mfq-metal-quantized-row-store-test
 )
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-target_link_libraries(
-    mfq-metal-ssd-expert-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(
-    mfq-metal-ssd-expert-benchmark PRIVATE cxx_std_20)
-set_target_properties(
-    mfq-metal-ssd-expert-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
-
-endif()
-
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-target_link_libraries(
-    mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(
-    mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE cxx_std_20)
-set_target_properties(
-    mfq-metal-deepseek-v4-moe-smallm-benchmark PROPERTIES
-    BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib"
-)
-
-endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-ssd-expert-arena-test

@@ -1,1 +1,1 @@
-"""Native runtime integration and optional realtime voice support."""
+"""Runtime processes, capacity management, and distributed execution."""
