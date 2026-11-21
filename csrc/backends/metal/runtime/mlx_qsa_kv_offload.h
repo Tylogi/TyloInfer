@@ -38,6 +38,7 @@ public:
         mlx::core::Dtype dtype, int priority);
     void append(const mlx::core::array& keys);
     mlx::core::array view(int start, int count) const;
+    std::optional<mlx::core::array> try_view() const;
     mlx::core::array gather(const mlx::core::array& indices) const;
     // Read overlapping selections into a shared key buffer when it fits.
     std::optional<MlxQsaStagedRows> gather_union(const mlx::core::array& indices) const;

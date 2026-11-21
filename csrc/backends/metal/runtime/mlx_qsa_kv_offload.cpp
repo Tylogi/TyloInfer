@@ -351,6 +351,16 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     return keys;
 }
 
+std::optional<array> MlxQsaIndexOffload::try_view() const {
+    const auto& state = rows_.view();
+    if (!state.position || state.position > state.store->config().buffer_bytes / 2 / state.row_bytes)
+        return std::nullopt;
+    const auto bytes = state.position * state.row_bytes;
+    if (!MlxResidentBudgetScope::permits_optional(bytes)) return std::nullopt;
+    MlxResidentBudgetScope::reserve(bytes);
+    return view(0, position());
+}
+
 array MlxQsaIndexOffload::gather(const array& indices) const {
     if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
         indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)

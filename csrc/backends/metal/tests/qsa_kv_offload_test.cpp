@@ -56,6 +56,10 @@ void test_dynamic_store() {
     store->flush();
     require(store->stats().hot_bytes <= 24576 && store->stats().disk_bytes > 8192,
         "indexer did not spill when it exceeded the budget");
+    require(store->read(raw.front())->at(0) == 10, "spilled latent KV cannot be read back");
+    const auto raw_read = store->stats().reads;
+    require(store->read(raw.front())->at(0) == 10 && store->stats().reads == raw_read,
+        "an oversized index evicted the most recently used latent KV");
     for (int i = 0; i < 12; ++i) require(store->read(index[i])->at(0) == i, "spilled indexer cannot be read back");
 }
 
@@ -180,6 +184,8 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     auto keys = values({1, 1024, 32}, 43, float32);
     auto query = values({1, 6, 4, 32}, 29);
     cache.append(keys);
+    const auto full_view = cache.try_view();
+    require(bool(full_view) == (keys.nbytes() <= buffer / 2), "offloaded index view exceeded the read buffer");
     require(budget > 32768 ? store->stats().disk_bytes == 0 : store->stats().disk_bytes > 0,
         "indexer residency does not match its byte budget");
     const array gathered_ids({101, 102, 103, -1, 302, 16, 15, 16}, Shape{1, 2, 4}, int32);
@@ -236,6 +242,10 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     const auto reference_scores = sum(maximum(mlx_sparse_indexer_head_scores(wide_queries, wide_keys), array(0.f)) *
         expand_dims(wide_weights, -1), -2);
     near(mlx_sparse_indexer_weighted_scores(wide_queries, wide_keys, wide_weights), reference_scores);
+    cache.trim(17);
+    const auto pooled = cache.try_view();
+    require(pooled && all(*pooled == slice(keys, {0, 0, 0}, {1, 17, 32})).item<bool>(),
+        "bounded offloaded index view differed from resident keys");
 }
 
 void test_quantized_attention(double bits, int queries, std::size_t buffer) {

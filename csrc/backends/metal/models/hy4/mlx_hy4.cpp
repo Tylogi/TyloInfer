@@ -1,4 +1,6 @@
 #include "mlx_hy4.h"
+#include "mlx_gguf_prefill.h"
+#include "mlx_moe_ops.h"
 
 #include "mlx_gguf_layer_tensors.h"
 #include "mlx_hyper_connection.h"
@@ -113,28 +115,29 @@ struct FeedForward {
 struct LatentMoe {
     MlxLinear router, reduce_input, expand_output;
     array bias;
-    MlxGgufWeight gate, up, down;
+    std::array<MlxGgufWeight, 3> experts;
     FeedForward shared;
     float limit;
 
     LatentMoe(const MlxGgufLayerTensors& t, float clamp)
         : router(t.linear("ffn_gate_inp.weight")), reduce_input(t.linear("ffn_routed_down.weight")),
           expand_output(t.linear("ffn_routed_up.weight")), bias(t.dense("exp_probs_b.bias")),
-          gate(t.experts("ffn_gate_exps.weight")), up(t.experts("ffn_up_exps.weight")),
-          down(t.experts("ffn_down_exps.weight")),
+          experts{t.experts("ffn_gate_exps.weight"), t.experts("ffn_up_exps.weight"),
+              t.experts("ffn_down_exps.weight")},
           shared(t.linear("ffn_gate_shexp.weight"), t.linear("ffn_up_shexp.weight"),
               t.linear("ffn_down_shexp.weight")), limit(clamp) {}
 
     array operator()(const array& input, const Geometry& g) const {
         const auto flat = reshape(input, {-1, g.hidden});
-        const auto probability = sigmoid(astype(router(flat), float32));
-        const auto ids = slice(argpartition(-(probability + bias), g.routes - 1, -1),
-            {0, 0}, {flat.shape(0), g.routes});
-        auto weights = take_along_axis(probability, ids, -1);
-        weights = weights * array(g.expert_scale) /
-            maximum(sum(weights, -1, true), array(0.00006103515625f));
-        const auto activation = gate.routed_swiglu(up, reduce_input(flat), ids, nullptr, limit);
-        const auto routed = down.routed_weighted_matmul(activation, ids, weights);
+        const auto route = moe_sigmoid_topk(router(flat), g.routes, bias, g.expert_scale);
+        const auto latent = reduce_input(flat);
+        const auto& [gate, up, down] = experts;
+        const auto routed = [&] {
+            if (gate.input_size() == down.output_size())
+                return gguf_routed_ffn(experts, latent, route.ids, route.weights, limit, true);
+            const auto activation = gate.routed_swiglu(up, latent, route.ids, nullptr, limit);
+            return down.routed_weighted_matmul(activation, route.ids, route.weights);
+        }();
         return shared(input) + reshape(expand_output(routed), input.shape());
     }
 };
@@ -395,17 +398,20 @@ void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, cons
     else cache.groups->append(rotated);
 }
 
-array choose_resident_groups(const MlxSequenceCache& groups, const Geometry& g,
+array choose_resident_groups(const array& groups, const Geometry& g,
     const array& query, const array& weights, int position) {
-    const int take = query.shape(1), available = groups.position();
+    const int take = query.shape(1);
     const int budget = g.index_budget / g.group_size - 1;
     const auto current = reshape(floor_divide(arange(position, position + take, 1, int32),
         array(g.group_size)), {1, take, 1});
-    const auto history = reshape(arange(0, available, 1, int32), {1, 1, available});
-    auto scores = mlx_sparse_indexer_weighted_scores(query, groups.view(), weights);
-    scores = where(history < current, scores, array(-std::numeric_limits<float>::infinity()));
-    auto ids = sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1);
     const auto all_visible = reshape(arange(0, budget, 1, int32), {1, 1, budget});
+    const int available = std::min(groups.shape(1), (position + take - 1) / g.group_size);
+    if (available <= budget)
+        return concatenate({where(all_visible < current, all_visible, array(-1, int32)), current}, -1);
+    const auto history = reshape(arange(0, available, 1, int32), {1, 1, available});
+    auto scores = mlx_sparse_indexer_weighted_scores(query, axis_slice(groups, 1, 0, available), weights);
+    scores = where(history < current, scores, array(-std::numeric_limits<float>::infinity()));
+    auto ids = astype(sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1), int32);
     ids = where(current <= budget, all_visible, ids);
     return concatenate({where(ids < current, ids, array(-1, int32)), current}, -1);
 }
@@ -454,14 +460,16 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     const auto head_weights = astype(index.weights(input), float32) * weight_scale;
     std::optional<array> resident;
     if (cache.latent) resident = cache.latent->view();
+    else if (!verified && count >= 4 && end <= 2 * g.index_budget)
+        resident = cache.offloaded_latent->try_view();
+    const auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
     std::vector<array> output;
     for (int start = 0; start < count; start += selected_query_tile) {
         const int stop = std::min(count, start + selected_query_tile);
         const auto q = axis_slice(iq, 1, start, stop);
         const auto weights = axis_slice(head_weights, 1, start, stop);
-        const auto groups = cache.offloaded_groups
-            ? cache.offloaded_groups->select(q, position + start, g.group_size, g.index_budget, weights, true)
-            : choose_resident_groups(*cache.groups, g, q, weights, position + start);
+        const auto groups = pooled ? choose_resident_groups(*pooled, g, q, weights, position + start)
+            : cache.offloaded_groups->select(q, position + start, g.group_size, g.index_budget, weights, true);
         const auto ids = token_selection(groups, g, position + start);
         if (verified) verified->selections = ids;
         const auto queries = axis_slice(query, 2, start, stop);
