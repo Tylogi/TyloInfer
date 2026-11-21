@@ -725,7 +725,7 @@ MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks
             final.index_start > static_cast<int>(count) ||
             final.index->shape != Shape{1, static_cast<int>(count) - final.index_start, width} ||
             final.index->dtype != mlx::core::float16 ||
-            count - final.index_start > static_cast<std::size_t>(ratio + kMlxMtpEngineMaximumDraftDepth + 1))
+            count - final.index_start > static_cast<std::size_t>(ratio) + MlxQwen4CausalLm::maximum_verification_rows)
             throw std::runtime_error("QSA index tail checkpoint mismatch");
         state.index_start = final.index_start;
         state.index_ratio = ratio;
