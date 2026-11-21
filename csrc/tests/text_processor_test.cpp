@@ -22,7 +22,7 @@ struct TokenizerFixture {
         ("mfq-text-prefix-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".gguf");
     int vocabulary = 0;
 
-    TokenizerFixture() {
+    explicit TokenizerFixture(const char* chat_template = "{{ messages[0]['content'] }}") {
         std::vector<std::string> names{"<unk>", "<s>", "</s>"};
         std::vector<std::int32_t> types{TYLOINFER_TEXT_TOKEN_TYPE_UNKNOWN,
             TYLOINFER_TEXT_TOKEN_TYPE_CONTROL, TYLOINFER_TEXT_TOKEN_TYPE_CONTROL};
@@ -50,7 +50,7 @@ struct TokenizerFixture {
         gguf_set_val_u32(metadata, "tokenizer.ggml.bos_token_id", 1);
         gguf_set_val_u32(metadata, "tokenizer.ggml.eos_token_id", 2);
         gguf_set_val_bool(metadata, "tokenizer.ggml.add_space_prefix", false);
-        gguf_set_val_str(metadata, "tokenizer.chat_template", "{{ messages[0]['content'] }}");
+        gguf_set_val_str(metadata, "tokenizer.chat_template", chat_template);
         const bool written = gguf_write_to_file(metadata, path.string().c_str(), true);
         gguf_free(metadata);
         require(written, "cannot write tokenizer fixture");
@@ -65,6 +65,26 @@ struct TokenizerFixture {
 
 int main() try {
     using namespace mfq::engine;
+    {
+        TokenizerFixture fixture(R"JINJA({% set efforts = {"none": 0, "high": 1} %}{{ efforts[reasoning_effort | default('high')] }}:{{ messages[0]['content'] }})JINJA");
+        TextProcessor inkling(fixture.path.string(), fixture.vocabulary, "inkling2_loop");
+        require(inkling.chat_template_capabilities().thinking, "Inkling did not advertise its thinking toggle");
+        InferenceInput input;
+        input.chat = true;
+        input.chat_input.emplace();
+        common_chat_msg message;
+        message.role = "user";
+        message.content = "abc";
+        auto& options = input.chat_input->template_inputs;
+        options.messages.push_back(std::move(message));
+        options.enable_thinking = false;
+        std::string rendered;
+        (void)inkling.prepare(input, 1024, &rendered);
+        require(rendered == "0:abc", "Inkling did not select zero reasoning effort when thinking was disabled");
+        options.chat_template_kwargs["reasoning_effort"] = R"("high")";
+        (void)inkling.prepare(input, 1024, &rendered);
+        require(rendered == "1:abc", "Inkling overrode an explicit reasoning effort");
+    }
     TokenizerFixture fixture;
     TextProcessor processor(fixture.path.string(), fixture.vocabulary, "deepseek_v41");
     for (const auto& prompt : std::vector<std::string>{"abc", "<s>abc</s>", std::string(4096, 'a')})

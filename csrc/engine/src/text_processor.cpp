@@ -313,7 +313,10 @@ struct TextProcessor::Impl {
             source.find("enable_thinking") != std::string::npos;
         if (source.find("reasoning_effort") != std::string::npos) {
             if (model_type == "hy_v4_flash" && source.find("'no_think'") != std::string::npos)
-                capabilities.thinking = true;
+                disabled_reasoning_effort = R"("no_think")";
+            if (model_type == "inkling2_loop" && source.find(R"("none")") != std::string::npos)
+                disabled_reasoning_effort = R"("none")";
+            if (disabled_reasoning_effort) capabilities.thinking = true;
             for (const char* value : {"low", "high", "max"}) {
                 if (std::string_view(value) == "low" && model_type != "hy_v4_flash") continue;
                 if (source.find(std::string("'") + value + "'") !=
@@ -329,6 +332,7 @@ struct TextProcessor::Impl {
     std::unique_ptr<MfqTokenizer> tokenizer;
     common_chat_templates_ptr templates;
     std::string model_type;
+    const char* disabled_reasoning_effort = nullptr;
     ChatTemplateCapabilities capabilities;
     std::optional<mfq::DecisionModelSpec> decision_model;
     std::map<std::string, std::pair<std::string, bool>> prefix_policies;
@@ -474,8 +478,8 @@ InferenceRequest TextProcessor::prepare(
                     "messages");
             }
             auto inputs = std::move(chat.template_inputs);
-            if (impl_->model_type == "hy_v4_flash" && impl_->capabilities.thinking && !inputs.enable_thinking)
-                inputs.chat_template_kwargs.try_emplace("reasoning_effort", R"("no_think")");
+            if (impl_->disabled_reasoning_effort && !inputs.enable_thinking)
+                inputs.chat_template_kwargs.try_emplace("reasoning_effort", impl_->disabled_reasoning_effort);
             if (chat.parallel_tool_calls) {
                 inputs.parallel_tool_calls = *chat.parallel_tool_calls;
             } else {
