@@ -5,6 +5,7 @@
 #include "mlx_sparse_attention.h"
 #include "mlx_weight_residency.h"
 #include "nlohmann/json.hpp"
+#include "tyloinfer/host_parallel.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <mlx/io.h>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -176,6 +178,7 @@ struct EngramTable {
     int grams, heads, width, pad;
     std::vector<std::uint64_t> multipliers;
     std::vector<int> layers, sizes, offsets, mapping;
+    mutable HostParallelPool io;
 
     EngramTable(const GgufModelSource& source, const json& meta)
         : read(source.mapped_tensor_reader("per_layer_token_embd.weight")),
@@ -220,8 +223,9 @@ struct EngramTable {
             }
             return table;
         }();
-        std::vector<float> rows(static_cast<std::size_t>(count) * columns * width);
-        std::vector<std::byte> packed(width);
+        const auto row_count = std::size_t(count) * columns;
+        std::vector<float> rows(row_count * width);
+        std::vector<std::uint64_t> addresses(row_count);
         const auto mapped = [&](std::int32_t token) { return mapping.at(token); };
         for (int n = 0; n < count; ++n) {
             const auto position = first + n;
@@ -232,14 +236,33 @@ struct EngramTable {
                 for (int head = 0; head < heads; ++head) {
                     const int column = (gram - 1) * heads + head;
                     const int slot = entry * columns + column;
-                    const auto row = hash % sizes[slot] + offsets[slot];
-                    read(row * width, packed.data(), packed.size());
-                    auto* output = rows.data() + (std::size_t(n) * columns + column) * width;
-                    for (int dim = 0; dim < width; ++dim)
-                        output[dim] = decode[std::to_integer<std::uint8_t>(packed[dim])];
+                    addresses[std::size_t(n) * columns + column] = (hash % sizes[slot] + offsets[slot]) * width;
                 }
             }
         }
+        std::vector<std::size_t> order;
+        if (count >= 16) {
+            order.resize(row_count);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](auto a, auto b) { return addresses[a] < addresses[b]; });
+        }
+        const auto decode_rows = [&](std::int64_t begin, std::int64_t end) {
+            std::array<std::byte, 1024> packed;
+            auto last_address = std::numeric_limits<std::uint64_t>::max();
+            for (auto n = begin; n < end; ++n) {
+                const auto index = order.empty() ? static_cast<std::size_t>(n) : order[n];
+                const auto address = addresses[index];
+                if (address != last_address) {
+                    read(address, packed.data(), width);
+                    last_address = address;
+                }
+                auto* output = rows.data() + index * width;
+                for (int dim = 0; dim < width; ++dim)
+                    output[dim] = decode[std::to_integer<std::uint8_t>(packed[dim])];
+            }
+        };
+        if (order.empty()) decode_rows(0, row_count);
+        else io.run(0, row_count, 64, 8, decode_rows);
         return array(rows.begin(), {1, count, columns, width}, float32);
     }
 };
@@ -266,8 +289,8 @@ struct Layer {
           query_norm(t.norm("attn_q_a_norm.weight", g.eps)), latent_norm(t.norm("attn_kv_a_norm.weight", g.eps)),
           query_a(t.linear("attn_q_a.weight")), query_b(t.linear("attn_q_b.weight")),
           latent(t.linear("attn_kv_a_mqa.weight")), gate(t.linear("attn_gate.weight")), output(t.linear("attn_output.weight")),
-          key_absorption(contiguous(transpose(t.dense("attn_k_b.weight"), {0, 2, 1}))),
-          value_expansion(contiguous(transpose(t.dense("attn_v_b.weight"), {0, 2, 1}))),
+          key_absorption(contiguous(transpose(t.dense("attn_k_b.weight", float16), {0, 2, 1}))),
+          value_expansion(contiguous(transpose(t.dense("attn_v_b.weight", float16), {0, 2, 1}))),
           sinks(t.dense("attn_sinks.weight")), projections({&query_a, &latent, &gate}) {
         if (!sliding) index.emplace(t, g);
         if (layer < g.dense_layers) dense.emplace(t.linear("ffn_gate.weight"),
@@ -292,19 +315,24 @@ array trailing_rope(const array& values, const array& positions, int rotary, flo
         rotate(axis_slice(values, -1, unrotated, values.shape(-1)), positions, base)}, -1);
 }
 
-array as_dense_attention(const array& query, const array& rows, const array& sinks,
-    int position, int first_key, int window, float scale, int value_dim) {
+array latent_attention(const array& query, const array& rows, const array& sinks,
+    float scale, int value_dim, const std::optional<array>& mask) {
     const auto keys = expand_dims(rows, 1);
     const auto q = astype(query, rows.dtype());
+    auto result = fast::scaled_dot_product_attention(q, keys, keys, scale, "", mask, astype(sinks, q.dtype()));
+    return transpose(axis_slice(result, -1, 0, value_dim), {0, 2, 1, 3});
+}
+
+array as_dense_attention(const array& query, const array& rows, const array& sinks,
+    int position, int first_key, int window, float scale, int value_dim) {
     std::optional<array> mask;
-    if (q.shape(2) > 1) {
-        const auto queries = expand_dims(arange(position, position + q.shape(2), 1, int32), -1);
+    if (query.shape(2) > 1) {
+        const auto queries = expand_dims(arange(position, position + query.shape(2), 1, int32), -1);
         const auto columns = arange(first_key, first_key + rows.shape(1), 1, int32);
         mask = columns <= queries;
         if (window) mask = logical_and(*mask, columns > queries - window);
     }
-    auto result = fast::scaled_dot_product_attention(q, keys, keys, scale, "", mask, astype(sinks, q.dtype()));
-    return transpose(axis_slice(result, -1, 0, value_dim), {0, 2, 1, 3});
+    return latent_attention(query, rows, sinks, scale, value_dim, mask);
 }
 
 array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const array& query,
@@ -402,7 +430,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     if (!cache.latent && !cache.offloaded_latent) {
         if (offload) {
             cache.offloaded_latent.emplace(offload, latent.shape(-1), latent.dtype(), 1);
-            cache.offloaded_groups.emplace(offload, g.index_width, float32, 0);
+            cache.offloaded_groups.emplace(offload, g.index_width, float32, kMlxQsaIndexPriority);
         } else {
             cache.latent.emplace(g.context, latent.shape(-1), latent.dtype());
             cache.groups.emplace(std::max(1, g.context / g.group_size), g.index_width, float32);
@@ -436,12 +464,25 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
             : choose_resident_groups(*cache.groups, g, q, weights, position + start);
         const auto ids = token_selection(groups, g, position + start);
         if (verified) verified->selections = ids;
-        const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
         const auto queries = axis_slice(query, 2, start, stop);
-        if (cache.offloaded_latent) {
-            const auto staged = cache.offloaded_latent->gather(ids);
-            output.push_back(mlx_gathered_mla_attention(queries, staged, mask, sinks, scale, g.kv_rank));
+        if (resident && end <= 2 * g.index_budget && stop - start >= 4) {
+            // At short contexts a dense boolean mask costs less than staging
+            // a separate copy of the selected latent rows for each query.
+            const auto selected = where(ids >= 0, ids, array(end, int32));
+            auto visible = put_along_axis(zeros({1, stop - start, end + 1}, bool_), selected, ids >= 0, -1);
+            output.push_back(latent_attention(queries, *resident, sinks, scale, g.kv_rank,
+                expand_dims(axis_slice(visible, -1, 0, end), 1)));
+        } else if (cache.offloaded_latent) {
+            const auto staged = verified ? std::nullopt : cache.offloaded_latent->gather_union(ids);
+            if (staged) {
+                output.push_back(latent_attention(queries, staged->rows, sinks, scale, g.kv_rank, staged->mask));
+            } else {
+                const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
+                const auto gathered = cache.offloaded_latent->gather(ids);
+                output.push_back(mlx_gathered_mla_attention(queries, gathered, mask, sinks, scale, g.kv_rank));
+            }
         } else {
+            const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
             output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
         }
         if (stop == count) cache.last_indices = axis_slice(ids, 1, stop - start - 1, stop - start);
@@ -460,7 +501,7 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
     auto low = layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
     const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
-    const auto absorbed = matmul(astype(no_rope, float32), layer.key_absorption);
+    const auto absorbed = matmul(astype(no_rope, layer.key_absorption.dtype()), layer.key_absorption);
     const auto rope_q = transpose(rotate(axis_slice(q, -1, plain, g.q_dim), positions, base), {0, 2, 1, 3});
     auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
     const auto latent = concatenate({layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
@@ -470,7 +511,8 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
 
 template <class Attention>
 array expand_mla(const Attention& layer, const Geometry& g, const array& attention, const array& gate, Dtype dtype) {
-    const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), float32), layer.value_expansion);
+    const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), layer.value_expansion.dtype()),
+        layer.value_expansion);
     const auto gated = reshape(transpose(expanded, {0, 2, 1, 3}),
         {1, attention.shape(1), layer.heads * g.v_dim}) * sigmoid(astype(gate, float32));
     return layer.post_attention_norm(layer.output(astype(gated, dtype)));
@@ -550,21 +592,19 @@ struct DflyLayer {
         auto weight = reshape(t.tensor("self_attn.kv_b_proj.weight"), {heads, no_rotary + g.v_dim, g.kv_rank});
         weight = value ? transpose(axis_slice(weight, 1, no_rotary, no_rotary + g.v_dim), {0, 2, 1})
             : axis_slice(weight, 1, 0, no_rotary);
-        return contiguous(astype(weight, float32));
+        return contiguous(astype(weight, float16));
     }
 
     array operator()(const Geometry& g, const array& input, const array& positions,
         const array& history, const array& valid) const {
         const auto rows = project_mla(*this, g, attention_norm(input), positions, g.rotary_base);
-        const auto keys = expand_dims(concatenate({history, rows.latent}, 1), 1);
+        const auto keys = concatenate({history, rows.latent}, 1);
         const int count = input.shape(1);
         auto relative = arange(0, count, 1, int32);
         auto causal = relative <= expand_dims(relative, 1);
         const auto mask = concatenate({broadcast_to(valid, {count, history.shape(1)}), causal}, 1);
         const float scale = 1.0f / std::sqrt(float(g.q_dim));
-        auto weights = fast::scaled_dot_product_attention(astype(rows.query, keys.dtype()),
-            keys, keys, scale, "", mask, astype(sinks, keys.dtype()));
-        auto attention = transpose(axis_slice(weights, -1, 0, g.kv_rank), {0, 2, 1, 3});
+        const auto attention = latent_attention(rows.query, keys, sinks, scale, g.kv_rank, mask);
         auto residual = input + expand_mla(*this, g, attention, rows.gate, input.dtype());
         return residual + ffn(ffn_norm(residual));
     }
@@ -990,7 +1030,7 @@ MlxHy4Cache MlxHy4Model::restore(const TextSessionState& state) const {
             restore_rows(source.latent, position, g.context, width, float16, 1, w.offload,
                 layer.latent, layer.offloaded_latent);
             restore_rows(source.groups, position / g.group_size, std::max(1, g.context / g.group_size),
-                g.index_width, float32, 0, w.offload, layer.groups, layer.offloaded_groups);
+                g.index_width, float32, kMlxQsaIndexPriority, w.offload, layer.groups, layer.offloaded_groups);
             layer.index_tail = source.index_tail;
             layer.last_indices = source.last_indices;
         }

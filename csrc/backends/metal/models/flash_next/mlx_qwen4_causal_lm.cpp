@@ -3966,7 +3966,7 @@ public:
                 static_cast<int>(config_.num_key_value_heads), static_cast<int>(config_.head_dim),
                 maximum_, static_cast<int>(config_.indexer_compress_ratio));
             offloaded_pool_ = std::make_unique<MlxQsaIndexOffload>(kv_store_,
-                static_cast<int>(config_.indexer_head_dim), mlx::core::float32, 2);
+                static_cast<int>(config_.indexer_head_dim), mlx::core::float32, kMlxQsaIndexPriority);
         } else cache_ = std::make_unique<MlxKvCache>(
             batch,
             static_cast<int>(config_.num_key_value_heads),

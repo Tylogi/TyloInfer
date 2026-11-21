@@ -1497,7 +1497,7 @@ MlxHy4TextSessionState MlxPagedSessionCodec<MlxHy4TextSessionState>::decode(
                 mlx::core::float16, 1, store);
             const auto first_group = start / ratio, groups = end / ratio - first_group;
             if (groups) layer.groups.append(reader.tensor(), first_group, 0, groups, position / ratio,
-                mlx::core::float32, 0, store);
+                mlx::core::float32, kMlxQsaIndexPriority, store);
             if (exact) {
                 std::optional<SerializedTensor> tail;
                 if (end % ratio) tail = reader.tensor();

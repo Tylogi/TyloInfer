@@ -1,4 +1,5 @@
 #include "mlx_transformer.h"
+#include "mlx_hyper_connection.h"
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
 #include "mlx_kernel_prepare.h"
@@ -191,6 +192,16 @@ int main() {
     try {
         using namespace mlx::core;
         test_runtime_rope_length_reuse();
+        for (int rows : {1, 6}) {
+            auto residual = reshape(astype(sin(arange(0, rows * 12288, 1, float32)), bfloat16), {1, rows, 4, 3072});
+            auto weight = reshape(cos(arange(0, 8 * 12288, 1, float32) * 0.013f) / 128.0f, {8, 12288});
+            constexpr float eps = 1e-5f;
+            auto expected = matmul(fast::rms_norm(reshape(astype(residual, float32), {1, rows, 12288}),
+                std::nullopt, eps), transpose(weight));
+            auto fused = mfq::metal::mlx_hyper_connection_decode_projection(residual, weight, eps);
+            if (!fused) throw std::runtime_error("small Hy4 iHC projection was not fused");
+            require_array_close(*fused, expected);
+        }
         for (const double factor : {2.0, 4.0}) {
             auto scaling = mfq::metal::qwen_yarn_scaling({}, 262144, static_cast<int>(262144 * factor), 4.0);
             require_close(scaling.attention_factor, 1.0 + 0.1 * std::log(factor));

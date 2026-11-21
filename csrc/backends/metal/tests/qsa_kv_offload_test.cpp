@@ -189,6 +189,13 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     require(all(gathered == where(visible_rows,
         reshape(gathered_reference, gathered.shape()), array(0.0f))).item<bool>(),
         "offloaded row gather differs from resident rows or exposes masked rows");
+    const array overlap({101, 102, -1, 102, 302, -1, 16, 101, 103, 16, 102, 103}, Shape{1, 4, 3}, int32);
+    const auto staged = cache.gather_union(overlap);
+    const array union_ids({16, 101, 102, 103, 302}, int32);
+    require(staged && all(staged->rows == take(keys, union_ids, 1)).item<bool>() &&
+        all(staged->mask == array({false, true, true, false, false, false, false, true, false, true,
+            true, true, false, true, false, true, false, true, true, false}, Shape{1, 1, 4, 5}, bool_)).item<bool>(),
+        "offloaded row union lost selected rows or per-query visibility");
     auto selected = cache.select(query, 4090, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});
@@ -216,10 +223,12 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     require(all(weighted == concatenate({history, current_group}, -1)).item<bool>(),
         "weighted streamed index selection disagrees with the reference or duplicates the current group");
 
+    const auto reads = store->stats().reads;
     const auto early = cache.select(query, 0, 4, 128, weights, true);
     require(all(slice(early, Shape{0, 0, 0}, Shape{1, 4, 31}) == array(-1, int32)).item<bool>() &&
             all(slice(early, Shape{0, 0, 31}, Shape{1, 4, 32}) == array(0, int32)).item<bool>(),
         "weighted streamed index selected invisible history at the start of the sequence");
+    require(store->stats().reads == reads, "an unranked early prefix recalled offloaded index rows");
 
     const auto wide_queries = values({1, 3, 16, 128}, 59);
     const auto wide_keys = values({1, 517, 128}, 47, float32);

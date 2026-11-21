@@ -553,10 +553,7 @@ array generic_selected_mla_attention(
     auto expanded_indices = mlx::core::broadcast_to(
         mlx::core::expand_dims(safe_indices, -1),
         Shape{batch, tokens, selected, dimension});
-    auto gathered = mlx::core::astype(
-        mlx::core::take_along_axis(
-            expanded_cache, expanded_indices, 2),
-        mlx::core::float32);
+    auto gathered = mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
     return mlx_gathered_mla_attention(query, gathered, mask, sinks, scale, value_dimension);
 }
 
@@ -1339,35 +1336,8 @@ array mlx_sparse_indexer_weighted_scores(const array& query, const array& pooled
     if (query.ndim() != 4 || pooled_keys.ndim() != 3 || query.shape(0) != pooled_keys.shape(0) ||
         query.shape(3) != pooled_keys.shape(2) || weights.shape() != Shape{query.shape(0), query.shape(1), query.shape(2)})
         throw std::invalid_argument("sparse index weights do not match query heads");
-    const auto head_weights = contiguous(astype(weights, float32));
-    const int count = pooled_keys.shape(1), rows = query.shape(1), heads = query.shape(2);
-    if (default_device() != Device::gpu || count < 256 || rows < 1 || rows > 8 || heads != 16 ||
-        query.shape(3) != 128 || pooled_keys.dtype() != float32) {
-        return sum(maximum(mlx_sparse_indexer_head_scores(query, pooled_keys), array(0.0f)) *
-            expand_dims(head_weights, -1), -2);
-    }
-    static const auto kernel = fast::metal_kernel("tyloinfer_weighted_sparse_indexer16",
-        {"query", "keys", "weights"}, {"scores"}, R"METAL(
-        const uint lane = thread_index_in_simdgroup;
-        const uint key = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
-        const uint rows = uint(query_shape[1]), count = uint(keys_shape[1]);
-        if (key >= count) return;
-        const uint batch = threadgroup_position_in_grid.y / rows;
-        const uint query_row = threadgroup_position_in_grid.y;
-        const uint first = lane * 4;
-        const auto input = keys + (ulong(batch) * count + key) * 128 + first;
-        const float4 k(input[0], input[1], input[2], input[3]);
-        float score = 0.f;
-        for (uint h = 0; h < 16u; ++h) {
-            const auto q = query + (ulong(query_row) * 16 + h) * 128 + first;
-            const float dot_product = simd_sum(dot(k, float4(q[0], q[1], q[2], q[3])));
-            score += max(dot_product, 0.f) * weights[query_row * 16 + h];
-        }
-        if (!lane) scores[ulong(query_row) * count + key] = score;
-        )METAL");
-    const Shape shape{query.shape(0), rows, count};
-    return kernel({contiguous(query), contiguous(pooled_keys), head_weights}, {shape}, {float32},
-        {((count + 3) / 4) * 128, query.shape(0) * rows, 1}, {128, 1, 1}, {}, std::nullopt, false, {}).front();
+    return sum(maximum(mlx_sparse_indexer_head_scores(query, pooled_keys), array(0.0f)) *
+        expand_dims(astype(weights, float32), -1), -2);
 }
 
 array mlx_qsa_prefill_attention(
@@ -1450,12 +1420,17 @@ array mlx_gathered_mla_attention(const array& query, const array& rows, const ar
         throw std::invalid_argument("invalid gathered sparse MLA geometry");
     const int batch = query.shape(0), heads = query.shape(1), tokens = query.shape(2);
     const int selected = rows.shape(2), dimension = rows.shape(3);
-    auto gathered = mlx::core::astype(rows, mlx::core::float32);
+    const bool use_half = rows.dtype() == mlx::core::float16 && value_dimension < dimension &&
+        mlx::core::default_device() == mlx::core::Device::gpu;
+    const auto dtype = use_half ? mlx::core::float16 : mlx::core::float32;
+    auto gathered = mlx::core::astype(rows, dtype);
     auto query_values = mlx::core::astype(
         mlx::core::transpose(query, {0, 2, 1, 3}),
         mlx::core::float32);
-    auto scores = mlx::core::matmul(
-        query_values, mlx::core::transpose(gathered, {0, 1, 3, 2})) * scale;
+    auto scores = use_half
+        ? mlx::core::astype(mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
+            mlx::core::transpose(gathered, {0, 1, 3, 2})), mlx::core::float32)
+        : mlx::core::matmul(query_values, mlx::core::transpose(gathered, {0, 1, 3, 2})) * scale;
     scores = scores + mlx::core::expand_dims(
         mlx::core::astype(mask, mlx::core::float32), 2);
     auto sink_values = mlx::core::reshape(
@@ -1471,7 +1446,7 @@ array mlx_gathered_mla_attention(const array& query, const array& rows, const ar
         mlx::core::expand_dims(denominator, -1);
     const auto value = value_dimension == dimension ? gathered :
         mlx::core::slice(gathered, {0, 0, 0, 0}, {batch, tokens, selected, value_dimension});
-    return mlx::core::matmul(probabilities, value);
+    return mlx::core::astype(mlx::core::matmul(mlx::core::astype(probabilities, dtype), value), mlx::core::float32);
 }
 
 array mlx_sparse_selected_mla_attention(

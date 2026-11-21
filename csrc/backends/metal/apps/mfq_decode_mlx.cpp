@@ -316,6 +316,8 @@ Arguments parse_arguments(int argc, char** argv) {
             usage_error("unknown option: " + value);
         }
     }
+    if (!result.dflash2_draft.empty() && !result.dfly2_draft.empty())
+        usage_error("select one draft checkpoint");
     return result;
 }
 
@@ -2630,6 +2632,7 @@ private:
                 metrics.emplace_back("qsa_kv_ssd_bytes", offload ? static_cast<double>(offload->disk_bytes) : 0.0);
                 metrics.emplace_back("qsa_kv_pending_bytes", offload ? static_cast<double>(offload->pending_bytes) : 0.0);
                 metrics.emplace_back("qsa_kv_hot_limit_bytes", offload ? static_cast<double>(offload->hot_limit) : 0.0);
+                metrics.emplace_back("qsa_kv_resident_index_bytes", offload ? static_cast<double>(offload->index_bytes) : 0.0);
                 metrics.emplace_back("qsa_kv_budget_bytes", offload ? static_cast<double>(offload->budget_bytes) : 0.0);
                 metrics.emplace_back("qsa_kv_ssd_read_bytes", offload ? static_cast<double>(offload->read_bytes) : 0.0);
                 metrics.emplace_back("qsa_kv_ssd_written_bytes", offload ? static_cast<double>(offload->written_bytes) : 0.0);
@@ -3158,6 +3161,8 @@ int run_native_runtime(
         std::chrono::steady_clock::now();
     const auto graph = mfq::metal::effective_model_graph(container);
     const auto& backbone = graph.backbone;
+    if (!arguments.dfly2_draft.empty() && backbone != "hy_v4_flash")
+        throw std::invalid_argument("--dfly2-draft requires a Hy4 Flash target");
     const bool native_hf =
         container.header().extra_json.count("source.format") != 0 &&
         container.header().extra_json.at("source.format") ==

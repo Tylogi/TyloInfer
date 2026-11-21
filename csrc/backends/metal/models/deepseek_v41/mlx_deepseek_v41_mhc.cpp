@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v41_mhc.h"
+#include "mlx_hyper_connection.h"
 #include "mlx_kernel_prepare.h"
 
 #include <algorithm>
@@ -24,44 +25,6 @@ constexpr int kSinkhornIterations = 20;
 constexpr int kPostThreads = 256;
 constexpr int kOfficialHidden = 5120;
 constexpr int kCollapseThreads = 1024;
-
-const mlx::core::fast::CustomKernelFunction& projection_kernel() {
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = mlx::core::MathMode::Safe;
-        return mlx::core::fast::metal_kernel(
-            "mfq_cpp_dsv41_hc_projection", {"residual", "weight", "params"}, {"output"},
-            R"METAL(
-                uint row = threadgroup_position_in_grid.x / 24u;
-                uint projection = threadgroup_position_in_grid.x % 24u;
-                uint tid = thread_index_in_threadgroup;
-                uint lane = thread_index_in_simdgroup;
-                uint group = simdgroup_index_in_threadgroup;
-                float product = 0.0f, square = 0.0f;
-                for (uint column = tid * 4u; column < uint(WIDTH); column += THREADS * 4u) {
-                    float4 x = float4(float(residual[row * WIDTH + column]),
-                        float(residual[row * WIDTH + column + 1u]),
-                        float(residual[row * WIDTH + column + 2u]),
-                        float(residual[row * WIDTH + column + 3u]));
-                    float4 w = reinterpret_cast<device const float4*>(weight + projection * WIDTH)[column / 4u];
-                    product += dot(x, w);
-                    square += dot(x, x);
-                }
-                product = simd_sum(product);
-                square = simd_sum(square);
-                threadgroup float products[THREADS / 32u], squares[THREADS / 32u];
-                if (lane == 0u) { products[group] = product; squares[group] = square; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (group == 0u) {
-                    product = simd_sum(lane < THREADS / 32u ? products[lane] : 0.0f);
-                    square = simd_sum(lane < THREADS / 32u ? squares[lane] : 0.0f);
-                    if (lane == 0u) output[row * 24u + projection] =
-                        product * metal::precise::rsqrt(square / float(WIDTH) + params[0]);
-                }
-            )METAL", "", true, false, options);
-    }();
-    return kernel;
-}
 
 constexpr const char* kV41HcCollapseNormSource = R"METAL(
     const int ROWS = residual_shape[0] * residual_shape[1];
@@ -591,18 +554,8 @@ array deepseek_v41_hc_projection(
         throw std::invalid_argument("invalid DeepSeek-V4.1 HC projection");
     }
     const int width = 4 * residual.shape(3);
-    const int rows = checked_int(static_cast<std::size_t>(residual.shape(0)) *
-        residual.shape(1), "projection row count");
-    if (rows <= 6 && width % 1024 == 0 &&
-        (residual.dtype() == mlx::core::float16 || residual.dtype() == mlx::core::bfloat16)) {
-        const int threads = width >= 8192 && rows <= 3 ? (rows == 1 ? 1024 : 512) : 256;
-        auto outputs = projection_kernel()(
-            {mlx::core::contiguous(residual), mlx::core::contiguous(weight), array({eps})},
-            {Shape{residual.shape(0), residual.shape(1), 24}}, {mlx::core::float32},
-            {rows * 24 * threads, 1, 1}, {threads, 1, 1}, {{"WIDTH", width}, {"THREADS", threads}},
-            std::nullopt, false, {});
-        return std::move(outputs.front());
-    }
+    if (auto projected = mlx_hyper_connection_decode_projection(residual, weight, eps))
+        return std::move(*projected);
     auto flattened = mlx::core::reshape(mlx::core::astype(residual, mlx::core::float32),
         Shape{residual.shape(0), residual.shape(1), width});
     auto inverse = mlx::core::rsqrt(mlx::core::mean(flattened * flattened, -1, true) + eps);

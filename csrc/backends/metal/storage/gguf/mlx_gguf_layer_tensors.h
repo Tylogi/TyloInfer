@@ -19,14 +19,14 @@ public:
         return source_.find_tensor(prefix_ + name) || model_.contains(canonical(name, false));
     }
     MlxLinear linear(const std::string& name) const {
-        return MlxLinear::load(model_, canonical(name));
+        return MlxLinear::load(model_, canonical(name), MlxLinear::GgufAccess::projection_only);
     }
     MlxGgufWeight experts(const std::string& name) const {
         return MlxGgufWeight::load(model_, canonical(name));
     }
-    mlx::core::array dense(const std::string& name) const {
+    mlx::core::array dense(const std::string& name, mlx::core::Dtype dtype = mlx::core::float32) const {
         const auto key = canonical(name);
-        return mlx::core::astype(load_dense_array(model_.record(key).dtype, model_.read(key)), mlx::core::float32);
+        return mlx::core::astype(load_dense_array(model_.record(key).dtype, model_.read(key)), dtype);
     }
     MlxRmsNorm norm(const std::string& name, float eps) const {
         return MlxRmsNorm(dense(name), eps);

@@ -21,6 +21,10 @@ struct MlxHyperConnectionState {
     std::optional<mlx::core::array> combination;
 };
 
+// Fuse the residual RMS and narrow projection for a small decode batch.
+std::optional<mlx::core::array> mlx_hyper_connection_decode_projection(
+    const mlx::core::array& residual, const mlx::core::array& weight, float epsilon);
+
 class MlxHyperConnection {
 public:
     MlxHyperConnection(mlx::core::array weight, mlx::core::array bias,
@@ -33,6 +37,7 @@ public:
 
 private:
     mlx::core::array weight_;
+    mlx::core::array prefill_weight_;
     mlx::core::array bias_;
     MlxHyperConnectionConfig config_;
     std::optional<mlx::core::array> projection_scale_;

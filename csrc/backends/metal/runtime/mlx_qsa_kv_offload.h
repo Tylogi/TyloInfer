@@ -8,6 +8,8 @@
 
 namespace mfq::metal {
 
+inline constexpr int kMlxQsaIndexPriority = 2;
+
 struct MlxQsaKvSnapshot {
     QsaKvSequenceSnapshot rows;
     int heads = 0;
@@ -25,6 +27,11 @@ struct MlxQsaIndexSnapshot {
     mlx::core::Dtype dtype = mlx::core::float16;
 };
 
+struct MlxQsaStagedRows {
+    mlx::core::array rows;
+    mlx::core::array mask;
+};
+
 class MlxQsaIndexOffload {
 public:
     MlxQsaIndexOffload(std::shared_ptr<QsaKvStore> store, int width,
@@ -32,6 +39,8 @@ public:
     void append(const mlx::core::array& keys);
     mlx::core::array view(int start, int count) const;
     mlx::core::array gather(const mlx::core::array& indices) const;
+    // Read overlapping selections into a shared key buffer when it fits.
+    std::optional<MlxQsaStagedRows> gather_union(const mlx::core::array& indices) const;
     // With reserve_current_group, the last index is the query's own group.
     // Unused history entries in that mode are represented by -1.
     mlx::core::array select(const mlx::core::array& query, int offset, int ratio, int budget,
