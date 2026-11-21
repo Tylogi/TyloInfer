@@ -374,6 +374,27 @@ int main() {
         flash_restored.mtp_layers.size() == 1 && flash_restored.mtp_layers[0].position == 5,
         "Flash-Next QSA/GDN/PLE/MTP checkpoint did not round trip");
     require(!flash_restored.dflash, "ordinary Flash-Next checkpoints must not require a draft ring");
+    {
+        constexpr int ratio = 4;
+        constexpr int tail_tokens = ratio - 1 + MlxQwen4CausalLm::maximum_verification_rows;
+        MlxQwen4TextSessionState full_tail;
+        full_tail.tokens.resize(tail_tokens, 1);
+        full_tail.cache_position = tail_tokens;
+        full_tail.cache_batch = 1;
+        MlxQwen4LayerCacheSnapshot layer;
+        layer.position = tail_tokens;
+        layer.batch = 1;
+        layer.index_ratio = ratio;
+        layer.index_keys = mlx::core::ones({1, tail_tokens, 3}, mlx::core::float16);
+        layer.pooled_keys = mlx::core::ones({1, tail_tokens / ratio, 3}, mlx::core::float32);
+        layer.kv = MlxKvCacheSnapshot{1, 2, 16, 2, tail_tokens, tail_tokens,
+            mlx::core::float16, fp16_values(tail_tokens * 4), fp16_values(tail_tokens * 4, 1)};
+        full_tail.layers.push_back(layer);
+        const auto payload = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(full_tail, 16, 0);
+        const auto decoded = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode({payload}, full_tail.tokens, 16);
+        require(byte_equal(*decoded.layers[0].index_keys, *layer.index_keys),
+            "Flash-Next did not restore the full verification index tail");
+    }
     auto flash_with_draft = flash;
     auto& draft = flash_with_draft.dflash.emplace();
     draft.position = flash.cache_position;
