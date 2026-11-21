@@ -620,6 +620,27 @@ static bool string_endswith(const std::string & str, const std::string & suffix)
 const func_builtins & value_string_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
+        {"format", [](const func_args & args) -> value {
+            const auto pattern = args.get_pos(0)->as_string().str();
+            std::string result;
+            result.reserve(pattern.size());
+            size_t arg = 1;
+            for (size_t i = 0; i < pattern.size(); ++i) {
+                const char ch = pattern[i];
+                if (ch != '{' && ch != '}') {
+                    result += ch;
+                } else if (i + 1 < pattern.size() && pattern[i + 1] == ch) {
+                    result += ch;
+                    ++i;
+                } else if (ch == '{' && i + 1 < pattern.size() && pattern[i + 1] == '}') {
+                    result += args.get_pos(arg++)->as_string().str();
+                    ++i;
+                } else {
+                    throw raised_exception("format() expects positional {} fields or escaped braces");
+                }
+            }
+            return mk_val<value_string>(result);
+        }},
         {"upper", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             jinja::string str = args.get_pos(0)->as_string().uppercase();

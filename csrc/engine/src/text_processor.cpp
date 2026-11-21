@@ -312,7 +312,10 @@ struct TextProcessor::Impl {
         capabilities.thinking =
             source.find("enable_thinking") != std::string::npos;
         if (source.find("reasoning_effort") != std::string::npos) {
-            for (const char* value : {"high", "max"}) {
+            if (model_type == "hy_v4_flash" && source.find("'no_think'") != std::string::npos)
+                capabilities.thinking = true;
+            for (const char* value : {"low", "high", "max"}) {
+                if (std::string_view(value) == "low" && model_type != "hy_v4_flash") continue;
                 if (source.find(std::string("'") + value + "'") !=
                         std::string::npos ||
                     source.find(std::string("\"") + value + "\"") !=
@@ -471,6 +474,8 @@ InferenceRequest TextProcessor::prepare(
                     "messages");
             }
             auto inputs = std::move(chat.template_inputs);
+            if (impl_->model_type == "hy_v4_flash" && impl_->capabilities.thinking && !inputs.enable_thinking)
+                inputs.chat_template_kwargs.try_emplace("reasoning_effort", R"("no_think")");
             if (chat.parallel_tool_calls) {
                 inputs.parallel_tool_calls = *chat.parallel_tool_calls;
             } else {

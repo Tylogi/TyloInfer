@@ -21,7 +21,7 @@ void require(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void test_jinja_dictionary_arguments() {
+void test_jinja_template_arguments() {
     const auto render = [](const std::string & source) {
         jinja::context context(source);
         const auto program = jinja::parse_from_tokens(jinja::lexer().tokenize(source));
@@ -33,6 +33,8 @@ void test_jinja_dictionary_arguments() {
         == "{\"a\": 3, \"b\": 2}", "Jinja dictionary replacement mismatch");
     require(render("{% macro f(a,b) %}{{a}}:{{b}}{% endmacro %}{{f(**{'a':1,'b':2})}}")
         == "1:2", "Jinja macro keyword unpack mismatch");
+    require(render("{{ '<｜hy_start{}｜> {{literal}} {}'.format(':example', '你好') }}")
+        == "<｜hy_start:example｜> {literal} 你好", "Jinja positional format mismatch");
     require(render("{{ namespace(**{'a':7}).a }}") == "7", "Jinja namespace keyword unpack mismatch");
     for (const std::string source : {
         "{{ dict(**1) }}", "{{ dict(**{1:'a'}) }}", "{{ dict(a=1, **{'a':2}) }}",
@@ -156,7 +158,7 @@ std::filesystem::path write_tokenizer_fixture() {
 }  // namespace
 
 int main() try {
-    test_jinja_dictionary_arguments();
+    test_jinja_template_arguments();
     test_tekken_regex_split();
     const auto path = write_tokenizer_fixture();
     std::ifstream input(path, std::ios::binary);
