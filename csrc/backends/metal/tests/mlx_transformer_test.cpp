@@ -683,6 +683,27 @@ int main() {
             throw std::runtime_error("sequence cache clear mismatch");
         }
 
+        const auto relative = reshape(arange(0, 120, 1, float32), {2, 3, 5, 4});
+        const std::vector<std::int32_t> positions{19, 20, 21, 12, 14, 18};
+        const array key_positions(positions.begin(), {static_cast<int>(positions.size())}, int32);
+        for (const int window : {0, 3}) {
+            std::vector<float> expected;
+            for (int head = 0; head < 6; ++head) {
+                for (int row = 0; row < 3; ++row) {
+                    for (const int key : positions) {
+                        const int distance = 18 + row - key;
+                        const auto bias = (head * 5 + 1 + row) * 4 + std::clamp(distance, 0, 3);
+                        expected.push_back(distance >= 0 && (!window || distance < window)
+                            ? static_cast<float>(bias) : -std::numeric_limits<float>::infinity());
+                    }
+                }
+            }
+            const auto actual = mfq::metal::mlx_attention_relative_bias(relative, key_positions, 1, 3, 18, window, bfloat16);
+            const auto reference = array(expected.begin(), {2, 3, 3, 6}, bfloat16);
+            if (!all(actual == reference).item<bool>())
+                throw std::runtime_error("relative attention bias differs with rotated KV positions");
+        }
+
         const array circular_cache(
             {
                 4.0f, 40.0f,

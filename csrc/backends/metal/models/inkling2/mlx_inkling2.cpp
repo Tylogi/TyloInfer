@@ -3,6 +3,7 @@
 #include "mfq_container.h"
 #include "mlx_gguf_layer_tensors.h"
 #include "mlx_detached_copy.h"
+#include "mlx_staged_attention.h"
 #include "mlx_tensor.h"
 #include "nlohmann/json.hpp"
 #include "tyloinfer/gguf_model_source.h"
@@ -10,7 +11,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -205,8 +205,9 @@ array mix_stream(const array& mixed, int stream) {
 array attention_rows(const array& query, const array& key, const array& value,
     const array& table, const array& key_pos, int offset, int window, float scale) {
     const int batch = query.shape(0), heads = query.shape(1), rows = query.shape(2);
-    const int keys = key.shape(2), max_distance = table.shape(-1) - 1;
+    const int keys = key.shape(2);
     const auto sinks = zeros({heads}, query.dtype());
+    const auto bias = contiguous(table);
     // Bound the gathered relative-position bias independently of cache length.
     const int tile = std::clamp((1 << 18) / std::min(keys, window ? window : keys), 1, 128);
     std::vector<array> chunks;
@@ -216,21 +217,13 @@ array attention_rows(const array& query, const array& key, const array& value,
             std::max(0, keys - rows + first - window + 1) : 0;
         const int key_end = window && rows > 1 ? keys - rows + last : keys;
         const auto selected_positions = slice(key_pos, {key_start}, {key_end});
-        auto distance = expand_dims(arange(offset + first, offset + last, 1, int32), -1) -
-            expand_dims(selected_positions, 0);
-        const auto valid = window ? logical_and(distance >= array(0), distance < array(window))
-            : distance >= array(0);
-        auto bucket = clip(distance, array(0), array(max_distance));
-        bucket = broadcast_to(reshape(bucket, {1, 1, last - first, key_end - key_start}),
-            {batch, heads, last - first, key_end - key_start});
-        auto scores = take_along_axis(slice(table, {0, 0, first, 0},
-            {batch, heads, last, max_distance + 1}), bucket, -1);
-        scores = where(valid, scores, array(-std::numeric_limits<float>::infinity()));
+        auto scores = mlx_attention_relative_bias(bias, selected_positions, first, last - first,
+            offset + first, window, query.dtype());
         const auto q = slice(query, {0, 0, first, 0}, {batch, heads, last, query.shape(3)});
         const auto k = slice(key, {0, 0, key_start, 0}, {key.shape(0), key.shape(1), key_end, key.shape(3)});
         const auto v = slice(value, {0, 0, key_start, 0},
             {value.shape(0), value.shape(1), key_end, value.shape(3)});
-        chunks.push_back(fast::scaled_dot_product_attention(q, k, v, scale, "", astype(scores, q.dtype()), sinks));
+        chunks.push_back(fast::scaled_dot_product_attention(q, k, v, scale, "", std::move(scores), sinks));
     }
     return chunks.size() == 1 ? chunks.front() : concatenate(chunks, 2);
 }

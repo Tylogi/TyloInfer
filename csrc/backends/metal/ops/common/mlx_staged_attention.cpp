@@ -122,4 +122,36 @@ std::optional<mlx::core::array> mlx_staged_attention(
         {heads * 8 * group * 256, 1, 1}, {256, 1, 1}, {{"GROUP", group}}, std::nullopt, false, {})[0];
     return reshape(transpose(slice(result, {0, 0, 0, 0}, {heads, rows, group, 256}), {0, 2, 1, 3}), query.shape());
 }
+
+mlx::core::array mlx_attention_relative_bias(const mlx::core::array& table,
+    const mlx::core::array& key_positions, int first_row, int count,
+    int first_position, int window, mlx::core::Dtype dtype) {
+    using namespace mlx::core;
+    if (table.ndim() != 4 || table.shape(-1) <= 0 || key_positions.ndim() != 1 ||
+        key_positions.dtype() != int32 || !key_positions.size() || first_row < 0 || count <= 0 ||
+        count > table.shape(2) - first_row || first_position < 0 || window < 0)
+        throw std::invalid_argument("invalid relative attention bias geometry");
+    const auto size = std::size_t(table.shape(0)) * table.shape(1) * count * key_positions.size();
+    if (!size || size > std::numeric_limits<int>::max())
+        throw std::invalid_argument("relative attention bias grid is too large");
+    static const auto kernel = cached_metal_kernel("tyloinfer_relative_attention_bias",
+        {"table", "positions", "params"}, {"bias"}, R"METAL(
+        const uint i = thread_position_in_grid.x;
+        const uint keys = uint(positions_shape[0]);
+        const uint rows = uint(params[1]);
+        const uint row = i / keys % rows;
+        const uint head = i / (keys * rows);
+        const uint extent = uint(table_shape[3]);
+        const int distance = params[2] + int(row) - positions[i % keys];
+        const bool visible = distance >= 0 && (params[3] == 0 || distance < params[3]);
+        const ulong table_row = ulong(head) * uint(table_shape[2]) + uint(params[0]) + row;
+        const uint bucket = uint(clamp(distance, 0, int(extent - 1)));
+        bias[i] = T(visible ? float(table[table_row * extent + bucket]) : -INFINITY);
+        )METAL");
+    const int grid = static_cast<int>(size);
+    const Shape shape{table.shape(0), table.shape(1), count, key_positions.shape(0)};
+    return kernel({contiguous(table), contiguous(key_positions), array({first_row, count, first_position, window}, int32)},
+        {shape}, {dtype}, {grid, 1, 1}, {std::min(256, grid), 1, 1}, {{"T", dtype}},
+        std::nullopt, false, {}).front();
+}
 }
