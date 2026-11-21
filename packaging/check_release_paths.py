@@ -6,6 +6,7 @@ import argparse
 import marshal
 from pathlib import Path
 from types import CodeType
+from typing import BinaryIO
 import zipfile
 
 
@@ -14,6 +15,8 @@ class PathChecker:
         self.needles: set[bytes] = set()
         for prefix in prefixes:
             normalized = prefix.rstrip("/\\").replace("\\", "/")
+            if not normalized:
+                raise ValueError("empty private path prefix")
             for spelling in (normalized, normalized.replace("/", "\\")):
                 for escaped in (spelling, spelling.replace("\\", "\\\\")):
                     for encoding in ("utf-8", "utf-16le"):
@@ -23,35 +26,38 @@ class PathChecker:
         self.files = 0
         self.python_modules = 0
 
-    def check_bytes(self, data: bytes, label: str) -> None:
+    def contains_private_path(self, data: bytes) -> bool:
         lowered = data.lower()
-        if any(needle in lowered for needle in self.needles):
-            self.failures.add(label)
+        return any(needle in lowered for needle in self.needles)
+
+    def check_bytes(self, data: bytes, label: str) -> None:
+        if self.contains_private_path(data):
+            self.failures.add("<redacted artifact name>" if self.contains_private_path(label.encode()) else label)
 
     def check_code(self, code: CodeType, label: str) -> None:
         # Marshal is uncompressed and includes filenames and nested constants,
         # including tuples and strings shared by multiple nested code objects.
         self.check_bytes(marshal.dumps(code), label)
 
-    def check_file(self, path: Path) -> None:
-        self.files += 1
-        label = str(path)
+    def check_stream(self, stream: BinaryIO, label: str) -> None:
         previous = b""
+        while block := stream.read(4 * 1024 * 1024):
+            data = previous + block
+            self.check_bytes(data, label)
+            previous = data[-self.overlap:] if self.overlap else b""
+
+    def check_file(self, path: Path, label: str | None = None) -> None:
+        self.files += 1
+        label = path.name if label is None else label
+        self.check_bytes(label.encode(), label)
         with path.open("rb") as stream:
-            while block := stream.read(4 * 1024 * 1024):
-                data = previous + block
-                self.check_bytes(data, label)
-                previous = data[-self.overlap:] if self.overlap else b""
+            self.check_stream(stream, label)
         if path.suffix.lower() == ".zip":
             with zipfile.ZipFile(path) as archive:
-                for name in archive.namelist():
-                    data = archive.read(name)
-                    member = f"{label}!{name}"
-                    self.check_bytes(data, member)
-                    if name.endswith(".pyc"):
-                        code = marshal.loads(data[16:])
-                        if isinstance(code, CodeType):
-                            self.check_code(code, member)
+                for info in archive.infolist():
+                    self.check_bytes(info.filename.encode(), label)
+                    with archive.open(info) as stream:
+                        self.check_stream(stream, f"{label}!{info.filename}")
 
     def check_python_cli(self, path: Path) -> None:
         from PyInstaller.archive.readers import CArchiveReader
@@ -83,11 +89,13 @@ def main() -> int:
     checker = PathChecker(args.private_prefix)
     for artifact in args.artifacts:
         if not artifact.exists():
-            parser.error(f"missing release artifact: {artifact}")
+            parser.error(f"missing release artifact: {artifact.name}")
         files = artifact.rglob("*") if artifact.is_dir() else (artifact,)
         for path in files:
             if path.is_file():
-                checker.check_file(path)
+                label = (artifact.name + "/" + path.relative_to(artifact).as_posix()
+                         if artifact.is_dir() else artifact.name)
+                checker.check_file(path, label)
     if args.python_cli:
         checker.check_python_cli(args.python_cli)
     if checker.failures:

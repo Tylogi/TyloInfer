@@ -2,7 +2,7 @@ Unicode true
 RequestExecutionLevel user
 SilentInstall silent
 AutoCloseWindow true
-InstallDir "$TEMP\TyloInferStudio"
+InstallDir "$TEMP\studio/web"
 SetCompressor /SOLID zlib
 Name "TyloInfer"
 Caption "TyloInfer"
@@ -12,7 +12,7 @@ VIProductVersion "@VERSION@.0"
 VIAddVersionKey /LANG=1033 "ProductName" "TyloInfer"
 VIAddVersionKey /LANG=1033 "FileDescription" "TyloInfer"
 VIAddVersionKey /LANG=1033 "FileVersion" "@VERSION@"
-VIAddVersionKey /LANG=1033 "LegalCopyright" "MFQ contributors"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "Tylogi AI Lab contributors"
 
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
@@ -37,7 +37,7 @@ Section
   StrCpy $CachePath "$CacheRoot\@PAYLOAD_ID@"
   StrCpy $Stage "$CachePath.partial"
 
-  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\TyloInferStudio-@PAYLOAD_ID@") p .r0'
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\studio/web-@PAYLOAD_ID@") p .r0'
   StrCpy $Mutex $0
   ${If} $Mutex == 0
     Goto failed
@@ -51,7 +51,7 @@ Section
   IfFileExists "$CachePath\.ready" 0 extract
   IfFileExists "$CachePath\tyloinfer.exe" 0 extract
   IfFileExists "$CachePath\mfq-runtime.exe" 0 extract
-  IfFileExists "$CachePath\tyloinfer-cli\tyloinfer-cli.exe" 0 extract
+  IfFileExists "$CachePath\tyloinfer-server\tyloinfer-server.exe" 0 extract
   IfFileExists "$CachePath\web-ui\index.html" cached extract
 
 extract:

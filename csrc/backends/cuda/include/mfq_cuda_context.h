@@ -1,0 +1,400 @@
+#pragma once
+
+#include <cublas_v2.h>
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace mfq::cuda {
+
+class Error final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+void check(cudaError_t status, const char* expression, const char* file, int line);
+void check(cublasStatus_t status, const char* expression, const char* file, int line);
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream);
+
+#define TYLOINFER_NATIVE_CUDA_CHECK(expression) \
+    ::mfq::cuda::check((expression), #expression, __FILE__, __LINE__)
+
+class DeviceGuard final {
+public:
+    explicit DeviceGuard(int device);
+    ~DeviceGuard() noexcept;
+
+    DeviceGuard(const DeviceGuard&) = delete;
+    DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+private:
+    int previous_ = 0;
+    bool restore_ = false;
+};
+
+class Event final {
+public:
+    explicit Event(unsigned flags = cudaEventDisableTiming);
+    ~Event() noexcept;
+
+    Event(Event&& other) noexcept;
+    Event& operator=(Event&& other) noexcept;
+    Event(const Event&) = delete;
+    Event& operator=(const Event&) = delete;
+
+    cudaEvent_t get() const noexcept { return event_; }
+    void record(cudaStream_t stream);
+    bool ready() const;
+    void synchronize() const;
+
+private:
+    int device_ = 0;
+    cudaEvent_t event_ = nullptr;
+};
+
+class Stream final {
+public:
+    explicit Stream(int device, unsigned flags = cudaStreamNonBlocking);
+    ~Stream() noexcept;
+
+    Stream(Stream&& other) noexcept;
+    Stream& operator=(Stream&& other) noexcept;
+    Stream(const Stream&) = delete;
+    Stream& operator=(const Stream&) = delete;
+
+    int device() const noexcept { return device_; }
+    cudaStream_t get() const noexcept { return stream_; }
+    void synchronize() const;
+    void wait(const Event& event) const;
+
+private:
+    int device_ = 0;
+    cudaStream_t stream_ = nullptr;
+};
+
+// Copyable stream handle used by the runtime graph.  Owning streams retain the
+// underlying Stream through shared ownership; the per-device default stream is
+// retained by its Context.  This mirrors the value semantics of ATen's
+// CUDAStream without exposing ATen in the native runtime ABI.
+class StreamHandle final {
+public:
+    StreamHandle() = default;
+    StreamHandle(int device, cudaStream_t stream, std::shared_ptr<Stream> owner = {})
+        : device_(device), stream_(stream), owner_(std::move(owner)) {}
+
+    int device_index() const noexcept { return device_; }
+    int device() const noexcept { return device_; }
+    cudaStream_t stream() const noexcept { return stream_; }
+    // Tensor consumers can outlive the executor which created a side stream.
+    // Preserve the control block even for stream_from_pool's null alias owner.
+    std::shared_ptr<void> lifetime() const noexcept {
+        return owner_.use_count()?std::shared_ptr<void>(owner_,reinterpret_cast<void*>(stream_)):std::shared_ptr<void>{};
+    }
+    operator cudaStream_t() const noexcept { return stream_; }
+    explicit operator bool() const noexcept { return stream_ != nullptr; }
+
+private:
+    int device_ = 0;
+    cudaStream_t stream_ = nullptr;
+    std::shared_ptr<Stream> owner_;
+};
+
+StreamHandle current_stream(int device = -1);
+StreamHandle stream_from_pool(bool high_priority = false, int device = -1);
+
+class StreamGuard final {
+public:
+    explicit StreamGuard(StreamHandle stream);
+    ~StreamGuard() noexcept;
+
+    StreamGuard(const StreamGuard&) = delete;
+    StreamGuard& operator=(const StreamGuard&) = delete;
+
+private:
+    int device_ = 0;
+    std::optional<StreamHandle> previous_;
+};
+
+class Context;
+
+class Graph final {
+public:
+    Graph() = default;
+    ~Graph() noexcept;
+
+    Graph(Graph&& other) noexcept;
+    Graph& operator=(Graph&& other) noexcept;
+    Graph(const Graph&) = delete;
+    Graph& operator=(const Graph&) = delete;
+
+    void prepare_memory();
+    void prepare_memory(
+        const std::vector<StreamHandle>& participant_streams);
+    void capture_begin();
+    // Record in a pool already owned by a decoder or expert-cache lifetime.
+    void capture_begin_shared();
+    void capture_end();
+    void replay();
+    void reset() noexcept;
+    bool valid() const noexcept { return executable_ != nullptr; }
+    cudaGraphExec_t native_executable()const noexcept{return executable_;}
+    std::size_t nodes() const;
+
+private:
+    int device_ = 0;
+    StreamHandle stream_;
+    std::shared_ptr<Context> context_;
+    std::vector<StreamHandle> pool_streams_;
+    std::vector<std::shared_ptr<Context>> pool_contexts_;
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t executable_ = nullptr;
+    bool shared_pool_ = false;
+};
+
+class BlasHandle final {
+public:
+    explicit BlasHandle(int device);
+    ~BlasHandle() noexcept;
+
+    BlasHandle(BlasHandle&& other) noexcept;
+    BlasHandle& operator=(BlasHandle&& other) noexcept;
+    BlasHandle(const BlasHandle&) = delete;
+    BlasHandle& operator=(const BlasHandle&) = delete;
+
+    cublasHandle_t get() const noexcept { return handle_; }
+    void set_stream(cudaStream_t stream);
+
+private:
+    int device_ = 0;
+    cublasHandle_t handle_ = nullptr;
+};
+
+struct AllocationBudget;
+struct DeviceMemoryStats {
+    std::size_t limit = 0;
+    std::size_t allocated = 0;
+    std::size_t peak = 0;
+};
+struct PhysicalDeviceMemoryStats {
+    std::size_t total=0,free=0,used=0;
+};
+// Optional driver-wide accounting. CUDA's WDDM free figure can omit memory
+// held by other processes; an unavailable management API preserves CUDA/DXGI.
+std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device);
+
+class Context final : public std::enable_shared_from_this<Context> {
+public:
+    explicit Context(int device);
+
+    int device() const noexcept { return device_; }
+    Stream& stream() noexcept { return stream_; }
+    const Stream& stream() const noexcept { return stream_; }
+    BlasHandle& blas() noexcept { return blas_; }
+    BlasHandle& blas(cudaStream_t stream);
+    bool supports_async_allocations() const noexcept { return async_allocations_; }
+    DeviceMemoryStats memory_stats() const noexcept;
+    std::pair<std::uint64_t,std::uint64_t> pool_memory_stats() const;
+    // Idle pages in the ordinary temporary pool can be reused without growing
+    // physical residency. Captured graph pools remain reserved for their owner.
+    std::size_t reusable_workspace_bytes() const;
+    std::size_t reusable_dense_weight_bytes() const;
+    std::size_t local_memory_usage() const;
+    // Process-owned pages, including idle allocator pages and CUDA libraries.
+    std::size_t resident_memory_usage() const;
+    std::size_t available_memory() const;
+    void reclaim_idle_memory();
+    // Temporarily reuse already charged expert-cache storage on one ordered
+    // compute stream. Graph/resident allocations never enter this workspace.
+    void begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                              cudaStream_t stream,std::shared_ptr<void> backing = {});
+    void suspend_workspace_loan();
+    void end_workspace_loan();
+    // An abandoned owner disables new allocations and retains backing until
+    // the last live suballocation and its ordered consumers have completed.
+    void retire_workspace_loan() noexcept;
+    bool workspace_loan_active() const;
+    std::size_t workspace_available() const;
+    std::size_t workspace_largest_available(cudaStream_t stream) const;
+    bool workspace_allocations_fit(const std::vector<std::size_t>& allocations,
+        std::size_t ordinary,cudaStream_t stream) const;
+    std::size_t workspace_live_bytes() const;
+    std::vector<std::pair<void*,std::size_t>> workspace_touched_regions() const;
+    void check_memory_limit(std::size_t additional = 0) const;
+    void set_memory_limit(std::size_t bytes);
+
+    void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
+    void release(
+        void* pointer,
+        std::size_t bytes,
+        cudaStream_t stream = nullptr) noexcept;
+    // Each owner pairs a successful begin with end; shared pools retire only
+    // after their last cache or graph owner releases the stream registration.
+    void begin_graph_pool(cudaStream_t stream,bool share_existing=false);
+    bool has_graph_pool(cudaStream_t stream) const;
+    void begin_graph_warmup(cudaStream_t stream);
+    void end_graph_warmup(cudaStream_t stream) noexcept;
+    void begin_graph_capture(cudaStream_t stream);
+    void end_graph_capture(cudaStream_t stream) noexcept;
+    void end_graph_pool(cudaStream_t stream) noexcept;
+    void trim();
+
+private:
+    struct GraphPool {
+        cudaMemPool_t memory = nullptr;
+        std::size_t owners = 1;
+        bool capturing = false;
+        bool warming = false;
+        std::map<std::size_t, std::vector<void*>> available;
+        std::unordered_set<void*> owned;
+    };
+
+    int device_ = 0;
+    Stream stream_;
+    BlasHandle blas_;
+    cudaMemPool_t pool_ = nullptr;
+    bool async_allocations_ = false;
+    std::shared_ptr<AllocationBudget> allocation_budget_;
+    void trim_pool_pages() const;
+    mutable std::mutex graph_pool_mutex_;
+    // A tensor may use a larger cached graph block and outlive its pool.
+    // Account/free the allocation's capacity, not that tensor's logical bytes.
+    std::unordered_map<void*,std::size_t> graph_allocation_sizes_;
+    struct WorkspaceLoan {
+        cudaStream_t stream=nullptr;
+        std::thread::id thread;
+        bool enabled=true;
+        bool retiring=false;
+        std::shared_ptr<void> backing;
+        std::map<std::uintptr_t,std::size_t> free;
+        std::unordered_map<void*,std::size_t> live;
+        std::vector<std::pair<std::uintptr_t,std::size_t>> touched;
+    };
+    std::unique_ptr<WorkspaceLoan> workspace_loan_;
+    std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
+    std::mutex stream_blas_mutex_;
+    std::unordered_map<cudaStream_t,std::unique_ptr<BlasHandle>> stream_blas_;
+};
+
+std::shared_ptr<Context> default_context(int device = 0);
+// A host callback serving a waiting graph must report allocation pressure
+// without synchronizing the device that is waiting for that callback.
+class NonblockingAllocationScope {
+public:
+    NonblockingAllocationScope();
+    ~NonblockingAllocationScope();
+    NonblockingAllocationScope(const NonblockingAllocationScope&)=delete;
+    NonblockingAllocationScope& operator=(const NonblockingAllocationScope&)=delete;
+};
+class GraphWarmupScope {
+public:
+    GraphWarmupScope(std::shared_ptr<Context> context,cudaStream_t stream):context_(std::move(context)),stream_(stream) {
+        context_->begin_graph_warmup(stream_);
+    }
+    ~GraphWarmupScope(){context_->end_graph_warmup(stream_);}
+    GraphWarmupScope(const GraphWarmupScope&)=delete;
+private:
+    std::shared_ptr<Context> context_;cudaStream_t stream_;
+};
+
+class Buffer final {
+public:
+    Buffer() = default;
+    Buffer(std::shared_ptr<Context> context, std::size_t bytes);
+    ~Buffer() noexcept;
+
+    Buffer(Buffer&& other) noexcept;
+    Buffer& operator=(Buffer&& other) noexcept;
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+
+    void* data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return bytes_; }
+    explicit operator bool() const noexcept { return data_ != nullptr; }
+
+private:
+    void reset() noexcept;
+
+    std::shared_ptr<Context> context_;
+    void* data_ = nullptr;
+    std::size_t bytes_ = 0;
+    StreamHandle stream_;
+};
+
+// cudaHostAlloc reports an exhausted pinned-memory limit as
+// cudaErrorMemoryAllocation on Linux, but WDDM can reject a large mapped
+// allocation with a mapping error instead ("resource already mapped").
+// Callers that retry smaller sizes or fall back to pageable memory treat all
+// of these as recoverable resource exhaustion.
+inline bool pinned_allocation_rejected(cudaError_t status) noexcept {
+    return status == cudaErrorMemoryAllocation || status == cudaErrorAlreadyMapped ||
+           status == cudaErrorMapBufferObjectFailed;
+}
+
+// Required request workspaces can reclaim optional pinned quota at their
+// model-thread boundary. Optional cache growth and held cache locks suppress
+// this hook; worker threads never inherit it.
+class PinnedAllocationScope {
+    const PinnedAllocationScope* previous_=nullptr;
+    friend std::size_t reclaim_pinned_allocation(std::size_t);
+    int device_;
+    cudaStream_t stream_;
+    std::function<std::size_t(std::size_t)> reclaim_;
+public:
+    PinnedAllocationScope(int device,cudaStream_t stream,std::function<std::size_t(std::size_t)> reclaim);
+    ~PinnedAllocationScope();
+    PinnedAllocationScope(const PinnedAllocationScope&)=delete;
+    PinnedAllocationScope& operator=(const PinnedAllocationScope&)=delete;
+};
+class PinnedReclaimPause {
+public:
+    PinnedReclaimPause();
+    ~PinnedReclaimPause();
+    PinnedReclaimPause(const PinnedReclaimPause&)=delete;
+    PinnedReclaimPause& operator=(const PinnedReclaimPause&)=delete;
+};
+bool pinned_allocation_scope_active() noexcept;
+std::size_t reclaim_pinned_allocation(std::size_t bytes);
+cudaError_t allocate_pinned_host(void** destination,std::size_t bytes,unsigned flags,const char* role);
+cudaError_t release_pinned_host(void* pointer,std::size_t bytes) noexcept;
+struct PinnedMemoryBudgetStats {std::size_t live_bytes=0,proven_bytes=0;bool proven=false;};
+PinnedMemoryBudgetStats pinned_memory_budget_stats() noexcept;
+std::size_t pinned_headroom_shortage(std::size_t live,std::size_t budget,std::size_t required,std::size_t margin) noexcept;
+// Reserve against the last proven committed population, not a presumed device
+// limit. The margin is a caller-priced transaction, not a hardware constant.
+void reserve_pinned_workspace(std::size_t required,std::size_t margin,
+    const std::function<std::size_t(std::size_t)>& reclaim);
+
+class HostBuffer final {
+public:
+    explicit HostBuffer(std::size_t bytes, bool mapped = false);
+    ~HostBuffer() noexcept;
+
+    HostBuffer(HostBuffer&& other) noexcept;
+    HostBuffer& operator=(HostBuffer&& other) noexcept;
+    HostBuffer(const HostBuffer&) = delete;
+    HostBuffer& operator=(const HostBuffer&) = delete;
+
+    void* data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return bytes_; }
+
+private:
+    void reset() noexcept;
+
+    void* data_ = nullptr;
+    std::size_t bytes_ = 0;
+};
+
+}  // namespace mfq::cuda

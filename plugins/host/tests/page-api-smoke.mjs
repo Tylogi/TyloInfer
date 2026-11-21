@@ -1,0 +1,66 @@
+import assert from 'node:assert/strict';
+import { setTimeout } from 'node:timers/promises';
+import { createCoreBridge } from '../core-bridge.js';
+
+const origin = process.argv[2];
+assert.equal(new URL(origin).hostname, '127.0.0.1');
+const handler = createCoreBridge({ getProvider: () => ({ baseURL: origin + '/v1' }), resolveCredential: async () => undefined });
+const call = (method, payload) => handler(method, payload, undefined, { principal: { kind: 'owner' } });
+const value = async (method, payload) => {
+  const reply = await call(method, payload);
+  assert.equal(reply.ok, true, JSON.stringify(reply));
+  return reply.value;
+};
+const read = (resource, params) => value('core/read', { resource, ...(params ? { params } : {}) });
+const waitFor = async (endpoint, id, state) => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const job = await value(endpoint, { operation_id: id });
+    if (job.status === state) return job;
+    assert.ok(!['failed', 'interrupted'].includes(job.status));
+    await setTimeout(10);
+  }
+  throw new Error('Controlled page operation did not settle');
+};
+assert.equal((await read('models')).data.length, 0);
+const directory = (await read('model_directories')).data[0];
+assert.match(directory.id, /^[0-9a-f]{32}$/);
+assert.equal((await read('model_directories', { directory_id: directory.id })).model_file_count, 1);
+const registered = await value('models/register', { directory_id: directory.id });
+assert.equal(registered.data.length, 1);
+const artifact = registered.data[0];
+const analysis = await value('models/analysis', { model_id: artifact.id });
+assert.equal(analysis.model_id, artifact.id);
+assert.ok(analysis.tensors.length > 0);
+assert.equal((await read('loaded_models')).data.length, 0);
+assert.equal((await read('instances')).data.length, 0);
+assert.equal((await read('resources')).sampled_at, 1);
+assert.equal((await read('listener')).configurable, false);
+assert.equal(typeof (await read('authentication_policy')).enabled, 'boolean');
+assert.ok((await read('serving', { scope: 'alltime' })).totals);
+assert.ok(Array.isArray((await read('logs', { limit: 2, after: 0 })).data));
+assert.ok(Array.isArray((await read('metrics', { limit: 2, since: '2026-01-01T00:00:00Z' })).data));
+assert.ok(Array.isArray((await read('prefix_cache', { limit: 2, offset: 0, query: '', search_in: 'id', text_filter: 'all', chain_filter: 'all', sort: 'recent' })).data));
+assert.equal((await value('service/configure', { resource: 'inference_policy', request: { mtp_enabled: false } })).mtp_enabled, false);
+assert.equal((await read('inference_policy')).mtp_enabled, false);
+assert.equal((await value('service/configure', { resource: 'context_policy', request: { max_context_size: 4096 } })).max_context_size, 4096);
+assert.equal((await read('context_policy')).max_context_size, 4096);
+assert.equal((await value('service/configure', { resource: 'model_aliases', request: { aliases: { [artifact.name]: 'bridge-alias' } } })).aliases[artifact.name], 'bridge-alias');
+const memory = await value('service/configure', { resource: 'memory_policy', request: { prefix_ram_limit_bytes: 0 } });
+assert.equal(memory.status, 'accepted');
+assert.equal((await waitFor('service/get', memory.operation_id, 'succeeded')).kind, 'runtime.memory.configure');
+assert.equal((await read('memory_policy')).prefix_ram_limit_bytes, 0);
+assert.equal((await value('hub/search', { provider: 'huggingface', query: 'example', formats: ['gguf'], limit: 2 })).data.length, 0);
+assert.equal((await value('hub/info', { provider: 'huggingface', repo_id: 'example/model', revision: 'main' })).repo_id, 'example/model');
+assert.equal((await value('hub/official', { refresh: false })).data.length, 0);
+const success = await value('downloads/create', { provider: 'huggingface', request: { repo_id: 'example/success', destination: 'success' } });
+assert.match(success.id, /^[0-9a-f-]{36}$/);
+assert.equal((await waitFor('downloads/get', success.id, 'succeeded')).kind, 'download.huggingface');
+const pending = await value('downloads/create', { provider: 'modelscope', request: { repo_id: 'example/pending', destination: 'pending', expected_bytes: null, max_workers: 2 } });
+await waitFor('downloads/get', pending.id, 'running');
+assert.equal((await value('downloads/cancel', { operation_id: pending.id })).cancel_requested, true);
+await waitFor('downloads/get', pending.id, 'cancelled');
+assert.ok((await read('jobs', { kind: 'download.modelscope', limit: 2 })).data.some(job => job.id === pending.id));
+assert.equal((await call('operations/get', { operation_id: pending.id })).error.code, 'tyloinfer/operation-not-supported');
+assert.equal((await call('service/get', { operation_id: pending.id })).error.code, 'tyloinfer/operation-not-supported');
+assert.equal((await call('downloads/get', { operation_id: memory.operation_id })).error.code, 'tyloinfer/operation-not-supported');
+console.log('CORE_PAGE_BRIDGE_API_PASS; HUB_AND_DOWNLOAD=controlled; NATIVE_INFERENCE=unused');

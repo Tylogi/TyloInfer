@@ -1,0 +1,1627 @@
+#include "mfq_cuda_context.h"
+#include "mfq_cuda_process_memory.h"
+#include "mfq_cuda_resident_allocations.h"
+#include "../runtime/routed_prefill_loan.h"
+#include "../runtime/cuda_event_status.h"
+#include "tyloinfer/runtime.h"
+#include <cuda.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <cstdio>
+#include <limits>
+#include <cstdlib>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#endif
+
+namespace mfq::cuda {
+namespace {
+thread_local unsigned nonblocking_allocations=0,pinned_reclaim_pauses=0;
+thread_local const PinnedAllocationScope* pinned_scope=nullptr;
+thread_local bool pinned_reclaim_running=false;
+std::atomic<std::size_t> pinned_live{0},pinned_proven{SIZE_MAX};
+}
+PinnedAllocationScope::PinnedAllocationScope(int device,cudaStream_t stream,
+        std::function<std::size_t(std::size_t)> reclaim)
+    :previous_(pinned_scope),device_(device),stream_(stream),reclaim_(std::move(reclaim)) {pinned_scope=this;}
+PinnedAllocationScope::~PinnedAllocationScope(){pinned_scope=previous_;}
+PinnedReclaimPause::PinnedReclaimPause(){++pinned_reclaim_pauses;}
+PinnedReclaimPause::~PinnedReclaimPause(){--pinned_reclaim_pauses;}
+bool pinned_allocation_scope_active()noexcept{return pinned_scope!=nullptr;}
+std::size_t reclaim_pinned_allocation(std::size_t bytes) {
+    if(!bytes || !pinned_scope || pinned_reclaim_pauses || pinned_reclaim_running || !pinned_scope->reclaim_)return 0;
+    DeviceGuard guard(pinned_scope->device_);cudaStreamCaptureStatus capture;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(pinned_scope->stream_,&capture));
+    if(capture!=cudaStreamCaptureStatusNone)return 0;
+    struct Running {Running(){pinned_reclaim_running=true;}~Running(){pinned_reclaim_running=false;}} running;
+    return pinned_scope->reclaim_(bytes);
+}
+cudaError_t allocate_pinned_host(void** destination,std::size_t bytes,unsigned flags,const char* role) {
+    auto result=cudaHostAlloc(destination,bytes,flags);
+    const auto charge=[&] {
+        const auto live=pinned_live.fetch_add(bytes)+bytes;
+        auto prior=pinned_proven.load();
+        while(prior!=SIZE_MAX && prior<live && !pinned_proven.compare_exchange_weak(prior,live)){}
+    };
+    if(result==cudaSuccess){charge();return result;}
+    if(!pinned_allocation_rejected(result))return result;
+    pinned_proven.store(pinned_live.load());
+    (void)cudaGetLastError();
+    const auto released=reclaim_pinned_allocation(bytes);
+    if(!released)return result;
+    std::fprintf(stderr,"native_required_pinned_recovery role=%s requested_bytes=%zu released_bytes=%zu allocation_only=1\n",
+        role,bytes,released);
+    result=cudaHostAlloc(destination,bytes,flags);
+    if(result==cudaSuccess)charge();
+    return result;
+}
+cudaError_t release_pinned_host(void* pointer,std::size_t bytes)noexcept {
+    const auto result=cudaFreeHost(pointer);
+    if(result==cudaSuccess)pinned_live.fetch_sub(bytes);
+    return result;
+}
+PinnedMemoryBudgetStats pinned_memory_budget_stats()noexcept {
+    const auto proven=pinned_proven.load();
+    return {pinned_live.load(),proven==SIZE_MAX?0:proven,proven!=SIZE_MAX};
+}
+std::size_t pinned_headroom_shortage(std::size_t live,std::size_t budget,
+        std::size_t required,std::size_t margin)noexcept {
+    const auto goal=required>SIZE_MAX-margin?SIZE_MAX:required+margin;
+    if(live<=budget) {const auto free=budget-live;return goal>free?goal-free:0;}
+    const auto excess=live-budget;return goal>SIZE_MAX-excess?SIZE_MAX:goal+excess;
+}
+void reserve_pinned_workspace(std::size_t required,std::size_t margin,
+        const std::function<std::size_t(std::size_t)>& reclaim) {
+    const auto before=pinned_memory_budget_stats();std::size_t released=0;
+    if(before.proven) {
+        const auto shortage=pinned_headroom_shortage(before.live_bytes,before.proven_bytes,required,margin);
+        if(shortage && reclaim) {const PinnedReclaimPause boundary;released=reclaim(shortage);}
+        const auto after=pinned_memory_budget_stats();
+        if(pinned_headroom_shortage(after.live_bytes,after.proven_bytes,required,margin))
+            throw MfqResourceExhausted("CUDA pinned allocation failed: required_headroom="+std::to_string(required)+
+                " safety_margin="+std::to_string(margin)+" live_bytes="+std::to_string(after.live_bytes)+
+                " proven_budget="+std::to_string(after.proven_bytes)+" before_state_advance=1");
+    }
+    std::fprintf(stderr,"native_pinned_workspace_admission required_bytes=%zu safety_margin_bytes=%zu live_bytes=%zu proven_budget_bytes=%zu budget_known=%d optional_released_bytes=%zu before_state_advance=1\n",
+        required,margin,pinned_live.load(),before.proven_bytes,int(before.proven),released);
+}
+NonblockingAllocationScope::NonblockingAllocationScope(){++nonblocking_allocations;}
+NonblockingAllocationScope::~NonblockingAllocationScope(){--nonblocking_allocations;}
+std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device) {
+#ifdef _WIN32
+    // Adapted from Strata's nvml_device_free (src/core/expert_cache.cpp, MIT;
+    // ../../../third_party/strata.LICENSE). NVML reports the whole card while
+    // CUDA/DXGI can expose this process's allowance under WDDM. A free-memory
+    // bound must honor both before admitting revocable expert pages.
+    // nvmlMemory_t ABI: NVIDIA NVML API, structnvmlMemory__t.html (v1).
+    struct Memory {unsigned long long total,free,used;};
+    struct Library {
+        using Init=int(*)();
+        using Handle=int(*)(const char*,void**);
+        using Query=int(*)(void*,Memory*);
+        Handle handle=nullptr;
+        Query query=nullptr;
+        Library() {
+            const auto module=LoadLibraryExW(L"nvml.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if(!module)return;
+            const auto init=reinterpret_cast<Init>(GetProcAddress(module,"nvmlInit_v2"));
+            const auto by_bus=reinterpret_cast<Handle>(GetProcAddress(module,"nvmlDeviceGetHandleByPciBusId_v2"));
+            const auto memory=reinterpret_cast<Query>(GetProcAddress(module,"nvmlDeviceGetMemoryInfo"));
+            if(init && by_bus && memory && init()==0){handle=by_bus;query=memory;}
+            // The driver library remains loaded for the CUDA context lifetime.
+        }
+    };
+    static const Library library;
+    if(library.query) {
+        char bus[64]{};
+        void* handle=nullptr;
+        Memory memory{};
+        if(cudaDeviceGetPCIBusId(bus,sizeof(bus),device)==cudaSuccess &&
+                library.handle(bus,&handle)==0 && library.query(handle,&memory)==0 &&
+                memory.free<=memory.total && memory.used<=memory.total)
+            return PhysicalDeviceMemoryStats{std::size_t(memory.total),std::size_t(memory.free),std::size_t(memory.used)};
+    }
+#else
+    (void)device;
+#endif
+    return {};
+}
+namespace {
+__global__ void record_gpu_timestamp_kernel(uint64_t* timestamps, std::size_t index) {
+    unsigned long long nanoseconds;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(nanoseconds));
+    timestamps[index]=nanoseconds;
+}
+}
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream) {
+    record_gpu_timestamp_kernel<<<1,1,0,stream>>>(timestamps,index);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
+}
+namespace {
+thread_local bool resident_allocations=false,routed_weight_allocations=false,dense_weight_allocations=false;
+thread_local bool prefill_allocations=false,isolated_prefill_allocations=false;
+thread_local std::optional<RequestStateAllocationScope::Kind> request_state_allocations;
+}
+PrefillAllocationScope::PrefillAllocationScope(bool enabled,bool reuse_ordinary_pool) noexcept
+    :previous_(prefill_allocations),previous_isolation_(isolated_prefill_allocations) {
+    prefill_allocations=enabled;
+    isolated_prefill_allocations=enabled && !reuse_ordinary_pool;
+}
+PrefillAllocationScope::~PrefillAllocationScope() noexcept {
+    prefill_allocations=previous_;
+    isolated_prefill_allocations=previous_isolation_;
+}
+bool PrefillAllocationScope::active() noexcept {return prefill_allocations;}
+ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
+    :previous_(resident_allocations) {resident_allocations=enabled;}
+void ResidentAllocationScope::finish() noexcept {
+    if(active_){resident_allocations=previous_;active_=false;}
+}
+RoutedWeightAllocationScope::RoutedWeightAllocationScope(bool enabled) noexcept
+    :resident_(enabled),previous_(routed_weight_allocations) {routed_weight_allocations=enabled;}
+RoutedWeightAllocationScope::~RoutedWeightAllocationScope() noexcept {routed_weight_allocations=previous_;}
+DenseWeightAllocationScope::DenseWeightAllocationScope() noexcept
+    :previous_(dense_weight_allocations) {dense_weight_allocations=true;}
+DenseWeightAllocationScope::~DenseWeightAllocationScope() noexcept {dense_weight_allocations=previous_;}
+RequestStateAllocationScope::RequestStateAllocationScope(bool enabled,Kind kind) noexcept
+    :resident_(enabled),previous_(request_state_allocations) {
+    request_state_allocations=enabled?std::optional(kind):std::nullopt;
+}
+RequestStateAllocationScope::~RequestStateAllocationScope() noexcept {request_state_allocations=previous_;}
+
+struct AllocationBudget {
+    std::mutex graph_memory_mutex;
+    // Retired pools remain visible until their persistent request tensors die.
+    std::unordered_map<cudaMemPool_t,bool> graph_memory_pools;
+    // Concurrent graph streams share backing pages. Their reuse/lifetime
+    // bookkeeping remains stream-local; one driver pool per branch exhausts
+    // finite CUDA pool handles even with ample free device memory.
+    cudaMemPool_t shared_graph_memory_pool=nullptr;
+    std::size_t shared_graph_pool_users=0;
+    cudaMemPool_t resident_memory_pool=nullptr;
+    cudaMemPool_t routed_weight_memory_pool=nullptr;
+    cudaMemPool_t dense_weight_memory_pool=nullptr;
+    cudaMemPool_t prefill_memory_pool=nullptr;
+    cudaMemPool_t request_state_memory_pool=nullptr;
+    cudaMemPool_t indexer_memory_pool=nullptr;
+    std::size_t limit = 0;
+    std::atomic<std::size_t> allocated{},peak{};
+#ifdef _WIN32
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+#endif
+    void acquire(std::size_t bytes) {
+        auto before=allocated.load(std::memory_order_relaxed);
+        do {
+            if(bytes>std::numeric_limits<std::size_t>::max()-before ||
+                (limit && (before>limit || bytes>limit-before)))
+                throw MfqResourceExhausted("CUDA VRAM limit exceeded: requested="+std::to_string(bytes)+
+                    " allocated="+std::to_string(before)+" limit="+std::to_string(limit));
+        } while(!allocated.compare_exchange_weak(before,before+bytes,std::memory_order_relaxed));
+        auto maximum=peak.load(std::memory_order_relaxed);
+        while(maximum<before+bytes && !peak.compare_exchange_weak(maximum,before+bytes,std::memory_order_relaxed)){}
+    }
+    void release(std::size_t bytes) noexcept {allocated.fetch_sub(bytes,std::memory_order_relaxed);}
+};
+namespace {
+
+std::mutex allocation_budgets_mutex;
+std::unordered_map<int,std::shared_ptr<AllocationBudget>> allocation_budgets;
+std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
+    std::lock_guard lock(allocation_budgets_mutex);
+    auto& budget=allocation_budgets[device];
+    if(!budget) {
+        auto candidate=std::make_shared<AllocationBudget>();
+        if(const auto* value=std::getenv("TYLOINFER_CUDA_VRAM_LIMIT_GIB")) {
+            char* end=nullptr;const double gib=std::strtod(value,&end);
+            const long double bytes=static_cast<long double>(gib)*1024*1024*1024;
+            if(end==value || *end || !std::isfinite(gib) || gib<0 ||
+                bytes>std::numeric_limits<std::size_t>::max() || (gib>0 && bytes<1))
+                throw Error("TYLOINFER_CUDA_VRAM_LIMIT_GIB must be a finite non-negative GiB value");
+            candidate->limit=static_cast<std::size_t>(bytes);
+        }
+#ifdef _WIN32
+        {
+            Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+            cudaDeviceProp properties{};TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDeviceProperties(&properties,device));
+            if(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+                for(UINT index=0;;++index) {
+                    Microsoft::WRL::ComPtr<IDXGIAdapter1> item;
+                    if(factory->EnumAdapters1(index,&item)==DXGI_ERROR_NOT_FOUND)break;
+                    DXGI_ADAPTER_DESC1 description{};
+                    if(SUCCEEDED(item->GetDesc1(&description)) &&
+                        !std::memcmp(properties.luid,&description.AdapterLuid,8)) {item.As(&candidate->adapter);break;}
+                }
+            }
+            if(candidate->limit && !candidate->adapter)throw Error("CUDA VRAM limit requires the matching WDDM adapter");
+        }
+#endif
+        budget=std::move(candidate);
+    }
+    return budget;
+}
+
+std::mutex default_context_mutex;
+std::unordered_map<int, std::weak_ptr<Context>> default_contexts;
+// ponytail: global lock is sufficient; shard by thread if stream switching contends.
+std::mutex active_streams_mutex;
+std::unordered_map<
+    std::thread::id,
+    std::unordered_map<int, StreamHandle>> active_streams;
+
+template <typename Function>
+void on_device_noexcept(int device, Function&& function) noexcept {
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) return;
+    const bool restore = previous != device;
+    if (restore && cudaSetDevice(device) != cudaSuccess) return;
+    try {
+        function();
+    } catch (...) {
+        // Resource destruction must never terminate inference during unwinding.
+    }
+    if (restore) (void)cudaSetDevice(previous);
+}
+
+std::string location_message(
+    const char* category,
+    const char* detail,
+    const char* expression,
+    const char* file,
+    int line) {
+    std::ostringstream message;
+    message << category << " error: " << detail << " (" << expression << ") at "
+            << file << ':' << line;
+    return message.str();
+}
+
+const char* cublas_status_name(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
+    }
+    return "unknown cuBLAS status";
+}
+
+}  // namespace
+
+std::shared_ptr<Context> default_context(int device) {
+    std::lock_guard lock(default_context_mutex);
+    if (const auto found = default_contexts.find(device); found != default_contexts.end()) {
+        if (auto context = found->second.lock()) {
+            return context;
+        }
+    }
+    auto context = std::make_shared<Context>(device);
+    default_contexts[device] = context;
+    return context;
+}
+
+void check(cudaError_t status, const char* expression, const char* file, int line) {
+    if (status != cudaSuccess) {
+        throw Error(location_message(
+            "CUDA", cudaGetErrorString(status), expression, file, line));
+    }
+}
+
+void check(cublasStatus_t status, const char* expression, const char* file, int line) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw Error(location_message(
+            "cuBLAS", cublas_status_name(status), expression, file, line));
+    }
+}
+
+DeviceGuard::DeviceGuard(int device) {
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&previous_));
+    if (previous_ != device) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaSetDevice(device));
+        restore_ = true;
+    }
+}
+
+DeviceGuard::~DeviceGuard() noexcept {
+    if (restore_) {
+        (void)cudaSetDevice(previous_);
+    }
+}
+
+Event::Event(unsigned flags) {
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device_));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
+}
+
+Event::~Event() noexcept {
+    if (event_ != nullptr) {
+        on_device_noexcept(device_, [&] { (void)cudaEventDestroy(event_); });
+    }
+}
+
+Event::Event(Event&& other) noexcept
+    : device_(other.device_), event_(std::exchange(other.event_, nullptr)) {}
+
+Event& Event::operator=(Event&& other) noexcept {
+    if (this != &other) {
+        if (event_ != nullptr) {
+            on_device_noexcept(device_, [&] { (void)cudaEventDestroy(event_); });
+        }
+        device_ = other.device_;
+        event_ = std::exchange(other.event_, nullptr);
+    }
+    return *this;
+}
+
+void Event::record(cudaStream_t stream) {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(event_, stream));
+}
+
+bool Event::ready() const {
+    DeviceGuard guard(device_);
+    return cuda_event_ready(event_);
+}
+
+void Event::synchronize() const {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaEventSynchronize(event_));
+}
+
+Stream::Stream(int device, unsigned flags) : device_(device) {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, flags));
+}
+
+Stream::~Stream() noexcept {
+    if (stream_ != nullptr) {
+        on_device_noexcept(device_, [&] { (void)cudaStreamDestroy(stream_); });
+    }
+}
+
+Stream::Stream(Stream&& other) noexcept
+    : device_(other.device_), stream_(std::exchange(other.stream_, nullptr)) {}
+
+Stream& Stream::operator=(Stream&& other) noexcept {
+    if (this != &other) {
+        if (stream_ != nullptr) {
+            on_device_noexcept(device_, [&] { (void)cudaStreamDestroy(stream_); });
+        }
+        device_ = other.device_;
+        stream_ = std::exchange(other.stream_, nullptr);
+    }
+    return *this;
+}
+
+StreamHandle current_stream(int device) {
+    if (device < 0) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
+    }
+    {
+        std::lock_guard lock(active_streams_mutex);
+        const auto thread = active_streams.find(std::this_thread::get_id());
+        if (thread != active_streams.end()) {
+            const auto found = thread->second.find(device);
+            if (found != thread->second.end() && found->second) {
+                return found->second;
+            }
+        }
+    }
+    auto context = default_context(device);
+    auto* stream = &context->stream();
+    auto owner = std::shared_ptr<Stream>(context, stream);
+    return StreamHandle(device, stream->get(), std::move(owner));
+}
+
+StreamHandle stream_from_pool(bool high_priority, int device) {
+    if (device < 0) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
+    }
+    int least = 0;
+    int greatest = 0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    const int priority = high_priority ? greatest : 0;
+    DeviceGuard guard(device);
+    cudaStream_t raw = nullptr;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamCreateWithPriority(
+        &raw, cudaStreamNonBlocking, priority));
+    // Stream's ordinary constructor cannot adopt a raw stream, so retain it
+    // through an independent shared owner with the same value semantics.
+    auto owner = std::shared_ptr<Stream>();
+    auto raw_owner = std::shared_ptr<void>(
+        reinterpret_cast<void*>(raw), [device](void* value) {
+            on_device_noexcept(device, [&] {
+                (void)cudaStreamDestroy(reinterpret_cast<cudaStream_t>(value));
+            });
+        });
+    // Alias the raw lifetime to a dummy Stream pointer.  StreamHandle only
+    // needs shared ownership; it never dereferences owner_.
+    owner = std::shared_ptr<Stream>(raw_owner, static_cast<Stream*>(nullptr));
+    return StreamHandle(device, raw, std::move(owner));
+}
+
+StreamGuard::StreamGuard(StreamHandle stream) : device_(stream.device_index()) {
+    std::lock_guard lock(active_streams_mutex);
+    auto& streams = active_streams[std::this_thread::get_id()];
+    if (const auto found = streams.find(device_); found != streams.end()) {
+        previous_ = found->second;
+    }
+    streams[device_] = std::move(stream);
+}
+
+StreamGuard::~StreamGuard() noexcept {
+    std::lock_guard lock(active_streams_mutex);
+    const auto thread_id = std::this_thread::get_id();
+    auto& streams = active_streams[thread_id];
+    if (previous_.has_value()) {
+        streams[device_] = std::move(*previous_);
+    } else {
+        streams.erase(device_);
+        if (streams.empty()) active_streams.erase(thread_id);
+    }
+}
+
+Graph::~Graph() noexcept {
+    reset();
+}
+
+Graph::Graph(Graph&& other) noexcept
+    : device_(other.device_),
+      stream_(std::move(other.stream_)),
+      context_(std::move(other.context_)),
+      pool_streams_(std::move(other.pool_streams_)),
+      pool_contexts_(std::move(other.pool_contexts_)),
+      graph_(std::exchange(other.graph_, nullptr)),
+      executable_(std::exchange(other.executable_, nullptr)),
+      shared_pool_(std::exchange(other.shared_pool_, false)) {}
+
+Graph& Graph::operator=(Graph&& other) noexcept {
+    if (this != &other) {
+        reset();
+        device_ = other.device_;
+        stream_ = std::move(other.stream_);
+        context_ = std::move(other.context_);
+        pool_streams_ = std::move(other.pool_streams_);
+        pool_contexts_ = std::move(other.pool_contexts_);
+        graph_ = std::exchange(other.graph_, nullptr);
+        executable_ = std::exchange(other.executable_, nullptr);
+        shared_pool_ = std::exchange(other.shared_pool_, false);
+    }
+    return *this;
+}
+
+void Graph::prepare_memory() {
+    prepare_memory({});
+}
+
+void Graph::prepare_memory(
+        const std::vector<StreamHandle>& participant_streams) {
+    reset();
+    stream_ = current_stream();
+    device_ = stream_.device_index();
+    context_ = default_context(device_);
+    const auto add_pool = [&](const StreamHandle& candidate) {
+        if (!candidate) return;
+        const auto duplicate = std::find_if(
+            pool_streams_.begin(), pool_streams_.end(),
+            [&](const StreamHandle& existing) {
+                return existing.device_index() == candidate.device_index() &&
+                    existing.stream() == candidate.stream();
+            });
+        if (duplicate != pool_streams_.end()) return;
+        auto participant_context =
+            default_context(candidate.device_index());
+        if (!participant_context->supports_async_allocations()) {
+            throw Error(
+                "CUDA graph participant does not support async allocations");
+        }
+        participant_context->begin_graph_pool(candidate.stream());
+        participant_context->begin_graph_warmup(candidate.stream());
+        pool_streams_.push_back(candidate);
+        pool_contexts_.push_back(std::move(participant_context));
+    };
+    try {
+        add_pool(stream_);
+        for (const auto& participant : participant_streams) {
+            add_pool(participant);
+        }
+    } catch (...) {
+        reset();
+        throw;
+    }
+}
+
+void Graph::capture_begin() {
+    if (!stream_) {
+        prepare_memory();
+    }
+    const auto active = current_stream();
+    if (active.device_index() != device_ ||
+            active.stream() != stream_.stream()) {
+        throw Error(
+            "CUDA graph capture stream differs from its prepared memory stream");
+    }
+    DeviceGuard guard(device_);
+    try {
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->begin_graph_capture(
+                pool_streams_[index].stream());
+        }
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
+            stream_.stream(), cudaStreamCaptureModeGlobal));
+    } catch (...) {
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->end_graph_capture(
+                pool_streams_[index].stream());
+        }
+        throw;
+    }
+}
+
+void Graph::capture_begin_shared() {
+    if (stream_ || graph_ || executable_) throw Error("graph already owns a capture");
+    stream_ = current_stream();
+    device_ = stream_.device_index();
+    context_ = default_context(device_);
+    shared_pool_ = true;
+    context_->begin_graph_capture(stream_.stream());
+    try {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
+            stream_.stream(), cudaStreamCaptureModeThreadLocal));
+    } catch (...) {
+        context_->end_graph_capture(stream_.stream());
+        throw;
+    }
+}
+
+std::size_t Graph::nodes() const {
+    if (!graph_) return 0;
+    DeviceGuard guard(device_);
+    std::size_t count = 0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &count));
+    return count;
+}
+
+void Graph::capture_end() {
+    if (!stream_) {
+        throw Error("CUDA graph capture_end called without capture_begin");
+    }
+    DeviceGuard guard(device_);
+    const auto capture_status =
+        cudaStreamEndCapture(stream_.stream(), &graph_);
+    if (shared_pool_) context_->end_graph_capture(stream_.stream());
+    for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+        pool_contexts_[index]->end_graph_capture(
+            pool_streams_[index].stream());
+    }
+    TYLOINFER_NATIVE_CUDA_CHECK(capture_status);
+    if (const char* dot_path = std::getenv("TYLOINFER_NATIVE_CUDA_GRAPH_DOT");
+        dot_path != nullptr && dot_path[0] != '\0') {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphDebugDotPrint(
+            graph_, dot_path, cudaGraphDebugDotFlagsVerbose));
+    }
+    if (const char* trace = std::getenv("TYLOINFER_TRACE_NATIVE_CUDA_GRAPH");
+        trace != nullptr && std::atoi(trace) != 0) {
+        std::size_t count = 0;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &count));
+        std::vector<cudaGraphNode_t> nodes(count);
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &count));
+        std::unordered_set<void*> allocations;
+        std::unordered_set<void*> frees;
+        std::unordered_set<void*> reported_kernels;
+        const char* resources=std::getenv("TYLOINFER_TRACE_NATIVE_CUDA_KERNEL_RESOURCES");
+        std::size_t kernels = 0;
+        std::size_t copies = 0;
+        std::size_t memops = 0;
+        for (auto node : nodes) {
+            // The Runtime API cannot classify a driver BatchMemOp node in
+            // older toolkits, even though capture/instantiate/replay support
+            // it. Query through the API that defines that node type.
+            CUgraphNodeType type = CU_GRAPH_NODE_TYPE_EMPTY;
+            const auto queried=cuGraphNodeGetType(reinterpret_cast<CUgraphNode>(node),&type);
+            if(queried!=CUDA_SUCCESS) {
+                const char* error=nullptr;cuGetErrorString(queried,&error);
+                throw Error(std::string("CUDA graph node type: ")+(error?error:"driver error"));
+            }
+            if (type == CU_GRAPH_NODE_TYPE_KERNEL) {
+                ++kernels;
+                if(resources && std::atoi(resources)!=0) {
+                    cudaKernelNodeParams params{};
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphKernelNodeGetParams(node,&params));
+                    if(reported_kernels.insert(params.func).second) {
+                        cudaFuncAttributes attributes{};
+                        TYLOINFER_NATIVE_CUDA_CHECK(cudaFuncGetAttributes(&attributes,params.func));
+                        std::cerr<<"native_cuda_kernel function="<<params.func
+                            <<" grid="<<params.gridDim.x<<','<<params.gridDim.y<<','<<params.gridDim.z
+                            <<" block="<<params.blockDim.x<<','<<params.blockDim.y<<','<<params.blockDim.z
+                            <<" registers="<<attributes.numRegs<<" local_bytes="<<attributes.localSizeBytes
+                            <<" static_shared_bytes="<<attributes.sharedSizeBytes
+                            <<" dynamic_shared_bytes="<<params.sharedMemBytes<<'\n';
+                    }
+                }
+            } else if (type == CU_GRAPH_NODE_TYPE_MEMCPY) {
+                ++copies;
+            } else if (type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP) {
+                ++memops;
+            } else if (type == CU_GRAPH_NODE_TYPE_MEM_ALLOC) {
+                cudaMemAllocNodeParams params{};
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphMemAllocNodeGetParams(node, &params));
+                allocations.insert(reinterpret_cast<void*>(params.dptr));
+            } else if (type == CU_GRAPH_NODE_TYPE_MEM_FREE) {
+                void* pointer = nullptr;
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphMemFreeNodeGetParams(node, &pointer));
+                frees.insert(pointer);
+            }
+        }
+        std::size_t allocation_only = 0;
+        std::size_t free_only = 0;
+        for (auto pointer : allocations) {
+            allocation_only += frees.contains(pointer) ? 0 : 1;
+        }
+        for (auto pointer : frees) {
+            free_only += allocations.contains(pointer) ? 0 : 1;
+        }
+        std::cerr << "native_cuda_graph nodes=" << count
+                  << " kernels=" << kernels
+                  << " copies=" << copies
+                  << " memops=" << memops
+                  << " allocations=" << allocations.size()
+                  << " frees=" << frees.size()
+                  << " allocation_only=" << allocation_only
+                  << " free_only=" << free_only << '\n';
+    }
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphInstantiate(&executable_, graph_, 0));
+    // A first replay may block in the driver while it uploads a large graph.
+    // Prepare it before replay can wait for CPU-produced mapped flags.
+    if (const char* upload = std::getenv("TYLOINFER_NATIVE_CUDA_GRAPH_UPLOAD");
+        upload == nullptr || std::atoi(upload) != 0) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphUpload(executable_, stream_.stream()));
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));
+        default_context(stream_.device_index())->check_memory_limit();
+    }
+}
+
+void Graph::replay() {
+    if (executable_ == nullptr || !stream_) {
+        throw Error("CUDA graph replay called before capture");
+    }
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphLaunch(executable_, stream_.stream()));
+}
+
+void Graph::reset() noexcept {
+    on_device_noexcept(device_, [&] {
+        if (stream_) {
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(
+                    stream_.stream(), &capture_status) == cudaSuccess &&
+                    capture_status != cudaStreamCaptureStatusNone) {
+                cudaGraph_t abandoned = nullptr;
+                if (cudaStreamEndCapture(
+                        stream_.stream(), &abandoned) == cudaSuccess &&
+                        abandoned != nullptr) {
+                    (void)cudaGraphDestroy(abandoned);
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+            (void)cudaStreamSynchronize(stream_.stream());
+        }
+        if (executable_ != nullptr) {
+            (void)cudaGraphExecDestroy(executable_);
+            executable_ = nullptr;
+        }
+        if (graph_ != nullptr) {
+            (void)cudaGraphDestroy(graph_);
+            graph_ = nullptr;
+        }
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->end_graph_capture(
+                pool_streams_[index].stream());
+            pool_contexts_[index]->end_graph_pool(
+                pool_streams_[index].stream());
+        }
+        if (shared_pool_ && context_) context_->end_graph_capture(stream_.stream());
+    });
+    pool_contexts_.clear();
+    pool_streams_.clear();
+    context_.reset();
+    stream_ = {};
+    shared_pool_ = false;
+}
+
+void Stream::synchronize() const {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void Stream::wait(const Event& event) const {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(stream_, event.get(), 0));
+}
+
+BlasHandle::BlasHandle(int device) : device_(device) {
+    DeviceGuard guard(device_);
+    TYLOINFER_NATIVE_CUDA_CHECK(cublasCreate(&handle_));
+    // Match the established runtime's explicit setAllowTF32CuBLAS(false).
+    // Individual GEMM launchers select their exact accumulation type.
+    TYLOINFER_NATIVE_CUDA_CHECK(cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH));
+}
+
+BlasHandle::~BlasHandle() noexcept {
+    if (handle_ != nullptr) {
+        on_device_noexcept(device_, [&] { (void)cublasDestroy(handle_); });
+    }
+}
+
+BlasHandle::BlasHandle(BlasHandle&& other) noexcept
+    : device_(other.device_), handle_(std::exchange(other.handle_, nullptr)) {}
+
+BlasHandle& BlasHandle::operator=(BlasHandle&& other) noexcept {
+    if (this != &other) {
+        if (handle_ != nullptr) {
+            on_device_noexcept(device_, [&] { (void)cublasDestroy(handle_); });
+        }
+        device_ = other.device_;
+        handle_ = std::exchange(other.handle_, nullptr);
+    }
+    return *this;
+}
+
+void BlasHandle::set_stream(cudaStream_t stream) {
+    TYLOINFER_NATIVE_CUDA_CHECK(cublasSetStream(handle_, stream));
+}
+
+Context::Context(int device)
+    : device_(device), stream_(device), blas_(device) {
+    DeviceGuard guard(device_);
+    allocation_budget_=device_allocation_budget(device_);
+    int pools_supported = 0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(
+        &pools_supported, cudaDevAttrMemoryPoolsSupported, device_));
+    async_allocations_ = pools_supported != 0;
+    if (async_allocations_) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool_, device_));
+        std::uint64_t threshold = allocation_budget_->limit ? 0 : std::numeric_limits<std::uint64_t>::max();
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(
+            pool_, cudaMemPoolAttrReleaseThreshold, &threshold));
+    }
+    blas_.set_stream(stream_.get());
+}
+
+BlasHandle& Context::blas(cudaStream_t stream) {
+    if(stream==stream_.get())return blas_;
+    std::lock_guard lock(stream_blas_mutex_);
+    auto& handle=stream_blas_[stream];
+    if(!handle) {
+        DeviceGuard guard(device_);cudaStreamCaptureStatus capture;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
+        if(capture!=cudaStreamCaptureStatusNone)throw Error("cuBLAS stream was not prepared before capture");
+        auto candidate=std::make_unique<BlasHandle>(device_);candidate->set_stream(stream);handle=std::move(candidate);
+    }
+    return *handle;
+}
+
+DeviceMemoryStats Context::memory_stats() const noexcept {
+    return {allocation_budget_->limit,allocation_budget_->allocated.load(std::memory_order_relaxed),
+        allocation_budget_->peak.load(std::memory_order_relaxed)};
+}
+
+std::size_t Context::local_memory_usage() const {
+#ifdef _WIN32
+    if(allocation_budget_->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(FAILED(allocation_budget_->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory)))
+            throw Error("Cannot read WDDM process VRAM usage for the configured limit");
+        return static_cast<std::size_t>(memory.CurrentUsage);
+    }
+#endif
+    return memory_stats().allocated;
+}
+
+std::optional<ProcessDeviceMemoryStats> process_device_memory_stats(int device) {
+#ifdef _WIN32
+    const auto allocation=device_allocation_budget(device);
+    if(allocation->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(allocation->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))) {
+            ProcessDeviceMemoryStats result{std::size_t(memory.Budget),std::size_t(memory.CurrentUsage),
+                std::size_t(memory.CurrentReservation)};
+            DXGI_QUERY_VIDEO_MEMORY_INFO shared{};
+            if(SUCCEEDED(allocation->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&shared))) {
+                result.shared_budget=std::size_t(shared.Budget);result.shared_usage=std::size_t(shared.CurrentUsage);
+            }
+            return result;
+        }
+    }
+#else
+    (void)device;
+#endif
+    return {};
+}
+
+std::size_t Context::resident_memory_usage() const {
+    DeviceGuard guard(device_);
+    auto bytes=memory_stats().allocated;
+    const auto [used,reserved]=pool_memory_stats();
+    // Allocated bytes already include live pool and graph allocations.
+    // Add only unused pages, never device-wide usage from other processes.
+    if(reserved>used)bytes+=reserved-used;
+    return std::max(bytes,local_memory_usage());
+}
+
+std::optional<std::size_t> shared_memory_available(int device) {
+#ifdef _WIN32
+    const auto budget=device_allocation_budget(device);
+    if(budget->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(budget->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&memory)))
+            return memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
+    }
+#endif
+    return std::nullopt;
+}
+
+std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
+    DeviceGuard guard(device_);
+    std::uint64_t used=0,reserved=0;
+    const auto add=[&](cudaMemPool_t memory) {
+        if(!memory)return;
+        std::uint64_t current_used=0,current_reserved=0;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&current_used));
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrReservedMemCurrent,&current_reserved));
+        used+=current_used;reserved+=current_reserved;
+    };
+    add(pool_);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(const auto& [memory,retired]:allocation_budget_->graph_memory_pools)add(memory);
+    return {used,reserved};
+}
+
+static std::size_t reusable_pool_bytes(cudaMemPool_t pool) {
+    if(!pool)return 0;
+    std::uint64_t used=0,reserved=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&used));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    return reserved>used?std::size_t(reserved-used):0;
+}
+
+std::size_t Context::reusable_workspace_bytes() const {
+    DeviceGuard guard(device_);
+    if(isolated_prefill_allocations) {
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        return reusable_pool_bytes(allocation_budget_->prefill_memory_pool);
+    }
+    return reusable_pool_bytes(pool_);
+}
+
+std::size_t Context::reusable_dense_weight_bytes() const {
+    DeviceGuard guard(device_);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    return reusable_pool_bytes(allocation_budget_->dense_weight_memory_pool);
+}
+
+void Context::trim_pool_pages() const {
+    if(pool_)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(auto entry=allocation_budget_->graph_memory_pools.begin();entry!=allocation_budget_->graph_memory_pools.end();) {
+        const auto [memory,retired]=*entry;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(memory,0));
+        std::uint64_t used=0;
+        if(retired)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&used));
+        if(retired && !used) {
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(memory));
+            if(allocation_budget_->shared_graph_memory_pool==memory)
+                allocation_budget_->shared_graph_memory_pool=nullptr;
+            entry=allocation_budget_->graph_memory_pools.erase(entry);
+        } else ++entry;
+    }
+}
+
+std::size_t Context::available_memory() const {
+    DeviceGuard guard(device_);
+    std::size_t free=0,total=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+    if(const auto physical=physical_device_memory_stats(device_))free=std::min(free,physical->free);
+#ifdef _WIN32
+    // CUDA may allocate beyond WDDM's current local-memory budget and let the
+    // driver page live weights through system RAM. Price revocable caches and
+    // new workspace against physical residency, before that silent slowdown.
+    if(allocation_budget_->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(allocation_budget_->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))) {
+            const auto available=memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
+            if(available<free) {
+                static std::atomic<bool> reported{false};
+                if(std::getenv("TYLOINFER_PROFILE_SSD_EXPERTS") && !reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"cuda_residency_budget scope=first_limit cuda_free_bytes=%zu budget_bytes=%llu usage_bytes=%llu available_bytes=%zu\n",
+                        free,static_cast<unsigned long long>(memory.Budget),static_cast<unsigned long long>(memory.CurrentUsage),available);
+                free=available;
+            }
+        }
+    }
+#endif
+    const auto budget=memory_stats();
+    if(budget.limit) {
+        const auto used=resident_memory_usage();
+        free=std::min(free,used<budget.limit?budget.limit-used:0);
+    }
+    return free;
+}
+
+void Context::reclaim_idle_memory() {
+    DeviceGuard guard(device_);
+    // Phase transitions must retire frees on all compute/transfer streams.
+    // Trimming unused pages leaves live graph-pool allocations untouched.
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+    trim_pool_pages();
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_POOLS");trace && trace[0]=='1') {
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        std::fprintf(stderr,
+            "cuda_pool_idle_bytes workspace=%zu prefill=%zu dense=%zu resident=%zu recurrence=%zu indexer=%zu routed=%zu graph=%zu\n",
+            reusable_pool_bytes(pool_),
+            reusable_pool_bytes(allocation_budget_->prefill_memory_pool),
+            reusable_pool_bytes(allocation_budget_->dense_weight_memory_pool),
+            reusable_pool_bytes(allocation_budget_->resident_memory_pool),
+            reusable_pool_bytes(allocation_budget_->request_state_memory_pool),
+            reusable_pool_bytes(allocation_budget_->indexer_memory_pool),
+            reusable_pool_bytes(allocation_budget_->routed_weight_memory_pool),
+            reusable_pool_bytes(allocation_budget_->shared_graph_memory_pool));
+    }
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1') {
+        std::lock_guard lock(graph_pool_mutex_);
+        std::size_t cached=0,blocks=0;
+        for(const auto& [stream,pool]:graph_pools_)for(const auto& [bytes,pointers]:pool.available) {
+            cached+=bytes*pointers.size();blocks+=pointers.size();
+        }
+        std::fprintf(stderr,"graph_workspace_memory cached_bytes=%zu cached_blocks=%zu\n",cached,blocks);
+    }
+}
+
+void Context::set_memory_limit(std::size_t bytes) {
+    // Called by the engine only while no requests or expert transfers are active.
+    reclaim_idle_memory();
+    if(bytes && bytes < std::max(memory_stats().allocated,local_memory_usage()))
+        throw Error("resident memory budget is below live CUDA allocations");
+    allocation_budget_->limit=bytes;
+}
+
+void Context::check_memory_limit(std::size_t additional) const {
+    if(!allocation_budget_->limit)return;
+    auto usage=local_memory_usage();
+    // Completed asynchronous frees can leave reusable pool pages charged to
+    // WDDM. Release those pages before pricing a new allocation against the
+    // process limit; the logical allocation budget remains checked separately.
+    if(!nonblocking_allocations && async_allocations_ && pool_ && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
+        trim_pool_pages();
+        usage=local_memory_usage();
+    }
+    if(!nonblocking_allocations && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
+        // A layer transition may still have frees pending on transfer/compute
+        // streams. Retire them before rejecting a request against physical use.
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+        trim_pool_pages();
+        usage=local_memory_usage();
+    }
+    if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
+        const auto [pool_used,pool_reserved]=pool_memory_stats();
+        const auto limit=allocation_budget_->limit;
+        const auto excess=usage>limit?usage-limit:0;
+        const auto shortfall=excess?excess+std::min(additional,SIZE_MAX-excess):additional-(limit-usage);
+        throw CudaMemoryLimitExceeded("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
+            " requested="+std::to_string(additional)+" limit="+std::to_string(allocation_budget_->limit)+
+            " owned="+std::to_string(memory_stats().allocated)+" pool_used="+std::to_string(pool_used)+
+            " pool_reserved="+std::to_string(pool_reserved),shortfall);
+    }
+}
+
+void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                                  cudaStream_t stream,std::shared_ptr<void> backing) {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)throw Error("CUDA workspace loan is already active");
+    auto loan=std::make_unique<WorkspaceLoan>();
+    loan->stream=stream;loan->thread=std::this_thread::get_id();
+    for(const auto& [pointer,bytes]:regions) {
+        const auto raw=reinterpret_cast<std::uintptr_t>(pointer);
+        const auto begin=(raw+255)&~std::uintptr_t(255);
+        if(begin-raw>=bytes)continue;
+        const auto size=(bytes-(begin-raw))&~std::size_t(255);
+        if(size && !loan->free.emplace(begin,size).second)throw Error("duplicate CUDA workspace loan region");
+    }
+    for(auto it=loan->free.begin();it!=loan->free.end();++it) {
+        const auto next=std::next(it);
+        if(next==loan->free.end())break;
+        if(it->first+it->second>next->first)throw Error("overlapping CUDA workspace loan regions");
+        // Keep a gap between distinct allocations even when the allocator
+        // happened to place them adjacently. Never coalesce across their bounds.
+        if(it->first+it->second==next->first)it->second-=256;
+    }
+    loan->backing=std::move(backing);workspace_loan_=std::move(loan);
+}
+void Context::suspend_workspace_loan() {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)workspace_loan_->enabled=false;
+}
+void Context::end_workspace_loan() {
+    std::unique_ptr<WorkspaceLoan> released;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && !workspace_loan_->live.empty()) {
+            std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+            throw Error("CUDA workspace loan still has live tensors: count="+
+                std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+        }
+        released=std::move(workspace_loan_);
+    }
+    // A backing tensor can itself release storage through this Context.
+    // Destroy it only after dropping graph_pool_mutex_.
+}
+void Context::retire_workspace_loan() noexcept {
+    std::unique_ptr<WorkspaceLoan> released;
+    try {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(!workspace_loan_)return;
+        workspace_loan_->enabled=false;workspace_loan_->retiring=true;
+        if(workspace_loan_->live.empty())released=std::move(workspace_loan_);
+    }catch(...) {return;}
+    if(released)on_device_noexcept(device_,[&] {(void)cudaStreamSynchronize(released->stream);});
+}
+bool Context::workspace_loan_active() const {
+    std::lock_guard lock(graph_pool_mutex_);return bool(workspace_loan_);
+}
+std::size_t Context::workspace_available() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id())
+        for(const auto& [p,n]:workspace_loan_->free)bytes+=n;
+    return bytes;
+}
+std::size_t Context::workspace_largest_available(cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id() && workspace_loan_->stream==stream)
+        for(const auto& [p,n]:workspace_loan_->free)bytes=std::max(bytes,n);
+    return bytes;
+}
+std::size_t Context::workspace_live_bytes() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_)for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+    return bytes;
+}
+
+bool Context::workspace_allocations_fit(const std::vector<std::size_t>& allocations,
+        std::size_t ordinary,cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::vector<std::size_t> intervals;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->stream==stream &&
+                workspace_loan_->thread==std::this_thread::get_id())
+            for(const auto& [pointer,bytes]:workspace_loan_->free)intervals.push_back(bytes);
+    }
+    return routed_workspace_allocations_fit(allocations,std::move(intervals),ordinary);
+}
+
+std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::vector<std::pair<void*,std::size_t>> result;
+    if(!workspace_loan_)return result;
+    auto ranges=workspace_loan_->touched;
+    std::sort(ranges.begin(),ranges.end());
+    for(const auto& [begin,size]:ranges) {
+        if(!result.empty()) {
+            auto& last=result.back();
+            const auto previous=reinterpret_cast<std::uintptr_t>(last.first);
+            if(begin<=previous+last.second) {
+                last.second=std::max(previous+last.second,begin+size)-previous;
+                continue;
+            }
+        }
+        result.emplace_back(reinterpret_cast<void*>(begin),size);
+    }
+    return result;
+}
+
+void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
+    if (bytes == 0) {
+        return nullptr;
+    }
+    DeviceGuard guard(device_);
+    const auto allocation_stream =
+        stream != nullptr ? stream : stream_.get();
+    bool capture_pool_miss = false,pooled_allocation=false;
+    cudaMemPool_t allocation_pool=pool_;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if (auto pool = graph_pools_.find(allocation_stream);
+            pool != graph_pools_.end() && (pool->second.capturing ||
+                (pool->second.warming && !resident_allocations))) {
+            if(pool->second.memory)allocation_pool=pool->second.memory;
+            pooled_allocation=true;
+            // Stable size classes let serial graph shapes share scratch. The
+            // same request must use the same class in warmup and capture; a
+            // free-form best-fit choice can consume a later operation's slot.
+            if(bytes>=4096) {
+                std::size_t capacity=4096;
+                while(capacity<bytes) {
+                    if(capacity>SIZE_MAX/2)throw Error("CUDA graph workspace size overflows");
+                    capacity*=2;
+                }
+                bytes=capacity;
+            }
+            auto available = pool->second.available.find(bytes);
+            if (available != pool->second.available.end() &&
+                    !available->second.empty()) {
+                void* pointer = available->second.back();
+                available->second.pop_back();
+                return pointer;
+            }
+            capture_pool_miss = pool->second.capturing;
+        }
+        if(!pooled_allocation && !resident_allocations && workspace_loan_ &&
+                workspace_loan_->enabled && workspace_loan_->stream==allocation_stream &&
+                workspace_loan_->thread==std::this_thread::get_id() && bytes<=SIZE_MAX-255) {
+            auto& loan=*workspace_loan_;
+            const auto aligned=(bytes+255)&~std::size_t(255);
+            // Best fit keeps the large regions available for transfer images.
+            auto best=loan.free.end();
+            for(auto it=loan.free.begin();it!=loan.free.end();++it)
+                if(it->second>=aligned && (best==loan.free.end() || it->second<best->second))best=it;
+            if(best!=loan.free.end()) {
+                const auto base=best->first,size=best->second;
+                auto* result=reinterpret_cast<void*>(base);
+                // Record conservatively before publishing the allocation.
+                // A failed bookkeeping allocation can only cause extra restore.
+                loan.touched.emplace_back(base,aligned);
+                loan.live.emplace(result,aligned);
+                loan.free.erase(best);
+                if(size>aligned)loan.free.emplace(base+aligned,size-aligned);
+                return result;
+            }
+        }
+    }
+    if (capture_pool_miss) {
+        throw Error(
+            "CUDA graph capture requested an un-warmed allocation of " +
+            std::to_string(bytes) + " bytes");
+    }
+    void* pointer = nullptr;
+    const bool async=async_allocations_;
+    if(async && (resident_allocations || isolated_prefill_allocations) && !pooled_allocation) {
+        // Indexer and recurrent state move independently. Keeping their pages
+        // separate lets either pool shrink while the other remains live.
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        auto& memory=!resident_allocations?allocation_budget_->prefill_memory_pool:
+            routed_weight_allocations?allocation_budget_->routed_weight_memory_pool:
+            dense_weight_allocations?allocation_budget_->dense_weight_memory_pool:
+            request_state_allocations==RequestStateAllocationScope::Kind::Indexer?allocation_budget_->indexer_memory_pool:
+            request_state_allocations?allocation_budget_->request_state_memory_pool:allocation_budget_->resident_memory_pool;
+        if(!memory) {
+            cudaMemPoolProps properties{};
+            properties.allocType=cudaMemAllocationTypePinned;
+            properties.location.type=cudaMemLocationTypeDevice;
+            properties.location.id=device_;
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            try {
+                std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+                if(routed_weight_allocations) {
+                    // An implicit reuse dependency can wait for a free queued
+                    // after a graph that itself waits for expert admission.
+                    // Reuse completed pages without inventing that cycle.
+                    int dependencies=0;
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolReuseAllowInternalDependencies,&dependencies));
+                }
+                allocation_budget_->graph_memory_pools.emplace(memory,false);
+            } catch(...) {(void)cudaMemPoolDestroy(memory);memory=nullptr;throw;}
+        }
+        allocation_pool=memory;
+    }
+    bool verify_pool_reuse=false,verify_request_state=false;
+    if(allocation_budget_->limit) {
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream,&capture));
+        if(capture==cudaStreamCaptureStatusNone) {
+            // Request-state pools can grow by more than the allocation. Check
+            // that growth before handing the tensor to admission or restore.
+            verify_request_state=request_state_allocations && async && allocation_pool;
+            const auto usage=local_memory_usage();
+            if(async && allocation_pool && usage<=allocation_budget_->limit &&
+                    bytes>allocation_budget_->limit-usage) {
+                std::uint64_t used=0,reserved=0;
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrUsedMemCurrent,&used));
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
+                // Reusing existing pages need not increase WDDM's charge.
+                // Check the actual charge after malloc and roll back if the
+                // allocator had to grow the pool instead.
+                verify_pool_reuse=reserved>=used && bytes<=reserved-used;
+            }
+            if(!verify_pool_reuse && (usage>allocation_budget_->limit || bytes>allocation_budget_->limit-usage))
+                check_memory_limit(bytes);
+        }
+    }
+    allocation_budget_->acquire(bytes);
+    try {
+        auto result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
+            : cudaMalloc(&pointer,bytes);
+        if(result==cudaErrorMemoryAllocation && !nonblocking_allocations) {
+            (void)cudaGetLastError();
+            reclaim_idle_memory();
+            result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
+                : cudaMalloc(&pointer,bytes);
+        }
+        if(result==cudaErrorMemoryAllocation)
+            throw MfqResourceExhausted("CUDA allocation failed: requested="+std::to_string(bytes)+
+                " allocated="+std::to_string(memory_stats().allocated));
+        TYLOINFER_NATIVE_CUDA_CHECK(result);
+        if(verify_pool_reuse || verify_request_state)check_memory_limit();
+        if(pooled_allocation) {
+            std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.emplace(pointer,bytes);
+            graph_pools_.at(allocation_stream).owned.insert(pointer);
+        }
+    } catch(...) {
+        if(pooled_allocation && pointer) {
+            std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.erase(pointer);
+            graph_pools_.at(allocation_stream).owned.erase(pointer);
+        }
+        if(pointer) {
+            if(async_allocations_)(void)cudaFreeAsync(pointer,allocation_stream);else (void)cudaFree(pointer);
+            if(verify_request_state && !nonblocking_allocations) {
+                // Retire the failed allocation before the caller retries it in RAM.
+                if(cudaStreamSynchronize(allocation_stream)==cudaSuccess)
+                    (void)cudaMemPoolTrimTo(allocation_pool,0);
+            }
+        }
+        allocation_budget_->release(bytes);throw;
+    }
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_allocate pointer="<<pointer<<" bytes="<<bytes
+            <<" graph="<<pooled_allocation<<" resident="<<resident_allocations<<'\n';
+    return pointer;
+}
+
+void Context::release(
+        void* pointer,
+        std::size_t bytes,
+        cudaStream_t stream) noexcept {
+    if (pointer == nullptr) {
+        return;
+    }
+    const auto allocation_stream =
+        stream != nullptr ? stream : stream_.get();
+    std::unique_ptr<WorkspaceLoan> retired_loan;
+    try {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_) {
+            auto& loan=*workspace_loan_;
+            if(auto it=loan.live.find(pointer);it!=loan.live.end()) {
+                if(loan.retiring) {
+                    loan.live.erase(it);
+                    if(!loan.live.empty())return;
+                    retired_loan=std::move(workspace_loan_);
+                } else {
+                    const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
+                    auto entry=loan.free.emplace(base,size).first;
+                    loan.live.erase(it);
+                    if(entry!=loan.free.begin()) {
+                        auto before=std::prev(entry);
+                        if(before->first+before->second==entry->first) {
+                            before->second+=entry->second;loan.free.erase(entry);entry=before;
+                        }
+                    }
+                    auto after=std::next(entry);
+                    if(after!=loan.free.end() && entry->first+entry->second==after->first) {
+                        entry->second+=after->second;loan.free.erase(after);
+                    }
+                    return;
+                }
+            }
+        }
+        if(!retired_loan) {
+            if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
+                bytes=capacity->second;
+            if (auto pool = graph_pools_.find(allocation_stream);
+                pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
+                pool->second.available[bytes].push_back(pointer);
+                return;
+            }
+            graph_allocation_sizes_.erase(pointer);
+        }
+    } catch (...) {
+        // Tensor destruction is noexcept. A warm-up bookkeeping allocation
+        // failure must release the CUDA allocation instead of terminating or
+        // leaking it. During capture the size bucket already exists and the
+        // preceding pop leaves enough vector capacity for this push.
+        std::lock_guard lock(graph_pool_mutex_);
+        // A host bookkeeping failure must never cudaFree an expert-cache
+        // suballocation. Keeping the live record makes return fail safely.
+        if(workspace_loan_ && workspace_loan_->live.count(pointer))return;
+        if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
+            pool->second.owned.erase(pointer);
+        graph_allocation_sizes_.erase(pointer);
+    }
+    if(retired_loan) {
+        // Tensor destruction enqueues cross-stream reader fences before
+        // release(). Complete them before returning an arena interval that
+        // another cache upload stream could immediately reuse.
+        on_device_noexcept(device_,[&] {(void)cudaStreamSynchronize(allocation_stream);});
+        return;
+    }
+    on_device_noexcept(device_, [&] {
+        if (async_allocations_) {
+            (void)cudaFreeAsync(pointer, allocation_stream);
+        } else {
+            (void)cudaFree(pointer);
+        }
+    });
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_release pointer="<<pointer<<" bytes="<<bytes<<'\n';
+    allocation_budget_->release(bytes);
+}
+
+bool Context::has_graph_pool(cudaStream_t stream) const {
+    std::lock_guard lock(graph_pool_mutex_);return graph_pools_.count(stream)!=0;
+}
+void Context::begin_graph_pool(cudaStream_t stream,bool share_existing) {
+    if (stream == nullptr) {
+        throw std::invalid_argument("CUDA graph memory pool requires a stream");
+    }
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto [found, inserted] = graph_pools_.try_emplace(stream);
+    if (!inserted) {
+        if(share_existing) {
+            if(found->second.owners==std::numeric_limits<std::size_t>::max())
+                throw Error("CUDA graph memory pool owner count overflow");
+            ++found->second.owners;return;
+        }
+        throw Error("CUDA graph memory pool is already active on this stream");
+    }
+    if(async_allocations_) {
+        // Graph scratch has a short lifetime compared with resident model
+        // weights. Keep its backing pages separate so retiring a window can
+        // return all of them despite live allocations in the default pool.
+        DeviceGuard guard(device_);
+        // Tight budgets can have more already charged space in the ordinary
+        // pool than free device pages. The graph still owns its allocations.
+        if(reusable_pool_bytes(pool_)>available_memory()) {
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1')
+                std::fprintf(stderr,"cuda_graph_workspace_pool reuse_ordinary=1\n");
+            return;
+        }
+        cudaMemPoolProps properties{};
+        properties.allocType=cudaMemAllocationTypePinned;
+        properties.location.type=cudaMemLocationTypeDevice;
+        properties.location.id=device_;
+        cudaMemPool_t memory=nullptr;
+        std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+        try {
+            // A workspace may outlive its graph by one operation. Reap its
+            // retired pool once its async free completes; pool handles are a
+            // finite driver resource even when their pages have been trimmed.
+            {
+                if(allocation_budget_->shared_graph_memory_pool) {
+                    memory=allocation_budget_->shared_graph_memory_pool;
+                    ++allocation_budget_->shared_graph_pool_users;
+                    allocation_budget_->graph_memory_pools.at(memory)=false;
+                    graph_pools_.at(stream).memory=memory;
+                    return;
+                }
+                for(auto entry=allocation_budget_->graph_memory_pools.begin();
+                        entry!=allocation_budget_->graph_memory_pools.end();) {
+                    std::uint64_t used=0;
+                    if(entry->second)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
+                        entry->first,cudaMemPoolAttrUsedMemCurrent,&used));
+                    if(entry->second && !used) {
+                        TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(entry->first));
+                        entry=allocation_budget_->graph_memory_pools.erase(entry);
+                    } else ++entry;
+                }
+            }
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+            allocation_budget_->graph_memory_pools.emplace(memory,false);
+            allocation_budget_->shared_graph_memory_pool=memory;
+            ++allocation_budget_->shared_graph_pool_users;
+            graph_pools_.at(stream).memory=memory;
+        } catch(...) {
+            if(memory)(void)cudaMemPoolDestroy(memory);
+            graph_pools_.erase(stream);throw;
+        }
+    }
+}
+
+void Context::begin_graph_capture(cudaStream_t stream) {
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto pool = graph_pools_.find(stream);
+    if (pool == graph_pools_.end()) {
+        throw Error("CUDA graph capture requires a prepared memory pool");
+    }
+    if (pool->second.capturing) {
+        throw Error("CUDA graph memory pool is already capturing");
+    }
+    pool->second.capturing = true;
+}
+void Context::begin_graph_warmup(cudaStream_t stream) {
+    std::lock_guard lock(graph_pool_mutex_);auto& pool=graph_pools_.at(stream);
+    if(pool.warming || pool.capturing)throw Error("nested CUDA graph warmup");pool.warming=true;
+}
+void Context::end_graph_warmup(cudaStream_t stream) noexcept {
+    std::lock_guard lock(graph_pool_mutex_);const auto pool=graph_pools_.find(stream);
+    if(pool!=graph_pools_.end())pool->second.warming=false;
+}
+
+void Context::end_graph_capture(cudaStream_t stream) noexcept {
+    std::lock_guard lock(graph_pool_mutex_);
+    if (const auto pool = graph_pools_.find(stream);
+        pool != graph_pools_.end()) {
+        pool->second.capturing = false;
+        pool->second.warming = false;
+    }
+}
+
+void Context::end_graph_pool(cudaStream_t stream) noexcept {
+    GraphPool pool;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        const auto found = graph_pools_.find(stream);
+        if (found == graph_pools_.end()) {
+            return;
+        }
+        if(found->second.owners>1){--found->second.owners;return;}
+        for(const auto& [bytes,pointers]:found->second.available)
+            for(void* pointer:pointers)graph_allocation_sizes_.erase(pointer);
+        pool = std::move(found->second);
+        graph_pools_.erase(found);
+    }
+    on_device_noexcept(device_, [&] {
+        for (const auto& [bytes, pointers] : pool.available) {
+            for (void* pointer : pointers) {
+                if (async_allocations_) {
+                    (void)cudaFreeAsync(pointer, stream);
+                } else {
+                    (void)cudaFree(pointer);
+                }
+                allocation_budget_->release(bytes);
+            }
+        }
+        if (async_allocations_) {
+            (void)cudaStreamSynchronize(stream);
+        }
+        // Request workspaces can outlive their graph. Keep that CUDA pool
+        // registered until their asynchronous releases finish as well.
+        if(pool.memory) {
+            std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+            if(pool.memory==allocation_budget_->shared_graph_memory_pool &&
+                    --allocation_budget_->shared_graph_pool_users) return;
+            std::uint64_t used=0;
+            if(cudaMemPoolGetAttribute(pool.memory,cudaMemPoolAttrUsedMemCurrent,&used)==cudaSuccess && !used) {
+                allocation_budget_->graph_memory_pools.erase(pool.memory);
+                (void)cudaMemPoolDestroy(pool.memory);
+                if(pool.memory==allocation_budget_->shared_graph_memory_pool)
+                    allocation_budget_->shared_graph_memory_pool=nullptr;
+            } else allocation_budget_->graph_memory_pools.at(pool.memory)=true;
+        }
+    });
+}
+
+void Context::trim() {
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if (!graph_pools_.empty()) {
+            throw Error("cannot trim CUDA memory while a graph pool is active");
+        }
+    }
+    stream_.synchronize();
+    if (async_allocations_) {
+        DeviceGuard guard(device_);
+        trim_pool_pages();
+    }
+    check_memory_limit();
+}
+
+Buffer::Buffer(std::shared_ptr<Context> context, std::size_t bytes)
+    : context_(std::move(context)), bytes_(bytes) {
+    if (!context_) {
+        throw std::invalid_argument("CUDA buffer requires a context");
+    }
+    stream_ = current_stream(context_->device());
+    data_ = context_->allocate(bytes_, stream_.stream());
+}
+
+Buffer::~Buffer() noexcept {
+    reset();
+}
+
+Buffer::Buffer(Buffer&& other) noexcept
+    : context_(std::move(other.context_)),
+      data_(std::exchange(other.data_, nullptr)),
+      bytes_(std::exchange(other.bytes_, 0)),
+      stream_(std::exchange(other.stream_, {})) {}
+
+Buffer& Buffer::operator=(Buffer&& other) noexcept {
+    if (this != &other) {
+        reset();
+        context_ = std::move(other.context_);
+        data_ = std::exchange(other.data_, nullptr);
+        bytes_ = std::exchange(other.bytes_, 0);
+        stream_ = std::exchange(other.stream_, {});
+    }
+    return *this;
+}
+
+void Buffer::reset() noexcept {
+    if (context_ && data_ != nullptr) {
+        context_->release(data_, bytes_, stream_.stream());
+    }
+    data_ = nullptr;
+    bytes_ = 0;
+    stream_ = {};
+    context_.reset();
+}
+
+HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
+    if (bytes_ == 0) {
+        return;
+    }
+    const auto flags = mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
+    const auto allocation=allocate_pinned_host(&data_,bytes_,flags,"host_buffer");
+    if(pinned_allocation_rejected(allocation)) {
+        (void)cudaGetLastError();
+        data_=nullptr;
+        throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes_)+
+            " error="+cudaGetErrorName(allocation));
+    }
+    TYLOINFER_NATIVE_CUDA_CHECK(allocation);
+}
+
+HostBuffer::~HostBuffer() noexcept {
+    reset();
+}
+
+HostBuffer::HostBuffer(HostBuffer&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      bytes_(std::exchange(other.bytes_, 0)) {}
+
+HostBuffer& HostBuffer::operator=(HostBuffer&& other) noexcept {
+    if (this != &other) {
+        reset();
+        data_ = std::exchange(other.data_, nullptr);
+        bytes_ = std::exchange(other.bytes_, 0);
+    }
+    return *this;
+}
+
+void HostBuffer::reset() noexcept {
+    if (data_ != nullptr) {
+        (void)release_pinned_host(data_,bytes_);
+    }
+    data_ = nullptr;
+    bytes_ = 0;
+}
+
+}  // namespace mfq::cuda

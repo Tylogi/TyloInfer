@@ -1,0 +1,34 @@
+:root {
+  --small-numerals-font: inherit;
+  --numeric-font: inherit;
+}
+
+:is(.metric-tile > strong, .overview-session-stats strong, .model-library-summary strong,
+  .resource-budget-summary strong, .resource-monitor-metric strong, .cache-stats strong,
+  .memory-tier-heading > span, .memory-tier-streaming-summary b, .memory-tier-prefix-quota,
+  .resource-tier-model > strong, .usage-bar span, .variant-memory-pressure > strong,
+  .checkpoint-available-memory > span, .list-match-count, .logs-tabs > button > span,
+  .log-record-toggle > time, .log-request-metric, .log-job-progress, .log-detail-metrics strong,
+  .download-item-progress > span, .download-transfer-stats, .detected-memory-pool,
+  .analysis-facts dd, .analysis-table-scroll td:not(:first-child), .kv-cache-breakdown td,
+  .server-unit-value strong, .server-temperature-control strong, .server-input-unit input,
+  .tylo-page-facts dd, .tylo-numeric) {
+  font-family: inherit;
+  font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: normal;
+}
+
+:is(.metric-grid > .metric-tile > strong, .overview-session-stats strong,
+  .model-library-summary strong, .resource-budget-summary strong,
+  .resource-monitor-metric strong, .cache-stats strong) {
+  font-weight: 550;
+}
+
+:is(.analysis-table-scroll, .kv-cache-breakdown) :is(th, td):not(:first-child),
+.tylo-page-table :is(th, td).tylo-numeric {
+  text-align: end;
+}
+
+:is(input[type='number'], output) {
+  font-variant-numeric: lining-nums tabular-nums;
+}

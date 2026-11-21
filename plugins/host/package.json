@@ -1,0 +1,14 @@
+{
+  "name": "@tyloinfer/dsh-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TyloInfer default provider configuration and core compatibility status for DSH",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": { "node": ">=24.9.0", "dsh": "0.2.2-rc.2" },
+  "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json", "./package.json": "./package.json" },
+  "files": ["index.js", "core-bridge.js", "page-reads.js", "page-actions.js", "maintenance-routes.js", "model-actions.js", "cordis.patch.yml", "locale"],
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/cordis": "~4.1.0", "@deepseek-ai/schemastery": "~3.19.0", "@deepseek-ai/dsh-settings": "0.2.2-rc.2", "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.2" }
+}

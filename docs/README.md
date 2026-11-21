@@ -5,9 +5,10 @@ TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 ## Get started
 
 - [Deploy a service and check performance (中文)](deployment.zh-CN.md)
-- [Build the C++ runtime](cli/build.md)
-- [Run TyloInfer Server and Studio](cli/serve.md)
-- [Complete the first API request](cli/serve.md#first-api-request)
+- [Build the C++ runtime](build.md)
+- [Run TyloInfer Server and Studio](serve.md)
+- [Run the Agent Host or install the DS Bot plugin (中文)](agent-host.md)
+- [Complete the first API request](serve.md#first-api-request)
 - [Measure inference performance](benchmarking.md)
 - [Create a self-contained release](packaging.md)
 - [Check model and backend support](runtime/support.md)
@@ -19,15 +20,9 @@ TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 - [Runtime support matrix](runtime/support.md)
 - [Python/C++ runtime transport](runtime/transport.md)
 - [CUDA KV memory policies](runtime/cuda-kv-memory.md)
-- [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
+- [CUDA Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
+- [Metal Flash-Next speculative decoding](serve.md#metal-native-serving)
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
-
-## Documentation checks
-
-From the repository root, run `python3 -B scripts/check_docs.py`. This
-read-only standard-library check covers public command names, local Markdown
-links/anchors, JSON/JSONL examples, the HTTP API table against checked-in
-OpenAPI, and selected CLI defaults/options.
 
 ## APIs
 
