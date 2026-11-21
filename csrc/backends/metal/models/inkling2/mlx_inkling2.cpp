@@ -105,6 +105,39 @@ array depth_mix(const array& history, const array& current, const array& query) 
 }
 
 array clip_norm(array x, const std::optional<array>& scale, float threshold) {
+    const int width = x.shape(-1), heads = x.shape(-2);
+    const auto rows = x.size() / width;
+    const bool per_head = scale && scale->shape() == Shape{heads, width};
+    if (default_device() == Device::gpu && width <= 256 && rows < std::numeric_limits<int>::max() / 32 - 4 &&
+        (!scale || (scale->dtype() == float32 && (per_head || scale->shape() == Shape{width})))) {
+        static const auto kernel = [] {
+            CompileOptions options;
+            options.math_mode = MathMode::Safe;
+            return fast::metal_kernel("tyloinfer_inkling_clip_norm",
+                {"source", "scale", "threshold", "count"}, {"output"}, R"MSL(
+                const uint index = thread_position_in_grid.x / 32u;
+                if (index >= count[0]) return;
+                const uint lane = thread_index_in_simdgroup;
+                const ulong start = ulong(index) * WIDTH;
+                const uint weights = HEADS > 1 ? (index % HEADS) * WIDTH : 0u;
+                float values[(WIDTH + 31) / 32];
+                float squares = 0.f;
+                for (uint i = lane; i < WIDTH; i += 32u) {
+                    float value = float(source[start + i]);
+                    if constexpr (SCALED) value *= scale[weights + i];
+                    values[i / 32u] = value;
+                    squares += value * value;
+                }
+                const float factor = min(1.f, threshold / (metal::precise::sqrt(simd_sum(squares)) + 1e-6f));
+                for (uint i = lane; i < WIDTH; i += 32u) output[start + i] = values[i / 32u] * factor;
+                )MSL", "", true, false, options);
+        }();
+        const auto count = array({uint32_t(rows)}, uint32);
+        return kernel({x, scale ? *scale : zeros({1}, float32), array(threshold), count},
+            {x.shape()}, {float32}, {static_cast<int>((rows + 3) / 4 * 128), 1, 1}, {128, 1, 1},
+            {{"WIDTH", width}, {"HEADS", per_head ? heads : 1}, {"SCALED", bool(scale)}},
+            std::nullopt, false, {}).front();
+    }
     x = astype(x, float32);
     if (scale) x = x * *scale;
     auto length = sqrt(sum(square(x), -1, true)) + array(1e-6f);
