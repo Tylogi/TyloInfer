@@ -1,0 +1,246 @@
+#pragma once
+
+#include <functional>
+#include <optional>
+#include <span>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace mfq::metal {
+
+struct MlxGatedDeltaNetResult {
+    mlx::core::array output;
+    mlx::core::array state;
+};
+
+struct MlxGatedDeltaGates {
+    mlx::core::array gate;
+    mlx::core::array beta;
+};
+
+struct MlxGatedDeltaDecodeResult {
+    mlx::core::array output;
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    std::optional<mlx::core::array> gate;
+    std::optional<mlx::core::array> beta;
+};
+
+struct MlxGatedDeltaDecodeInput {
+    mlx::core::array qk, value, output_gate, alpha, beta;
+    mlx::core::array convolution_state, recurrent_state;
+};
+
+struct MlxGatedDeltaTreeResult {
+    mlx::core::array output, keys, values, decay, beta;
+};
+
+MlxGatedDeltaTreeResult gated_delta_decode_tree(const MlxGatedDeltaDecodeInput& input,
+    std::span<const int> parents, const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias, const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight, int key_heads, int value_heads,
+    float norm_eps, bool silu_gate, bool tiled_heads, mlx::core::Dtype output_dtype);
+
+struct MlxGatedDeltaTreeLane {
+    std::span<const int> parents;
+    mlx::core::array convolution, recurrent;
+};
+
+struct MlxGatedDeltaPackedTreeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaTreeResult> tapes;
+};
+
+MlxGatedDeltaPackedTreeResult gated_delta_decode_packed_trees(
+    const std::vector<mlx::core::array>& projections, std::span<const MlxGatedDeltaTreeLane> lanes,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float norm_eps, bool silu_gate, bool tiled_heads,
+    mlx::core::Dtype output_dtype);
+
+struct MlxGatedDeltaDecodeState {
+    mlx::core::array convolution, recurrent;
+};
+
+MlxGatedDeltaDecodeState fold_gated_delta_tree(const MlxGatedDeltaDecodeState& state,
+    const mlx::core::array& qk, const mlx::core::array& value, const mlx::core::array& keys,
+    const mlx::core::array& values, const mlx::core::array& decay, const mlx::core::array& beta,
+    const mlx::core::array& retained, bool tiled_heads);
+
+struct MlxGatedDeltaBatchDecodeResult {
+    mlx::core::array output;
+    std::vector<MlxGatedDeltaDecodeState> states;
+};
+
+MlxGatedDeltaBatchDecodeResult gated_delta_decode_batch(
+    const std::vector<mlx::core::array>& projections,
+    const std::vector<MlxGatedDeltaDecodeState>& states,
+    const mlx::core::array& convolution_weight, const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale, const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, float convolution_eps, float norm_eps,
+    bool output_gate_silu, bool tiled_heads, mlx::core::Dtype output_dtype);
+
+std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
+    const std::vector<MlxGatedDeltaDecodeInput>& requests,
+    const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, int dimension,
+    float convolution_eps, float norm_eps, bool output_gate_silu = false,
+    bool tiled_heads = false, mlx::core::Dtype output_dtype = mlx::core::float32,
+    bool transposed_state = true, bool round_fp16 = false);
+
+// Projected inputs are [B,T,H]; outputs are FP32 [B,H,T]. The caller
+// precomputes decay_scale = -exp(a_log), preserving the model's storage
+// precision before promotion. No packed-weight format is involved here.
+MlxGatedDeltaGates gated_delta_gates(
+    const mlx::core::array& alpha,
+    const mlx::core::array& beta,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale);
+
+mlx::core::array gated_delta_output_norm(
+    const mlx::core::array& recurrent,
+    const mlx::core::array& gate,
+    const mlx::core::array& norm_weight,
+    float eps,
+    bool silu_gate,
+    mlx::core::Dtype output_dtype);
+
+// Single-row decode fast path for scalar-gated DeltaNet layers. The recurrent
+// state layout matches the transposed_state contract of gated_delta_net.
+MlxGatedDeltaDecodeResult gated_delta_decode_step(
+    const mlx::core::array& qk,
+    const mlx::core::array& value,
+    const mlx::core::array& output_gate,
+    const mlx::core::array& alpha,
+    const mlx::core::array& beta,
+    const mlx::core::array& convolution_state,
+    const mlx::core::array& recurrent_state,
+    const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight,
+    int key_heads,
+    int value_heads,
+    int dimension,
+    float convolution_eps,
+    float norm_eps,
+    bool output_gate_silu = false,
+    bool tiled_heads = false,
+    mlx::core::Dtype output_dtype = mlx::core::float32,
+    bool transposed_state = true, bool round_fp16 = false);
+
+struct MlxLinearConvQkvResult {
+    mlx::core::array query;
+    mlx::core::array key;
+    mlx::core::array value;
+    mlx::core::array state;
+};
+
+struct MlxCachedDepthwiseConvResult {
+    mlx::core::array output;
+    mlx::core::array state;
+};
+
+// Architecture-neutral transaction payload for speculative verification over
+// a recurrent Gated DeltaNet cache.  The expensive input projections are
+// evaluated for the complete [confirmed, drafts...] window once; rollback
+// replays only the retained recurrent prefix from these projected values.
+struct MlxGatedDeltaSpeculativeState {
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    std::optional<mlx::core::array> qk;
+    std::optional<mlx::core::array> value;
+    std::optional<mlx::core::array> gate;
+    std::optional<mlx::core::array> beta;
+    int position = 0;
+    int batch = 0;
+    int confirmed_tokens = 0;
+    int total_tokens = 0;
+};
+
+struct MlxGatedDeltaCacheState {
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    int position = 0;
+};
+
+using MlxGatedDeltaReplay = std::function<MlxGatedDeltaCacheState(
+    const MlxGatedDeltaSpeculativeState&, int)>;
+
+MlxGatedDeltaReplay compile_gated_delta_speculative_replay(
+    const mlx::core::array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<mlx::core::array>& convolution_bias = std::nullopt,
+    float eps = 1e-5f,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
+MlxGatedDeltaNetResult gated_delta_net(
+    const mlx::core::array& query,
+    const mlx::core::array& key,
+    const mlx::core::array& value,
+    const mlx::core::array& gate,
+    const mlx::core::array& beta,
+    const std::optional<mlx::core::array>& state = std::nullopt,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
+mlx::core::array gated_delta_net_state(
+    const mlx::core::array& key,
+    const mlx::core::array& value,
+    const mlx::core::array& gate,
+    const mlx::core::array& beta,
+    const std::optional<mlx::core::array>& state = std::nullopt,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
+mlx::core::array ssm_conv_silu(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    int tokens,
+    const std::optional<mlx::core::array>& bias = std::nullopt);
+
+MlxCachedDepthwiseConvResult cached_depthwise_conv_silu(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const std::optional<mlx::core::array>& state = std::nullopt,
+    int dilation = 1,
+    const std::optional<mlx::core::array>& bias = std::nullopt);
+
+mlx::core::array tree_depthwise_conv_silu(
+    const mlx::core::array& input, const mlx::core::array& weight,
+    const mlx::core::array& history, const mlx::core::array& taps);
+
+MlxLinearConvQkvResult linear_conv_qkv(
+    const mlx::core::array& state,
+    const mlx::core::array& qk,
+    const mlx::core::array& value,
+    const mlx::core::array& weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<mlx::core::array>& bias = std::nullopt,
+    float eps = 1e-5f);
+
+MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
+    const MlxGatedDeltaSpeculativeState& transaction,
+    int accepted_tokens,
+    const mlx::core::array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<mlx::core::array>& convolution_bias = std::nullopt,
+    float eps = 1e-5f,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
+} // namespace mfq::metal

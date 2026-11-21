@@ -1,0 +1,28 @@
+:root {
+  --control-font-size: 12px;
+  --control-line-height: 1.4;
+  --control-font-weight: 500;
+}
+
+button, input, textarea, select {
+  font-family: inherit;
+  font-synthesis: none;
+}
+button {
+  font-size: var(--control-font-size);
+  font-weight: var(--control-font-weight);
+  line-height: var(--control-line-height);
+  letter-spacing: normal;
+}
+:is(.screen-header-trailing, .runtime-hero-actions, .server-page-footer, .model-row-actions,
+  .model-settings-actions, .download-queue, .repository-files, .model-browser-header,
+  .community-search-form, .tylo-library-actions, .server-settings-panel, .tylo-download-confirm,
+  .tylo-page-toolbar, .tylo-model-confirm, .tylo-model-restore) button {
+  font-family: inherit;
+  font-size: var(--control-font-size);
+  font-weight: var(--control-font-weight);
+  line-height: var(--control-line-height);
+}
+button.primary, .screen-header-trailing button.primary, .runtime-hero-actions button.primary {
+  font-weight: 600;
+}

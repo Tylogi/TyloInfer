@@ -1,0 +1,25 @@
+#pragma once
+#include "tyloinfer/runtime.h"
+#include <cstddef>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace mfq::cuda {
+class CudaMemoryLimitExceeded final : public MfqResourceExhausted {
+public:
+    CudaMemoryLimitExceeded(std::string message,std::size_t shortfall)
+        : MfqResourceExhausted(std::move(message)),shortfall_(shortfall) {}
+    std::size_t shortfall() const noexcept {return shortfall_;}
+
+private:
+    std::size_t shortfall_;
+};
+
+struct ProcessDeviceMemoryStats {
+    std::size_t budget=0,usage=0,reservation=0;
+    std::size_t shared_budget=0,shared_usage=0;
+};
+// Optional OS residency accounting, distinct from device-wide free VRAM.
+std::optional<ProcessDeviceMemoryStats> process_device_memory_stats(int device);
+}

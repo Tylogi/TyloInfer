@@ -1,0 +1,16 @@
+body.tylo-studio-product { --tylo-surface-soft: var(--dsw-alias-bg-layer-1); }
+body.tylo-studio-product [data-slot='sidebar'] > div { box-sizing: border-box; background: var(--dsw-specific-sidebar-fill); border-right: 1px solid var(--dsw-alias-border-l1); }
+body.tylo-studio-product [data-slot='sidebar'] > div > button:not([data-sidebar-toggle]) { box-shadow: none; border-color: var(--dsw-alias-border-l1); border-radius: 9px; background: var(--dsw-alias-bg-base); }
+body.tylo-studio-product [data-slot='sidebar'] button:has(.tylo-studio-brand-name) { border: 0; background: transparent; }
+body.tylo-studio-product [data-slot='sidebar.workspaces'] { font-size: 12px; }
+body.tylo-studio-product [data-conversation-content] { --dsh-chat-content-width: var(--dsh-chat-user-width, min(1000px, calc(100% - 48px))); }
+body.tylo-studio-product [data-slot='conversation.composer.bar'] > div { border-radius: 14px; border-color: var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-base); box-shadow: 0 8px 28px rgb(0 0 0 / 4%); }
+body.tylo-studio-product [data-conversation-region='chat'] { background: var(--dsw-alias-bg-layer-1); }
+body.tylo-studio-product [data-conversation-region='composer'] { font-family: inherit; }
+.tylo-studio-launcher { padding: 10px 8px; }
+.tylo-studio-launcher nav { gap: 3px; padding-bottom: 7px; }
+.tylo-studio-launcher nav button { min-height: 36px; border-radius: 7px; font-size: 12px; }
+.tylo-studio-launcher nav button[aria-current='page'] { color: var(--dsw-alias-brand-primary); background: color-mix(in srgb, var(--dsw-alias-brand-primary) 9%, transparent); font-weight: 550; }
+.tylo-studio-launcher nav button svg { flex: none; opacity: .8; }
+.tylo-studio-version { font-size: 11px; line-height: 1.6; }
+@media (max-width: 680px) { body.tylo-studio-product [data-conversation-content] { --dsh-chat-content-width: min(calc(100% - 24px), 1000px); } }

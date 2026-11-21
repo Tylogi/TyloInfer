@@ -1,8 +1,9 @@
 # Flash-Next CUDA continuous batching
 
-Enable an explicit request capacity with `tyloinfer serve --max-requests-per-runtime N`
-or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
-from 1 to 32 on one CUDA device. The managed server's default remains one request.
+The managed CUDA server accepts eight requests per worker by default. Set a
+different limit with `python -m serve --max-requests-per-runtime N`. The native
+runtime exposes `mfq-runtime --continuous-batching N`. Flash-Next supports
+capacities from 1 to 32 on one CUDA device.
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded
@@ -26,24 +27,26 @@ the newest eligible request receives a context-capacity error and existing
 requests retain their state. Unexpected CUDA failures still fail the backend.
 This does not resize the resident expert cache or automatically enable KV offload.
 
-Explicit continuous batching currently runs ordinary token decoding. Batched
-requests do not use MTP or persistent prefix reuse. Explicit session IDs and
-multimodal requests remain exclusive. The default single-request path retains
-MTP and prefix caching. Configured QSA KV offload uses the eager batch path.
+Explicit continuous batching runs ordinary token decoding. Flash-Next text
+requests without an explicit session ID can reuse the existing persistent prefix
+cache. A cold request saves a stable checkpoint at a configured cache-page
+boundary (or the exact boundary for a shorter prefix); matching requests restore
+independent QSA, exact Indexer, GDN recurrent, PLE convolution/ngram and positional
+state. Immutable snapshot storage may be shared, but mutable request state is not.
+Cancelling one request does not consume the snapshot or change its siblings.
 
-Run the state check with the native diagnostics executable:
+A cache hit is reported as `usage.prompt_tokens_details.cached_tokens` and
+`mfq_metrics.cached_tokens`; `prefill_tokens` counts only newly computed input.
+`mfq_metrics.prefix_restore_ms` reports request-local restore/setup time, which
+remains inside TTFT. A retained expert-weight cache is not a prefix hit. Reuse
+requires a complete matching checkpoint and enabled cache budgets; it is not
+guaranteed merely because another request previously used similar text.
 
-```shell
-mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching
-mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching --continuous-batching-check-requests 32
-```
+Batched requests do not use MTP. Explicit session IDs and multimodal requests
+remain exclusive. The default single-request path retains MTP and prefix caching.
+Configured QSA KV offload uses the eager batch path.
 
-The check compares outputs against serial generation, exercises paused rows,
-decode cancellation, partial-prefill cancellation and subsequent request reuse.
-The larger check holds all requests until their prefills finish, then decodes
-them together across the 256-token cache-capacity boundary. Small native model
-fixtures include QSA, GDN, PLE and routed experts. The shared execution test also
-injects prefill and decode-capacity failures to verify surviving requests, and
+The shared execution test alsoinjects prefill and decode-capacity failures to verify surviving requests, and
 checks staggered request scheduling. The stdio chat-client integration test
 compares simultaneous generations with serial output and verifies that the
 decoder actually processes multiple tokens per batch.

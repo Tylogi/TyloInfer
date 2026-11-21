@@ -10,7 +10,7 @@ settings for every engine. Set input lengths using token counts, not characters.
 Start a single-model, single-request server:
 
 ```sh
-uv run tyloinfer serve --model /models/model.gguf \
+uv run --project studio python -m serve --model /models/model.gguf \
   --context-size 32768 --max-runtime-instances 1 \
   --max-requests-per-runtime 1 --no-prefix-cache --no-web-ui
 ```
@@ -39,10 +39,10 @@ curl --fail-with-body http://127.0.0.1:8090/v1/chat/completions \
 ```
 
 In PowerShell, use `curl.exe` and put the command on one line. Authentication
-and curl compatibility are covered in the [serving guide](cli/serve.md#first-api-request).
+and curl compatibility are covered in the [serving guide](serve.md#first-api-request).
 
 For native MTP or DFlash2, configure a matching
-[companion](cli/serve.md#speculative-decoding-mtp--dflash2) before launch, then
+[companion](serve.md#speculative-decoding-mtp--dflash2) before launch, then
 set `"enable_mtp": true` and choose `mtp_max_draft_tokens`. Run each mode in a
 fresh process and check the returned `mfq_metrics` for the mode actually used.
 

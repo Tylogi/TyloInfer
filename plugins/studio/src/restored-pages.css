@@ -1,0 +1,99 @@
+.tylo-studio-inference { --text-font: var(--dsh-font-family-text, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif); padding: 32px clamp(18px, 3.5vw, 48px) 48px; background: var(--canvas); font-family: inherit; font-size: inherit; }
+.tylo-studio-inference .tylo-restored-page { width: 100%; max-width: var(--content-max); margin-inline: auto; min-width: 0; }
+.tylo-studio-inference .screen-header { padding-inline-start: var(--dsh-frame-leading-clearance, 0px); }
+.tylo-studio-inference .screen-header > div:first-child { display: block; }
+.tylo-studio-inference .screen-header h1 { font-size: 30px; }
+.tylo-studio-inference .screen-header h1, .tylo-studio-inference .screen-header p { margin-inline: 0; }
+.tylo-studio-inference h2 { margin-top: 0; }
+.tylo-studio-inference dl { margin: 0; }
+.tylo-studio-inference .tylo-page-section { background: var(--panel-surface); border-color: var(--panel-line); }
+.tylo-studio-inference .tylo-page-facts { gap: 14px !important; margin: 0; }
+.tylo-studio-inference .tylo-page-facts dd { font-size: 14px !important; }
+.tylo-studio-inference .tylo-page-guidance { margin-top: 24px; }
+.tylo-studio-inference .tylo-page-section .tylo-page-section { margin: 0; padding: 0; border: 0; }
+.tylo-studio-inference .server-input-unit { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 12px; }
+.tylo-studio-inference .server-input-unit input, .tylo-studio-inference .setting-row-trailing > input { width: 130px; }
+.tylo-studio-inference .server-settings-panel form > button { margin-top: 16px; }
+.tylo-studio-inference .server-policy-actions { display: flex; justify-content: flex-end; }
+.tylo-studio-inference .server-settings-panel .tylo-page-check { display: flex; white-space: nowrap; }
+.tylo-studio-inference .server-settings-panel .tylo-page-check input { width: auto; }
+.tylo-studio-inference .tylo-library-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 16px 0; }
+.tylo-studio-inference .model-catalog-panel:not(.model-library-panel) .model-row { grid-template-columns: 8px minmax(0, 1fr) auto; }
+.tylo-studio-inference .checkpoint-row-details { overflow-wrap: anywhere; }
+.tylo-studio-inference .tylo-model-registration { margin: 0 0 20px; }
+.tylo-studio-inference .tylo-model-confirm { background: var(--panel-surface); border-color: var(--accent-border); }
+.tylo-studio-inference .studio-dialog .tylo-model-confirm { margin: 0; border: 0; border-radius: 0; }
+.tylo-studio-inference .studio-dialog .tylo-model-confirm fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.tylo-studio-inference .studio-switch { flex-shrink: 0; justify-content: flex-start; gap: 0; }
+.tylo-studio-inference .model-settings-body .model-load-context > h3 { display: none; }
+.tylo-studio-inference .logs-tabs > button { border-radius: 0; }
+.tylo-studio-inference .logs-filters label { display: grid; gap: 7px; margin: 0; }
+.tylo-studio-inference .logs-console { padding: 0; }
+.tylo-studio-inference .log-record-toggle { width: 100%; justify-content: stretch; text-align: left; }
+.tylo-studio-inference .log-record-detail pre { max-height: 380px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tylo-studio-inference .model-browser-layout > .official-model-grid { align-self: start; }
+.tylo-studio-inference .model-browser-layout > .empty-panel { min-height: 320px; }
+.tylo-studio-inference .community-search-form { align-items: end; margin: 0; }
+.tylo-studio-inference .community-search-form > label { display: grid; gap: 7px; }
+.tylo-studio-inference .community-search-input { flex: 1 1 160px; }
+.tylo-studio-inference .model-variant > div { display: grid; gap: 5px; }
+.tylo-studio-inference .model-detail-panel h3 { margin-top: 0; }
+.tylo-studio-inference .model-download-page { position: relative; min-height: 80%; padding-bottom: 72px; }
+.tylo-studio-inference .download-concurrency { white-space: nowrap; }
+.tylo-studio-inference .download-concurrency select { width: auto; flex: none; }
+.tylo-studio-inference .tylo-download-confirm { border-top: 1px solid var(--line-soft); padding-top: 16px; }
+.tylo-studio-inference .tylo-download-confirm label { display: flex; gap: 8px; margin: 14px 0; font-size: 12px; }
+.tylo-studio-inference .model-detail-panel > label { display: grid; gap: 8px; font-size: 12px; }
+.tylo-studio-inference .repository-files input[type='checkbox'] { width: 14px; min-height: 14px; }
+.tylo-studio-inference .tylo-shared-tooltip { position: relative; display: inline-flex; }
+.tylo-studio-inference .tylo-shared-tooltip > [role='tooltip'] { display: none; position: absolute; z-index: 8; left: 0; top: 100%; width: min(360px, 70vw); padding: 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface-raised); box-shadow: var(--shadow-sm); font-size: 12px; line-height: 1.7; }
+.tylo-studio-inference .tylo-shared-tooltip:is(:hover, :focus-within) > [role='tooltip'] { display: block; }
+.tylo-studio-inference dialog.studio-dialog { box-sizing: border-box; margin: auto; padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--line); max-width: calc(100vw - 24px); max-height: calc(100dvh - 32px); overflow: auto; }
+.tylo-studio-inference dialog.studio-dialog::backdrop { background: rgb(0 0 0 / 48%); }
+.tylo-studio-inference .studio-dialog > header { display: flex; align-items: start; justify-content: space-between; gap: 14px; }
+.tylo-studio-inference .studio-dialog > header > div { min-width: 0; }
+.tylo-studio-inference .studio-dialog > header h2 { margin: 2px 0 0; color: var(--ink-strong); font-size: 18px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+.tylo-studio-inference .studio-dialog > header p { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.tylo-studio-inference .studio-dialog > header > button { display: grid; place-items: center; flex: none; width: 30px; min-height: 30px; padding: 0; border: 0; color: var(--muted); font-size: 20px; line-height: 1; }
+.tylo-studio-inference .studio-dialog > header > button:hover { background: var(--surface-control); color: var(--ink-strong); }
+.tylo-studio-inference dialog.tylo-action-dialog { display: flex; flex-direction: column; width: 460px; overflow: hidden; }
+.tylo-studio-inference .tylo-action-dialog > header { flex: none; padding: 22px 22px 18px; }
+.tylo-studio-inference .tylo-action-dialog > form { display: flex; flex-direction: column; min-width: 0; min-height: 0; margin: 0; }
+.tylo-studio-inference .tylo-action-body { display: grid; gap: 12px; padding: 0 22px 20px; font-size: 13px; line-height: 1.5; overflow-y: auto; overflow-wrap: anywhere; }
+.tylo-studio-inference .tylo-action-body p { margin: 0; color: var(--muted); }
+.tylo-studio-inference .tylo-action-body :is(.tylo-page-facts, .tylo-action-summary) { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--canvas); }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts { grid-template-columns: minmax(0, 1fr); gap: 8px !important; }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts > div { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 1.6fr); align-items: baseline; gap: 10px; }
+.tylo-studio-inference .tylo-action-body .tylo-page-facts dd { margin: 0 !important; color: var(--ink-strong); font-weight: 550; }
+.tylo-studio-inference .tylo-action-summary { gap: 4px; }
+.tylo-studio-inference .tylo-action-summary > span { color: var(--muted); font-size: 12px; }
+.tylo-studio-inference .tylo-action-body ul { max-height: 28dvh; overflow: auto; margin: 0; padding-inline-start: 20px; }
+.tylo-studio-inference .tylo-action-body label > span { display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
+.tylo-studio-inference .tylo-action-body input[type='number'] { width: min(150px, 100%); }
+.tylo-studio-inference .tylo-action-dialog footer { flex: none; flex-wrap: wrap; gap: 8px; padding: 12px 22px; }
+.tylo-studio-inference .tylo-action-dialog footer button { min-width: 76px; }
+.tylo-studio-inference .tylo-action-dialog footer .danger { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, var(--surface)); font-weight: 650; }
+.tylo-studio-inference .tylo-action-dialog footer .danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 16%, var(--surface)); }
+.tylo-studio-inference .analysis-facts { display: grid; }
+.tylo-studio-inference .analysis-facts dd { margin: 0; font-size: 14px; }
+.tylo-studio-inference .analysis-page .architecture-flow { max-width: none; }
+@media (max-width: 1100px) {
+  .tylo-studio-inference .model-browser-layout { grid-template-columns: minmax(220px, .8fr) minmax(0, 1.2fr); }
+  .tylo-studio-inference .model-library-panel .model-row { grid-template-columns: 8px minmax(0, 1fr) auto; }
+  .tylo-studio-inference .model-library-panel .local-checkpoint-resources { grid-column: 2 / -1; }
+}
+@media (max-width: 760px) {
+  .tylo-studio-inference { padding: 22px 18px 36px; }
+  .tylo-studio-inference .screen-header h1 { font-size: 24px; }
+  .tylo-studio-inference .screen-header-trailing { flex-wrap: wrap; max-width: 100%; min-width: 0; flex-shrink: 1; }
+  .tylo-studio-inference .model-browser-layout { grid-template-columns: minmax(0, 1fr); }
+  .tylo-studio-inference .model-browser-header { display: flex; flex-wrap: wrap; }
+  .tylo-studio-inference .model-browser-tabs { overflow-x: auto; max-width: 100%; }
+  .tylo-studio-inference .detected-configuration { grid-template-columns: minmax(0, 1fr); }
+  .tylo-studio-inference .detected-configuration > div { min-width: 0; }
+  .tylo-studio-inference .model-browser-layout > .empty-panel { min-height: 180px; }
+  .tylo-studio-inference .model-library-panel .model-row { grid-template-columns: 8px minmax(0, 1fr); }
+  .tylo-studio-inference .model-library-panel .model-row-controls { grid-column: 2; grid-row: 3; }
+  .tylo-studio-inference .memory-tier-heading { align-items: flex-start; flex-direction: column; }
+  .tylo-studio-inference .model-library-summary strong { font-size: 17px; }
+}
