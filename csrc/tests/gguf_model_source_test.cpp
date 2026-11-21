@@ -928,11 +928,106 @@ void fixture_composition(const std::filesystem::path& directory,const std::files
     write(spec);require(bool(mfq::open_model_source(fixture)),"fixture failure retained a recursive-open guard");
 }
 }
+namespace {
+void loop_model_sources(const std::filesystem::path& directory) {
+    for (const bool sensenova : {true, false}) {
+        const std::string arch = sensenova ? "sensenova_loop" : "inkling2_loop";
+        const auto key = [&](const char* field) { return arch + "." + field; };
+        auto file = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+        auto tensors = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+            ggml_init({1 << 16, nullptr, false}), ggml_free);
+        gguf_set_val_str(file.get(), "general.architecture", arch.c_str());
+        gguf_set_val_u32(file.get(), key("block_count").c_str(), sensenova ? 7 : 4);
+        gguf_set_val_u32(file.get(), key("loop.start").c_str(), 1);
+        gguf_set_val_u32(file.get(), key("loop.end").c_str(), 3);
+        gguf_set_val_u32(file.get(), key("loop.count").c_str(), 2);
+        if (sensenova) {
+            gguf_set_val_u32(file.get(), key("embedding_length").c_str(), 8);
+            gguf_set_val_u32(file.get(), key("attention.head_count").c_str(), 2);
+            gguf_set_val_u32(file.get(), key("nextn_predict_layers").c_str(), 1);
+            gguf_set_val_u32(file.get(), key("ssm.group_count").c_str(), 1);
+            gguf_set_val_u32(file.get(), key("ssm.time_step_rank").c_str(), 2);
+            gguf_set_val_u32(file.get(), key("ssm.state_size").c_str(), 2);
+        } else {
+            gguf_set_val_u32(file.get(), key("attention.sliding_window").c_str(), 1024);
+        }
+        const std::array<bool, 7> recurrent{false, true, false, true, false, true, false};
+        const std::array<bool, 4> sliding{false, true, false, true};
+        const auto pattern = key(sensenova ? "attention.recurrent_layers" : "attention.sliding_window_pattern");
+        gguf_set_arr_data(file.get(), pattern.c_str(), GGUF_TYPE_BOOL,
+            sensenova ? recurrent.data() : sliding.data(), sensenova ? recurrent.size() : sliding.size());
+
+        auto* tensor = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 8, sensenova ? 12 : 2);
+        auto* data = static_cast<float*>(tensor->data);
+        for (int64_t i = 0; i < ggml_nelements(tensor); ++i) data[i] = static_cast<float>(i);
+        ggml_set_name(tensor, sensenova ? "blk.1.attn_qkv_gate.weight" : "blk.1.attn_gate.weight");
+        gguf_add_tensor(file.get(), tensor);
+        const auto path = directory / (arch + ".gguf");
+        require(gguf_write_to_file(file.get(), path.string().c_str(), false), "loop GGUF write failed");
+
+        const mfq::GgufModelSource source(path);
+        const auto config = nlohmann::json::parse(source.model_config_json());
+        require(config.at("num_hidden_layers") == 4 && config.at("num_hidden_visits") == 6,
+            "loop weight and state counts must differ");
+        const std::vector<int64_t> expected{0, 1, 2, 1, 2, sensenova ? 5 : 3};
+        require(config.at("layer_weight_ids") == expected, "loop GGUF chose incorrect weight layers");
+        const auto alternate = sensenova ? "linear_attention" : "sliding_attention";
+        require(config.at("layer_types") == std::vector<std::string>{
+            "full_attention", alternate, "full_attention", alternate, "full_attention", alternate},
+            "loop attention geometry does not follow repeated visits");
+        require(source.find_tensor(sensenova ? "model.block.1.linear_attention.qkv_gate.weight" :
+                    "model.block.1.attention.gate.weight"), "loop GGUF projection name mismatch");
+        if (sensenova) {
+            const char* gate = "model.block.1.linear_attention.gate.weight";
+            const char* qkv = "model.block.1.linear_attention.qkv.weight";
+            require(*source.find_tensor(gate)->shape == std::vector<int64_t>{4, 8} &&
+                *source.find_tensor(qkv)->shape == std::vector<int64_t>{8, 8},
+                "SenseNova projection views have the wrong dimensions");
+            const auto bytes = source.read(gate, 4 + 2 * 8, sizeof(float));
+            float first = -1;
+            std::memcpy(&first, bytes.data(), sizeof(first));
+            require(first == 64.0f, "SenseNova gate projection uses the wrong output rows");
+        }
+    }
+}
+
+void hy4_model_source(const std::filesystem::path& directory) {
+    auto file = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+    auto tensors = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        ggml_init({1 << 16, nullptr, false}), ggml_free);
+    gguf_set_val_str(file.get(), "general.architecture", "hy_v4_flash");
+    for (const char* name : {"blk.0.attn_gate.weight", "blk.0.post_attention_norm.weight",
+                             "blk.0.ffn_norm.weight", "blk.0.post_ffw_norm.weight"}) {
+        auto* tensor = ggml_new_tensor_1d(tensors.get(), GGML_TYPE_F32, 8);
+        std::memset(tensor->data, 0, ggml_nbytes(tensor));
+        ggml_set_name(tensor, name);
+        gguf_add_tensor(file.get(), tensor);
+    }
+    auto* table = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F8_E4M3, 96, 16);
+    std::memset(table->data, 0x38, ggml_nbytes(table));
+    ggml_set_name(table, "per_layer_token_embd.weight");
+    gguf_add_tensor(file.get(), table);
+    const auto path = directory / "hy4.gguf";
+    require(gguf_write_to_file(file.get(), path.string().c_str(), false), "Hy4 GGUF write failed");
+    const mfq::GgufModelSource source(path);
+    require(source.find_tensor("model.block.0.attention.post_norm.weight") &&
+            source.find_tensor("model.block.0.attention.gate.weight") &&
+            source.find_tensor("model.block.0.mlp.norm.weight") &&
+            source.find_tensor("model.block.0.mlp.post_norm.weight"), "Hy4 GGUF attention/MLP names overlap");
+    const auto* record = source.find_tensor("per_layer_token_embd.weight");
+    require(record && record->dtype == "F8_E4M3" &&
+        *record->shape == std::vector<int64_t>{16, 96}, "Hy4 GGUF FP8 table geometry mismatch");
+    const auto range = source.tensor_file_range(record->name);
+    require(range && range->nbytes == 16 * 96, "Hy4 GGUF FP8 table is not addressable by file range");
+}
+}
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("tinfer-gguf-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(directory);
     try {
+        loop_model_sources(directory);
+        hy4_model_source(directory);
         auto* tensors = ggml_init({1 << 20, nullptr, false});
         auto* gguf = gguf_init_empty();
         gguf_set_val_str(gguf, "general.architecture", "qwen35");

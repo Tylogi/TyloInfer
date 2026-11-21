@@ -10,6 +10,9 @@ namespace mfq::metal {
 mlx::core::array mlx_sparse_indexer_dot_scores(
     const mlx::core::array& query, const mlx::core::array& pooled_keys);
 
+mlx::core::array mlx_sparse_indexer_head_scores(
+    const mlx::core::array& query, const mlx::core::array& pooled_keys);
+
 // Exact FP32 top-512 selection adapted from DeepSelect. The operator and its
 // device/shape policy are model-neutral; architecture adapters only provide
 // score tensors and valid-key counts.

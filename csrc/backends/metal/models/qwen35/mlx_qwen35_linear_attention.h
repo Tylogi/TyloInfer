@@ -98,6 +98,12 @@ public:
         return forward(input, use_cache);
     }
 
+    mlx::core::array forward_attention(const mlx::core::array& input,
+        int position_offset, bool use_cache);
+    mlx::core::array forward_feed_forward(const mlx::core::array& input) const {
+        return ffn_.forward_normalized(input, ffn_norm_);
+    }
+
     void reset_cache(int batch);
     void materialize_cache();
     void clear_cache() noexcept;

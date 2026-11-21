@@ -31,7 +31,11 @@ public:
         mlx::core::Dtype dtype, int priority);
     void append(const mlx::core::array& keys);
     mlx::core::array view(int start, int count) const;
-    mlx::core::array select(const mlx::core::array& query, int offset, int ratio, int budget) const;
+    // With reserve_current_group, the last index is the query's own group.
+    // Unused history entries in that mode are represented by -1.
+    mlx::core::array select(const mlx::core::array& query, int offset, int ratio, int budget,
+        const std::optional<mlx::core::array>& head_weights = std::nullopt,
+        bool reserve_current_group = false) const;
     MlxQsaIndexSnapshot snapshot() const;
     void restore(const MlxQsaIndexSnapshot& state);
     void trim(int position);

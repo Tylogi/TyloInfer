@@ -511,6 +511,32 @@ Qwen35Config Qwen35Config::from_json(std::string_view payload) {
         required_integer(text, "intermediate_size");
     config.num_hidden_layers =
         required_integer(text, "num_hidden_layers");
+    if (config.model_type == "sensenova_loop") {
+        config.layer_weight_ids = optional_integer_array(text, "layer_weight_ids");
+        config.num_hidden_layers = required_integer(text, "num_hidden_visits");
+        if (config.num_hidden_layers <= 0 ||
+            config.layer_weight_ids.size() != static_cast<std::size_t>(config.num_hidden_layers) ||
+            std::any_of(config.layer_weight_ids.begin(), config.layer_weight_ids.end(),
+                [&](int64_t layer) { return layer < 0 || layer >= config.num_hidden_layers; })) {
+            throw std::runtime_error("invalid SenseNova weight-layer schedule");
+        }
+        if (text.contains("mhc")) {
+            const auto& options = text.at("mhc");
+            const auto start = required_integer(options, "start");
+            const auto end = required_integer(options, "end");
+            const auto streams = required_integer(options, "streams");
+            const auto iterations = optional_boolean(options, "fixed_identity", false) ?
+                0 : required_integer(options, "iterations");
+            const float pre_scale = optional_number(options, "pre_scale", 1.0);
+            if (start < 0 || end <= start || end > config.num_hidden_layers ||
+                streams < 2 || streams > 4 || iterations < 0 || iterations > 100 ||
+                !std::isfinite(pre_scale)) {
+                throw std::runtime_error("invalid SenseNova mHC configuration");
+            }
+            config.loop_hyper_connection = Qwen35Config::LoopHyperConnection{
+                start, end, static_cast<int>(streams), static_cast<int>(iterations), pre_scale};
+        }
+    }
     config.num_attention_heads =
         required_integer(text, "num_attention_heads");
     config.num_key_value_heads =
@@ -919,7 +945,7 @@ void validate_qwen35_model_bindings(
     for (std::size_t index = 0;
          index < config.layer_types.size();
          ++index) {
-        const auto layer = names.layer(index);
+        const auto layer = names.layer(config.weight_layer(index));
         require_tensor(
             model,
             layer.attention_norm,

@@ -1,4 +1,5 @@
 #include "tyloinfer/gguf_model_source.h"
+#include "tyloinfer/layer_loop.h"
 #include "tyloinfer/mapped_tensor_reader.h"
 #include "tyloinfer/mirrored_file_reader.h"
 #include "tyloinfer/hf_model_source.h"
@@ -303,8 +304,25 @@ std::string canonical_name(const std::string& name, const json* meta = nullptr) 
         {"engram_k_norm.weight", "associative_memory.key.weight"},
         {"engram_kv.weight", "associative_memory.projection.weight"},
     };
-    const auto found = names.find(name.substr(dot + 1));
-    if (meta && meta->value("general.architecture", std::string{}) == "qwen35") {
+    const auto suffix = name.substr(dot + 1);
+    const auto architecture = meta ? meta->value("general.architecture", std::string{}) : std::string{};
+    if (architecture == "hy_v4_flash" || architecture == "inkling2_loop") {
+        const auto prefix = "model.block." + name.substr(4, dot - 4) + ".";
+        if (suffix == "attn_gate.weight") return prefix + "attention.gate.weight";
+        if (architecture == "hy_v4_flash") {
+            if (suffix == "post_attention_norm.weight") return prefix + "attention.post_norm.weight";
+            if (suffix == "post_ffw_norm.weight") return prefix + "mlp.post_norm.weight";
+        }
+    }
+    if (architecture == "sensenova_loop") {
+        const auto prefix = "model.block." + name.substr(4, dot - 4) + ".";
+        if (suffix == "attn_qkv_gate.weight") return prefix + "linear_attention.qkv_gate.weight";
+        if (suffix == "ssm_beta_alpha.weight") return prefix + "linear_attention.beta_alpha.weight";
+        if (suffix == "hc_attn_fn.bias") return prefix + "attention.mhc.pre.bias";
+        if (suffix == "hc_ffn_fn.bias") return prefix + "mlp.mhc.pre.bias";
+    }
+    const auto found = names.find(suffix);
+    if (architecture == "qwen35") {
         const auto predictors = meta->value("qwen35.nextn_predict_layers", json(0));
         const auto blocks = meta->value("qwen35.block_count", json(0));
         if (predictors.is_number_integer() && blocks.is_number_integer() && predictors.get<int64_t>() == 1 &&
@@ -416,7 +434,65 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
     if (shapes.contains("model.token_embedding.weight"))
         config["vocab_size"] = shapes["model.token_embedding.weight"][0];
     config["tie_word_embeddings"] = !shapes.contains("model.output.weight");
-    if (arch == "qwen35" || arch == "qwen4exp") {
+    if (arch == "sensenova_loop" || arch == "inkling2_loop") {
+        const bool sensenova = arch == "sensenova_loop";
+        const auto begin = number("loop.start").get<int64_t>();
+        const auto end = number("loop.end").get<int64_t>();
+        const auto passes = number("loop.count").get<int64_t>();
+        const auto stored_blocks = number("block_count").get<int64_t>();
+        const auto nextn = sensenova ? number("nextn_predict_layers", 0).get<int64_t>() : 0;
+        const auto attention_pattern = number(
+            sensenova ? "attention.recurrent_layers" : "attention.sliding_window_pattern");
+        if (stored_blocks <= 0 || stored_blocks > (1 << 20) || nextn < 0 || nextn >= stored_blocks ||
+            begin < 0 || begin >= end || end > stored_blocks || passes <= 0 ||
+            !attention_pattern.is_array() ||
+            attention_pattern.size() != static_cast<std::size_t>(stored_blocks)) {
+            throw std::runtime_error("invalid GGUF loop metadata");
+        }
+        if (sensenova && passes - 1 > (stored_blocks - nextn - 1) / (end - begin))
+            throw std::runtime_error("GGUF loop visits exceed the declared block count");
+        const auto weight_layers = sensenova ?
+            stored_blocks - nextn - (end - begin) * (passes - 1) : stored_blocks;
+        const LayerLoop loop(weight_layers, begin, end, passes);
+        if (loop.visits() > (1 << 20)) throw std::runtime_error("GGUF loop visit count exceeds the limit");
+
+        config["num_hidden_layers"] = weight_layers;
+        config["num_hidden_visits"] = loop.visits();
+        config["loop_start"] = begin;
+        config["loop_end"] = end;
+        config["loop_count"] = passes;
+        config["nextn_predict_layers"] = nextn;
+        config["layer_types"] = json::array();
+        config["layer_weight_ids"] = json::array();
+        for (int64_t visit = 0; visit < loop.visits(); ++visit) {
+            const auto layer = loop.weight_layer(visit);
+            const auto stored = sensenova ? loop.first_visit(layer) : layer;
+            const auto pattern_index = sensenova ? visit : layer;
+            const bool alternate = attention_pattern.at(pattern_index).get<bool>();
+            if (sensenova && alternate != attention_pattern.at(stored).get<bool>())
+                throw std::runtime_error("GGUF loop visits disagree on their shared attention geometry");
+            config["layer_types"].push_back(alternate ?
+                (sensenova ? "linear_attention" : "sliding_attention") : "full_attention");
+            config["layer_weight_ids"].push_back(stored);
+        }
+        if (!sensenova) {
+            config["sliding_window"] = number("attention.sliding_window");
+        } else if (meta.contains(key("mhc.streams"))) {
+            const auto mhc_start = number("mhc.start").get<int64_t>();
+            const auto mhc_end = number("mhc.end").get<int64_t>();
+            if (mhc_start < 0 || mhc_start >= mhc_end || mhc_end > weight_layers)
+                throw std::runtime_error("invalid SenseNova GGUF mHC layer range");
+            config["mhc"] = {
+                {"start", loop.first_visit(mhc_start)},
+                {"end", loop.first_visit(mhc_end - 1) + 1},
+                {"streams", number("mhc.streams")},
+                {"iterations", number("mhc.iterations")},
+                {"fixed_identity", number("mhc.fixed_identity", false)},
+                {"pre_scale", number("mhc.pre_scale", 1.0)},
+            };
+        }
+    }
+    if (arch == "qwen35" || arch == "qwen4exp" || arch == "sensenova_loop") {
         const auto heads = config.value("num_attention_heads", int64_t{0});
         const auto hidden = config.value("hidden_size", int64_t{0});
         if (heads <= 0 || hidden <= 0) throw std::runtime_error("GGUF is missing attention geometry");
@@ -465,13 +541,28 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
                 config["mtp_num_hidden_layers"]=available;
             }
         }
-        json layers = json::array();
-        const auto count = config.value("num_hidden_layers", int64_t{0});
-        for (int64_t i = 0; i < count; ++i) {
-            const auto prefix = "model.block." + std::to_string(i) + ".";
-            layers.push_back(shapes.contains(prefix + "linear_attention.qkv.weight") ? "linear_attention" : "full_attention");
+        if (arch == "sensenova_loop") {
+            config["rope_parameters"] = {
+                {"rope_type", number("rope.scaling.type", "default")},
+                {"factor", number("rope.scaling.factor", 1.0)},
+                {"original_max_position_embeddings", number("rope.scaling.original_context_length",
+                    config.value("max_position_embeddings", json(0)))},
+            };
+            if (const auto sections = number("rope.dimension_sections"); sections.is_array()) {
+                std::vector<int64_t> active;
+                for (const auto& section : sections) if (section.get<int64_t>() > 0) active.push_back(section.get<int64_t>());
+                config["rope_parameters"]["mrope_section"] = active;
+                config["rope_parameters"]["mrope_interleaved"] = true;
+            }
+        } else {
+            json layers = json::array();
+            const auto count = config.value("num_hidden_layers", int64_t{0});
+            for (int64_t i = 0; i < count; ++i) {
+                const auto prefix = "model.block." + std::to_string(i) + ".";
+                layers.push_back(shapes.contains(prefix + "linear_attention.qkv.weight") ? "linear_attention" : "full_attention");
+            }
+            config["layer_types"] = std::move(layers);
         }
-        config["layer_types"] = std::move(layers);
         if (arch == "qwen4exp") {
             config["model_type"] = "qwen4_exp_text";
             config["linear_tiled_heads"] = true;
@@ -868,12 +959,16 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             } else if (type == GGML_TYPE_F32) dtype = "F32";
             else if (type == GGML_TYPE_F16) dtype = "F16";
             else if (type == GGML_TYPE_BF16) dtype = "BF16";
+            else if (type == GGML_TYPE_F8_E4M3) dtype = "F8_E4M3";
             else if (type == GGML_TYPE_I32) dtype = "I32";
             else if (type == GGML_TYPE_I64) dtype = "I64";
             else if (ggml_is_quantized(type)) dtype = "GGUF_" + std::string(ggml_type_name(type));
             else throw std::runtime_error("unsupported GGUF tensor type: " + std::string(ggml_type_name(type)));
             std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) { return std::toupper(c); });
-            if (!ggml_is_quantized(type) && !engram) record.prefix = dense_prefix(shape);
+            // Hy4 Engram uses raw FP8 rows in a separate, memory-mapped table.
+            const bool hy4_engram = impl_->arch == "hy_v4_flash" &&
+                name == "per_layer_token_embd.weight" && type == GGML_TYPE_F8_E4M3;
+            if (!ggml_is_quantized(type) && !engram && !hy4_engram) record.prefix = dense_prefix(shape);
             record.tensor = {name, dtype, dtype, shape, size + record.prefix.size()};
             if(qwen4_companion && name=="predictor.fusion.weight") {
                 const auto hidden=meta.at("qwen4exp.embedding_length").get<int64_t>();
@@ -931,6 +1026,44 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 }
                 record.tensor.dtype = record.tensor.stored_dtype = "F32";
                 record.tensor.nbytes = record.inline_bytes.size();
+            }
+            if (impl_->arch == "sensenova_loop" &&
+                (name.find(".linear_attention.qkv_gate.weight") != std::string::npos ||
+                 name.find(".linear_attention.beta_alpha.weight") != std::string::npos)) {
+                const auto prefix_end = name.find(".linear_attention.") + sizeof(".linear_attention.") - 1;
+                const auto prefix = name.substr(0, prefix_end);
+                const auto value_heads = meta.at("sensenova_loop.ssm.time_step_rank").get<int64_t>();
+                const auto key_heads = meta.at("sensenova_loop.ssm.group_count").get<int64_t>();
+                const auto dim = meta.at("sensenova_loop.ssm.state_size").get<int64_t>();
+                if (value_heads <= 0 || key_heads <= 0 || dim <= 0 ||
+                    value_heads > INT32_MAX || key_heads > INT32_MAX || dim > INT32_MAX ||
+                    2 * key_heads + value_heads > INT64_MAX / dim ||
+                    shape.size() != 2 || shape.front() <= 0)
+                    throw std::runtime_error("invalid SenseNova GGUF GDN projection geometry");
+                const bool qkv = name == prefix + "qkv_gate.weight";
+                const int64_t first = qkv ? (2 * key_heads + value_heads) * dim : value_heads;
+                const int64_t second = qkv ? value_heads * dim : value_heads;
+                if (shape.front() < first || shape.front() - first != second)
+                    throw std::runtime_error("SenseNova GGUF fused GDN projection row count differs from metadata");
+                const auto row_bytes = ggml_row_size(type, shape.back());
+                const auto first_bytes = static_cast<uint64_t>(first) * row_bytes;
+                // View the two contiguous output ranges without copying compressed rows.
+                for (int part = 0; part < 2; ++part) {
+                    auto slice = record;
+                    const auto rows = part == 0 ? first : second;
+                    const std::vector<int64_t> dimensions{rows, shape.back()};
+                    const char* role = qkv ? (part == 0 ? "qkv.weight" : "gate.weight")
+                        : (part == 0 ? "beta.weight" : "alpha.weight");
+                    const auto sliced_name = prefix + role;
+                    slice.offset += part == 0 ? 0 : first_bytes;
+                    if (!record.prefix.empty()) slice.prefix = dense_prefix(dimensions);
+                    slice.tensor = {sliced_name, dtype, dtype, dimensions,
+                        static_cast<uint64_t>(rows) * row_bytes + slice.prefix.size()};
+                    if (!impl_->records.emplace(sliced_name, std::move(slice)).second)
+                        throw std::runtime_error("duplicate GGUF tensor: " + sliced_name);
+                    shapes[sliced_name] = dimensions;
+                    impl_->tensors.push_back(impl_->records.at(sliced_name).tensor);
+                }
             }
             shapes[name] = shape;
             impl_->tensors.push_back(record.tensor);
@@ -1271,7 +1404,8 @@ const std::unordered_map<std::string, std::string>& GgufModelSource::metadata() 
 const HadamardTransforms* GgufModelSource::hadamard_transforms() const noexcept { return &impl_->hadamard; }
 
 const MfqLegacyTensorAliases& GgufModelSource::legacy_tensor_compatibility() const noexcept {
-    if(impl_->arch!="qwen35")return ModelSource::legacy_tensor_compatibility();
+    if (impl_->arch != "qwen35" && impl_->arch != "sensenova_loop")
+        return ModelSource::legacy_tensor_compatibility();
     // Canonical names retain the original GGUF numeric/layout conventions:
     // RMS weights include their offset, A is already negative, and GDN value
     // heads are tiled. The tensor payload itself is intentionally unchanged.

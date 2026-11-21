@@ -1338,6 +1338,25 @@ array mlx_sparse_indexer_dot_scores(const array& query, const array& pooled_keys
         {{"T", query.dtype()}, {"HEADS", query.shape(2)}, {"DIM", query.shape(3)}}, std::nullopt, false, {}).front();
 }
 
+array mlx_sparse_indexer_head_scores(const array& query, const array& pooled_keys) {
+    if (query.ndim() != 4 || pooled_keys.ndim() != 3 ||
+        query.shape(0) != pooled_keys.shape(0) ||
+        query.shape(3) != pooled_keys.shape(2)) {
+        throw std::invalid_argument("sparse index query and key dimensions disagree");
+    }
+    if (query.shape(1) >= 1 && query.shape(1) <= 8 && query.shape(2) <= 8 &&
+        query.shape(3) >= 4 && query.shape(3) <= 1024 && query.shape(3) % 4 == 0 &&
+        pooled_keys.dtype() == mlx::core::float32)
+        return mlx_sparse_indexer_dot_scores(query, pooled_keys);
+    auto keys = mlx::core::transpose(
+        mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1});
+    return mlx::core::reshape(
+        mlx::core::matmul(
+            mlx::core::reshape(mlx::core::astype(query, mlx::core::float32),
+                Shape{query.shape(0), query.shape(1) * query.shape(2), query.shape(3)}), keys),
+        Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
+}
+
 array mlx_qsa_prefill_attention(
     const array& query,
     const array& key,

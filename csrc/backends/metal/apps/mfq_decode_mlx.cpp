@@ -3406,7 +3406,7 @@ int run_native_runtime(
             runtime_stream);
     }
 
-    if (backbone != "qwen3_5") {
+    if (backbone != "qwen3_5" && backbone != "sensenova_loop") {
         throw std::runtime_error(
             "unsupported native Metal backbone implementation: " + backbone);
     }

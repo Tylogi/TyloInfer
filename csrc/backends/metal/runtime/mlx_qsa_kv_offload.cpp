@@ -1,5 +1,6 @@
 #include "mlx_qsa_kv_offload.h"
 #include "qwen4_ops.h"
+#include "mlx_sparse_attention.h"
 #include "mlx_resident_budget.h"
 #include "mlx_mtp.h"
 
@@ -350,11 +351,23 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     return keys;
 }
 
-array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int budget) const {
+array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int budget,
+    const std::optional<array>& head_weights, bool reserve_current_group) const {
+    if (ratio <= 0 || budget < ratio || offset < 0 || query.ndim() != 4 || query.shape(0) != 1 ||
+        query.shape(1) <= 0 || query.shape(2) <= 0 || query.shape(3) != width_ ||
+        offset > std::numeric_limits<int>::max() - query.shape(1) ||
+        (head_weights && head_weights->shape() != Shape{1, query.shape(1), query.shape(2)}))
+        throw std::invalid_argument("invalid offloaded sparse index selection");
     const int complete = position();
-    const int count = std::min(complete, budget / ratio);
-    if (count <= 0 || query.ndim() != 4 || query.shape(0) != 1 || query.shape(3) != width_)
-        throw std::invalid_argument("invalid offloaded QSA index selection");
+    const int group_budget = budget / ratio - int(reserve_current_group);
+    const int count = std::min(complete, group_budget);
+    if (count <= 0) {
+        if (reserve_current_group && group_budget >= 0)
+            return mlx::core::reshape(mlx::core::floor_divide(
+                mlx::core::arange(offset, offset + query.shape(1), 1, mlx::core::int32),
+                array(ratio, mlx::core::int32)), Shape{1, query.shape(1), 1});
+        throw std::invalid_argument("offloaded sparse index selection has no visible groups");
+    }
     const auto& state = rows_.view();
     const int key_chunk = static_cast<int>(std::max<std::size_t>(1,
         std::min<std::size_t>(complete, state.store->config().buffer_bytes / 8 / state.row_bytes)));
@@ -363,17 +376,26 @@ array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int 
         const int take = std::min(8, query.shape(1) - token);
         auto queries = mlx::core::slice(query, Shape{0, token, 0, 0},
             Shape{1, token + take, query.shape(2), width_});
+        const int first_position = offset + token + int(!reserve_current_group);
         const auto visible = mlx::core::reshape(mlx::core::floor_divide(
-            mlx::core::arange(offset + token + 1, offset + token + take + 1, 1, mlx::core::int32),
+            mlx::core::arange(first_position, first_position + take, 1, mlx::core::int32),
             array(ratio, mlx::core::int32)), Shape{1, take, 1});
+        std::optional<array> weights;
+        if (head_weights)
+            weights = mlx::core::expand_dims(mlx::core::astype(mlx::core::slice(
+                *head_weights, Shape{0, token, 0}, Shape{1, token + take, query.shape(2)}),
+                mlx::core::float32), -1);
         std::optional<array> scores, indices;
         for (int start = 0; start < complete; start += key_chunk) {
             const int length = std::min(key_chunk, complete - start);
             auto ids = mlx::core::broadcast_to(mlx::core::reshape(
                 mlx::core::arange(start, start + length, 1, mlx::core::int32), Shape{1, 1, length}),
                 Shape{1, take, length});
-            auto values = mlx::core::where(ids < visible,
-                qwen4_qsa_block_scores(queries, view(start, length)), array(-std::numeric_limits<float>::infinity()));
+            const auto keys = view(start, length);
+            auto values = weights ? mlx::core::sum(
+                mlx::core::maximum(mlx_sparse_indexer_head_scores(queries, keys), array(0.0f)) * *weights, -2)
+                : qwen4_qsa_block_scores(queries, keys);
+            values = mlx::core::where(ids < visible, values, array(-std::numeric_limits<float>::infinity()));
             if (scores) {
                 values = mlx::core::concatenate({*scores, values}, -1);
                 ids = mlx::core::concatenate({*indices, ids}, -1);
@@ -389,7 +411,11 @@ array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int 
         }
         auto canonical = mlx::core::broadcast_to(mlx::core::reshape(
             mlx::core::arange(0, count, 1, mlx::core::int32), Shape{1, 1, count}), Shape{1, take, count});
-        results.push_back(mlx::core::sort(mlx::core::where(visible <= count, canonical, *indices), -1));
+        auto selected = mlx::core::sort(mlx::core::where(visible <= count, canonical, *indices), -1);
+        if (reserve_current_group)
+            selected = mlx::core::concatenate({
+                mlx::core::where(selected < visible, selected, array(-1, mlx::core::int32)), visible}, -1);
+        results.push_back(std::move(selected));
     }
     return results.size() == 1 ? results.front() : mlx::core::concatenate(results, 1);
 }

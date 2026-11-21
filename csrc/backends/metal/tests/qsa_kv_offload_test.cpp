@@ -194,6 +194,25 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
         all(slice(tied, Shape{0, 0, 1}, tied.shape()) >
             slice(tied, Shape{0, 0, 0}, Shape{1, 6, 31})).item<bool>(),
         "tied streamed top-k selected duplicate or invisible blocks");
+
+    const auto weights = values({1, 6, 4}, 113, float32);
+    const auto weighted = cache.select(query, 4090, 4, 128, weights, true);
+    const auto keys_transposed = transpose(keys, {0, 2, 1});
+    const auto dots = reshape(matmul(reshape(astype(query, float32), {1, 24, 32}),
+        keys_transposed), {1, 6, 4, 1024});
+    auto weighted_scores = sum(maximum(dots, array(0.0f)) * expand_dims(weights, -1), -2);
+    const auto current_group = reshape(floor_divide(arange(4090, 4096, 1, int32),
+        array(4, int32)), {1, 6, 1});
+    weighted_scores = where(positions < current_group, weighted_scores, array(-1e30f));
+    const auto history = sort(slice(argpartition(-weighted_scores, 30, -1),
+        Shape{0, 0, 0}, Shape{1, 6, 31}), -1);
+    require(all(weighted == concatenate({history, current_group}, -1)).item<bool>(),
+        "weighted streamed index selection disagrees with the reference or duplicates the current group");
+
+    const auto early = cache.select(query, 0, 4, 128, weights, true);
+    require(all(slice(early, Shape{0, 0, 0}, Shape{1, 4, 31}) == array(-1, int32)).item<bool>() &&
+            all(slice(early, Shape{0, 0, 31}, Shape{1, 4, 32}) == array(0, int32)).item<bool>(),
+        "weighted streamed index selected invisible history at the start of the sequence");
 }
 
 void test_quantized_attention(double bits, int queries, std::size_t buffer) {

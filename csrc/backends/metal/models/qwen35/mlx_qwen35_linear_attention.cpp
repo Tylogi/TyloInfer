@@ -563,6 +563,17 @@ array MlxQwen35LinearAttentionBlock::forward(
     const array& input,
     int position_offset,
     bool use_cache) {
+    auto residual = input + forward_attention(input, position_offset, use_cache);
+    detail::profile_eval("qwen35.linear_attention.output", residual);
+    residual = residual + forward_feed_forward(residual);
+    detail::profile_eval("qwen35.ffn", residual);
+    return residual;
+}
+
+array MlxQwen35LinearAttentionBlock::forward_attention(
+    const array& input,
+    int position_offset,
+    bool use_cache) {
     if (input.ndim() != 3 ||
         input.shape(0) <= 0 ||
         input.shape(1) <= 0 ||
@@ -688,11 +699,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         auto projected = output_(decoded.output);
         if (projected.dtype() != activation_dtype)
             projected = mlx::core::astype(projected, activation_dtype);
-        auto residual = input + projected;
-        detail::profile_eval("qwen35.linear_attention.output", residual);
-        residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-        detail::profile_eval("qwen35.ffn", residual);
-        return residual;
+        return projected;
     }
     const auto beta = mlx::core::sigmoid(beta_logits);
     if (detail::component_profile_active()) {
@@ -790,14 +797,7 @@ array MlxQwen35LinearAttentionBlock::forward(
     const auto gated_value =
         normalized_value *
         (z * mlx::core::sigmoid(z));
-    auto residual = input + output_(
-        mlx::core::astype(
-            gated_value,
-            activation_dtype));
-    detail::profile_eval("qwen35.linear_attention.output", residual);
-    residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-    detail::profile_eval("qwen35.ffn", residual);
-    return residual;
+    return output_(mlx::core::astype(gated_value, activation_dtype));
 }
 
 array MlxQwen35LinearAttentionBlock::forward_speculative(

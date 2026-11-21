@@ -361,7 +361,8 @@ void MlxQwen35MtpModule::restore_cache(const std::vector<MlxKvCacheSnapshot>& st
 MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const MfqContainer& model, int requested_context) {
     const auto graph = effective_model_graph(model);
-    if (graph.graph_kind != "causal_lm" || graph.backbone != "qwen3_5" ||
+    if (graph.graph_kind != "causal_lm" ||
+        (graph.backbone != "qwen3_5" && graph.backbone != "sensenova_loop") ||
         !graph.has_component("text")) {
         throw std::runtime_error(
             "model graph does not describe a Qwen3.5 causal runtime");
@@ -370,7 +371,9 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         Qwen35Config::from_mfq(model),
         model.legacy_tensor_layout().qwen_gdn_gguf_layout);
     if (requested_context == 0) requested_context = static_cast<int>(config.max_position_embeddings);
-    config.yarn = qwen_yarn_scaling(config.yarn, config.max_position_embeddings, requested_context, config.yarn_max_factor);
+    const auto rope_context = graph.backbone == "sensenova_loop" ?
+        qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor) : requested_context;
+    config.yarn = qwen_yarn_scaling(config.yarn, config.max_position_embeddings, rope_context, config.yarn_max_factor);
     config.max_position_embeddings = requested_context;
     auto runtime = load(model, config, Qwen35TensorNames::canonical());
     const bool predictor_declared = graph.has_component("predictor");
@@ -418,21 +421,32 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const auto projection_access = decision
         ? MlxLinear::GgufAccess::projection_only : MlxLinear::GgufAccess::general;
     std::vector<MlxQwen35Layer> layers;
-    layers.reserve(
-        static_cast<std::size_t>(
-            runtime_config.num_hidden_layers));
+    layers.reserve(runtime_config.num_hidden_layers);
+    const bool loop = !runtime_config.layer_weight_ids.empty();
+    std::vector<std::size_t> first_visit(
+        loop ? runtime_config.num_hidden_layers : 0, runtime_config.num_hidden_layers);
+    std::vector<std::optional<LoopHyperConnections>> hyper_connections;
+    if (runtime_config.loop_hyper_connection) hyper_connections.reserve(runtime_config.num_hidden_layers);
     for (std::size_t index = 0;
          index < runtime_config.layer_types.size();
          ++index) {
-        const auto& type =
-            runtime_config.layer_types[index];
+        const auto& type = runtime_config.layer_types[index];
+        const auto weight = runtime_config.weight_layer(index);
+        if (loop && first_visit.at(weight) < index) {
+            const auto previous = first_visit[weight];
+            layers.push_back(layers.at(previous));
+            if (runtime_config.loop_hyper_connection)
+                hyper_connections.push_back(hyper_connections.at(previous));
+            continue;
+        }
+        if (loop) first_visit.at(weight) = index;
         if (type == "full_attention") {
             layers.emplace_back(
                 MlxQwen35FullAttentionBlock::load(
                     model,
                     runtime_config,
                     names,
-                    index,
+                    weight,
                     projection_access));
         } else if (type == "linear_attention") {
             layers.emplace_back(
@@ -440,12 +454,39 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
                     model,
                     runtime_config,
                     names,
-                    index,
+                    weight,
                     projection_access));
         } else {
             throw std::runtime_error(
                 "unsupported Qwen3.5 layer type at index " +
                 std::to_string(index) + ": " + type);
+        }
+        if (runtime_config.loop_hyper_connection) {
+            const auto& cfg = *runtime_config.loop_hyper_connection;
+            const auto first = static_cast<std::size_t>(cfg.start);
+            const auto last = static_cast<std::size_t>(cfg.end - 1);
+            if (weight >= first && weight <= last) {
+                const auto root = "model.block." + std::to_string(weight);
+                const auto load_mhc = [&](const char* domain) {
+                    const auto prefix = root + domain + ".mhc.pre.";
+                    const auto load_fp32 = [&](const char* suffix) {
+                        const auto name = prefix + suffix;
+                        const auto& record = model.record(name);
+                        if (record.dtype != "F32")
+                            throw std::runtime_error("SenseNova mHC projection must use FP32: " + name);
+                        return load_dense_array(record.dtype, model.read(name));
+                    };
+                    MlxHyperConnectionConfig config;
+                    config.streams = cfg.streams;
+                    config.sinkhorn_iterations = cfg.iterations;
+                    config.pre_scale = cfg.pre_scale;
+                    return MlxHyperConnection(load_fp32("function"), load_fp32("bias"), config);
+                };
+                hyper_connections.emplace_back(LoopHyperConnections{
+                    load_mhc(".attention"), load_mhc(".mlp"), weight == first, weight == last});
+            } else {
+                hyper_connections.emplace_back();
+            }
         }
     }
 
@@ -462,7 +503,7 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         runtime_config,
         names);
 
-    return MlxQwen35CausalLm(
+    auto runtime = MlxQwen35CausalLm(
         runtime_config,
         std::move(embedding),
         std::move(layers),
@@ -477,6 +518,8 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         std::nullopt,
         std::move(decision),
         std::move(decision_weight));
+    runtime.loop_hyper_connections_ = std::move(hyper_connections);
+    return runtime;
 }
 
 MlxQwen35CausalLm::MlxQwen35CausalLm(
@@ -830,6 +873,28 @@ array MlxQwen35CausalLm::backbone_forward(
         hidden = std::visit(
             [&](auto& block) {
                 using Block = std::decay_t<decltype(block)>;
+                if (!loop_hyper_connections_.empty() && loop_hyper_connections_[layer_index]) {
+                    const auto& connections = *loop_hyper_connections_[layer_index];
+                    if (speculative_confirmed > 0)
+                        throw std::runtime_error("SenseNova mHC requires serial verification");
+                    auto residual = connections.enter ?
+                        mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
+                            Shape{batch, tokens, config_.loop_hyper_connection->streams, hidden.shape(-1)}) :
+                        hidden;
+                    const auto attention = connections.attention.collapse(residual);
+                    auto attended = [&] {
+                        if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>)
+                            return block.forward_attention(attention.branch,
+                                explicit_positions ? &*explicit_positions : nullptr, position, use_cache);
+                        else
+                            return block.forward_attention(attention.branch, position, use_cache);
+                    }();
+                    residual = MlxHyperConnection::expand(residual, attended, attention);
+                    const auto feed_forward = connections.feed_forward.collapse(residual);
+                    residual = MlxHyperConnection::expand(residual,
+                        block.forward_feed_forward(feed_forward.branch), feed_forward);
+                    return connections.leave ? mlx::core::mean(residual, -2) : residual;
+                }
                 if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>) {
                     if (decision_state) return block.forward_decision(hidden, *decision_state);
                 }

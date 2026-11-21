@@ -714,6 +714,17 @@ int main() {
                 },
                 Shape{1, 2, 2}));
 
+        const array appended(
+            {60.0f, 61.0f, 70.0f, 71.0f, 80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f},
+            Shape{1, 5, 2});
+        auto latest = mfq::metal::mlx_circular_cache_append(circular_cache, appended, 6, circular_history);
+        require_array_close(mfq::metal::mlx_circular_cache_history(latest, 11),
+            array({70.0f, 71.0f, 80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f}, Shape{1, 4, 2}));
+        auto decoded = mfq::metal::mlx_circular_cache_append(
+            latest, array({110.0f, 111.0f}, Shape{1, 1, 2}), 11);
+        require_array_close(mfq::metal::mlx_circular_cache_history(decoded, 12),
+            array({80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f, 110.0f, 111.0f}, Shape{1, 4, 2}));
+
         const array query(
             {0.0f, 0.0f, 0.0f, 0.0f},
             Shape{1, 1, 2, 2});

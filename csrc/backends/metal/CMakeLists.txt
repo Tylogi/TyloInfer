@@ -367,6 +367,7 @@ add_library(mfq-metal-runtime STATIC
     ops/common/mlx_mx.cpp
     ops/tq/mlx_tq.cpp
     ops/common/mlx_sparse_attention.cpp
+    ops/common/mlx_hyper_connection.cpp
     ops/common/mlx_sparse_prefill_tiles.cpp
     ops/common/mlx_csa2.cpp
     ops/common/mlx_dsa_cache_ops.cpp
