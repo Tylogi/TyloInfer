@@ -34,7 +34,6 @@ struct MlxDFlash2Context {
     };
     int position = 0;
     const void* owner = nullptr;
-    std::optional<mlx::core::array> window;
     std::vector<Layer> layers;
     std::size_t bytes() const noexcept;
 };

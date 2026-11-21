@@ -386,8 +386,7 @@ struct MlxDFlash2::Impl {
     void validate_context(const MlxDFlash2Context& context) const {
         if (context.owner != this || context.position < 0 ||
             context.position > std::numeric_limits<int>::max() - config.block_size ||
-            context.layers.size() != std::size_t(config.layers) || !context.window ||
-            context.window->shape() != Shape{1, config.window, config.hidden} || context.window->dtype() != bfloat16)
+            context.layers.size() != std::size_t(config.layers))
             throw std::invalid_argument("DFlash2 context state differs from checkpoint");
         for (const auto& layer : context.layers) for (const auto* value : {&layer.keys, &layer.values})
             if (!*value || (*value)->shape() != Shape{1, config.kv_heads, config.window, config.head_dimension} ||
@@ -407,7 +406,7 @@ void MlxDFlash2::track_weights() const {
     for (const auto& value : impl_->allocations) MlxWeightResidency::track(value);
 }
 std::size_t MlxDFlash2Context::bytes() const noexcept {
-    std::size_t result = window ? window->nbytes() : 0;
+    std::size_t result = 0;
     for (const auto& layer : layers) {
         if (layer.keys) result += layer.keys->nbytes();
         if (layer.values) result += layer.values->nbytes();
@@ -419,7 +418,6 @@ void MlxDFlash2::reset(MlxDFlash2Context& context) const {
     const auto& c = config();
     MlxDFlash2Context next;
     next.owner = impl_.get();
-    next.window = zeros({1, c.window, c.hidden}, bfloat16);
     for (int index = 0; index < c.layers; ++index) next.layers.push_back({
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16),
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16)});
@@ -436,7 +434,7 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
     const auto& c = config();
     struct Lane {
         int begin, retained, position, end_position;
-        array slots, index;
+        array index;
         std::vector<MlxDFlash2Context::Layer> layers;
     };
     std::vector<Lane> lanes;
@@ -454,7 +452,7 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
         features.push_back(astype(slice(hidden, {0, offset, 0}, {1, count, hidden.shape(2)}), bfloat16));
         auto slots = remainder(arange(start + offset, start + count, int32), array(c.window, int32));
         auto index = broadcast_to(reshape(slots, {1, 1, retained, 1}), {1, c.kv_heads, retained, c.head_dimension});
-        lanes.push_back({begin, retained, start + offset, start + count, std::move(slots), std::move(index), {}});
+        lanes.push_back({begin, retained, start + offset, start + count, std::move(index), {}});
         if (begin > std::numeric_limits<int>::max() - retained)
             throw std::invalid_argument("DFlash2 context batch is too large");
         begin += retained;
@@ -482,18 +480,10 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
             lane.layers.push_back({std::move(keys), std::move(values)});
         }
     }
-    std::vector<array> windows;
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-        const auto& lane = lanes[i];
-        auto index = broadcast_to(reshape(lane.slots, {1, lane.retained, 1}), {1, lane.retained, c.hidden});
-        windows.push_back(put_along_axis(*commits[i].context->window, index, part(hidden, lane), 1));
-        outputs.push_back(windows.back());
-    }
     if (!MlxKernelPreparation::collecting()) async_eval(outputs);
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         auto& context = *commits[i].context;
         context.layers = std::move(lanes[i].layers);
-        context.window = std::move(windows[i]);
         context.position = lanes[i].end_position;
     }
 }

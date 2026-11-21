@@ -86,7 +86,7 @@ int main() {
         const std::vector<std::uint16_t> saved_keys(original_keys.data<std::uint16_t>(),
             original_keys.data<std::uint16_t>() + original_keys.size());
         draft.append_context(context, ones({1, 3, 64}, bfloat16), 17);
-        if (context.position != 20 || original.position != 17 || context.bytes() != 6144)
+        if (context.position != 20 || original.position != 17 || context.bytes() != 4096)
             throw std::runtime_error("draft context accounting or snapshot changed");
         auto updated_keys = view(*context.layers[0].keys, uint16);
         updated_keys.eval();
@@ -164,7 +164,6 @@ int main() {
                 const auto& actual = *actual_contexts[lane];
                 const auto& expected = *expected_contexts[lane];
                 if (actual.position != expected.position ||
-                    !allclose(*actual.window, *expected.window, 1e-3, 1e-5).item<bool>() ||
                     !allclose(*actual.layers[0].keys, *expected.layers[0].keys, 1e-3, 1e-5).item<bool>() ||
                     !allclose(*actual.layers[0].values, *expected.layers[0].values, 1e-3, 1e-5).item<bool>())
                     throw std::runtime_error("batched DFlash2 context commit differs from independent rings");
