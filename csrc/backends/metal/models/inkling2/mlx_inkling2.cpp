@@ -11,6 +11,7 @@
 #include "tyloinfer/layer_loop.h"
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -32,12 +33,69 @@ array rms(const array& x, float eps = 1e-6f) {
     return fast::rms_norm(x, std::nullopt, eps);
 }
 
-array depth_mix(const std::vector<array>& history, const array& current, const array& query) {
-    auto states = history;
-    states.push_back(current);
-    auto values = rms(astype(stack(states, -2), float32));
+array depth_mix(const std::vector<array>& normalized_history, const array& current, const array& query) {
+    auto states = normalized_history;
+    states.push_back(rms(astype(current, float32)));
+    auto values = stack(states, -2);
     const int hidden = values.shape(-1);
     auto rows = reshape(astype(query, float32), {-1, hidden});
+    const auto threads = std::int64_t(values.shape(0)) * values.shape(1) * rows.shape(0) * 256;
+    if (default_device() == Device::gpu && values.shape(1) <= 8 && values.shape(2) <= 16 &&
+        threads <= std::numeric_limits<int>::max() &&
+        (current.dtype() == float16 || current.dtype() == bfloat16)) {
+        static const auto kernel = [] {
+            CompileOptions options;
+            options.math_mode = MathMode::Safe;
+            return fast::metal_kernel("tyloinfer_inkling_depth_mix",
+                {"values", "queries"}, {"mixed"}, R"MSL(
+                const uint row = threadgroup_position_in_grid.x;
+                const uint token = row / QUERIES;
+                const uint query = row % QUERIES;
+                const uint tid = thread_index_in_threadgroup;
+                const uint lane = thread_index_in_simdgroup;
+                const uint group = simdgroup_index_in_threadgroup;
+                threadgroup float partial[DEPTH][8];
+                threadgroup float weights[DEPTH];
+                for (uint depth = 0; depth < DEPTH; ++depth) {
+                    float sum = 0.f;
+                    const auto v = values + (ulong(token) * DEPTH + depth) * WIDTH;
+                    const auto q = queries + query * WIDTH;
+                    for (uint i = tid; i < WIDTH; i += 256)
+                        sum = metal::fma(q[i], v[i], sum);
+                    sum = simd_sum(sum);
+                    if (lane == 0) partial[depth][group] = sum;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    float maximum = -INFINITY;
+                    for (uint depth = 0; depth < DEPTH; ++depth) {
+                        float dot = 0.f;
+                        for (uint group = 0; group < 8; ++group) dot += partial[depth][group];
+                        weights[depth] = dot / metal::precise::sqrt(float(WIDTH));
+                        maximum = max(maximum, weights[depth]);
+                    }
+                    float norm = 0.f;
+                    for (uint depth = 0; depth < DEPTH; ++depth) {
+                        weights[depth] = metal::exp(weights[depth] - maximum);
+                        norm += weights[depth];
+                    }
+                    for (uint depth = 0; depth < DEPTH; ++depth) weights[depth] /= norm;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = tid; i < WIDTH; i += 256) {
+                    float value = 0.f;
+                    for (uint depth = 0; depth < DEPTH; ++depth)
+                        value = metal::fma(weights[depth], values[(ulong(token) * DEPTH + depth) * WIDTH + i], value);
+                    mixed[ulong(row) * WIDTH + i] = T(value);
+                }
+                )MSL", "", true, false, options);
+        }();
+        const Shape shape{values.shape(0), values.shape(1), rows.shape(0), hidden};
+        return kernel({values, rows}, {shape}, {current.dtype()},
+            {static_cast<int>(threads), 1, 1}, {256, 1, 1},
+            {{"T", current.dtype()}, {"DEPTH", values.shape(2)}, {"WIDTH", hidden}, {"QUERIES", rows.shape(0)}},
+            std::nullopt, false, {}).front();
+    }
     auto score = matmul(rows, transpose(values, {0, 1, 3, 2})) / std::sqrt(float(hidden));
     return astype(matmul(softmax(score, -1, true), values), current.dtype());
 }
@@ -361,7 +419,7 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     attended = reshape(transpose(attended, {0, 2, 1, 3}), {batch, rows, g.heads * g.dim});
     auto branch = layer.attention_out(attended * sigmoid(projections[3]));
     branch = short_convolution(branch, layer.shortconv[2], cache.convolution[2]);
-    if (physical % g.block == 0) blocks.push_back(hidden);
+    if (physical % g.block == 0) blocks.push_back(rms(astype(hidden, float32)));
     else branch = branch + hidden;
     auto ffn = mix_stream(depth_mix(blocks, branch, layer.ffn_res_query), 0);
     if (messages) ffn = layer.controls[3](ffn, mix_stream(*messages, 3));
@@ -433,8 +491,11 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
             std::optional<array>(depth_mix(previous_blocks, *previous_output, *layer.message_query)) : std::nullopt;
         hidden = apply_layer(layer, g, physical, cache.position, hidden, blocks, messages, cache.visits[visit]);
     }
+    if (last_logit_only) {
+        hidden = time_slice(hidden, count - 1, count);
+        for (auto& block : blocks) block = time_slice(block, count - 1, count);
+    }
     hidden = mix_stream(depth_mix(blocks, hidden, weights_->output_query), 0);
-    if (last_logit_only) hidden = time_slice(hidden, count - 1, count);
     auto logits = astype(weights_->output(weights_->output_norm(hidden)), float32);
     if (g.logit_cap > 0) logits = tanh(logits / g.logit_cap) * g.logit_cap;
     cache.position += count;
