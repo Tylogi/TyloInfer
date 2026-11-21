@@ -188,6 +188,11 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     require(bool(full_view) == (keys.nbytes() <= buffer / 2), "offloaded index view exceeded the read buffer");
     require(budget > 32768 ? store->stats().disk_bytes == 0 : store->stats().disk_bytes > 0,
         "indexer residency does not match its byte budget");
+    require(all(cache.view(0, 32) == slice(keys, {0, 0, 0}, {1, 32, 32})).item<bool>(),
+        "batched offloaded index read differs from resident keys");
+    if (full_view)
+        require(all(cache.view(15, 38) == slice(keys, {0, 15, 0}, {1, 53, 32})).item<bool>(),
+            "batched offloaded index read lost its partial boundaries");
     const array gathered_ids({101, 102, 103, -1, 302, 16, 15, 16}, Shape{1, 2, 4}, int32);
     const auto gathered = cache.gather(gathered_ids);
     const auto gathered_reference = take(keys, maximum(gathered_ids, array(0, int32)), 1);

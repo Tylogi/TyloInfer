@@ -346,8 +346,30 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     const auto& state = rows_.view();
     if (static_cast<std::size_t>(count) * state.row_bytes > state.store->config().buffer_bytes / 2)
         throw std::invalid_argument("offloaded QSA index range exceeds read buffer");
+    const auto begin = static_cast<std::size_t>(start), end = begin + count;
+    if (end > state.position) throw std::out_of_range("QSA KV read exceeds its snapshot");
     auto keys = array(mlx::core::allocator::malloc(count * state.row_bytes), Shape{1, count, width_}, dtype_);
-    state.read_rows(start, count, keys.data<std::uint8_t>());
+    auto* output = keys.data<std::uint8_t>();
+    const auto first_block = (begin + state.block_rows - 1) / state.block_rows;
+    const auto stop_block = std::min(end / state.block_rows, state.blocks.size());
+    if (state.priority != kMlxQsaIndexPriority || stop_block <= first_block + 1) {
+        state.read_rows(begin, count, output);
+        return keys;
+    }
+    // An index scan reads a bounded view once. Coalesce its complete disk
+    // blocks without evicting the hot KV rows selected by preceding queries.
+    const auto first_row = first_block * state.block_rows;
+    const auto stop_row = stop_block * state.block_rows;
+    state.read_rows(begin, first_row - begin, output);
+    std::vector<QsaKvStore::ReadRequest> blocks;
+    blocks.reserve(stop_block - first_block);
+    for (auto block = first_block; block < stop_block; ++block) {
+        const auto offset = block * state.block_rows - begin;
+        blocks.push_back({state.blocks[block], output + offset * state.row_bytes,
+            state.block_rows * state.row_bytes});
+    }
+    state.store->read_into_batch(blocks);
+    state.read_rows(stop_row, end - stop_row, output + (stop_row - begin) * state.row_bytes);
     return keys;
 }
 
