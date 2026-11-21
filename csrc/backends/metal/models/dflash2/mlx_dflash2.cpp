@@ -877,6 +877,40 @@ std::int32_t MlxDFlash2::generate_greedy(MlxQwen4CausalLm& target,
         prefill_chunk_size, stop_token, stats, maximum_drafts);
 }
 
+std::int32_t mlx_dflash2_constrained_token(MlxSampler& sampler, const mlx::core::array& logits,
+    std::int32_t token, const MfqTokenConstraintPtr& constraint) {
+    if (!constraint || constraint->allows(token)) return token;
+    auto adjusted = mlx::core::contiguous(mlx::core::astype(logits, mlx::core::float32));
+    adjusted.eval();
+    std::vector<float> masked(adjusted.data<float>(), adjusted.data<float>() + adjusted.size());
+    constraint->apply(masked.data(), masked.size());
+    const mlx::core::array row(masked.begin(), {1, static_cast<int>(masked.size())}, mlx::core::float32);
+    const auto selected = sampler.sample(row).item<std::int32_t>();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= masked.size() || !constraint->allows(selected))
+        throw std::runtime_error("DFlash2 constrained target sampler returned an invalid token");
+    return selected;
+}
+
+mfq::engine::mtp::ChainVerification mlx_dflash2_verify_constraint(MlxSampler& sampler,
+    const mlx::core::array& logits, std::span<const std::int32_t> drafts,
+    std::span<const std::int32_t> targets, const MfqTokenConstraintPtr& constraint) {
+    auto cursor = constraint->clone();
+    if (!cursor) throw std::runtime_error("DFlash2 token constraint clone is incomplete");
+    const int vocab = logits.shape(-1);
+    const auto rows = mlx::core::reshape(logits, {static_cast<int>(targets.size()), vocab});
+    for (std::size_t i = 0; i < drafts.size(); ++i) {
+        const int row = static_cast<int>(i);
+        const auto token = mlx_dflash2_constrained_token(sampler,
+            mlx::core::slice(rows, {row, 0}, {row + 1, vocab}), targets[i], cursor);
+        if (token != drafts[i]) return {i, token, false};
+        cursor->accept(token);
+    }
+    const int last = static_cast<int>(drafts.size());
+    const auto bonus = mlx_dflash2_constrained_token(sampler,
+        mlx::core::slice(rows, {last, 0}, {last + 1, vocab}), targets.back(), cursor);
+    return {drafts.size(), bonus, true};
+}
+
 namespace {
 
 struct Qwen4DFlashTarget {
@@ -934,7 +968,8 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) {
     const auto& c = draft.config();
     if (prompt.empty() || prompt.size() > std::size_t(target.context_capacity()) || max_tokens < 0 ||
         prefill_chunk_size < 1 || maximum_drafts < 1 || maximum_drafts >= c.block_size ||
@@ -947,6 +982,10 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
     if (sampling.has_penalties()) throw std::invalid_argument("DFlash2 does not support sampling penalties");
     MlxSampler sampler(sampling);
     const auto select = [&](const array& logits) { return reshape(astype(sampler.sample(logits), int32), {-1}); };
+    const auto select_one = [&](const array& logits) {
+        return mlx_dflash2_constrained_token(sampler, logits,
+            select(logits).template item<std::int32_t>(), constraint);
+    };
     if (stats) *stats = {};
     if (!max_tokens) return 0;
     target.set_hidden_capture_layers(c.target_layers);
@@ -973,11 +1012,12 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         start += count;
     }
     const int limit = std::min(max_tokens, target.context_capacity() - int(prompt.size()) + 1);
-    int pending = select(*logits).template item<std::int32_t>();
+    int pending = select_one(*logits);
     int generated = 0;
     bool running = true;
     const auto emit = [&](int token) {
         if (stop_token && token == *stop_token) { running = false; return false; }
+        if (constraint) constraint->accept(token);
         ++generated;
         running = !callback || callback(token);
         return running;
@@ -989,7 +1029,7 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         if (remaining == 1) {
             const auto started = Clock::now();
             auto value = target.decode(pending);
-            const auto token = select(value).template item<std::int32_t>();
+            const auto token = select_one(value);
             if (stats) stats->target_ms += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
             emit(token);
             if (stats) ++stats->standard_tokens;
@@ -1038,9 +1078,11 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         if (stats) stats->target_ms += std::chrono::duration<double, std::milli>(Clock::now() - verify_started).count();
         auto features = target.take_hidden_capture();
         if (!features) throw std::runtime_error("DFlash2 target omitted verification features");
-        const auto decision = mfq::engine::mtp::verify_greedy(
-            std::span<const std::int32_t>(proposal.tokens.template data<std::int32_t>(), depth),
-            std::span<const std::int32_t>(predictions.template data<std::int32_t>(), depth + 1));
+        const std::span<const std::int32_t> drafts(proposal.tokens.template data<std::int32_t>(), depth);
+        const std::span<const std::int32_t> targets(predictions.template data<std::int32_t>(), depth + 1);
+        const auto decision = constraint
+            ? mlx_dflash2_verify_constraint(sampler, verified, drafts, targets, constraint)
+            : mfq::engine::mtp::verify_greedy(drafts, targets);
         const int matched = int(decision.accepted_drafts);
         if (stats) {
             ++stats->cycles; stats->proposed += c.block_size - 1;
@@ -1078,20 +1120,22 @@ std::int32_t MlxDFlash2::generate(MlxQwen4CausalLm& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) const {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) const {
     Qwen4DFlashTarget adapter(target);
     return generate_target(*this, adapter, prompt, sampling, max_tokens, callback, prefill_callback,
-        prefill_chunk_size, stop_token, stats, maximum_drafts);
+        prefill_chunk_size, stop_token, stats, maximum_drafts, constraint);
 }
 
 std::int32_t MlxDFlash2::generate(MlxQwen35CausalLm& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) const {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) const {
     Qwen35DFlashTarget adapter(target);
     return generate_target(*this, adapter, prompt, sampling, max_tokens, callback, prefill_callback,
-        prefill_chunk_size, stop_token, stats, maximum_drafts);
+        prefill_chunk_size, stop_token, stats, maximum_drafts, constraint);
 }
 
 }

@@ -1901,11 +1901,8 @@ public:
     std::size_t request_capacity() const override { return batching_capacity; }
     bool can_batch(const mfq::engine::EngineRequest& request) const override {
         if (!batching || request.input.media) return false;
-        if (runtime_components.dflash2 && mfq::metal::mlx_dflash2_sampling_supported(request.input.sampling, {})) {
-            if (!request.input.chat_input) return true;
-            const auto& chat = request.input.chat_input->template_inputs;
-            if (chat.grammar.empty() && chat.json_schema.empty() && chat.tools.empty()) return true;
-        }
+        if (runtime_components.dflash2 && mfq::metal::mlx_dflash2_sampling_supported(request.input.sampling))
+            return true;
         return !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
     }
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
@@ -2023,13 +2020,25 @@ public:
                     (!cache_plan.session_id.empty() ||
                      session_cache->persistent_prefix_enabled()) &&
                     loaded_runtime.supports_text_session_state();
+                std::size_t restored = 0;
+                double restore_ms = 0.0;
                 if (cache_enabled) {
-                    const auto restored = session_cache->restore_best(
+                    bool native_mtp_available = runtime_components.mtp_available;
+                    if constexpr (requires { loaded_runtime.supports_mtp(); }) {
+                        // A loaded DFlash2 draft also sets the advertised MTP flag.
+                        if (runtime_components.dflash2)
+                            native_mtp_available = loaded_runtime.supports_mtp();
+                    }
+                    const auto restore_started = std::chrono::steady_clock::now();
+                    restored = session_cache->restore_best(
                         loaded_runtime,
                         cache_plan.session_id,
                         prompt,
-                        stable_prefix_tokens, parameters.enable_mtp && runtime_components.mtp_available &&
+                        stable_prefix_tokens, parameters.enable_mtp && native_mtp_available &&
                             sampling.max_tokens > 1, media_key);
+                    if (restored)
+                        restore_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - restore_started).count();
                     if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>)
                         if (request.vision && restored == 0) loaded_runtime.reset_cache(1);
                 }
@@ -2069,11 +2078,16 @@ public:
                     cache_tokens.push_back(token);
                     return !callback || callback(token);
                 };
+                std::size_t prefilled = 0;
+                const auto report_prefill = [&](MfqPrefillTiming timing) {
+                    prefilled += timing.prompt_tokens;
+                    on_prefill(timing);
+                };
                 const auto generated = [&] {
                     if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
                         if (request.vision) return loaded_runtime.generate_multimodal(prompt, images, parameters,
                             sampling.max_tokens, cached_callback, [&](std::size_t tokens, double ms) {
-                                on_prefill(MfqPrefillTiming{tokens, ms, 0.0, ms});
+                                report_prefill(MfqPrefillTiming{tokens, ms, 0.0, ms});
                             }, token_constraint, effective_cache_plan.stable_prefix_tokens, prefill_chunk_size, prefix_hooks);
                     }
                     return generate_with_prefill_metrics(
@@ -2082,12 +2096,16 @@ public:
                     parameters,
                     sampling.max_tokens,
                     cached_callback,
-                    on_prefill,
+                    report_prefill,
                     effective_cache_plan,
                     token_constraint,
                     prefill_chunk_size,
                     prefix_hooks);
                 }();
+                if (restored && prefilled == prompt.size() - restored) {
+                    job.cached_tokens = restored;
+                    job.prefix_restore_ms = restore_ms;
+                }
                 if (!prefix_hooks && cache_enabled &&
                     loaded_runtime.cache_position() ==
                         static_cast<int>(stable_prefix_tokens)) {

@@ -268,9 +268,10 @@ public:
         : runtime_(runtime), hooks_(std::move(hooks)) {}
 
     std::int64_t prepare(const std::shared_ptr<Request>& request) {
-        if (hooks_.dflash2 && mlx_dflash2_sampling_supported(request->sampling, request->token_constraint))
+        if (hooks_.dflash2 && mlx_dflash2_sampling_supported(request->sampling))
             hooks_.dflash2->reset(request->dflash_context.emplace());
-        request->mtp = request->dflash_context || (request->sampling.enable_mtp && runtime_.supports_mtp());
+        request->mtp = request->dflash_context || (request->sampling.enable_mtp &&
+            request->sampling.max_tokens > 1 && runtime_.supports_batch_mtp());
         runtime_.clear_cache();
         request->cache = runtime_.make_request_cache();
         const auto restored = hooks_.restore ? hooks_.restore(*request) : 0;
@@ -753,9 +754,15 @@ private:
         auto& context = *request->dflash_context;
         auto& stats = request->mtp_stats;
         stats.available = true;
+        const auto emit = [&](const std::vector<std::int64_t>& tokens) {
+            auto delta = output.append(tokens);
+            if (request->token_constraint)
+                for (const auto token : delta.token_ids) request->token_constraint->accept(token);
+            return delta;
+        };
         auto pending = static_cast<std::int32_t>(sample_logits(*request, *request->initial_logits));
         request->initial_logits.reset();
-        auto delta = output.append({pending});
+        auto delta = emit({pending});
         request->produced += delta.token_ids.size();
         stats.standard_tokens = request->produced;
         if (mlx_dflash_tree_enabled() && request->sampler.params().greedy() && !request->counts && !request->token_constraint) {
@@ -813,15 +820,19 @@ private:
                     node = child;
                 }
                 matched = static_cast<int>(tokens.size());
-            } else if (depth) {
-                const auto decision = mfq::engine::mtp::verify_greedy(
-                    {drafts, static_cast<std::size_t>(depth)}, {target, static_cast<std::size_t>(depth + 1)});
+            } else if (depth || request->token_constraint) {
+                const std::span<const std::int32_t> proposed(drafts, depth);
+                const std::span<const std::int32_t> predicted(target, depth + 1);
+                const auto decision = request->token_constraint
+                    ? mlx_dflash2_verify_constraint(request->sampler, verified.logits, proposed,
+                        predicted, request->token_constraint)
+                    : mfq::engine::mtp::verify_greedy(proposed, predicted);
                 matched = static_cast<int>(decision.accepted_drafts);
                 pending = decision.next_token;
-                tokens.assign(drafts, drafts + matched);
+                if (matched) tokens.assign(drafts, drafts + matched);
             }
             tokens.push_back(pending);
-            delta = output.append(tokens);
+            delta = emit(tokens);
             const int retained = std::min(matched, static_cast<int>(delta.token_ids.size()));
             auto features = std::move(verified.hidden);
             if (tree) {

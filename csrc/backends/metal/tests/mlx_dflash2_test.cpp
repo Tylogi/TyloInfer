@@ -4,6 +4,8 @@
 #include "mlx_linear_attention.h"
 #include "mlx_dflash2_serving.h"
 #include "mlx_qwen35_causal_lm.h"
+#include "grammar_fixture.h"
+#include "mtp_policy.h"
 #include <mlx/io.h>
 #include <nlohmann/json.hpp>
 #include <cmath>
@@ -20,15 +22,30 @@ int main() {
         set_default_device(Device::gpu);
         MfqSamplingParams sampling;
         sampling.temperature = 0;
-        if (!mlx_dflash2_sampling_supported(sampling, {})) throw std::runtime_error("greedy DFlash2 unavailable");
+        if (!mlx_dflash2_sampling_supported(sampling)) throw std::runtime_error("greedy DFlash2 unavailable");
+        {
+            auto constraint = mfq::metal::test::grammar_constraint(3, "root ::= \"a\" \"b\" root");
+            MlxSampler sampler(MlxSamplingParams{});
+            const array logits({9.f, 4.f, 1.f, 9.f, 4.f, 1.f, 9.f, 4.f, 1.f}, {3, 3});
+            const std::array<std::int32_t, 3> predictions{0, 0, 0};
+            auto decision = mlx_dflash2_verify_constraint(sampler, logits,
+                std::array<std::int32_t, 2>{0, 0}, predictions, constraint);
+            if (decision.accepted_drafts != 1 || decision.next_token != 1 ||
+                !constraint->allows(0) || constraint->allows(1))
+                throw std::runtime_error("DFlash2 accepted a forbidden draft or advanced the committed grammar");
+            decision = mlx_dflash2_verify_constraint(sampler, logits,
+                std::array<std::int32_t, 2>{0, 1}, predictions, constraint);
+            if (decision.accepted_drafts != 2 || decision.next_token != 0 || !decision.bonus)
+                throw std::runtime_error("DFlash2 constrained resampling did not retain a valid draft");
+        }
         sampling.temperature = 1;
-        if (!mlx_dflash2_sampling_supported(sampling, {})) throw std::runtime_error("stochastic DFlash2 unavailable");
+        if (!mlx_dflash2_sampling_supported(sampling)) throw std::runtime_error("stochastic DFlash2 unavailable");
         sampling.top_k = 1;
-        if (!mlx_dflash2_sampling_supported(sampling, {})) throw std::runtime_error("top-k one DFlash2 unavailable");
+        if (!mlx_dflash2_sampling_supported(sampling)) throw std::runtime_error("top-k one DFlash2 unavailable");
         sampling.presence_penalty = .1;
-        if (mlx_dflash2_sampling_supported(sampling, {})) throw std::runtime_error("penalty DFlash2 accepted");
+        if (mlx_dflash2_sampling_supported(sampling)) throw std::runtime_error("penalty DFlash2 accepted");
         sampling.presence_penalty = 0; sampling.enable_mtp = false;
-        if (mlx_dflash2_sampling_supported(sampling, {})) throw std::runtime_error("disabled DFlash2 accepted");
+        if (mlx_dflash2_sampling_supported(sampling)) throw std::runtime_error("disabled DFlash2 accepted");
         std::filesystem::create_directories(directory);
         nlohmann::json config{{"model_type", "qwen3"}, {"hidden_size", 64}, {"vocab_size", 1024}, {"num_hidden_layers", 1},
             {"intermediate_size", 64}, {"num_attention_heads", 1}, {"num_key_value_heads", 1}, {"head_dim", 64},

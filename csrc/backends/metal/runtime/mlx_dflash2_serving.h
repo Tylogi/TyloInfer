@@ -13,11 +13,10 @@ class MlxQwen4CausalLm;
 class MlxQwen35CausalLm;
 struct MlxEngineComponents;
 
-inline bool mlx_dflash2_sampling_supported(const MfqSamplingParams& sampling,
-    const MfqTokenConstraintPtr& constraint) noexcept {
+inline bool mlx_dflash2_sampling_supported(const MfqSamplingParams& sampling) noexcept {
     return sampling.enable_mtp && sampling.max_tokens > 1 &&
         sampling.presence_penalty == 0 && sampling.frequency_penalty == 0 &&
-        sampling.repetition_penalty == 1 && !constraint;
+        sampling.repetition_penalty == 1;
 }
 void configure_mlx_dflash2(MlxEngineComponents& components,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
