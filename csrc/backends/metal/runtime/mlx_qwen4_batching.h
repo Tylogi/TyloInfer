@@ -76,13 +76,15 @@ private:
 
 class MlxDFlashTreeBudget {
 public:
-    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false) const {
+    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false, bool price_wide_rows = false) const {
         const int lanes = static_cast<int>(trees.size());
         if (lanes == 0 || lanes > static_cast<int>(costs_.size())) return;
         const auto& cost = costs_[lanes - 1];
-        if (!calibrated && (cost.samples < 4 || cost.samples % 16 == 15)) return;
+        const bool probe = !calibrated && (cost.samples < 4 || cost.samples % 16 == 15);
+        if (probe && !price_wide_rows) return;
         const auto step_cost = [&](int rows) {
-            return calibrated ? row_bucket_price(lanes, rows) : price(cost, lanes, rows);
+            if (calibrated) return row_bucket_price(lanes, rows);
+            return price(cost, lanes, rows) * wide_row_factor(price_wide_rows, rows);
         };
         // Splash StepCosts pools the next row of every lane by path reach,
         // then chooses the prefix with the most expected tokens per cost.
@@ -111,10 +113,11 @@ public:
         }
     }
 
-    void observe(int lanes, int rows, double ms) {
+    void observe(int lanes, int rows, double ms, bool price_wide_rows = false) {
         if (lanes < 1 || lanes > static_cast<int>(costs_.size()) || ms <= 0.0) return;
         auto& c = costs_[lanes - 1];
-        const double wall = c.samples ? std::min(ms, 2.0 * price(c, lanes, rows)) : ms;
+        const double normalized_ms = ms / wide_row_factor(price_wide_rows, rows);
+        const double wall = c.samples ? std::min(normalized_ms, 2.0 * price(c, lanes, rows)) : normalized_ms;
         constexpr double decay = .95;
         ++c.samples;
         c.weight = c.weight * decay + 1.0;
@@ -129,6 +132,12 @@ private:
         int samples = 0;
         double weight = 0.0, rows = 0.0, rows_squared = 0.0, wall = 0.0, rows_wall = 0.0;
     };
+
+    static double wide_row_factor(bool enabled, int rows) {
+        // Flash-Next's native GGUF projections switch plans above 32 rows.
+        // The factor includes the draft time in the measured decode step.
+        return enabled && rows > 32 ? 1.30 : 1.0;
+    }
 
     static double row_bucket_price(int lanes, int rows) {
         // Splash's measured step costs on resident Flash-Next
@@ -933,9 +942,10 @@ private:
             mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
         const bool calibrated = three_way && flash_next_on_m5_max;
         const bool four_way_buckets = four_way && width >= 3 && flash_next_on_m5_max;
+        const bool price_wide_rows = width >= 5 && flash_next_on_m5_max && !runtime_.ssd_expert_payload_bytes();
         // Use full trees once a calibrated three-request group drains.
         if (adaptive && (!calibrated || width == 3))
-            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets);
+            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets, price_wide_rows);
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
         const auto verification = std::chrono::steady_clock::now();
@@ -997,7 +1007,7 @@ private:
         const auto finished = std::chrono::steady_clock::now();
         dflash_tree_verify_ms_ += std::chrono::duration<double, std::milli>(finished - verification).count();
         if (adaptive && !calibrated) dflash_tree_budget_.observe(static_cast<int>(caches.size()), start,
-            std::chrono::duration<double, std::milli>(finished - started).count());
+            std::chrono::duration<double, std::milli>(finished - started).count(), price_wide_rows);
         ++decode_batches_;
         decode_rows_ += caches.size();
         maximum_batch_ = std::max(maximum_batch_, caches.size());
