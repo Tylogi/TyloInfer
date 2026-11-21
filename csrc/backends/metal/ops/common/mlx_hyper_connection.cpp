@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace mfq::metal {
@@ -155,6 +156,41 @@ MlxHyperConnectionState MlxHyperConnection::collapse(const array& residual) cons
 
 array MlxHyperConnection::expand(const array& residual, const array& branch,
     const MlxHyperConnectionState& state) {
+    if (state.combination && residual.ndim() == 4 && residual.size() > 0 &&
+        residual.size() <= std::size_t(std::numeric_limits<int>::max()) && default_device() == Device::gpu &&
+        residual.dtype() == branch.dtype() && (residual.dtype() == float16 || residual.dtype() == bfloat16) &&
+        state.combination->shape() == Shape{residual.shape(0), residual.shape(1), residual.shape(2), residual.shape(2)} &&
+        state.post.shape() == Shape{residual.shape(0), residual.shape(1), residual.shape(2)} &&
+        branch.shape() == Shape{residual.shape(0), residual.shape(1), residual.shape(3)}) {
+        const int streams = residual.shape(2), width = residual.shape(3);
+        static const auto kernel = [] {
+            CompileOptions options;
+            options.math_mode = MathMode::Safe;
+            return fast::metal_kernel("tyloinfer_hyper_connection_expand",
+                {"residual", "branch", "post", "combination"}, {"output"}, R"MSL(
+                const uint i = thread_position_in_grid.x;
+                const ulong count = ulong(residual_shape[0]) * residual_shape[1] * STREAMS * WIDTH;
+                if (i >= count) return;
+                const uint row = i / (STREAMS * WIDTH);
+                const uint stream = (i / WIDTH) % STREAMS;
+                const uint channel = i % WIDTH;
+                float mixed = 0.0f;
+                for (uint k = 0; k < STREAMS; ++k) {
+                    const T coefficient = T(combination[(ulong(row) * STREAMS + stream) * STREAMS + k]);
+                    const uint source = (row * STREAMS + k) * WIDTH + channel;
+                    mixed = metal::fma(float(coefficient), float(residual[source]), mixed);
+                }
+                const T gate = T(post[row * STREAMS + stream]);
+                const T delta = T(float(gate) * float(branch[row * WIDTH + channel]));
+                output[i] = T(float(T(mixed)) + float(delta));
+                )MSL", "", true, false, options);
+        }();
+        const auto size = static_cast<int>(residual.size());
+        return kernel({residual, branch, state.post, *state.combination}, {residual.shape()}, {residual.dtype()},
+            {size, 1, 1}, {std::min(size, 256), 1, 1},
+            {{"T", residual.dtype()}, {"WIDTH", width}, {"STREAMS", streams}},
+            std::nullopt, false, {}).front();
+    }
     const auto mixed = state.combination ? matmul(astype(*state.combination, residual.dtype()), residual) : residual;
     return mixed + expand_dims(astype(state.post, branch.dtype()), -1) * expand_dims(branch, -2);
 }

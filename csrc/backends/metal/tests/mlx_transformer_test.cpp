@@ -202,6 +202,16 @@ int main() {
             if (!fused) throw std::runtime_error("small Hy4 iHC projection was not fused");
             require_array_close(*fused, expected);
         }
+        {
+            const auto residual = reshape(astype(arange(0, 192, 1, float32) / 128.0f, bfloat16), {1, 3, 2, 32});
+            const auto branch = astype(ones({1, 3, 32}), bfloat16);
+            const auto gates = full({1, 3, 2}, array(0.25f));
+            const auto mixing = broadcast_to(array({0.75f, 0.25f, 0.25f, 0.75f}, {1, 1, 2, 2}), {1, 3, 2, 2});
+            const mfq::metal::MlxHyperConnectionState state{branch, gates, mixing};
+            const auto expected = matmul(astype(mixing, bfloat16), residual) +
+                expand_dims(astype(gates, bfloat16), -1) * expand_dims(branch, -2);
+            require_array_close(mfq::metal::MlxHyperConnection::expand(residual, branch, state), expected);
+        }
         for (const double factor : {2.0, 4.0}) {
             auto scaling = mfq::metal::qwen_yarn_scaling({}, 262144, static_cast<int>(262144 * factor), 4.0);
             require_close(scaling.attention_factor, 1.0 + 0.1 * std::log(factor));
