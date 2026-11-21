@@ -61,7 +61,7 @@ export function DFlash2Controls({ model, artifacts, instance, backend, disabled,
 
   return <>
     <SectionLabel title="DFlash2" />
-    <TMPanel>
+    <TMPanel className="dflash2-panel">
       <SettingRow title={tr('草稿模型', 'Draft model')} detail={status}
         trailing={drafts.length > 1 ? <select aria-label={tr('DFlash2 草稿', 'DFlash2 draft')}
           value={draft?.id ?? ''} disabled={busy}
@@ -79,7 +79,7 @@ export function DFlash2Controls({ model, artifacts, instance, backend, disabled,
           else void run(() => onLoad(draft.id));
         }}>{tr('加载 DFlash2 草稿', 'Load DFlash2 draft')}</button>
       </div>
-      {confirm && draft && <div className="model-settings-actions">
+      {confirm && draft && <div className="model-settings-actions dflash2-confirmation">
         <span>{tr('加载会重载主模型并清空活动 KV。', 'Loading reloads the target model and clears its active KV.')}</span>
         <button type="button" onClick={() => setConfirm(false)}>{tr('取消', 'Cancel')}</button>
         <button type="button" disabled={Boolean(loadDisabled)} onClick={() => {
