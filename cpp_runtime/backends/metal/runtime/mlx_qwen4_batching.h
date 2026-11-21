@@ -935,11 +935,11 @@ private:
         dflash_tree_draft_ms_ += std::chrono::duration<double, std::milli>(verification - started).count();
         DFlashCapture capture(runtime_, &draft);
         // Reuse Splash's one- and two-row expert kernels while the cohort drains.
-        const bool use_short_expert_tiles = flash_next_on_m5_max &&
-            std::ranges::any_of(cohort.active, [](const auto& request) {
-                return request->dflash_max_verify_width >= 3;
-            });
-        auto logits = runtime_.forward_request_trees(caches, plans, &dflash_tree_qsa_lanes_, use_short_expert_tiles);
+        int tuned_dflash_width = 0;
+        if (flash_next_on_m5_max)
+            for (const auto& request : cohort.active)
+                tuned_dflash_width = std::max(tuned_dflash_width, static_cast<int>(request->dflash_max_verify_width));
+        auto logits = runtime_.forward_request_trees(caches, plans, &dflash_tree_qsa_lanes_, tuned_dflash_width);
         ++dflash_tree_batches_;
         for (std::size_t lane = 0; lane < plans.size(); ++lane) {
             auto& work = *cohort.active[lane];

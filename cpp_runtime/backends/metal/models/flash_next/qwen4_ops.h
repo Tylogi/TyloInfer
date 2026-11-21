@@ -5,6 +5,7 @@
 #include "mlx_tensor.h"
 
 #include <optional>
+#include <span>
 #include <utility>
 #include <mlx/mlx.h>
 
@@ -150,5 +151,14 @@ mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& key,
     const mlx::core::array& value,
     int query_offset);
+
+struct MlxQsaTreeAttentionLane {
+    mlx::core::array history_keys, history_values, tree_keys, tree_values;
+    std::span<const int> parents;
+};
+
+mlx::core::array qwen4_qsa_batched_tree_attention(const mlx::core::array& query,
+    std::span<const MlxQsaTreeAttentionLane> lanes);
+void qwen4_qsa_prepare_batched_tree();
 
 } // namespace mfq::metal

@@ -2927,4 +2927,139 @@ array qwen4_dense_gqa_attention(
     return mlx::core::transpose(output, {0, 2, 1, 3});
 }
 
+namespace {
+class QsaTreeCacheLayout final : public mlx::core::UnaryPrimitive {
+public:
+    QsaTreeCacheLayout(mlx::core::Stream stream, std::vector<std::uint32_t> geometry)
+        : UnaryPrimitive(stream), geometry_(std::move(geometry)) {}
+    const char* name() const override { return "QsaTreeCacheLayout"; }
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("QSA tree cache layout requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, array& output) override { fill(inputs, output); }
+
+private:
+    void fill(const std::vector<array>& inputs, array& output) const {
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        // Lazy cache views only expose their physical strides after evaluation.
+        auto* values = output.data<std::uint32_t>();
+        std::copy(geometry_.begin(), geometry_.end(), values);
+        constexpr std::size_t Words = 19;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& kv = inputs[i];
+            if (kv.strides(1) < 0 || kv.strides(2) < 0 || kv.strides(3) != 1)
+                throw std::invalid_argument("invalid QSA tree cache stride");
+            const std::size_t offset = (i / 4) * Words + 3 + 2 * (i % 4);
+            values[offset] = static_cast<std::uint32_t>(kv.strides(1));
+            values[offset + 1] = static_cast<std::uint32_t>(kv.strides(2));
+        }
+    }
+    std::vector<std::uint32_t> geometry_;
+};
+}
+
+array qwen4_qsa_batched_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    using namespace mlx::core;
+    constexpr int Heads = 24, KvHeads = 2, Dim = 256, Words = 19;
+    const int width = static_cast<int>(lanes.size()), total = query.shape(2);
+    if (width < 2 || width > 4 || query.shape() != Shape{1, Heads, total, Dim} || query.dtype() != bfloat16)
+        throw std::invalid_argument("invalid batched QSA verification query");
+    const auto valid_cache = [&](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == KvHeads && value.shape(2) > 0 &&
+            value.shape(3) == Dim && value.dtype() == float16;
+    };
+    int first = 0, max_rows = 0, max_keys = 0;
+    std::vector<std::uint32_t> geometry;
+    std::vector<array> backing;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size()), history = lane.history_keys.shape(2);
+        if (!valid_cache(lane.history_keys) || !valid_cache(lane.history_values) ||
+            !valid_cache(lane.tree_keys) || !valid_cache(lane.tree_values) ||
+            lane.history_keys.shape() != lane.history_values.shape() || lane.tree_keys.shape() != lane.tree_values.shape() ||
+            lane.tree_keys.shape(2) != rows || rows < 3 || rows > 8 || history + rows > kQsaGroupedDecodeMaxKeys)
+            throw std::invalid_argument("invalid batched QSA verification cache");
+        geometry.insert(geometry.end(), {std::uint32_t(first), std::uint32_t(rows), std::uint32_t(history)});
+        geometry.insert(geometry.end(), 8, 0);
+        std::array<std::uint32_t, 8> mask{};
+        for (int row = 0; row < rows; ++row) {
+            const int parent=lane.parents[row];
+            if (parent < (row == 0 ? -1 : 0) || parent >= row)
+                throw std::invalid_argument("invalid QSA parent");
+            mask[row] = (1u << row) | (parent < 0 ? 0u : mask[parent]);
+        }
+        geometry.insert(geometry.end(),mask.begin(),mask.end());
+        backing.insert(backing.end(),{lane.history_keys, lane.history_values, lane.tree_keys, lane.tree_values});
+        first += rows;
+        max_rows = std::max(max_rows, rows);
+        max_keys = std::max(max_keys, history + rows);
+    }
+    if (first != total) throw std::invalid_argument("invalid QSA verification layout");
+    const auto layout = array(Shape{width, Words}, uint32,
+        std::make_shared<QsaTreeCacheLayout>(default_stream(Device::gpu), std::move(geometry)), std::move(backing));
+    static const auto pack = cached_metal_kernel("tylo_qsa_pack_for_mlx_attention",
+        {"query","layout","sizes","hk0","hk1","hk2","hk3","hv0","hv1","hv2","hv3",
+        "pk0","pk1","pk2","pk3","pv0","pv1","pv2","pv3"}, {"q","k","v","mask"}, R"METAL(
+constexpr uint D=256u, QH=24u, KH=2u, P=19u;
+const uint2 g=thread_position_in_grid.xy;
+const uint i=g.x, lane=g.y, Q=sizes[0], K=sizes[1];
+const device uint* p=layout+lane*P;
+const uint anchor=p[0], rows=p[1], history=p[2];
+if (i<QH*Q*D) {
+    const uint head=i/(Q*D), row=(i/D)%Q, dim=i%D;
+    const long from=long(head)*query_strides[1]+long(anchor+row)*query_strides[2]+long(dim)*query_strides[3];
+    q[lane*QH*Q*D+i]=row<rows?query[from]:bfloat(0);
+}
+if (i<KH*K*D) {
+    const uint head=i/(K*D), token=(i/D)%K, dim=i%D;
+    bfloat key=bfloat(0), value=bfloat(0);
+    if (token<history) {
+        const device half* hk=lane==0?hk0:lane==1?hk1:lane==2?hk2:hk3;
+        const device half* hv=lane==0?hv0:lane==1?hv1:lane==2?hv2:hv3;
+        key=bfloat(float(hk[head*p[3]+token*p[4]+dim]));
+        value=bfloat(float(hv[head*p[5]+token*p[6]+dim]));
+    } else if (token<history+rows) {
+        const device half* pk=lane==0?pk0:lane==1?pk1:lane==2?pk2:pk3;
+        const device half* pv=lane==0?pv0:lane==1?pv1:lane==2?pv2:pv3;
+        key=bfloat(float(pk[head*p[7]+(token-history)*p[8]+dim]));
+        value=bfloat(float(pv[head*p[9]+(token-history)*p[10]+dim]));
+    }
+    k[lane*KH*K*D+i]=key;
+    v[lane*KH*K*D+i]=value;
+}
+if (i<Q*K) {
+    const uint row=i/K, token=i%K;
+    mask[lane*Q*K+i]=token<history || (row<rows && token<history+rows && ((p[11u+row]>>(token-history))&1u));
+}
+)METAL", "", false);
+    std::vector<array> inputs{query, layout, array({std::uint32_t(max_rows), std::uint32_t(max_keys)})};
+    for (const auto member : {&MlxQsaTreeAttentionLane::history_keys, &MlxQsaTreeAttentionLane::history_values,
+            &MlxQsaTreeAttentionLane::tree_keys, &MlxQsaTreeAttentionLane::tree_values}) {
+        for (int lane = 0; lane < 4; ++lane)
+            inputs.push_back(lanes[lane < width ? lane : 0].*member);
+    }
+    const int columns = std::max(Heads * max_rows, KvHeads * max_keys) * Dim;
+    const auto packed = pack(inputs, {{width, Heads, max_rows, Dim}, {width, KvHeads, max_keys, Dim},
+        {width, KvHeads, max_keys, Dim}, {width, 1, max_rows, max_keys}},
+        {bfloat16, bfloat16, bfloat16, bool_}, {columns, width, 1}, {256, 1, 1}, {}, std::nullopt, false, {});
+    const auto attended = fast::scaled_dot_product_attention(packed[0], packed[1], packed[2], 1.f / 16.f, "", packed[3]);
+    std::vector<array> rows;
+    for (int lane = 0; lane < width; ++lane) {
+        const int count = static_cast<int>(lanes[lane].parents.size());
+        rows.push_back(transpose(slice(attended, {lane, 0, 0, 0}, {lane + 1, Heads, count, Dim}), {0, 2, 1, 3}));
+    }
+    return concatenate(rows, 1);
+}
+
+void qwen4_qsa_prepare_batched_tree() {
+    using namespace mlx::core;
+    if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
+        const auto history = zeros({1, 2, 320, 256}, float16);
+        const auto kv = zeros({1, 2, 8, 256}, float16);
+        const std::array parents{-1, 0, 1, 0, 3, 2, 2, 4};
+        const MlxQsaTreeAttentionLane lane{history, history, kv, kv, parents};
+        const std::array lanes{lane, lane, lane, lane};
+        preparation->add(qwen4_qsa_batched_tree_attention(zeros({1, 24, 32, 256}, bfloat16), lanes));
+    });
+}
+
 } // namespace mfq::metal

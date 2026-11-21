@@ -1,4 +1,5 @@
 #include "mlx_qwen4_causal_lm.h"
+#include "mlx_platform.h"
 #include "native/mlx_native_gguf.h"
 #include "mlx_gguf_rows.h"
 #include "mlx_affine_rows.h"
@@ -145,7 +146,7 @@ struct Qwen4TreeRows {
     // then gather the recurrence output of each node from one of its paths.
     array expand, gather, positions, ple_taps;
     std::vector<Lane> lanes;
-    bool use_short_expert_tiles = false;
+    int tuned_dflash_width = 0;
 };
 
 Qwen4RequestLayerCache fork_tree_layer(const Qwen4RequestLayerCache& source) {
@@ -3598,6 +3599,18 @@ public:
             static_cast<float>(config_.rope_theta), query_norm_.eps(), &projections[2], false,
             gate_ ? &projections[4] : nullptr);
 
+        // With twelve query heads per KV head, one or two rows use MLX's
+        // vector kernel. Keep those lanes on their independent path.
+        const bool batch_attention = tree->tuned_dflash_width == 4 &&
+            tree->lanes.size() >= 2 && tree->lanes.size() <= 4 && prologue.query.dtype() == mlx::core::bfloat16 &&
+            config_.num_attention_heads == 24 && config_.num_key_value_heads == 2 && config_.head_dim == 256 &&
+            prologue.key.dtype() == mlx::core::float16 && prologue.cache_value->dtype() == mlx::core::float16 &&
+            std::all_of(tree->lanes.begin(), tree->lanes.end(), [](const auto& lane) {
+                return lane.parents.size() >= 3 && lane.parents.size() <= 8 && lane.position > 0 &&
+                    lane.position + int(lane.parents.size()) <= kQsaGroupedDecodeMaxKeys;
+            });
+        std::vector<MlxQsaTreeAttentionLane> attention_lanes;
+        if (batch_attention) attention_lanes.reserve(tree->lanes.size());
         std::vector<array> outputs;
         for (const auto& lane : tree->lanes) {
             const int rows = static_cast<int>(lane.parents.size()), begin = lane.begin, end = begin + rows;
@@ -3609,6 +3622,11 @@ public:
             auto index_keys = mlx::core::slice(*prologue.cache_index_key, {0, begin, 0},
                 {1, end, prologue.cache_index_key->shape(2)});
             auto [history_keys, history_values] = lane.cache->kv->view();
+            if (batch_attention) {
+                attention_lanes.push_back({std::move(history_keys), std::move(history_values), keys, values, lane.parents});
+                lane.tape->emplace(Qwen4TreeQsaTape{std::move(keys), std::move(values), std::move(index_keys)});
+                continue;
+            }
             if (!lane.dense_mask) {
                 const int columns = lane.position + rows;
                 std::vector<std::uint8_t> visible(static_cast<std::size_t>(rows) * columns);
@@ -3640,7 +3658,8 @@ public:
             outputs.push_back(mlx::core::transpose(attended, {0, 2, 1, 3}));
             lane.tape->emplace(Qwen4TreeQsaTape{std::move(keys), std::move(values), std::move(index_keys)});
         }
-        auto packed = mlx::core::concatenate(outputs, 1);
+        auto packed = batch_attention ? qwen4_qsa_batched_tree_attention(prologue.query, attention_lanes)
+                            : mlx::core::concatenate(outputs, 1);
         auto gated = qwen4_qsa_output_gate(packed, mlx::core::reshape(prologue.output_gate, packed.shape()), hidden.dtype());
         return output_(gated);
     }
@@ -4709,7 +4728,7 @@ public:
         auto fv = ffn_gr_.pre_after(attention, av);
         detail::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
         auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode, nullptr, confirmed > 0,
-            tree && tree->use_short_expert_tiles), fv);
+            tree && tree->tuned_dflash_width >= 3), fv);
         detail::profile_eval("qwen4.ffn_mhc_post", result);
         return result;
     }
@@ -5667,8 +5686,14 @@ struct MlxQwen4CausalLm::Impl {
         auto embedding = MlxEmbedding::load(
             model, "model.token_embedding.weight", model.header().extra_json.contains("gguf_metadata")
                 ? std::optional<mlx::core::Dtype>{mlx::core::bfloat16} : std::nullopt);
-        if (auto* preparation = MlxKernelPreparation::current())
+        if (auto* preparation = MlxKernelPreparation::current()) {
             preparation->set_activation_dtype(embedding.preferred_activation_dtype());
+            if (config.hidden_size == 2560 && config.hc_count == 4 && !config.ple_layer_ids.empty() &&
+                config.num_attention_heads == 24 && config.num_key_value_heads == 2 && config.head_dim == 256 &&
+                !config.yarn.enabled && qsa_decode_prologue_enabled() &&
+                preparation->activation_dtype() == mlx::core::bfloat16 && mlx_apple_chip_is("Apple M5 Max"))
+                qwen4_qsa_prepare_batched_tree();
+        }
         std::optional<MlxLinear> output;
         if (!config.tie_word_embeddings && model.contains("model.output.weight")) {
             output.emplace(MlxLinear::load(model, "model.output.weight"));
@@ -6491,7 +6516,7 @@ bool MlxQwen4CausalLm::can_verify_request_tree(const MlxQwen4RequestCache& cache
 array MlxQwen4CausalLm::forward_request_trees(
     const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
     const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
-    bool use_short_expert_tiles) {
+    int tuned_dflash_width) {
     if (caches.empty() || trees.size() != caches.size())
         throw std::invalid_argument("Qwen4 tree batch requires one tree per cache");
     std::unordered_set<const MlxQwen4RequestCache*> seen;
@@ -6578,7 +6603,7 @@ array MlxQwen4CausalLm::forward_request_trees(
     Qwen4TreeRows treerows{
         array(expand.begin(), {static_cast<int>(expand.size())}, int32),
         array(gather.begin(), {rows}, int32), array(rotary_positions.begin(), {rows}, int32),
-        array(ple_taps.begin(), {rows, taps}, int32), {}, use_short_expert_tiles};
+        array(ple_taps.begin(), {rows, taps}, int32), {}, tuned_dflash_width};
     for (std::size_t lane = 0; lane < caches.size(); ++lane)
         treerows.lanes.push_back({lane_begins[lane], caches[lane]->position, transactions[lane]->parents, transactions[lane]->depth});
     const array ids(tokens.begin(), {1, rows}, int32);
