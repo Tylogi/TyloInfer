@@ -108,12 +108,21 @@ array clip_norm(array x, const std::optional<array>& scale, float threshold) {
 }
 
 struct Controller {
-    MlxLinear down, gain, forget;
+    MlxLinear down;
+    MlxProjectionBatch gates;
+
+    Controller(MlxLinear down, MlxLinear gain, MlxLinear forget)
+        : down(std::move(down)), gates({&gain, &forget}) {}
 
     array operator()(const array& current, const array& message) const {
-        auto state = down(concatenate({rms(current), rms(message)}, -1));
-        return current * (array(1.0f, current.dtype()) - tanh(forget(state))) +
-            message * tanh(gain(state));
+        const auto inputs = reshape(rms(stack({current, message}, -2)),
+            {current.shape(0), current.shape(1), current.shape(2) * 2});
+        const auto projected = gates(down(inputs));
+        static const auto blend = compile([](const std::vector<array>& values) {
+            return std::vector<array>{values[0] * (array(1.0f, values[0].dtype()) - tanh(values[3])) +
+                values[1] * tanh(values[2])};
+        });
+        return blend({current, message, projected[0], projected[1]}).front();
     }
 };
 
@@ -294,12 +303,16 @@ struct Layer {
         const auto dims = input.shape();
         const auto flat = reshape(input, {-1, g.hidden});
         const auto route = moe_sigmoid_topk(router(flat), g.routes, router_bias, g.expert_scale);
-        auto projected = astype(gate_up.routed_matmul(flat, route.ids, true), float32);
-        const auto split_at = projected.shape(-1) / 2;
-        auto parts = split(projected, Shape{split_at}, -1);
-        auto activated = tanh(parts[0] / g.situ) * sigmoid(parts[0]) *
-            tanh(parts[1] / g.situ_linear) * (g.situ * g.situ_linear);
-        return reshape(down.routed_weighted_matmul(astype(activated, input.dtype()), route.ids, route.weights), dims);
+        static const auto activate = compile([](const std::vector<array>& arguments) {
+            const auto& projected = arguments[0];
+            const auto parts = split(astype(projected, float32), Shape{projected.shape(-1) / 2}, -1);
+            auto values = tanh(parts[0] / arguments[1]) * sigmoid(parts[0]) *
+                tanh(parts[1] / arguments[2]) * (arguments[1] * arguments[2]);
+            return std::vector<array>{astype(values, projected.dtype())};
+        });
+        const auto projected = gate_up.routed_matmul(flat, route.ids, true);
+        const auto activated = activate({projected, array(g.situ), array(g.situ_linear)}).front();
+        return reshape(down.routed_weighted_matmul(activated, route.ids, route.weights), dims);
     }
 };
 
