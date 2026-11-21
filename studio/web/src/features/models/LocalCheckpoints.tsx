@@ -33,7 +33,7 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
       status === 'incomplete' && !item.complete || status === 'components' && isComponent(item) || status === 'unavailable' && !item.loadable && !isComponent(item)))
     .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
-  const families = groupCheckpoints(visibleArtifacts);
+  const families = groupCheckpoints(visibleArtifacts, artifacts);
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
   const separate = hasSeparateVram(runtime);
   const available = availableResidentMemory(runtime);
@@ -93,7 +93,8 @@ export function LocalCheckpoints({ catalog, capabilities = {}, companionMode = '
                 || (companionMode === 'both' && /^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(companion))
                 || artifacts.some(candidate => candidate.id === companion && candidate.id !== item.id && candidate.format === 'gguf' && candidate.complete === true && isCompanionId)));
               const componentLabel = item.asset_kind === 'engram' ? tr('可独立使用的Engram', 'Independently usable Engram')
-                : item.asset_kind === 'dflash2' ? tr('DFlash2 草稿', 'DFlash2 draft') : tr('可独立使用的PLE', 'Independently usable PLE');
+                : item.asset_kind === 'dflash2' ? item.dflash2_target ? tr('DFlash2 草稿', 'DFlash2 draft')
+                  : tr('DFlash2 草稿 · 目标未知', 'DFlash2 draft · Target unknown') : tr('可独立使用的PLE', 'Independently usable PLE');
               const instance = activeInstances.get(item.name);
               const loaded = Boolean(instance);
               const placement = instance?.memory?.ram_weight_bytes != null

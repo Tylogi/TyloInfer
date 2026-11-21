@@ -17,11 +17,11 @@ from server.state.catalog import ModelCatalog
 from tests.test_server_models import IdleBackend, _model
 
 
-def _draft(path):
+def _draft(path, **config):
     path.mkdir()
     (path / "config.json").write_text(json.dumps({
         "model_type": "qwen3", "hidden_size": 64, "vocab_size": 128,
-        "dflash_config": {"target_layer_ids": [0, 2]},
+        "dflash_config": {"target_layer_ids": [0, 2]}, **config,
     }))
     header = json.dumps({
         "projection.weight": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]},
@@ -49,6 +49,27 @@ def test_dflash2_is_a_registered_companion_and_launches_by_id(tmp_path):
         with pytest.raises(JobExecutionError, match="geometry does not match"):
             await pool._dflash2_artifact(incompatible, draft.id)
         await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_dflash2_catalog_reports_the_target_independently_of_the_local_directory(tmp_path):
+    _draft(tmp_path / "dflash2", architectures=["DFlash2DraftModel"], hidden_size=2560,
+           vocab_size=248320, num_target_layers=48, dflash_config={"target_layer_ids": [5, 15, 25, 35, 45]})
+    _draft(tmp_path / "Qwen3.8-27B-DFlash2")
+    _draft(tmp_path / "declared", target_model_name_or_path="publisher/Qwen3.6-35B-A3B")
+    _draft(tmp_path / "unknown", target_model_name_or_path="/private/models/target")
+
+    async def run():
+        catalog = ModelCatalog([tmp_path])
+        artifacts = (await catalog.list(include_components=True)).data
+        assert {item.name: item.dflash2_target for item in artifacts} == {
+            "dflash2": "Qwen3.8-Flash-Next",
+            "Qwen3.8-27B-DFlash2": "Qwen3.8-27B",
+            "declared": "Qwen3.6-35B-A3B",
+            "unknown": None,
+        }
+        assert all(item.asset_kind == "dflash2" and not item.loadable for item in artifacts)
 
     asyncio.run(run())
 

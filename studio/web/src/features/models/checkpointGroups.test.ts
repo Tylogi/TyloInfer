@@ -78,3 +78,20 @@ it('places independently usable tables under the same base model as its quantize
   expect(groups[0].models[0].name).toBe('Qwen3.8-Flash-Next');
   expect(groups[0].models[0].artifacts).toEqual(items);
 });
+
+it('groups DFlash2 assets with their declared target, even when the draft directory is renamed', () => {
+  const flash = artifact('Qwen3.8-Flash-Next-GSQ-IQ3_XXS');
+  const dense = artifact('Qwen3.8-27B-Q8', 'qwen3_5');
+  const draft = (name: string, target?: string): ModelArtifact => ({
+    ...artifact(name, 'dflash2', 'hf'), asset_kind: 'dflash2', dflash2_target: target,
+  });
+  const flashDraft = draft('dflash2', 'Qwen3.8-Flash-Next');
+  const denseDraft = draft('Qwen3.8-27B-DFlash2', 'Qwen3.8-27B');
+  const unknown = draft('unknown-draft');
+  const groups = groupCheckpoints([flashDraft, flash, dense, denseDraft, unknown]);
+  expect(groups.map(group => group.name)).toEqual(['Qwen', 'dflash2']);
+  expect(groups[0].models.map(group => [group.name, group.artifacts])).toEqual([
+    ['Qwen3.8-Flash-Next', [flashDraft, flash]], ['Qwen3.8-27B', [dense, denseDraft]],
+  ]);
+  expect(groups[1].models[0].artifacts).toEqual([unknown]);
+});

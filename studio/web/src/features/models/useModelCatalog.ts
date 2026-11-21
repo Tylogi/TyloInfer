@@ -179,7 +179,7 @@ export function useModelCatalog() {
   const filteredArtifacts = useMemo(
     () =>
       artifacts.filter((item) =>
-        item.name.toLowerCase().includes(modelFilter.trim().toLowerCase()),
+        [item.name, item.dflash2_target].some(name => name?.toLowerCase().includes(modelFilter.trim().toLowerCase())),
       ),
     [artifacts, modelFilter],
   );

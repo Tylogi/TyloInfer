@@ -3958,6 +3958,18 @@
             ],
             "title": "Context Capacity"
           },
+          "dflash2_target": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dflash2 Target"
+          },
           "dtypes": {
             "items": {
               "type": "string"

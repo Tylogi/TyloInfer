@@ -71,6 +71,30 @@ _ALWAYS_STREAMED_RE = re.compile(
     r"|\.position_embedding\.ngram\.shard\.\d+\.(?:weight|scales|biases))$"
 )
 _LOGGER = logging.getLogger(__name__)
+_PUBLIC_MODEL_NAME = re.compile(r"(?:[\w.-]+/)?([A-Za-z0-9][A-Za-z0-9_.-]{0,127})", re.ASCII)
+_DFLASH2_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}?)[-_]dflash[-_]?2(?:[-_].+)?", re.IGNORECASE)
+
+
+def _dflash2_target_name(name: str, config: dict) -> str | None:
+    draft = config["dflash_config"]
+    for value in (
+        draft.get("target_model_name_or_path"),
+        config.get("target_model_name_or_path"),
+        config.get("base_model_name_or_path"),
+    ):
+        if isinstance(value, str) and (match := _PUBLIC_MODEL_NAME.fullmatch(value)):
+            return match[1]
+
+    # The published Flash-Next draft omits the target name and may be installed under an alias.
+    if (
+        config.get("architectures") == ["DFlash2DraftModel"]
+        and (config.get("hidden_size"), config.get("vocab_size"), config.get("num_target_layers")) == (2560, 248320, 48)
+        and draft.get("target_layer_ids") == [5, 15, 25, 35, 45]
+    ):
+        return "Qwen3.8-Flash-Next"
+    if match := _DFLASH2_NAME.fullmatch(name):
+        return match[1]
+    return None
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -1204,7 +1228,8 @@ class ModelCatalog:
             if is_dflash2:
                 resource = ModelArtifactResource(
                     id=identifier, name=name, architecture="dflash2", format="hf",
-                    asset_kind="dflash2", shard_count=len(shard_paths),
+                    asset_kind="dflash2", dflash2_target=_dflash2_target_name(name, config),
+                    shard_count=len(shard_paths),
                     total_bytes=sum(stat.st_size for stat in stats),
                     tensor_count=len(tensors), record_count=len(tensors) + 1,
                     dtypes=sorted(dtypes), complete=True, loadable=False,

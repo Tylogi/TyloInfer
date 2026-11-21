@@ -963,6 +963,7 @@ class ModelArtifactResource(ProtocolModel):
     architecture: str = Field(min_length=1, max_length=128)
     format: Literal["tq", "hf", "gguf"] = "tq"
     asset_kind: Literal['model', 'ple', 'engram', 'dflash2'] = 'model'
+    dflash2_target: str | None = Field(default=None, max_length=128)
     owned_file_bytes: int | None = Field(default=None, ge=0)
     gguf_companion_required: bool = False
     structured_decisions: bool = False

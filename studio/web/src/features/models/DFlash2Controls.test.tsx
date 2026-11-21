@@ -9,8 +9,8 @@ const model: ModelArtifact = {
   complete: true, loadable: true, modified_at: '',
 };
 const draft: ModelArtifact = {
-  ...model, id: 'b'.repeat(32), name: 'Qwen3.8-Flash-Next-DFlash2', architecture: 'dflash2',
-  format: 'hf', asset_kind: 'dflash2', loadable: false,
+  ...model, id: 'b'.repeat(32), name: 'dflash2', architecture: 'dflash2',
+  format: 'hf', asset_kind: 'dflash2', dflash2_target: 'Qwen3.8-Flash-Next', loadable: false,
 };
 const instance: RuntimeInstance = {
   id: 'instance', model: model.name, devices: ['metal'], state: 'ready',
@@ -21,14 +21,16 @@ it('downloads an explicit draft and enables loading after it appears in the cata
   const download = vi.fn(async () => ({ id: 'download' }));
   const load = vi.fn(async () => undefined);
   const props = { model, backend: 'metal', tr: (_zh: string, en: string) => en, onDownload: download, onLoad: load };
-  const { rerender } = render(<DFlash2Controls {...props} artifacts={[model]} />);
+  const unrelated = { ...draft, id: 'c'.repeat(32), name: 'Qwen3.8-27B-DFlash2', dflash2_target: 'Qwen3.8-27B' };
+  const { rerender } = render(<DFlash2Controls {...props} artifacts={[model, unrelated]} />);
+  expect(screen.getByText('Qwen3.8-Flash-Next · Draft')).toBeVisible();
 
   expect(screen.getByRole('button', { name: 'Load DFlash2 draft' })).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: 'Download DFlash2 draft' }));
   await screen.findByText('Added to download queue');
   expect(download).toHaveBeenCalledOnce();
 
-  rerender(<DFlash2Controls {...props} artifacts={[model, draft]} />);
+  rerender(<DFlash2Controls {...props} artifacts={[model, unrelated, draft]} />);
   fireEvent.click(screen.getByRole('button', { name: 'Load DFlash2 draft' }));
   await waitFor(() => expect(load).toHaveBeenCalledWith(draft.id));
 });

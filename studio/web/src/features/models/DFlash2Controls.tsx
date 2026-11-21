@@ -3,6 +3,9 @@ import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import type { ModelArtifact, RuntimeInstance } from '../../shared/api/types';
 import { Switch } from '../../shared/ui/Switch';
 
+const flashNextTarget = 'Qwen3.8-Flash-Next';
+const flashNextDraftName = flashNextTarget + '-DFlash2';
+
 export const flashNextDraft = {
   repo_id: 'incoai/Qwen3.8-Flash-Next-DFlash2',
   revision: 'a22a1744e85c17364dcc54a6a420af7135d4c7f6',
@@ -34,9 +37,10 @@ export function DFlash2Controls({ model, artifacts, instance, backend, disabled,
   if (!model?.architecture.toLowerCase().startsWith('qwen4_exp')
     || (backend && backend !== 'cuda' && backend !== 'metal')) return null;
 
-  const drafts = artifacts.filter(item => item.asset_kind === 'dflash2' && item.complete);
+  const drafts = artifacts.filter(item => item.asset_kind === 'dflash2' && item.complete
+    && (item.dflash2_target ?? (item.name === flashNextDraftName ? flashNextTarget : null))?.toLowerCase() === flashNextTarget.toLowerCase());
   const draft = drafts.find(item => item.id === selected)
-    ?? drafts.find(item => item.name === 'Qwen3.8-Flash-Next-DFlash2') ?? drafts[0];
+    ?? drafts.find(item => item.name === flashNextDraftName) ?? drafts[0];
   const busy = Boolean(disabled || pending);
   const loaded = Boolean(instance?.dflash2_draft && ['ready', 'busy'].includes(instance.state));
   const reloadBusy = instance && (instance.state !== 'ready' || instance.queued_requests > 0);
@@ -62,14 +66,14 @@ export function DFlash2Controls({ model, artifacts, instance, backend, disabled,
   return <>
     <SectionLabel title="DFlash2" />
     <TMPanel className="dflash2-panel">
-      <SettingRow title={tr('草稿模型', 'Draft model')} detail={status}
+      <SettingRow title={flashNextTarget + ' · ' + tr('草稿', 'Draft')} detail={status}
         trailing={drafts.length > 1 ? <select aria-label={tr('DFlash2 草稿', 'DFlash2 draft')}
           value={draft?.id ?? ''} disabled={busy}
           onChange={event => { setSelected(event.target.value); setConfirm(false); }}>
           {drafts.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select> : undefined} />
       <div className="model-settings-actions">
-        <button type="button" disabled={busy || loaded || downloadPending || downloadAvailable === false || drafts.some(item => item.name === 'Qwen3.8-Flash-Next-DFlash2')}
+        <button type="button" disabled={busy || loaded || downloadPending || downloadAvailable === false || drafts.some(item => item.name === flashNextDraftName)}
           onClick={() => void run(onDownload, tr('已加入下载队列', 'Added to download queue'))}>
           {tr('下载 DFlash2 草稿', 'Download DFlash2 draft')}
         </button>

@@ -15,7 +15,7 @@ function ModelLibrary({ state, runtime, tr, openLoad, openUnload, openSettings, 
   const catalog = {
     runtime, artifacts, instances: state.inventory.instances, busy: disabled || deletionBusy, modelFilter: query, setModelFilter: setQuery,
     prepareModelDeletion,
-    filteredArtifacts: artifacts.filter(item => (item.name || item.id).toLowerCase().includes(query.toLowerCase())),
+    filteredArtifacts: artifacts.filter(item => [item.name || item.id, item.dflash2_target].some(name => name?.toLowerCase().includes(query.trim().toLowerCase()))),
     connectionRevision: refreshKey, loadDeviceIds: undefined,
     loadContextForModel: name => loadContextForModel(name) || { jev_weights: 'stream' },
     loadArtifact: (name, companionIds) => { const model = artifacts.find(item => item.name === name); if (model) openLoad(model, companionIds); },

@@ -112,22 +112,25 @@ export function ModelDirectoryDialog({ catalog, title, navigation = 'path', show
           <p>{tr('这个文件夹中没有子文件夹或模型文件。', 'This folder has no subfolders or model files.')}</p>
         )}
       </div>
-      <footer>
+      <footer className="model-browser-footer">
         {showNativeOpen && <button className="model-browser-open-finder" disabled={busy || !modelBrowser?.current_id || !(modelBrowser.can_open_directory ?? modelBrowser.can_open_in_finder) || Boolean(modelBrowserError)}
-          onClick={() => void openCurrentDirectory()} type="button">
-          <Icon name="folder" size={13} />{modelBrowser?.can_open_in_finder ? tr('在访达中打开', 'Open in Finder') : tr('在文件管理器中打开', 'Open in file manager')}
+          onClick={() => void openCurrentDirectory()} type="button"
+          title={modelBrowser?.can_open_in_finder ? tr('在访达中打开', 'Open in Finder') : tr('在文件管理器中打开', 'Open in file manager')}>
+          <Icon name="folder" size={13} />{tr('打开目录', 'Open folder')}
         </button>}
-        <button onClick={() => setModelBrowserOpen(false)} type="button">
-          {tr('取消', 'Cancel')}
-        </button>
-        {!modelFilesMode && <button
-          className="primary"
-          disabled={busy || hasUnvisitedPath || !modelBrowser?.current_id || Boolean(modelBrowserError)}
-          onClick={() => void registerCurrentModelDirectory()}
-          type="button"
-        >
-          {registerModelFile && Boolean(modelBrowser?.model_file_count) ? tr('导入此文件夹', 'Import this folder') : tr('使用此文件夹', 'Use this folder')}
-        </button>}
+        <div className="model-browser-footer-actions">
+          <button onClick={() => setModelBrowserOpen(false)} type="button">
+            {tr('取消', 'Cancel')}
+          </button>
+          {!modelFilesMode && <button
+            className="primary"
+            disabled={busy || hasUnvisitedPath || !modelBrowser?.current_id || Boolean(modelBrowserError)}
+            onClick={() => void registerCurrentModelDirectory()}
+            type="button"
+          >
+            {registerModelFile && Boolean(modelBrowser?.model_file_count) ? tr('导入目录', 'Import folder') : tr('选定目录', 'Select folder')}
+          </button>}
+        </div>
       </footer>
     </Dialog>
   );
