@@ -165,14 +165,55 @@ array clip_norm(array x, const std::optional<array>& scale, float threshold) {
 struct Controller {
     MlxLinear down;
     MlxProjectionBatch gates;
+    std::optional<std::pair<array, array>> decode_gates;
 
     Controller(MlxLinear down, MlxLinear gain, MlxLinear forget)
-        : down(std::move(down)), gates({&gain, &forget}) {}
+        : down(std::move(down)), gates({&gain, &forget}) {
+        const auto* gain_weight = gain.dense_weight_ref();
+        const auto* forget_weight = forget.dense_weight_ref();
+        if (gain_weight && forget_weight && gain_weight->dtype() == float32 && forget_weight->dtype() == float32 &&
+            gain_weight->shape() == forget_weight->shape() && gain.input_size() == 64 && gain.output_size() % 16 == 0)
+            decode_gates.emplace(*gain_weight, *forget_weight);
+    }
 
     array operator()(const array& current, const array& message) const {
         const auto inputs = reshape(rms(stack({current, message}, -2)),
             {current.shape(0), current.shape(1), current.shape(2) * 2});
-        const auto projected = gates(down(inputs));
+        const auto low = down(inputs);
+        const int width = current.shape(-1);
+        if (decode_gates && default_device() == Device::gpu && low.dtype() == float32 && low.shape(-1) == 64 &&
+            current.shape() == message.shape() && width == decode_gates->first.shape(0) &&
+            current.size() / width <= 4 && current.size() <= std::size_t(std::numeric_limits<int>::max() / 8)) {
+            static const auto kernel = [] {
+                CompileOptions options;
+                options.math_mode = MathMode::Safe;
+                return fast::metal_kernel("tyloinfer_inkling_message_gates", {"current", "message", "low", "gain", "forget"},
+                    {"output"}, R"MSL(
+                    const uint index = thread_position_in_grid.x / 8u;
+                    const uint lane = thread_index_in_simdgroup % 8u;
+                    const uint channel = index % WIDTH;
+                    const auto hidden = low + ulong(index / WIDTH) * 64;
+                    const auto g = gain + ulong(channel) * 64;
+                    const auto f = forget + ulong(channel) * 64;
+                    float add = 0.f, keep = 0.f;
+                    for (uint i = lane; i < 64; i += 8) {
+                        add = metal::fma(hidden[i], g[i], add);
+                        keep = metal::fma(hidden[i], f[i], keep);
+                    }
+                    for (uint step = 4; step; step /= 2) {
+                        add += simd_shuffle_xor(add, step);
+                        keep += simd_shuffle_xor(keep, step);
+                    }
+                    if (lane == 0)
+                        output[index] = float(current[index]) * (1.f - metal::tanh(keep)) +
+                            float(message[index]) * metal::tanh(add);
+                    )MSL", "", true, false, options);
+            }();
+            return kernel({current, message, low, decode_gates->first, decode_gates->second},
+                {current.shape()}, {float32}, {static_cast<int>(current.size() * 8), 1, 1}, {128, 1, 1},
+                {{"WIDTH", width}}, std::nullopt, false, {}).front();
+        }
+        const auto projected = gates(low);
         static const auto blend = compile([](const std::vector<array>& values) {
             return std::vector<array>{values[0] * (array(1.0f, values[0].dtype()) - tanh(values[3])) +
                 values[1] * tanh(values[2])};
