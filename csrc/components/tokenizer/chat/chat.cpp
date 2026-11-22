@@ -2252,6 +2252,85 @@ static common_chat_params common_chat_params_init_cohere2moe(const common_chat_t
     return data;
 }
 
+static common_chat_params common_chat_params_init_inkling2(const common_chat_template & tmpl,
+        const autoparser::generation_params & inputs) {
+    const std::string model = "<|message_model|>";
+    const std::string thinking = "<|content_thinking|>";
+    const std::string text = "<|content_text|>";
+    const std::string invoke = "<|content_invoke_tool_json|>";
+    const std::string message_end = "<|end_message|>";
+    const std::string turn_end = "<|content_model_end_sampling|>";
+    const bool allow_tools = inputs.tools.is_array() && !inputs.tools.empty() &&
+        inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    const bool required = allow_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+
+    common_chat_params data;
+    data.prompt = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    data.thinking_start_tag = thinking;
+    data.thinking_end_tag = message_end;
+    data.preserved_tokens = {model, thinking, text, invoke, message_end, turn_end};
+    data.additional_stops = {turn_end};
+    data.message_delimiters = {{COMMON_CHAT_ROLE_ASSISTANT, model},
+        {COMMON_CHAT_ROLE_USER, "<|message_user|>"}, {COMMON_CHAT_ROLE_SYSTEM, "<|message_system|>"},
+        {COMMON_CHAT_ROLE_TOOL, "<|message_tool|>"}};
+    data.grammar_lazy = allow_tools && !required;
+
+    const auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto reasoning = p.eps();
+        if (inputs.enable_thinking || !required) {
+            const auto block = p.literal(model + thinking);
+            const auto body = p.until(message_end);
+            reasoning = p.optional(inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE
+                ? block + p.reasoning(body) + p.literal(message_end)
+                : p.content(block + body + p.literal(message_end)));
+        }
+
+        const auto content_body = p.content(p.until_one_of({message_end, turn_end})) +
+            p.optional(p.literal(message_end));
+        const auto content = p.literal(model + text) + content_body;
+        const auto start = p.literal(data.generation_prompt) + p.space() + reasoning;
+        const auto end = p.optional(p.literal(turn_end)) + p.end();
+        if (!allow_tools) {
+            return start + p.choice({content, content_body}) + end;
+        }
+
+        auto tools = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            const std::string name = function.at("name");
+            const auto schema = function.value("parameters", json::object());
+            const auto header = model + name + invoke;
+            if (data.grammar_lazy) {
+                data.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, header});
+            }
+            tools |= p.rule("tool-" + name, p.tool(
+                p.tool_open(p.literal(header) + p.literal("{") + p.space() + p.literal("\"name\"") +
+                    p.space() + p.literal(":")) + p.space() + p.literal("\"") +
+                p.tool_name(p.literal(name)) + p.literal("\"") +
+                p.space() + p.literal(",") + p.space() + p.literal("\"args\"") + p.space() + p.literal(":") +
+                p.space() + p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)) +
+                p.space() + p.tool_close(p.literal("}") + p.literal(message_end))));
+        });
+        const auto calls = p.trigger_rule("tool-call", p.repeat(tools, 1, inputs.parallel_tool_calls ? -1 : 1));
+        const auto body = required ? calls : p.choice({p.optional(content) + calls, content});
+        return start + body + end;
+    });
+    data.parser = parser.save();
+    if (allow_tools) {
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                auto schema = tool.at("function").value("parameters", json::object());
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+    }
+    return data;
+}
+
 namespace workaround {
 
 static void map_developer_role_to_system(json & messages) {
@@ -2614,6 +2693,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         const common_chat_template &          tmpl,
         const std::string &                   src,
         autoparser::generation_params & params) {
+    if (src.find("<|content_invoke_tool_json|>") != std::string::npos &&
+        src.find("<|content_model_end_sampling|>") != std::string::npos &&
+        params.json_schema.empty() && !params.has_continuation()) {
+        return common_chat_params_init_inkling2(tmpl, params);
+    }
+
     // Ministral/Mistral Large 3 - uses special reasoning structure fixes, can't use autoparser
     // Note: Mistral Small 3.2 uses [CALL_ID] which Ministral doesn't have, so we can distinguish them
     if (src.find("[SYSTEM_PROMPT]") != std::string::npos && src.find("[TOOL_CALLS]") != std::string::npos &&

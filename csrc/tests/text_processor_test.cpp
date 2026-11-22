@@ -85,6 +85,53 @@ int main() try {
         (void)inkling.prepare(input, 1024, &rendered);
         require(rendered == "1:abc", "Inkling overrode an explicit reasoning effort");
     }
+    {
+        TokenizerFixture fixture(R"JINJA({% set data = {'z': [{'b': '月', 'a': 1}], 'a': messages[0].content} %}{{ data | tojson(sort_keys=true, ensure_ascii=true, separators=(',', ':')) }}|{{ data | tojson }})JINJA");
+        TextProcessor inkling(fixture.path.string(), fixture.vocabulary, "inkling2_loop");
+        InferenceInput input;
+        input.chat = true;
+        input.chat_input.emplace();
+        common_chat_msg message;
+        message.role = "user";
+        message.content = "Moon";
+        input.chat_input->template_inputs.messages.push_back(std::move(message));
+        std::string rendered;
+        (void)inkling.prepare(input, 1024, &rendered);
+        require(rendered == R"({"a":"Moon","z":[{"a":1,"b":"\u6708"}]}|{"z": [{"b": "月", "a": 1}], "a": "Moon"})",
+            "Jinja tojson did not recursively sort keys or mutated the input order");
+    }
+    {
+        const auto templates = common_chat_templates_init(nullptr, R"JINJA({% if tools %}{{ tools | tojson }}{% endif %}
+            {{ messages[0].content }}{# <|content_invoke_tool_json|> <|content_model_end_sampling|> #})JINJA");
+        common_chat_templates_inputs inputs;
+        inputs.messages = {{"user", "Record the Moon"}};
+        inputs.tools = {{"record_satellite", "Record a satellite",
+            R"({"type":"object","properties":{"body":{"const":"Moon"}},"required":["body"],"additionalProperties":false})"}};
+        inputs.enable_thinking = false;
+        for (const auto selection : {COMMON_CHAT_TOOL_CHOICE_REQUIRED, COMMON_CHAT_TOOL_CHOICE_AUTO}) {
+            inputs.tool_choice = selection;
+            const auto format = common_chat_templates_apply(templates.get(), inputs);
+            require(!format.grammar.empty() && format.grammar_lazy == (selection == COMMON_CHAT_TOOL_CHOICE_AUTO),
+                "Inkling tool grammar does not match the requested tool choice");
+            common_chat_parser_params parser(format);
+            parser.parser.load(format.parser);
+            const auto parsed = common_chat_parse(
+                R"(<|message_model|>record_satellite<|content_invoke_tool_json|>{"name":"record_satellite","args":{"body":"Moon"}}<|end_message|>)",
+                false, parser);
+            require(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "record_satellite" &&
+                parsed.tool_calls[0].arguments == R"({"body":"Moon"})", "Inkling tool call was not decoded");
+        }
+        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        const auto format = common_chat_templates_apply(templates.get(), inputs);
+        common_chat_parser_params parser(format);
+        parser.reasoning_format = inputs.reasoning_format;
+        parser.parser.load(format.parser);
+        const auto reply = common_chat_parse("<|message_model|><|content_thinking|>Tool confirmed<|end_message|>"
+            "<|message_model|><|content_text|>Moon<|end_message|>", false, parser);
+        require(format.grammar.empty() && reply.content == "Moon" && reply.reasoning_content == "Tool confirmed",
+            "Inkling tool result reply leaked message control tokens");
+    }
     TokenizerFixture fixture;
     TextProcessor processor(fixture.path.string(), fixture.vocabulary, "deepseek_v41");
     for (const auto& prompt : std::vector<std::string>{"abc", "<s>abc</s>", std::string(4096, 'a')})
