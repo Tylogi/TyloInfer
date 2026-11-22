@@ -1,4 +1,5 @@
 #include "tq.h"
+#include "../../../tests/numeric_assertions.h"
 #include "tyloinfer/tq_rows.h"
 #include <cmath>
 #include <fstream>
@@ -65,10 +66,14 @@ int main(int argc,char** argv) {
                     for(int t=0;t<tokens;++t)for(std::size_t r=0;r<layout.rows;++r) {
                         double expected=0;
                         for(std::size_t c=0;c<columns;++c)expected+=double(input[t*columns+c])*reference[r*columns+c];
-                        error+=std::pow(double(output[t*layout.rows+r])-expected,2);scale+=expected*expected;
+                        const double difference=mfq::test::checked_absolute_error(
+                            double(output[t*layout.rows+r]),expected);
+                        error+=difference*difference;scale+=expected*expected;
                     }
                     const double limit=type==tb::kFloat16?.001:type==tb::kBFloat16?.004:3e-6;
-                    if(std::sqrt(error/scale)>limit)throw std::runtime_error("native TQ forward differs from FP64 oracle");
+                    const double relative=std::sqrt(error/scale);
+                    if(!std::isfinite(relative) || relative>limit)
+                        throw std::runtime_error("native TQ forward differs from FP64 oracle");
                 }
             }
             auto invalid=blob;invalid[64+4]|=0x80;

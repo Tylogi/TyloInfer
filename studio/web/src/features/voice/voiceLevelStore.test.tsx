@@ -106,6 +106,26 @@ describe('语音音量独立订阅', () => {
     level.unmount();
   });
 
+  it('消息回调使用事件 sessionId，而不是当前会话覆盖旧消息', () => {
+    const conversation = renderHook(
+      ({ sessionId }) => useVoiceConversation(sessionId, 1, vi.fn()),
+      { initialProps: { sessionId: 'session-a' } },
+    );
+    const callbacks = mockControllers[0].callbacks;
+
+    conversation.rerender({ sessionId: 'session-b' });
+    act(() => {
+      callbacks.onInputStart({ id: 'input-a', sessionId: 'session-a' });
+      callbacks.onTurn({ id: 'assistant-a', sessionId: 'session-a', text: 'old answer', audio: null });
+    });
+
+    expect(conversation.result.current.voiceMessages).toEqual([
+      expect.objectContaining({ id: 'input-a', sessionId: 'session-a', role: 'user' }),
+      expect.objectContaining({ id: 'assistant-a', sessionId: 'session-a', role: 'assistant', text: 'old answer' }),
+    ]);
+    conversation.unmount();
+  });
+
   it('控制器停止发布零音量，卸载后旧回调无法重新写入', async () => {
     const level = renderHook(useVoiceLevel);
     const conversation = renderHook(() => useVoiceConversation('session-a', 1, vi.fn()));

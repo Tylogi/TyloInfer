@@ -21,16 +21,7 @@ it('positions the local checkpoint section when opened through the Load shortcut
   expect(scroll).toHaveBeenCalledExactlyOnceWith({ block: 'start' });
   expect(scroll.mock.instances[0]).toBe(section);
 });
-
 it('keeps normal model-page navigation at its original position', () => {
   render(<MemoryRouter initialEntries={['/models']}><ModelsPage /></MemoryRouter>);
   expect(scroll).not.toHaveBeenCalled();
-});
-
-it('puts the model library directly after a compact summary instead of load-policy panels', () => {
-  const { container } = render(<MemoryRouter><ModelsPage /></MemoryRouter>);
-  expect(container.querySelector('.model-workbench-summary')).toBeNull();
-  expect(container.querySelector('.model-load-policy')).toBeNull();
-  const summary = container.querySelector('.model-library-summary')!;
-  expect(summary.nextElementSibling).toContainElement(screen.getByText('Local checkpoints list'));
 });

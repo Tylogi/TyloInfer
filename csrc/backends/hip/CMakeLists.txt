@@ -399,6 +399,9 @@ if(BUILD_TESTING)
         target_include_directories(${target} PRIVATE ${TYLOINFER_HIP_TEST_INCLUDES})
         target_compile_definitions(${target} PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1)
         target_compile_features(${target} PRIVATE cxx_std_20)
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:HIP>:-UNDEBUG>"
+            "$<$<COMPILE_LANGUAGE:CXX>:$<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>>")
         set_target_properties(${target} PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON

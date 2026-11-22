@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import socket
 import subprocess
-import threading
 from pathlib import Path
 
 import pytest
-import uvicorn
 
+from tests.agent_bridge_server import running_agent_bridge
 from tests.test_server_service import FakeBackend
 from server.api import create_app
 from server.services.service import ServerService
@@ -44,25 +42,10 @@ def test_model_bridge_real_api_tickets_completion_cancel_and_validation(tmp_path
     runtime = ControlledRuntime()
     backend = FakeBackend()
     service = ServerService(SessionStore(tmp_path / "core.sqlite3"), backend, runtime_manager=runtime)
-    ready = threading.Event()
-
-    class ReadyServer(uvicorn.Server):
-        async def startup(self, sockets=None):
-            await super().startup(sockets=sockets)
-            if self.started:
-                ready.set()
-
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
-    server = ReadyServer(uvicorn.Config(create_app(service), log_level="error", access_log=False))
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve(sockets=[listener])), daemon=True)
-    thread.start()
-    try:
-        assert ready.wait(10), "controlled core API did not start"
+    with running_agent_bridge(create_app(service)) as base_url:
         root = Path(__file__).resolve().parents[2]
         subprocess.run(
-            [node, "plugins/host/tests/core-api-smoke.mjs", f"http://127.0.0.1:{port}"],
+            [node, "plugins/host/tests/core-api-smoke.mjs", base_url],
             cwd=root, check=True, timeout=30,
         )
         assert [item["model"] for item in runtime.loads] == ["bridge-fixture-success", "bridge-fixture-pending"]
@@ -71,8 +54,3 @@ def test_model_bridge_real_api_tickets_completion_cancel_and_validation(tmp_path
         assert len(runtime.unloads) == 1
         assert runtime.unloads[0]["force"] is False
         assert backend.calls == []
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        listener.close()
-        assert not thread.is_alive(), "controlled core API did not stop"

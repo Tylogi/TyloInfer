@@ -126,6 +126,70 @@ def test_stdio_runtime_client_handles_unary_and_streaming_frames() -> None:
     asyncio.run(run())
 
 
+def test_stdio_cancelled_stream_preserves_other_requests_and_recovers() -> None:
+    """Closing A cancels only A; B completes and late A frames leave the client usable."""
+    async def run() -> None:
+        generated: dict[str, str] = {}
+        cancelled: list[str] = []
+
+        def event(request_id: str, **data: Any) -> dict[str, Any]:
+            return {"v": 1, "id": request_id, "type": "event",
+                    "data": {"request_id": request_id, **data}}
+
+        def handler(request: dict[str, Any]) -> list[dict[str, Any]]:
+            request_id = request.get("id")
+            if request["op"] == "generate":
+                prompt = request["params"]["input"]["messages"][0]["content"]
+                generated[prompt] = request_id
+                frames = [event(request_id, event="delta", delta={"content": prompt})]
+                if prompt == "C":
+                    frames.extend([
+                        event(request_id, event="complete", finish_reason="stop"),
+                        {"v": 1, "id": request_id, "type": "done"},
+                    ])
+                return frames
+            if request["op"] == "request.cancel":
+                target = request["params"]["target_id"]
+                cancelled.append(target)
+                other = generated["B"]
+                return [
+                    event(other, event="delta", delta={"content": " done"}),
+                    event(other, event="complete", finish_reason="stop"),
+                    {"v": 1, "id": other, "type": "done"},
+                    event(target, event="complete", finish_reason="cancelled"),
+                    {"v": 1, "id": target, "type": "done"},
+                ]
+            if request["op"] == "health":
+                return [{"v": 1, "id": request_id, "type": "result", "data": {"status": "ok"}}]
+            return []
+
+        def payload(prompt: str) -> dict[str, Any]:
+            return {"messages": [{"role": "user", "content": prompt}], "stream": True}
+
+        client = _client(handler)
+        try:
+            async with client.generate(payload("B")) as events_b:
+                received_b = [await anext(events_b)]
+                async with client.generate(payload("A")) as events_a:
+                    first_a = await anext(events_a)
+                    assert first_a["choices"][0]["delta"]["content"] == "A"
+                assert cancelled == [generated["A"]]
+                received_b += [item async for item in events_b if item is not None]
+                assert "".join(item["choices"][0]["delta"].get("content", "") for item in received_b) == "B done"
+                assert received_b[-1]["choices"][0]["finish_reason"] == "stop"
+                assert {item["id"] for item in received_b} == {generated["B"]}
+
+            assert await client.health() == {"status": "ok"}
+            async with client.generate(payload("C")) as events:
+                recovered = [item async for item in events if item is not None]
+            assert recovered[0]["choices"][0]["delta"]["content"] == "C"
+            assert recovered[-1]["choices"][0]["finish_reason"] == "stop"
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_stdio_runtime_client_maps_structured_errors() -> None:
     async def run() -> None:
         def handler(request: dict[str, Any]) -> list[dict[str, Any]]:

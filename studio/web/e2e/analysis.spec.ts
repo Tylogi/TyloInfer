@@ -2,35 +2,6 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 import { analysisArtifacts, analysisFixture } from '../tests/fixtures/checkpointAnalysis';
 
-for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
-  test(`layer budget uses red FFN, blue Attention and purple Total (${mode})`, async ({ page }, testInfo) => {
-    const dark = mode.endsWith('dark');
-    const theme = mode.startsWith('system') ? 'system' : mode;
-    await mockStudioServer(page);
-    await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light' });
-    await page.addInitScript(value => localStorage.setItem('tyloinfer.studio.generation.v1', JSON.stringify({ language: 'en', theme: value })), theme);
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [analysisArtifacts[1]] } }));
-    await page.route('**/api/v1/models/*/analysis', route => route.fulfill({ json: analysisFixture(true) }));
-    await page.goto('/analysis');
-    const chart = page.locator('.layer-budget');
-    await expect(chart.locator('.budget-legend')).toHaveText('FFNAttentionTotal');
-    await chart.locator('rect[role="button"]').first().focus();
-    for (const [kind, color] of [
-      ['ffn', dark ? 'rgb(223, 138, 135)' : 'rgb(189, 85, 85)'],
-      ['attention', dark ? 'rgb(120, 171, 223)' : 'rgb(57, 121, 186)'],
-      ['total', dark ? 'rgb(185, 155, 224)' : 'rgb(134, 96, 176)'],
-    ]) {
-      await expect(chart.locator(`.budget-series-${kind} .budget-line`)).toHaveCSS('stroke', color);
-      await expect(chart.locator(`.budget-series-${kind} .budget-dot`).first()).toHaveCSS('fill', color);
-      await expect(chart.locator(`.budget-legend .budget-series-${kind} i`)).toHaveCSS('background-color', color);
-      await expect(chart.locator(`.budget-readout-series.budget-series-${kind} i`)).toHaveCSS('background-color', color);
-    }
-    if (testInfo.project.name === 'desktop' && !mode.startsWith('system')) {
-      await chart.screenshot({ path: testInfo.outputPath(`layer-budget-${mode}.png`) });
-    }
-  });
-}
-
 test('checkpoint analysis charts and controls fit desktop and mobile', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));

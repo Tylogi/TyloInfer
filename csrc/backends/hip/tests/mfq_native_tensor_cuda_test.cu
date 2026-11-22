@@ -1,4 +1,5 @@
 #include "mfq_weight_memory.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mfq_cuda_context.h"
 #include "mfq_native_tensor.h"
 
@@ -23,7 +24,7 @@ void require(bool condition, const char* message) {
 }
 
 void require_close(float actual, float expected, float tolerance, const char* message) {
-    if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+    if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
         throw std::runtime_error(
             std::string(message) + ": expected " + std::to_string(expected) +
             ", got " + std::to_string(actual));

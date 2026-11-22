@@ -30,6 +30,7 @@
 #include "attention_mma_verify.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numeric>
 #include <chrono>
@@ -46,14 +47,26 @@ static void check(bool ok, const char *message) {
         throw std::runtime_error(message);
 }
 
-static void check_attention_logical_prefix() {
+static int check_attention_logical_prefix() {
     namespace tb = mfq_tensor_backend;
+    int device = 0;
+    check(cudaGetDevice(&device) == cudaSuccess,
+        "could not query the active CUDA device for attention-prefix coverage");
+    cudaDeviceProp properties{};
+    check(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
+        "could not query CUDA capability for attention-prefix coverage");
+    if (properties.major < 7) {
+        std::cout << "Logical-prefix attention: skipped (MMA requires CUDA compute capability 7.0+)\n";
+        return 0;
+    }
+    const std::array<std::pair<int, int>, 4> geometries{{
+        {64, 1024}, {128, 1024}, {256, 32768}, {512, 1024}}};
+    constexpr int expected_variants = 4 * 2 * 3 * 2;
     const auto context = default_context();
     const auto stream = mfq_current_cuda_stream();
     context->begin_graph_pool(stream);
-    int cases = 0, skipped = 0;
-    for (auto [width, capacity] : {std::pair{64, 1024}, std::pair{128, 1024},
-                                  std::pair{256, 32768}, std::pair{512, 1024}})
+    int cases = 0;
+    for (auto [width, capacity] : geometries)
     for (int ratio : {6, 10}) for (int tokens : {2, 3, 4})
     for (auto query_type : {tb::kFloat16, tb::kFloat32}) {
         constexpr int batch = 2, kv_heads = 2, initialized_rows = 160;
@@ -88,7 +101,14 @@ static void check_attention_logical_prefix() {
             output = try_attention_mma_verify_cuda(query, keys, values, lengths, scale, capacity);
         };
         { GraphWarmupScope warmup(context, stream); body(); }
-        if (!output.defined()) { ++skipped; continue; }
+        if (!output.defined()) {
+            throw std::runtime_error(
+                "attention-prefix required variant unavailable: cc=" + std::to_string(properties.major) + "." +
+                std::to_string(properties.minor) + " width=" + std::to_string(width) +
+                " capacity=" + std::to_string(capacity) + " ratio=" + std::to_string(ratio) +
+                " tokens=" + std::to_string(tokens) +
+                " query_dtype=" + std::to_string(static_cast<int>(query_type)));
+        }
         TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
         output = {};
         Graph graph;
@@ -131,8 +151,13 @@ static void check_attention_logical_prefix() {
         }
     }
     context->end_graph_pool(stream);
-    std::cout << "Logical-prefix attention: " << cases << " changing Graph/reference cases passed; "
-              << skipped << " variants unavailable with current MMA resources\n";
+    check(cases == expected_variants * 3,
+        "attention-prefix coverage did not execute every required variant and replay");
+    std::cout << "Logical-prefix attention: " << cases
+              << " changing Graph/reference cases passed across " << expected_variants
+              << "/" << expected_variants << " required variants (cc="
+              << properties.major << "." << properties.minor << ")\n";
+    return cases;
 }
 
 struct MemoryTensorSource final : mfq::ModelSource {
@@ -1917,7 +1942,7 @@ int main(int argc, char** argv) try {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_memory_topology();
     if (argc == 2 && std::string(argv[1]) == "--attention-prefix-check") {
-        check_attention_logical_prefix(); return 0;
+        return check_attention_logical_prefix() == 0 ? 77 : 0;
     }
     if(argc==2 && std::string(argv[1])=="--tq-tp-check") {check_tq_parallel();return 0;}
     if(argc==2 && std::string(argv[1])=="--workspace-loan-check") {
@@ -1974,7 +1999,6 @@ int main(int argc, char** argv) try {
     check_streamed_graph_segments();
     check_retained_recurrent_storage();
     check_speculative_recurrent_input_reuse();
-    check_attention_logical_prefix();
     check_sampling_storage();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     check_linear_execution();
@@ -1987,7 +2011,6 @@ int main(int argc, char** argv) try {
     check_gemma_composition();
     check_tts_sampling();
     check_ffn_branches();
-    check_tq_parallel();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     check_mfe_cached_dispatch_geometry();
 #endif

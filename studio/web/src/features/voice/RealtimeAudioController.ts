@@ -39,6 +39,9 @@ export class RealtimeAudioController {
   private currentStepWasListen = false;
   private sessionReady = false;
   private clientSessionId: string | null = null;
+  private connectionGeneration = 0;
+  private captureGeneration = 0;
+  private pendingConnection: { sessionId: string; promise: Promise<void> } | null = null;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
   private activeTurn: BufferedVoiceTurn | null = null;
@@ -88,11 +91,13 @@ export class RealtimeAudioController {
   }
 
 
+  /** Starts capture and the realtime session; may be superseded by a newer session. */
   async start(config: RealtimeSessionConfig): Promise<void> {
     await this.connect(config, true);
   }
 
 
+  /** Sends text through the realtime session, creating output resources as needed. */
   async submitText(value: string, config: RealtimeSessionConfig): Promise<void> {
     const text = value.trim();
     if (!text || this.awaitingHalfDuplexResponse) return;
@@ -100,10 +105,40 @@ export class RealtimeAudioController {
     this.sendText(text);
   }
 
+  /** Coalesces duplicate setup and invalidates stale session setup before switching. */
   private async connect(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
+    const pending = this.pendingConnection;
+    if (pending) {
+      if (pending.sessionId === config.sessionId) {
+        await pending.promise;
+        if (
+          capture &&
+          !this.audio.capturing &&
+          this.socket?.readyState === WebSocket.OPEN &&
+          this.sessionReady
+        ) {
+          await this.startAudio();
+          this.callbacks.onState("listening");
+        }
+        return;
+      }
+      await this.stop();
+    }
+    const promise = this.connectInternal(config, capture);
+    this.pendingConnection = { sessionId: config.sessionId, promise };
+    try {
+      await promise;
+    } finally {
+      if (this.pendingConnection?.promise === promise) this.pendingConnection = null;
+    }
+  }
+
+  /** Performs one connection attempt under a generation ownership token. */
+  private async connectInternal(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
     if (this.clientSessionId && this.clientSessionId !== config.sessionId) {
       await this.stop();
     }
+    const generation = ++this.connectionGeneration;
     if (this.audio.capturing || this.awaitingHalfDuplexResponse) return;
     this.clientSessionId = config.sessionId;
     if (this.socket?.readyState === WebSocket.OPEN && this.sessionReady) {
@@ -117,24 +152,41 @@ export class RealtimeAudioController {
     this.callbacks.onState("connecting");
     try {
       if (capture) {
+        this.captureGeneration = generation;
         await this.startAudio();
       } else {
         await this.audio.ensureOutput();
       }
+      if (
+        generation !== this.connectionGeneration ||
+        this.clientSessionId !== config.sessionId
+      ) {
+        if (capture && this.captureGeneration === generation) await this.stopInputCapture();
+        return;
+      }
       const socket = new WebSocket(runtimeRealtimeUrl());
       this.socket = socket;
       socket.onmessage = (message) => {
+        if (this.socket !== socket || this.clientSessionId !== config.sessionId) return;
         try {
           this.handleEvent(JSON.parse(String(message.data)) as Record<string, unknown>, config);
         } catch (error) {
           this.fail(error);
         }
       };
-      socket.onerror = () => this.callbacks.onError("Voice connection failed");
+      socket.onerror = () => {
+        if (this.socket !== socket || this.clientSessionId !== config.sessionId) return;
+        this.callbacks.onError("Voice connection failed");
+      };
       socket.onclose = () => {
+        if (this.socket !== socket) return;
         if (!this.stopping) void this.stop(false);
       };
     } catch (error) {
+      if (
+        generation !== this.connectionGeneration ||
+        this.clientSessionId !== config.sessionId
+      ) return;
       this.fail(error);
     }
   }
@@ -177,8 +229,10 @@ export class RealtimeAudioController {
   }
 
 
+  /** Stops the session idempotently and releases socket, capture, and playback resources. */
   async stop(sendClose = true): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
+    if (!this.active && !this.clientSessionId) return;
     const pending = this.performStop(sendClose);
     this.stopPromise = pending;
     try {
@@ -189,6 +243,7 @@ export class RealtimeAudioController {
   }
 
   private async performStop(sendClose: boolean): Promise<void> {
+    this.connectionGeneration += 1;
     this.stopping = true;
     if (sendClose && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: "session.close", reason: "user_stop" }));

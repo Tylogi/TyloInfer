@@ -7,6 +7,7 @@
 #include "qwen4_exp/model.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_context.h"
+#include "tests/numeric_assertions.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
@@ -36,7 +37,8 @@ void require_constant(
     for (int64_t index = 0; index < host.numel(); ++index) {
         maximum_error = std::max(
             maximum_error,
-            std::abs(host.data_ptr<float>()[index] - expected));
+            mfq::test::checked_absolute_error(
+                host.data_ptr<float>()[index], expected));
     }
     if (maximum_error > tolerance) {
         throw std::runtime_error(
@@ -54,13 +56,77 @@ void require_qsa_gqa_means(
         for (int width = 0; width < 256; ++width) {
             maximum_error = std::max(
                 maximum_error,
-                std::abs(host.data_ptr<float>()[head * 256 + width] - expected));
+                mfq::test::checked_absolute_error(
+                    host.data_ptr<float>()[head * 256 + width], expected));
         }
     }
     if (maximum_error > tolerance) {
         throw std::runtime_error(
             "QSA sparse GQA mismatch, max_abs=" +
             std::to_string(maximum_error));
+    }
+}
+
+void check_numerical_assertion_smoke() {
+    const auto cpu = TensorOptions{}.dtype(kFloat32).device(kCPU);
+    const auto require_failure = [](const auto& check, const char* message) {
+        bool rejected = false;
+        try {
+            check();
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error(message);
+        }
+    };
+    require_constant(ones({4}, cpu), 1.0f, 0.0f, "finite constant smoke");
+    require_constant(full({4}, 1.05f, cpu), 1.0f, 0.1f,
+        "finite constant within tolerance smoke");
+    require_failure([&] {
+        require_constant(full({4}, 1.2f, cpu), 1.0f, 0.1f,
+            "finite constant outside tolerance smoke");
+    }, "constant numerical assertion lost its tolerance bound");
+
+    for (const float invalid : {
+             std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity(),
+             -std::numeric_limits<float>::infinity()}) {
+        require_failure([&] {
+            require_constant(full({4}, invalid, cpu), 1.0f, 0.0f,
+                "nonfinite constant smoke");
+        }, "constant numerical assertion accepted a nonfinite value");
+    }
+
+    std::vector<float> finite_values(24 * 256);
+    for (int head = 0; head < 24; ++head) {
+        std::fill_n(finite_values.data() + head * 256, 256,
+            head < 12 ? 1.0f : 2.0f);
+    }
+    require_qsa_gqa_means(
+        tensor(finite_values).reshape({24, 256}).to(cpu),
+        1.0f, 2.0f, 0.0f);
+    auto within_values = finite_values;
+    within_values[0] = 1.05f;
+    require_qsa_gqa_means(
+        tensor(within_values).reshape({24, 256}).to(cpu),
+        1.0f, 2.0f, 0.1f);
+    auto outside_values = finite_values;
+    outside_values[0] = 1.2f;
+    require_failure([&] {
+        require_qsa_gqa_means(
+            tensor(outside_values).reshape({24, 256}).to(cpu),
+            1.0f, 2.0f, 0.1f);
+    }, "QSA numerical assertion lost its tolerance bound");
+
+    for (const float invalid : {
+             std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity(),
+             -std::numeric_limits<float>::infinity()}) {
+        require_failure([&] {
+            require_qsa_gqa_means(
+                full({24, 256}, invalid, cpu), 1.0f, 2.0f, 0.0f);
+        }, "QSA numerical assertion accepted a nonfinite value");
     }
 }
 
@@ -646,6 +712,16 @@ void check_attention_fusion() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--numerical-assertions-check") {
+        try {
+            check_numerical_assertion_smoke();
+            std::cout << "Flash-Next numerical assertions: finite tolerance and nonfinite rejection checks passed\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "Flash-Next numerical assertions failed: " << error.what() << '\n';
+            return 1;
+        }
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
@@ -657,6 +733,7 @@ int main(int argc, char** argv) {
         if(argc==2 && std::string(argv[1])=="--rotary-yarn-check") {check_rotary_yarn_fusion();return 0;}
         if(argc==2 && std::string(argv[1])=="--attention-fused-check") {check_attention_fusion();return 0;}
         if (argc == 1) {
+            check_numerical_assertion_smoke();
             auto q = mfq::cuda::ones({1,1,2,4}, mfq::cuda::TensorOptions{}.device(mfq::cuda::kCUDA));
             auto k = mfq::cuda::ones({1,3,4}, q.options());
             auto got = mfq_qwen4_exp::block_scores(q,k).cpu();

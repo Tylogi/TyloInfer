@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import pytest
-import uvicorn
 
+from tests.agent_bridge_server import running_agent_bridge
 from tests.test_checkpoint_analysis import checkpoint
 from tests.test_server_service import FakeBackend
 from server.api import create_app
@@ -89,29 +87,9 @@ def test_page_bridge_real_api_registration_analysis_policies_and_controlled_down
     service = ServerService(store, backend, catalog=catalog, runtime_manager=runtime, jobs=jobs, tool_handlers=handlers, hub_catalog=hub)
     service.resource_monitor = ControlledSensors()
     service._hub_system_profile = lambda: HubSystemProfile(platform="fixture", machine="fixture", backend="cpu")
-    ready = threading.Event()
-
-    class ReadyServer(uvicorn.Server):
-        async def startup(self, sockets=None):
-            await super().startup(sockets=sockets)
-            if self.started:
-                ready.set()
-
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
-    server = ReadyServer(uvicorn.Config(create_app(service), log_level="error", access_log=False))
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve(sockets=[listener])), daemon=True)
-    thread.start()
-    try:
-        assert ready.wait(10), "controlled page API did not start"
-        subprocess.run([node, "plugins/host/tests/page-api-smoke.mjs", f"http://127.0.0.1:{port}"], cwd=root, check=True, timeout=30)
+    with running_agent_bridge(create_app(service)) as base_url:
+        subprocess.run([node, "plugins/host/tests/page-api-smoke.mjs", base_url], cwd=root, check=True, timeout=30)
         assert [item["repo_id"] for item in downloads] == ["example/success", "example/pending"]
         assert [item[0] for item in hub.calls] == ["search", "info", "official"]
         assert not runtime._instances
         assert backend.calls == []
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        listener.close()
-        assert not thread.is_alive(), "controlled page API did not stop"

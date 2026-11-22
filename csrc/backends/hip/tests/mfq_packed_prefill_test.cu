@@ -1,4 +1,5 @@
 #include "mfq_tensor_backend.h"
+#include "../../../tests/numeric_assertions.h"
 #include <cuda_runtime.h>
 #include "studio/kernels/hip/fp8_sq.h"
 #include "studio/kernels/hip/mxfp4_sq.h"
@@ -25,7 +26,7 @@ void close(const Tensor& actual, const Tensor& reference, float atol, float rtol
     auto b = reference.contiguous().to(kCPU, kFloat32);
     for (std::int64_t i = 0; i < a.numel(); ++i) {
         const float x = a.data_ptr<float>()[i], y = b.data_ptr<float>()[i];
-        if (!std::isfinite(x) || std::abs(x - y) > atol + rtol * std::abs(y)) {
+        if (mfq::test::checked_absolute_error(x, y) > atol + rtol * std::abs(y)) {
             throw std::runtime_error("numerical mismatch at " + std::to_string(i) +
                 ": " + std::to_string(x) + " vs " + std::to_string(y));
         }

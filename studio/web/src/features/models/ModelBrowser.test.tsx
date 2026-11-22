@@ -31,10 +31,11 @@ it.each([3, 60])('downloads all shared Engram dependencies into one repository d
   await waitFor(() => expect(button).toBeEnabled());
   fireEvent.click(button);
   await waitFor(() => expect(jobsApi.createJob).toHaveBeenCalledWith('download.modelscope',
-    expect.objectContaining({ destination: 'models/modelscope/owner/first',
-      include: expect.arrayContaining([table]) })));
+    expect.objectContaining({ destination: 'models/modelscope/owner/first' })));
   const include = vi.mocked(jobsApi.createJob).mock.calls[0][1].include as string[];
-  expect(include[0]).toMatch(/^Q3\//);
+  const primary = first.variants[0].files.filter(file => file !== table);
+  const expectedPrimary = count === 3 ? primary : ['Q3/model-EW-Q3*.tq'];
+  expect(include).toEqual(expect.arrayContaining([...expectedPrimary, table]));
 });
 
 it('uses one combined MoE pressure bar and includes applied KV in its total', async () => {

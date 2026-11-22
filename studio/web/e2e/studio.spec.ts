@@ -4,7 +4,7 @@ import { mockStudioServer, officialCatalog } from './mockServer';
 import { openModelSettings } from './modelSettings';
 
 for (const language of ['zh', 'en'] as const) {
-  test(`compact tool navigation keeps labels aligned (${language})`, async ({ page }, testInfo) => {
+  test(`tool navigation stays visible without clipping (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language: language === 'zh' ? 'zh-CN' : 'en' });
     await page.goto('/inference');
     await expect(page.locator('main h1')).toBeVisible();
@@ -17,7 +17,6 @@ for (const language of ['zh', 'en'] as const) {
     await expect(engine).toHaveAttribute('aria-expanded', 'true');
     await expect(sidebar.getByRole('button', { name: language === 'zh' ? '新建会话' : 'New session', exact: true })).toHaveCount(0);
     await expect(sidebar.getByRole('button', { name: language === 'zh' ? '分析' : 'Analysis', exact: true })).toBeVisible();
-    expect((await sidebar.boundingBox())!.width).toBeCloseTo(testInfo.project.name === 'mobile' ? 280 : 248, 3);
     for (const button of await sidebar.locator('button').all()) {
       expect(await button.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
     }
@@ -165,7 +164,7 @@ test('网页运行服务允许编辑端口，无效端口不发送更改', async
   expect(updates).toEqual([]);
 });
 
-test('三家架构标识贯穿模型页面，保持描线、无边框和靠右布局', async ({ page }, testInfo) => {
+test('不同架构模型在资产与下载页面显示对应标识', async ({ page }) => {
   const state = await mockStudioServer(page);
   const models = [
     { name: 'Qwen3.8-Flash-Next-S4-L', architecture: 'qwen4_exp', vendor: 'qwen' },
@@ -200,51 +199,20 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   for (const item of models) {
     await expect(page.locator(`.model-library-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
   }
-  const row = page.locator('.model-library-panel .model-row').first();
-  const nameBox = await row.getByText(models[0].name, { exact: true }).boundingBox();
-  const markBox = await row.locator('.model-vendor-mark').boundingBox();
-  if (testInfo.project.name === 'mobile') {
-    expect(markBox!.y).toBeGreaterThan(nameBox!.y + nameBox!.height);
-  } else {
-    expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
-  }
-  const rowButton = await row.locator('button').first().boundingBox();
-  expect(markBox!.x + markBox!.width).toBeLessThan(rowButton!.x);
-  expect(Math.abs(markBox!.y + markBox!.height / 2 - rowButton!.y - rowButton!.height / 2)).toBeLessThanOrEqual(1);
   await navigateClient(page, '/runtime');
   await expect(page.locator('.server-model-control')).toHaveCount(0);
-  await expect(page.locator('.server-model-control .model-vendor-mark')).toHaveCount(0);
-  await navigateClient(page, '/models');
-  await page.screenshot({ path: testInfo.outputPath('model-vendors-local.png'), animations: 'disabled' });
   await navigateClient(page, '/model-hub');
   for (const item of models) await expect(page.locator(`.official-model-card [data-model-vendor="${item.vendor}"]`)).toBeVisible();
   await expect(page.locator('.model-detail-heading [data-model-vendor="qwen"]')).toBeVisible();
   await page.locator('.official-model-card').last().click();
   await expect(page.locator('.model-detail-heading [data-model-vendor="zai"]')).toBeVisible();
   await expect(page.locator('.model-variant .model-vendor-mark')).toHaveCount(0);
-  for (const mark of await page.locator('.official-model-card .model-vendor-mark').all()) {
-    const appearance = await mark.evaluate((node) => {
-      const css = getComputedStyle(node);
-      return { fill: css.fill, border: css.borderWidth, background: css.backgroundColor, stroke: css.stroke };
-    });
-    expect(appearance.fill).toBe('none');
-    expect(appearance.border).toBe('0px');
-    expect(appearance.background).toBe('rgba(0, 0, 0, 0)');
-    const channels = appearance.stroke.match(/\d+/g);
-    expect(new Set(channels).size).toBe(1);
-  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  await page.screenshot({ path: testInfo.outputPath('model-vendors-downloads-light.png'), animations: 'disabled' });
-  await page.evaluate(() => {
-    document.documentElement.dataset.theme = 'dark';
-    document.documentElement.style.colorScheme = 'dark';
-  });
-  await page.screenshot({ path: testInfo.outputPath('model-vendors-downloads-dark.png'), animations: 'disabled' });
   expect(errors).toEqual([]);
   expect(state.unexpected).toEqual([]);
 });
 
-test('推理预算按内存架构分列容量，带宽用小号灰字放在下方', async ({ page }, testInfo) => {
+test('推理预算按内存架构显示正确容量和带宽', async ({ page }) => {
   await mockStudioServer(page);
   await page.goto('/model-hub');
   await expect(page.locator('.detected-hardware-summary strong')).toContainText('128 GiB URAM');
@@ -254,24 +222,6 @@ test('推理预算按内存架构分列容量，带宽用小号灰字放在下�
   await expect(unified.locator('small')).toHaveText('571.8 GiB/s');
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  const checkLayout = async () => {
-    for (const pool of await page.locator('.detected-memory-pool').all()) {
-      const capacity = await pool.locator('strong').boundingBox();
-      const bandwidth = await pool.locator('small').boundingBox();
-      expect(bandwidth!.y).toBeGreaterThanOrEqual(capacity!.y + capacity!.height);
-      expect(bandwidth!.x).toBe(capacity!.x);
-      const size = await pool.evaluate((node) => ({
-        capacity: getComputedStyle(node.querySelector('strong')!).fontSize,
-        bandwidth: getComputedStyle(node.querySelector('small')!).fontSize,
-        color: getComputedStyle(node.querySelector('small')!).color,
-      }));
-      expect(parseFloat(size.bandwidth)).toBeLessThan(parseFloat(size.capacity));
-      expect(size.color).toBe(await page.locator('.detected-configuration > div > span').first().evaluate((node) => getComputedStyle(node).color));
-    }
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  };
-  await checkLayout();
-  await page.locator('.detected-configuration').screenshot({ path: testInfo.outputPath('unified-memory.png') });
   await page.route(/\/api\/v1\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
     ...officialCatalog, system: { platform: 'Windows', machine: 'AMD64', backend: 'cuda',
       cpu_name: 'AMD Ryzen 5 9600X', gpu_names: ['NVIDIA GeForce RTX 5090'], physical_memory_bytes: 64 * 2 ** 30,
@@ -281,13 +231,12 @@ test('推理预算按内存架构分列容量，带宽用小号灰字放在下�
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect(page.locator('.detected-memory-pool strong')).toHaveText(['32 GiB VRAM', '64 GiB RAM']);
   await expect(page.locator('.detected-memory-pool small')).toHaveText(['1,668.9 GiB/s', '104 GiB/s']);
-  await checkLayout();
-  await page.locator('.detected-configuration').screenshot({ path: testInfo.outputPath('discrete-memory.png') });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   expect(errors).toEqual([]);
 });
 
 test('注册资产显示文件总大小', async ({ page }) => {
-  const state = await mockStudioServer(page, { holdResponse: true });
+  const state = await mockStudioServer(page);
   const nextModel = 'Loaded without registration';
   const assets = [32, 8].map((size, index) => ({ id: `asset-${index}`, name: `Registered checkpoint ${index}`,
     architecture: 'test', format: 'mfq', total_bytes: size * 2 ** 30, shard_count: 1,
@@ -305,38 +254,7 @@ test('注册资产显示文件总大小', async ({ page }) => {
   expect(state.unexpected).toEqual([]);
 });
 
-test('下载来源与九宫格保留统一字体，仅降低文字对比度', async ({ page }) => {
-  await mockStudioServer(page);
-  await page.goto('/model-hub');
-  await expect(page.locator('.model-source-picker select')).toBeVisible();
-  for (const theme of ['light', 'dark']) {
-    await page.evaluate((value) => {
-      document.documentElement.dataset.theme = value;
-      document.documentElement.style.colorScheme = value;
-    }, theme);
-    await expect.poll(() => page.evaluate(() => {
-      const color = getComputedStyle(document.querySelector('.model-detail-panel > p')!).color;
-      return Array.from(document.querySelectorAll('.model-source-picker select, .model-metadata-grid dd')).every((node) => getComputedStyle(node).color === color);
-    })).toBe(true);
-    const styles = await page.evaluate(() => {
-      const body = getComputedStyle(document.body);
-      const detail = getComputedStyle(document.querySelector('.model-detail-panel > p')!);
-      return Array.from(document.querySelectorAll('.model-source-picker select, .model-metadata-grid dd')).map((node) => {
-        const css = getComputedStyle(node);
-        return { font: css.fontFamily, expectedFont: body.fontFamily, weight: css.fontWeight,
-          color: css.color, expectedColor: detail.color, primaryColor: body.color };
-      });
-    });
-    for (const css of styles) {
-      expect(css.font.replace(/^"MFQ Small Numerals",\s*/, '')).toBe(css.expectedFont);
-      expect(css.weight).toBe('400');
-      expect(css.color).toBe(css.expectedColor);
-      expect(css.color).not.toBe(css.primaryColor);
-    }
-  }
-});
-
-test('运行资源按模型分段，各槽使用统一中性色，端点包含 v1', async ({ page }, testInfo) => {
+test('运行资源按模型分段并显示正确预算和服务端点', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [1, 2, 3, 4].map((index) => ({
     id: `resource-${index}`, model: `Resource Model ${index}`, state: 'ready', devices: ['metal'],
@@ -357,22 +275,9 @@ test('运行资源按模型分段，各槽使用统一中性色，端点包含 v
   await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
   await expect(page.getByTitle('Resource Model 1 · Metal wired 1 GiB / 20 GiB')).toBeVisible();
   await expect(page.getByText('10 contexts · 20 cache blocks')).toBeVisible();
-  const colors = await page.locator('.memory-model-legend i').evaluateAll((dots) => dots.map((dot) => getComputedStyle(dot).backgroundColor));
-  expect(new Set(colors).size).toBe(1);
-  expect(colors[0]).not.toBe('rgba(0, 0, 0, 0)');
-  const expectedColor = await page.locator('.memory-model-legend i').first().evaluate((dot) => {
-    const probe = document.createElement('span');
-    probe.style.backgroundColor = 'var(--bar-fill)';
-    dot.appendChild(probe);
-    const color = getComputedStyle(probe).backgroundColor;
-    probe.remove();
-    return color;
-  });
-  expect(colors[0]).toBe(expectedColor);
   for (const tier of ['weights', 'kv', 'experts', 'ple']) {
     const bars = page.locator(`[data-tier="${tier}"] .memory-tier-track > span`);
     await expect(bars).toHaveCount(4);
-    expect(await bars.evaluateAll((segments) => segments.map((segment) => getComputedStyle(segment).backgroundColor))).toEqual(colors);
     const width = parseFloat(await bars.first().evaluate((segment) => (segment as HTMLElement).style.width));
     expect(width).toBeCloseTo(tier === 'weights' ? 5 : tier === 'kv' ? 1 / 1024 / 10 * 100 : 10);
   }

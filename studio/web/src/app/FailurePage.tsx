@@ -1,8 +1,10 @@
 
 import { ArrowLeftIcon, ArrowClockwiseIcon, PlugsIcon, WarningCircleIcon } from '@phosphor-icons/react';
+import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
 import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
+import { isStudio } from '../studio';
 
 interface FailurePageProps {
   kind: 'connection' | 'render';
@@ -23,7 +25,51 @@ interface FailureViewProps {
   onLeave: () => void;
 }
 
+interface AppErrorBoundaryState {
+  error: Error | null;
+}
 
+/**
+ * Replaces the application shell with a fatal recovery view when rendering fails.
+ */
+export class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("TyloInfer failed to render", error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    const chinese = navigator.language.toLowerCase().startsWith("zh");
+    return (
+      <main className="fatal-workspace">
+        <FailureView
+          code="APP / 03"
+          description={chinese
+            ? '应用界面遇到了意外问题。服务可能仍在运行，可以重新载入界面后继续。'
+            : 'The interface encountered an unexpected problem. The service may still be running; reload to continue.'}
+          detail={this.state.error.message || this.state.error.name}
+          detailLabel={chinese ? '查看错误详情' : 'View error details'}
+          kind="render"
+          leaveLabel={chinese ? '返回工作台' : 'Back to workspace'}
+          onLeave={() => window.location.assign(isStudio() ? '#/' : '/')}
+          onRetry={() => window.location.reload()}
+          retryLabel={chinese ? '重新载入' : 'Reload'}
+          title={chinese ? '界面暂时无法显示' : 'Interface unavailable'}
+        />
+      </main>
+    );
+  }
+}
+
+/**
+ * Renders the shared recovery view for connection and page failures.
+ */
 export function FailureView({ kind, code, title, description, retryLabel, leaveLabel, detailLabel, detail, onRetry, onLeave }: FailureViewProps) {
   return (
     <section aria-labelledby="failure-title" className="failure-page" role="alert">
@@ -66,6 +112,9 @@ export function FailureView({ kind, code, title, description, retryLabel, leaveL
 }
 
 
+/**
+ * Renders a localized failure page with route-aware recovery actions.
+ */
 export function FailurePage({ kind, detail, onRetry }: FailurePageProps) {
   const { tr } = useSettings();
   const navigate = useNavigate();

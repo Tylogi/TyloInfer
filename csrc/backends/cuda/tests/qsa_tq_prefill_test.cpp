@@ -1,6 +1,7 @@
 
 #include "kernels/qsa_tq.h"
 #include "mfq_cuda_context.h"
+#include "tests/numeric_assertions.h"
 #include "mfq_tensor_backend.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
@@ -152,7 +153,8 @@ struct Fixture {
         exact(old_hits, hits, "history hits");
         auto expected = old_mass.cpu(), actual = mass.cpu();
         for (int i = 0; i < blocks; ++i)
-            if (std::abs(expected.data_ptr<float>()[i] - actual.data_ptr<float>()[i]) > 1.e-5f)
+            if (mfq::test::checked_absolute_error(
+                    expected.data_ptr<float>()[i], actual.data_ptr<float>()[i]) > 1.e-5f)
                 throw std::runtime_error("Staged attention changed history mass");
     }
 };

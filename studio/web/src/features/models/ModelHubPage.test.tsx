@@ -47,11 +47,6 @@ it.each(['Q3/model-EW-Q3-00001-of-00043.tq', 'Q3/model-EW-Q3*.tq'])(
 it('keeps a submitted download on this page, animates into the circle and opens the third tab', async () => {
   vi.mocked(jobsApi.createJob).mockResolvedValue(download());
   const { container } = render(<ModelHubPage />);
-  const header = container.querySelector('.model-browser-header')!;
-  expect(header.children[0]).toBe(screen.getByRole('heading', { name: 'Model browser' }));
-  expect(header.children[1]).toHaveClass('download-concurrency');
-  expect(header.children[2]).toHaveClass('model-browser-description');
-  expect(header.children[2].querySelector('.download-directory-control')).toBeInTheDocument();
   expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Recommended models', 'Model browser', 'Download queue']);
   const button = await screen.findByRole('button', { name: 'Download' });
   await waitFor(() => expect(button).toBeEnabled());

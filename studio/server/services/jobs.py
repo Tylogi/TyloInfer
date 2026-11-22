@@ -175,6 +175,7 @@ class JobManager:
         self._runtime_semaphore = asyncio.Semaphore(max_concurrency)
         self._tasks: dict[UUID, asyncio.Task[None]] = {}
         self._cancel_events: dict[UUID, asyncio.Event] = {}
+        self._cancel_dispatched: set[UUID] = set()
         self._started = False
         self._closing = False
         self._lifecycle_lock = asyncio.Lock()
@@ -215,18 +216,20 @@ class JobManager:
                 self._schedule(job_id)
 
     async def close(self) -> None:
+        """Stop running jobs and await cleanup without interrupting an existing cancellation."""
         async with self._lifecycle_lock:
             if not self._started:
                 return
             self._closing = True
             tasks = list(self._tasks.values())
-            for task in tasks:
-                task.cancel()
+            for job_id, task in list(self._tasks.items()):
+                self._cancel_task_once(job_id, task)
             for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
             self._tasks.clear()
             self._cancel_events.clear()
+            self._cancel_dispatched.clear()
             self._started = False
 
     async def submit(self, request: CreateJobRequest) -> JobResource:
@@ -238,13 +241,14 @@ class JobManager:
         return job
 
     async def cancel(self, job_id: UUID) -> JobResource:
+        """Request user cancellation once and return the currently persisted job state."""
         job = await asyncio.to_thread(self.store.request_job_cancel, job_id)
         event = self._cancel_events.get(job_id)
         if event is not None:
             event.set()
         task = self._tasks.get(job_id)
-        if task is not None and not task.done():
-            task.cancel()
+        if task is not None:
+            self._cancel_task_once(job_id, task)
         return job
 
     async def retry(self, job_id: UUID, *, payload: dict[str, Any] | None = None) -> JobResource:
@@ -288,11 +292,19 @@ class JobManager:
         self._tasks[job_id] = task
         task.add_done_callback(lambda completed: self._forget(job_id, completed))
 
+    def _cancel_task_once(self, job_id: UUID, task: asyncio.Task[None]) -> None:
+        """Inject cancellation once so cleanup awaits cannot be interrupted twice."""
+        if task.done() or job_id in self._cancel_dispatched:
+            return
+        self._cancel_dispatched.add(job_id)
+        task.cancel()
+
     def _forget(self, job_id: UUID, task: asyncio.Task[None] | None = None) -> None:
         if task is not None and self._tasks.get(job_id) is not task:
             return
         self._tasks.pop(job_id, None)
         self._cancel_events.pop(job_id, None)
+        self._cancel_dispatched.discard(job_id)
 
     async def _run(self, job_id: UUID, cancel_event: asyncio.Event) -> None:
         context = JobContext(self.store, job_id, cancel_event)
@@ -327,9 +339,10 @@ class JobManager:
                 context.raise_if_cancelled()
                 await asyncio.to_thread(self.store.complete_job, job_id, result)
         except (JobCancelledError, asyncio.CancelledError):
+            user_cancelled = cancel_event.is_set()
             cancel_event.set()
             with suppress(InvalidJobStateError, JobNotFoundError):
-                if self._closing:
+                if self._closing and not user_cancelled:
                     await asyncio.to_thread(self.store.interrupt_job, job_id)
                     job = await asyncio.to_thread(self.store.get_job, job_id)
                     if (

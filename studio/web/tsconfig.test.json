@@ -4,6 +4,6 @@
     "composite": false,
     "types": ["vite/client", "@testing-library/jest-dom", "node"]
   },
-  "include": ["src", "tests", "e2e", "vitest.config.ts", "playwright.config.ts"],
+  "include": ["src", "tests", "e2e", "e2e-service", "vitest.config.ts", "playwright.config.ts"],
   "exclude": []
 }

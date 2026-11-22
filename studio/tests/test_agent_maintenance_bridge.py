@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import shutil
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-import uvicorn
 
+from tests.agent_bridge_server import running_agent_bridge
 from tests.test_prefix_cache_management import text_record
 from tests.test_prefix_disk_budget import block
 from tests.test_server_service import FakeBackend
@@ -108,23 +105,8 @@ def test_maintenance_bridge_real_api_scope_partial_failure_directory_and_events(
     store.complete_job(fixture_job.id, {"fixture": True})
     handlers = ToolJobHandlers(catalog, ToolJobPaths(work_root=work, python=Path(sys.executable), modelscope=None, huggingface=None, runtime=None), runtime_manager=pool)
     service = ServerService(store, backend, catalog=catalog, runtime_manager=pool, tool_handlers=handlers)
-    ready = threading.Event()
-
-    class ReadyServer(uvicorn.Server):
-        async def startup(self, sockets=None):
-            await super().startup(sockets=sockets)
-            if self.started:
-                ready.set()
-
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
-    server = ReadyServer(uvicorn.Config(create_app(service), log_level="error", access_log=False))
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve(sockets=[listener])), daemon=True)
-    thread.start()
-    try:
-        assert ready.wait(10), "maintenance fixture API did not start"
-        subprocess.run([node, "plugins/host/tests/maintenance-api-smoke.mjs", f"http://127.0.0.1:{port}", str(fixture_job.id)], cwd=root, check=True, timeout=30)
+    with running_agent_bridge(create_app(service)) as base_url:
+        subprocess.run([node, "plugins/host/tests/maintenance-api-smoke.mjs", base_url, str(fixture_job.id)], cwd=root, check=True, timeout=30)
         assert backend.controls == [("clear", INSTANCE_ID), ("trim", INSTANCE_ID, 0)]
         assert image_releases == [True]
         assert backend.calls == [] and not pool._instances
@@ -135,8 +117,3 @@ def test_maintenance_bridge_real_api_scope_partial_failure_directory_and_events(
         assert handlers.download_directories.selected is None
         assert handlers.download_directories.evict_prefix_cache is False
         assert not list(downloads.iterdir())
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        listener.close()
-        assert not thread.is_alive(), "maintenance fixture API did not stop"

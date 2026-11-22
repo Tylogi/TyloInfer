@@ -1,8 +1,6 @@
 
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { DocumentPartView, MediaPartView, VideoWithFirstFrame } from '../src/features/chat/MessageMedia';
 import { mediaMetadata } from '../src/features/chat/attachments';
 import { useChatAttachments } from '../src/features/chat/hooks/useChatAttachments';
@@ -84,7 +82,7 @@ describe('test_studio_loads_message_media_through_authenticated_blob_urls（行�
   });
 });
 
-describe('test_studio_renders_video_first_frame_posters（行为；接线单独标注源码）', () => {
+describe('test_studio_renders_video_first_frame_posters（行为）', () => {
   it('首帧按最大宽度缩放并生成海报，卸载释放海报和离屏解码器', async () => {
     const view = render(<VideoWithFirstFrame src="blob:video" controls />);
     const visibleVideo = view.container.querySelector('video')!;
@@ -116,10 +114,6 @@ describe('test_studio_renders_video_first_frame_posters（行为；接线单独�
     expect(view.container.querySelector('video')).toHaveClass('message-media', 'media-video');
   });
 
-  it('过渡源码契约：输入框附件预览复用静音首帧组件（非行为）', () => {
-    const composer = readFileSync(resolve('src/features/chat/components/ChatComposer.tsx'), 'utf8');
-    expect(composer).toContain('<VideoWithFirstFrame muted src={attachment.previewUrl} />');
-  });
 });
 
 describe('test_studio_validates_video_metadata_before_uploading_media（行为）', () => {

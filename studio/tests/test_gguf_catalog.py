@@ -134,7 +134,13 @@ def test_raw_gguf_vocabulary_reads_across_parts(tmp_path):
     unchanged = (parts[0].stat().st_mtime_ns, parts[-1].stat().st_mtime_ns)
     payload = parts[2].read_bytes()
     assert b'world' in payload
+    previous_stat = parts[2].stat()
     parts[2].write_bytes(payload.replace(b'world', b'there'))
+    # Make the cache invalidation signal deterministic on filesystems whose
+    # timestamp resolution is coarser than the write interval.
+    forced_mtime_ns = previous_stat.st_mtime_ns + 2_000_000_000
+    os.utime(parts[2], ns=(previous_stat.st_atime_ns, forced_mtime_ns))
+    assert parts[2].stat().st_mtime_ns != previous_stat.st_mtime_ns
     assert unchanged == (parts[0].stat().st_mtime_ns, parts[-1].stat().st_mtime_ns)
     assert decode_prefix_cache_tokens(parts[-1], [0, 1]) == 'hello there'
 

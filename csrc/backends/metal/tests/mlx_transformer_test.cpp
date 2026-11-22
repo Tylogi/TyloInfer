@@ -1,5 +1,6 @@
 #include "mlx_transformer.h"
 #include "mlx_hyper_connection.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
 #include "mlx_kernel_prepare.h"
@@ -22,7 +23,7 @@
 namespace {
 
 void require_close(float actual, float expected, float tolerance = 1e-4f) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
         throw std::runtime_error(
             "transformer primitive mismatch: actual=" +
             std::to_string(actual) +

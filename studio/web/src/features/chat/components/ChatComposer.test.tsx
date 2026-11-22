@@ -3,11 +3,12 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ChatComposer } from './ChatComposer';
+import { useChatAttachmentList } from '../ChatAttachmentsProvider';
 import { useDraftStore } from '../state/draftStore';
 
 vi.mock('../ChatAttachmentsProvider', () => ({
   useChatAttachmentActions: () => ({ selectAttachments: vi.fn(), removeAttachment: vi.fn() }),
-  useChatAttachmentList: () => [],
+  useChatAttachmentList: vi.fn(),
 }));
 
 const props = {
@@ -28,6 +29,20 @@ const props = {
 beforeEach(() => {
   useDraftStore.setState({ drafts: {} });
   vi.clearAllMocks();
+  vi.mocked(useChatAttachmentList).mockReturnValue([]);
+});
+
+it('renders a video attachment preview without enabling its audio', () => {
+  vi.mocked(useChatAttachmentList).mockReturnValue([{
+    id: 'video', kind: 'video', previewUrl: 'blob:video-preview',
+    file: new File(['video'], 'clip.mp4', { type: 'video/mp4' }),
+  }]);
+  vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {});
+  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {});
+  const { container } = render(<ChatComposer {...props} />);
+  const video = container.querySelector('video')!;
+  expect(video).toHaveAttribute('src', 'blob:video-preview');
+  expect(video.muted).toBe(true);
 });
 
 it('没有可用模型时仍可编辑草稿，但不能提交', async () => {

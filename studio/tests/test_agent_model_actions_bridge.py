@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from uuid import UUID
 
 import pytest
-import uvicorn
 
+from tests.agent_bridge_server import running_agent_bridge
 from tests.test_checkpoint_cache_profile import checkpoint
 from tests.test_server_service import FakeBackend
 from server.api import create_app
@@ -111,17 +109,6 @@ def test_model_actions_bridge_real_api_with_isolated_deletion_and_controlled_wor
         modelscope=None, huggingface=None, runtime=None))
     service = ServerService(store, backend, catalog=catalog, runtime_manager=runtime, jobs=jobs,
         tool_handlers=handlers, hub_catalog=hub)
-    ready = threading.Event()
-
-    class ReadyServer(uvicorn.Server):
-        async def startup(self, sockets=None):
-            await super().startup(sockets=sockets)
-            if self.started:
-                ready.set()
-
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
     app = create_app(service)
 
     @app.post("/fixture/release-context")
@@ -129,12 +116,8 @@ def test_model_actions_bridge_real_api_with_isolated_deletion_and_controlled_wor
         runtime.context_release.set()
         return {"released": True}
 
-    server = ReadyServer(uvicorn.Config(app, log_level="error", access_log=False))
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve(sockets=[listener])), daemon=True)
-    thread.start()
-    try:
-        assert ready.wait(10), "model action fixture API did not start"
-        subprocess.run([node, "plugins/host/tests/model-actions-api-smoke.mjs", f"http://127.0.0.1:{port}",
+    with running_agent_bridge(app) as base_url:
+        subprocess.run([node, "plugins/host/tests/model-actions-api-smoke.mjs", base_url,
             artifact_id, str(failed.id)], cwd=root, check=True, timeout=30)
         assert runtime.policy_updates == [{"pinned": True, "idle_ttl_seconds": None}]
         assert len(runtime.context_updates) == 1
@@ -144,8 +127,3 @@ def test_model_actions_bridge_real_api_with_isolated_deletion_and_controlled_wor
         assert reusable.read_bytes() == b"fixture"
         assert backend.calls == [] and not runtime._instances
         assert [row[0] for row in hub.calls] == ["readme", "readme", "probe", "files", "files"]
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        listener.close()
-        assert not thread.is_alive(), "model action fixture API did not stop"

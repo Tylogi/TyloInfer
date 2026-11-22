@@ -190,4 +190,14 @@ describe('Markdown', () => {
     expect(view.container.querySelector('.katex')).not.toBeNull();
     expect(view.container.querySelector('.katex-display')).not.toBeNull();
   });
+
+  it('GFM 表格和删除线正常显示，代码中的公式保持原文', () => {
+    const view = render(<Markdown text={'| name | value |\n| --- | --- |\n| item | 42 |\n\n~~old~~\n\n`$x$`\n\n```text\n$$y$$\n```'} />);
+    expect(screen.getByRole('table')).toHaveTextContent('item');
+    expect(view.container.querySelector('del')).toHaveTextContent('old');
+    expect(view.container.querySelector('code')).toHaveTextContent('$x$');
+    expect(view.container.querySelector('code .katex')).toBeNull();
+    expect(view.container.querySelector('pre .katex')).toBeNull();
+    expect(view.container.querySelector('pre')).toHaveTextContent('$$y$$');
+  });
 });

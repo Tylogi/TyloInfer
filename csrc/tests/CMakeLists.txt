@@ -18,6 +18,10 @@ add_executable(tyloinfer-routed-prefill-loan-test routed_prefill_loan_test.cpp)
 target_compile_features(tyloinfer-routed-prefill-loan-test PRIVATE cxx_std_20)
 add_test(NAME tyloinfer-routed-prefill-loan-test COMMAND tyloinfer-routed-prefill-loan-test)
 
+add_executable(tyloinfer-numeric-assertions-test numeric_assertions_test.cpp)
+target_compile_features(tyloinfer-numeric-assertions-test PRIVATE cxx_std_17)
+add_test(NAME tyloinfer-numeric-assertions-test COMMAND tyloinfer-numeric-assertions-test)
+
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
 )
@@ -53,10 +57,12 @@ target_compile_features(mfq-session-snapshot-cache-test PRIVATE cxx_std_17)
 add_test(NAME mfq-session-snapshot-cache-test
     COMMAND mfq-session-snapshot-cache-test)
 
-add_executable(tyloinfer-session-cache-restore-test session_cache_restore_test.cpp)
-target_link_libraries(tyloinfer-session-cache-restore-test PRIVATE mfq-engine)
-target_compile_features(tyloinfer-session-cache-restore-test PRIVATE cxx_std_20)
-add_test(NAME tyloinfer-session-cache-restore-test COMMAND tyloinfer-session-cache-restore-test)
+if(TARGET mfq-paged-prefix-cache)
+    add_executable(tyloinfer-session-cache-restore-test session_cache_restore_test.cpp)
+    target_link_libraries(tyloinfer-session-cache-restore-test PRIVATE mfq-engine)
+    target_compile_features(tyloinfer-session-cache-restore-test PRIVATE cxx_std_20)
+    add_test(NAME tyloinfer-session-cache-restore-test COMMAND tyloinfer-session-cache-restore-test)
+endif()
 
 function(mfq_add_core_test target source)
     add_executable(${target} ${source})

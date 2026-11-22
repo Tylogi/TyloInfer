@@ -8,9 +8,15 @@ ERROR_RESPONSES = {
     400: {"model": ErrorResponse},
     404: {"model": ErrorResponse},
     409: {"model": ErrorResponse},
-    413: {"model": ErrorResponse},
+    413: {
+        "model": ErrorResponse,
+        "description": "Request Entity Too Large",
+    },
     415: {"model": ErrorResponse},
-    422: {"model": ErrorResponse},
+    422: {
+        "model": ErrorResponse,
+        "description": "Unprocessable Entity",
+    },
     501: {"model": ErrorResponse},
     502: {"model": ErrorResponse},
     503: {"model": ErrorResponse},

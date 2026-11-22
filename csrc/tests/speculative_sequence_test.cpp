@@ -1,8 +1,10 @@
 #include "speculative_sequence.h"
 #include "mtp_batch_policy.h"
+#include "numeric_assertions.h"
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <thread>
 
 namespace {
@@ -664,9 +666,10 @@ void early_target_prefetch() {
             if(i+1>=events.size() || events[i+1]!='p')
                 throw std::runtime_error("target hint did not precede drafting");
         }
+        // Parking is tested with a virtual clock below. This prefetch test must
+        // not require real sleep timings to make the adaptive policy park.
         if((count==1 && (hints || extensions || publications)) ||
-           (count>1 && (!hints || !extensions || !publications)) || model.cache_pos!=count+2 ||
-           (count==96 && !output.metrics.mtp.standard_tokens))
+           (count>1 && (!hints || !extensions || !publications)) || model.cache_pos!=count+2)
             throw std::runtime_error("early target hint boundary: count="+std::to_string(count)+
                 " hints="+std::to_string(hints)+" extensions="+std::to_string(extensions)+
                 " cache="+std::to_string(model.cache_pos)+" events="+std::string(events.begin(),events.end()));
@@ -792,9 +795,17 @@ void batch_policy_observations() {
     using Sample = mtp::BatchAcceptance;
     using Clock = mtp::BatchDepthPolicy::Clock;
     const auto near = [](double actual, double expected) {
-        if (std::abs(actual - expected) > 1e-10)
+        if (mfq::test::checked_absolute_error(actual, expected) > 1e-10)
             throw std::runtime_error("batch MTP conditional acceptance is inconsistent");
     };
+    bool rejected_nonfinite = false;
+    try {
+        near(std::numeric_limits<double>::quiet_NaN(), 0.0);
+    } catch (const std::runtime_error&) {
+        rejected_nonfinite = true;
+    }
+    if (!rejected_nonfinite)
+        throw std::runtime_error("batch MTP near accepted a nonfinite value");
     {
         mtp::BatchDepthPolicy policy({"one"}, 3);
         const auto start = Clock::time_point{};
