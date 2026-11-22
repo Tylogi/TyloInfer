@@ -667,23 +667,51 @@ array decode_token_selection(const array& groups, const Geometry& g, int positio
         {{"GROUP", g.group_size}, {"HISTORY", groups.shape(-1)}}, std::nullopt, false, {}).front();
 }
 
-std::pair<array, array> gather_index_pair(std::span<const array> views, std::span<const array> indices) {
-    static const auto kernel = fast::metal_kernel("hy4_decode_gather_index_pair",
-        {"left", "right", "ids_left", "ids_right"}, {"data", "mask"}, R"METAL(
-        const uint token = threadgroup_position_in_grid.x, lane = threadgroup_position_in_grid.y;
-        const uint i = thread_index_in_threadgroup;
-        const int chosen = lane == 0u ? ids_left[token] : ids_right[token];
-        const auto source = (lane == 0u ? left : right) + ulong(max(chosen, 0)) * WIDTH;
-        auto dest = data + (ulong(lane) * SELECTED + token) * WIDTH;
-        for (uint d = i * 4u; d < WIDTH; d += 256u)
-            for (uint j = 0; j < 4u; ++j) dest[d + j] = source[d + j];
-        if (i == 0u) mask[lane * SELECTED + token] = half(chosen >= 0 ? 0.0f : -INFINITY);
-        )METAL");
-    const int width = views[0].shape(2), selected = indices[0].shape(2);
-    auto out = kernel({views[0], views[1], indices[0], indices[1]},
-        {{2, 1, selected, width}, {2, 1, selected}}, {float16, float16},
-        {selected * 64, 2, 1}, {64, 1, 1}, {{"WIDTH", width}, {"SELECTED", selected}},
-        std::nullopt, false, {});
+constexpr int index_gather_max_batch = 8;
+
+std::pair<array, array> gather_index_batch(std::span<const array> views, std::span<const array> indices) {
+    static const auto kernels = [] {
+        std::array<fast::CustomKernelFunction, index_gather_max_batch + 1> result;
+        for (int batch = 2; batch <= index_gather_max_batch; ++batch) {
+            std::vector<std::string> names;
+            std::string body = R"METAL(
+                const uint token = thread_position_in_grid.x / 32u;
+                const uint request = threadgroup_position_in_grid.y;
+                const uint lane = thread_index_in_simdgroup;
+                const device half* cache;
+                int chosen;
+                switch (request) {
+                )METAL";
+            for (int lane = 0; lane < batch; ++lane) {
+                const auto suffix = std::to_string(lane);
+                names.push_back("cache" + suffix);
+                names.push_back("indices" + suffix);
+                body += "case " + suffix + ": cache = cache" + suffix + "; chosen = indices" +
+                    suffix + "[token]; break;\n";
+            }
+            body += R"METAL(
+                default: return;
+                }
+                const uint row = request * 2048u + token;
+                const auto source = reinterpret_cast<device const uint4*>(cache + ulong(max(chosen, 0)) * 576u);
+                auto dest = reinterpret_cast<device uint4*>(data + ulong(row) * 576u);
+                for (uint word = lane; word < 72u; word += 32u) dest[word] = source[word];
+                if (lane == 0u) mask[row] = half(chosen >= 0 ? 0.0f : -INFINITY);
+                )METAL";
+            result[batch] = fast::metal_kernel("hy4_decode_gather_index_batch_" + std::to_string(batch),
+                names, {"data", "mask"}, body);
+        }
+        return result;
+    }();
+    const int batch = static_cast<int>(views.size());
+    std::vector<array> inputs;
+    inputs.reserve(2 * batch);
+    for (int lane = 0; lane < batch; ++lane) {
+        inputs.push_back(views[lane]);
+        inputs.push_back(indices[lane]);
+    }
+    auto out = kernels[batch](inputs, {{batch, 1, 2048, 576}, {batch, 1, 2048}}, {float16, float16},
+        {2048 * 32, batch, 1}, {128, 1, 1}, {}, std::nullopt, false, {});
     return {std::move(out[0]), std::move(out[1])};
 }
 
@@ -1679,11 +1707,11 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
             }
             if (singleton_batch && layer.index && !w.offload && !g.indexed_kv.quantization.enabled() &&
                 (!score_index || all_scored)) {
-                const bool pair_gather = batch == 2 && scoring && g.index_budget == 2048 &&
+                const bool packed_gather = batch <= index_gather_max_batch && scoring && g.index_budget == 2048 &&
                     rows.latent.shape(-1) == 576 && rows.latent.dtype() == float16 && default_device() == Device::gpu;
                 std::vector<array> visible, masks, indices;
                 visible.reserve(batch);
-                (pair_gather ? indices : masks).reserve(batch);
+                (packed_gather ? indices : masks).reserve(batch);
                 for (int row = 0; row < batch; ++row) {
                     auto& request = *requests[row];
                     auto& cache = request.layers[index];
@@ -1694,7 +1722,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
                         auto selected = choose_resident_tokens(cache.groups->view(), g,
                             axis_slice(scoring->query, 1, row, row + 1),
                             axis_slice(scoring->weights, 1, row, row + 1), request.position);
-                        if (pair_gather) {
+                        if (packed_gather) {
                             visible.push_back(std::move(view));
                             indices.push_back(selected);
                         } else {
@@ -1711,7 +1739,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
                 }
                 if (!scoring)
                     return batch_dense_mla_decode(rows.query, std::move(visible), layer.sinks, scale, g.kv_rank);
-                const auto [data, mask] = pair_gather ? gather_index_pair(visible, indices) :
+                const auto [data, mask] = packed_gather ? gather_index_batch(visible, indices) :
                     std::pair{concatenate(visible, 0), concatenate(masks, 0)};
                 auto result = mlx_gathered_mla_attention(batch_decode_queries(rows.query), data,
                     mask, layer.sinks, scale, g.kv_rank);
