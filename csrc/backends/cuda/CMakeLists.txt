@@ -129,6 +129,9 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_KERNEL_ROOT}/attention_mma.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/independent_hc.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/index_pool.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/loop_mixing.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/embedding.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/selected_attention.cu
@@ -491,6 +494,12 @@ set(TYLOINFER_CUDA_MODEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/models/glm_dsa/ops.cpp
     ${TYLOINFER_CUDA_ROOT}/models/minicpmo45/ops.cpp
     ${TYLOINFER_CUDA_ROOT}/models/nemotron_h/ops.cpp
+    ${TYLOINFER_CUDA_ROOT}/models/inkling2/ops.cpp
+    ${TYLOINFER_CUDA_ROOT}/models/inkling2/dspark.cpp
+    ${TYLOINFER_CUDA_ROOT}/engine/stateful_batching.cpp
+    ${TYLOINFER_CUDA_ROOT}/models/hy4_flash/ops.cpp
+    ${TYLOINFER_CUDA_ROOT}/models/hy4_flash/engram.cpp
+    ${TYLOINFER_CUDA_ROOT}/models/hy4_flash/dfly2.cpp
     ${TYLOINFER_CUDA_ROOT}/models/qwen35/ops.cpp
     ${TYLOINFER_CUDA_ROOT}/models/qwen35/batch_state.cpp
 )

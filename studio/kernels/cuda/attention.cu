@@ -16,6 +16,7 @@
 #include <cfloat>
 #include <climits>
 #include <cstdlib>
+#include <type_traits>
 #include <utility>
 
 #include "reduce.cuh"
@@ -898,7 +899,7 @@ mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
         std::move(partial_m), std::move(partial_l), max_parts, true);
 }
 
-template <int BD, typename scalar_t>
+template <int BD, typename scalar_t, bool Relative>
 __global__ void attention_cache_swa_kernel(
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
@@ -906,7 +907,7 @@ __global__ void attention_cache_swa_kernel(
     const int64_t* __restrict__ seq_len,
     scalar_t* __restrict__ out,
     int Hq, int Hk, int T, int capacity, int D, int rep,
-    int window, float scale)
+    int window, float scale, const float* relative_bias, const float* sinks, int extent)
 {
     constexpr int NW = BD / 32;
     const int qv = blockIdx.x;
@@ -925,8 +926,8 @@ __global__ void attention_cache_swa_kernel(
     if (tid < D) q_s[tid] = (float)q[(size_t)qv * D + tid];
     __syncthreads();
 
-    float m = -1e30f;
-    float l = 0.0f;
+    float m = Relative ? sinks[qv] : -1e30f;
+    float l = Relative ? 1.0f : 0.0f;
     float O = 0.0f;
     for (int64_t pos = start; pos < end; ++pos) {
         const int slot = (int)(pos % capacity);
@@ -934,7 +935,11 @@ __global__ void attention_cache_swa_kernel(
         const float kd = tid < D ? (float)k[kv_idx] : 0.0f;
         float dot = tid < D ? q_s[tid] * kd : 0.0f;
         dot = block_sum<NW>(dot);
-        const float score = dot * scale;
+        const auto distance = qpos - pos;
+        float score = dot * scale;
+        if constexpr (Relative) {
+            if (distance < extent) score += relative_bias[int64_t(qv) * extent + distance];
+        }
         const float m_new = fmaxf(m, score);
         const float fac = expf(m - m_new);
         const float p = expf(score - m_new);
@@ -946,7 +951,7 @@ __global__ void attention_cache_swa_kernel(
     if (tid < D) out[(size_t)qv * D + tid] = (scalar_t)(O / (l > 0.0f ? l : 1.0f));
 }
 
-template <int BD, typename scalar_t>
+template <int BD, typename scalar_t, bool Relative>
 __global__ void attention_cache_swa_split_part_kernel(
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
@@ -956,7 +961,7 @@ __global__ void attention_cache_swa_split_part_kernel(
     float* __restrict__ partial_m,
     float* __restrict__ partial_l,
     int Hq, int Hk, int T, int capacity, int D, int rep,
-    int window, int parts, float scale)
+    int window, int parts, float scale, const float* relative_bias, const float* sinks, int extent)
 {
     constexpr int NW = BD / 32;
     const int part = blockIdx.x % parts;
@@ -979,8 +984,9 @@ __global__ void attention_cache_swa_split_part_kernel(
     if (tid < D) q_s[tid] = (float)q[(size_t)qv * D + tid];
     __syncthreads();
 
-    float m = -1e30f;
-    float l = 0.0f;
+    const bool has_sink = Relative && part == 0;
+    float m = has_sink ? sinks[qv] : -1e30f;
+    float l = has_sink ? 1.0f : 0.0f;
     float O = 0.0f;
     for (int64_t pos = start; pos < end; ++pos) {
         const int slot = (int)(pos % capacity);
@@ -988,7 +994,11 @@ __global__ void attention_cache_swa_split_part_kernel(
         const float kd = tid < D ? (float)k[kv_idx] : 0.0f;
         float dot = tid < D ? q_s[tid] * kd : 0.0f;
         dot = block_sum<NW>(dot);
-        const float score = dot * scale;
+        const auto distance = qpos - pos;
+        float score = dot * scale;
+        if constexpr (Relative) {
+            if (distance < extent) score += relative_bias[int64_t(qv) * extent + distance];
+        }
         const float m_new = fmaxf(m, score);
         const float fac = expf(m - m_new);
         const float p = expf(score - m_new);
@@ -1000,14 +1010,67 @@ __global__ void attention_cache_swa_split_part_kernel(
     const size_t stat = (size_t)qv * parts + part;
     if (tid < D) partial_o[stat * D + tid] = O;
     if (tid == 0) {
-        partial_m[stat] = start < end ? m : -1e30f;
-        partial_l[stat] = start < end ? l : 0.0f;
+        partial_m[stat] = m;
+        partial_l[stat] = l;
+    }
+}
+
+template<int D,class Scalar,bool Split,int Warps>
+__global__ void relative_swa_warp(
+    const Scalar* q,const Scalar* k,const Scalar* v,const int64_t* lengths,
+    const float* bias,const float* sinks,Scalar* output,float* partial_output,
+    float* partial_max,float* partial_sum,int total,int heads,int kv_heads,int tokens,
+    int capacity,int window,int extent,int parts,float scale) {
+    const int lane=threadIdx.x%32;
+    const int row=blockIdx.x*Warps+threadIdx.x/32;
+    if (row>=total*parts) return;
+    const int part=row%parts,query=row/parts;
+    const int batch=query/(tokens*heads);
+    const int key_head=query/tokens%heads/(heads/kv_heads);
+    const int64_t qpos=lengths[batch]-tokens+query%tokens;
+    const int64_t end=qpos+1;
+    const int64_t start=max(int64_t(0),end-window);
+    const int64_t first=start+(end-start)*part/parts;
+    const int64_t last=start+(end-start)*(part+1)/parts;
+    const auto bank=(int64_t(batch)*kv_heads+key_head)*capacity*D;
+    float q_values[D/32],acc[D/32]{};
+    for (int i=0;i<D/32;++i) q_values[i]=float(q[int64_t(query)*D+lane+i*32]);
+    float maximum=part==0?sinks[query]:-1e30f;
+    float denominator=part==0?1.f:0.f;
+    int slot=int(first%capacity);
+    for (auto token=first;token<last;++token) {
+        const auto at=bank+int64_t(slot)*D+lane;
+        float dot=0;
+        #pragma unroll
+        for (int i=0;i<D/32;++i) dot+=q_values[i]*float(k[at+i*32]);
+        for (int offset=16;offset;offset/=2) dot+=__shfl_down_sync(0xffffffff,dot,offset);
+        const auto distance=qpos-token;
+        float score=__shfl_sync(0xffffffff,dot,0)*scale;
+        if (distance<extent) score+=bias[int64_t(query)*extent+distance];
+        const float next=fmaxf(maximum,score);
+        const float prev=expf(maximum-next);
+        const float value=expf(score-next);
+        #pragma unroll
+        for (int i=0;i<D/32;++i) acc[i]=acc[i]*prev+value*float(v[at+i*32]);
+        denominator=denominator*prev+value;
+        maximum=next;
+        if (++slot==capacity) slot=0;
+    }
+    if constexpr (Split) {
+        #pragma unroll
+        for (int i=0;i<D/32;++i) partial_output[int64_t(row)*D+lane+i*32]=acc[i];
+        if (!lane) {partial_max[row]=maximum;partial_sum[row]=denominator;}
+    } else {
+        const float inv=denominator>0?1.f/denominator:1.f;
+        #pragma unroll
+        for (int i=0;i<D/32;++i) output[int64_t(query)*D+lane+i*32]=Scalar(acc[i]*inv);
     }
 }
 
 static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
-    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length)
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length,
+    const mfq_tensor_backend::Tensor& relative_bias = {}, const mfq_tensor_backend::Tensor& sinks = {})
 {
     TYLOINFER_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_swa: q must be cuda contiguous");
     TYLOINFER_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous() &&
@@ -1037,7 +1100,27 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
     TYLOINFER_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_swa: cache shape mismatch");
     TYLOINFER_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_swa: GQA requires Hq % Hk == 0");
 
-    if(T>1 && T<=8 && planned_length>0 && window>=planned_length &&
+    const bool relative = relative_bias.defined() || sinks.defined();
+    int extent = 0;
+    const float* bias = nullptr;
+    const float* sink = nullptr;
+    if (relative) {
+        using namespace mfq_tensor_backend;
+        TYLOINFER_RUNTIME_CHECK(relative_bias.is_cuda() && relative_bias.device() == q.device() &&
+            relative_bias.is_contiguous() && relative_bias.scalar_type() == kFloat32 && relative_bias.dim() == 4 &&
+            relative_bias.size(0) == B && relative_bias.size(1) == Hq && relative_bias.size(2) == T &&
+            relative_bias.size(3) > 0 && relative_bias.size(3) <= INT_MAX &&
+            sinks.is_cuda() && sinks.device() == q.device() && sinks.is_contiguous() &&
+            sinks.scalar_type() == kFloat32 && sinks.dim() == 3 &&
+            sinks.size(0) == B && sinks.size(1) == Hq && sinks.size(2) == T,
+            "relative SWA expects f32 bias [B,Hq,T,extent] and sinks [B,Hq,T]");
+        TYLOINFER_RUNTIME_CHECK(planned_length >= T && capacity >= std::min(planned_length, window + T - 1),
+            "relative SWA cache must retain the oldest query's complete window");
+        extent = static_cast<int>(relative_bias.size(3));
+        bias = relative_bias.data_ptr<float>();
+        sink = sinks.data_ptr<float>();
+    }
+    if(!relative && T>1 && T<=8 && planned_length>0 && window>=planned_length &&
             q.scalar_type()==mfq_tensor_backend::kFloat16) {
         auto mma=try_attention_mma_verify_cuda(q,k_cache,v_cache,seq_len,scale,planned_length);
         if(mma.defined())return mma.to(q.scalar_type()).permute({0,2,1,3});
@@ -1050,38 +1133,88 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
     const int visible_keys = planned_length > 0
         ? std::min<int64_t>(window, planned_length)
         : static_cast<int>(window);
-    int parts = total < 128 && visible_keys >= 512 ? (visible_keys + 255) / 256 : 1;
+    // Short verification windows still benefit from limiting the serial
+    // softmax chain when batch lanes multiply the number of query rows.
+    const bool split_verification=relative && T>1 && T<=8;
+    int parts = (total < 128 || split_verification) && visible_keys >= 512 ? (visible_keys + 255) / 256 : 1;
     parts = std::max(1, std::min(parts, 16));
     cudaStream_t stream = mfq_current_cuda_stream();
+    if (relative && (D==64 || D==128 || D==256)) {
+        using namespace mfq_tensor_backend;
+        Tensor po,pm,pl;
+        if (parts>1) {
+            po=empty({total,parts,D},q.options().dtype(kFloat32));
+            pm=empty({total,parts},q.options().dtype(kFloat32));
+            pl=empty_like(pm);
+        }
+        TYLOINFER_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(),"relative_swa_warp",[&] {
+            const auto launch=[&]<int Width,int Warps,bool Split>() {
+                const int blocks=(total*parts+Warps-1)/Warps;
+                relative_swa_warp<Width,scalar_t,Split,Warps><<<blocks,Warps*32,0,stream>>>(
+                    q.data_ptr<scalar_t>(),k_cache.data_ptr<scalar_t>(),v_cache.data_ptr<scalar_t>(),
+                    seq_len.data_ptr<int64_t>(),bias,sink,out.data_ptr<scalar_t>(),
+                    Split?po.data_ptr<float>():nullptr,Split?pm.data_ptr<float>():nullptr,
+                    Split?pl.data_ptr<float>():nullptr,total,Hq,Hk,T,capacity,int(window),extent,parts,float(scale));
+                if constexpr (Split) attention_split_reduce_kernel<Width,scalar_t><<<total,Width,0,stream>>>(
+                    po.data_ptr<float>(),pm.data_ptr<float>(),pl.data_ptr<float>(),out.data_ptr<scalar_t>(),total,parts,D);
+            };
+            const auto dispatch=[&]<int Width>() {
+                if (parts>1 && total>=128) launch.template operator()<Width,4,true>();
+                else if (parts>1) launch.template operator()<Width,1,true>();
+                else if (total<256) launch.template operator()<Width,1,false>();
+                else launch.template operator()<Width,4,false>();
+            };
+            if (D==64) dispatch.template operator()<64>();
+            else if (D==128) dispatch.template operator()<128>();
+            else dispatch.template operator()<256>();
+        });
+        return out;
+    }
 
-#define ATT_CACHE_SWA(BD) do {                                                                  \
+#define ATT_CACHE_SWA(BD,R) do {                                                                \
     if (parts == 1) {                                                                            \
-        attention_cache_swa_kernel<BD, scalar_t><<<total, BD, shmem, stream>>>(                  \
+        attention_cache_swa_kernel<BD, scalar_t,R><<<total, BD, shmem, stream>>>(                \
             q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),  \
             seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                               \
-            Hq, Hk, T, capacity, D, rep, (int)window, (float)scale);                             \
+            Hq, Hk, T, capacity, D, rep, (int)window, (float)scale, bias, sink, extent);         \
     } else {                                                                                     \
         auto po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));            \
         auto pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
         auto pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
-        attention_cache_swa_split_part_kernel<BD, scalar_t><<<total * parts, BD, shmem, stream>>>( \
+        attention_cache_swa_split_part_kernel<BD, scalar_t,R><<<total * parts, BD, shmem, stream>>>( \
             q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),  \
             seq_len.data_ptr<int64_t>(), po.data_ptr<float>(), pm.data_ptr<float>(),             \
-            pl.data_ptr<float>(), Hq, Hk, T, capacity, D, rep, (int)window, parts, (float)scale); \
+            pl.data_ptr<float>(), Hq, Hk, T, capacity, D, rep, (int)window, parts, (float)scale, bias, sink, extent); \
         attention_split_reduce_kernel<BD, scalar_t><<<total, BD, 0, stream>>>(                   \
             po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),                    \
             out.data_ptr<scalar_t>(), total, parts, D);                                          \
     }                                                                                            \
 } while (0)
     TYLOINFER_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cache_swa_cuda", [&] {
-        if (D <= 64) { ATT_CACHE_SWA(64); }
-        else if (D <= 128) { ATT_CACHE_SWA(128); }
-        else if (D <= 256) { ATT_CACHE_SWA(256); }
-        else if (D <= 512) { ATT_CACHE_SWA(512); }
-        else { TYLOINFER_RUNTIME_CHECK(false, "attention_cache_swa: D>512 unsupported, got ", D); }
+        const auto launch = [&](auto flag) {
+            constexpr bool with_bias = decltype(flag)::value;
+            if (D <= 64) { ATT_CACHE_SWA(64,with_bias); }
+            else if (D <= 128) { ATT_CACHE_SWA(128,with_bias); }
+            else if (D <= 256) { ATT_CACHE_SWA(256,with_bias); }
+            else if (D <= 512) { ATT_CACHE_SWA(512,with_bias); }
+            else { TYLOINFER_RUNTIME_CHECK(false, "attention_cache_swa: D>512 unsupported, got ", D); }
+        };
+        if (relative) launch(std::true_type{});
+        else launch(std::false_type{});
     });
 #undef ATT_CACHE_SWA
     return out;
+}
+
+mfq_tensor_backend::Tensor attention_cache_relative_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, mfq_tensor_backend::Tensor relative_bias,
+    mfq_tensor_backend::Tensor sinks, double scale, int64_t window, int64_t planned_length) {
+    TYLOINFER_RUNTIME_CHECK(relative_bias.defined() && sinks.defined(), "relative SWA requires both bias and sinks");
+    auto output = attention_cache_swa_impl_cuda(q, k_cache, v_cache, seq_len, scale, window, planned_length,
+                                               relative_bias, sinks);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }
 
 mfq_tensor_backend::Tensor attention_cache_swa_cuda(

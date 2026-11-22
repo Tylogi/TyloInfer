@@ -2350,25 +2350,6 @@ void require_rank(const array& value, int rank, const char* name) {
     }
 }
 
-array qsa_head_scores(const array& query, const array& pooled_keys) {
-    require_rank(query, 4, "Qwen4 index query");
-    require_rank(pooled_keys, 3, "Qwen4 pooled key");
-    if (query.shape(0) != pooled_keys.shape(0) ||
-        query.shape(3) != pooled_keys.shape(2)) {
-        throw std::invalid_argument("Qwen4 QSA score dimensions disagree");
-    }
-    if (query.shape(1) >= 1 && query.shape(1) <= 8 && query.shape(2) <= 8 &&
-        query.shape(3) >= 4 && query.shape(3) <= 1024 && query.shape(3) % 4 == 0 &&
-        pooled_keys.dtype() == mlx::core::float32)
-        return mlx_sparse_indexer_dot_scores(query, pooled_keys);
-    auto keys = mlx::core::transpose(
-        mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1});
-    return mlx::core::reshape(
-        mlx::core::matmul(
-            mlx::core::reshape(mlx::core::astype(query, mlx::core::float32),
-                Shape{query.shape(0), query.shape(1) * query.shape(2), query.shape(3)}), keys),
-        Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
-}
 
 } // namespace
 
@@ -2821,7 +2802,7 @@ array qwen4_qsa_output_gate(const array& attended, const array& gate,
 array qwen4_qsa_block_scores(
     const array& query,
     const array& pooled_keys) {
-    auto scores = qsa_head_scores(query, pooled_keys);
+    auto scores = mlx_sparse_indexer_head_scores(query, pooled_keys);
     scores = mlx::core::maximum(scores, array(0.0f));
     return mlx::core::sum(scores, -2) /
         std::sqrt(static_cast<float>(query.shape(3)));
@@ -2833,7 +2814,7 @@ array qwen4_qsa_select_blocks(
     int query_offset,
     int block_size) {
     return mlx_sparse_indexer_topk512(
-        qsa_head_scores(query, pooled_keys), query_offset, block_size);
+        mlx_sparse_indexer_head_scores(query, pooled_keys), query_offset, block_size);
 }
 
 array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,

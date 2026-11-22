@@ -93,6 +93,58 @@ struct Qwen35Mtp final : MtpModule {
         return result;
     }
 
+    std::unique_ptr<MtpModule> fork_session() const override {
+        auto session=std::make_unique<Qwen35Mtp>();
+        session->config=config;
+        session->fusion=fusion;
+        session->hidden_norm=hidden_norm;
+        session->embedding_norm=embedding_norm;
+        session->output_norm=output_norm;
+        session->execution=execution;
+        for (const auto& block:blocks) {
+            const auto* full=dynamic_cast<const FullBlock*>(block.get());
+            if (!full) return {};
+            if (full->ffn.is_moe || full->ffn.important_neurons) return {};
+            auto copy=std::make_unique<FullBlock>();
+            static_cast<Block&>(*copy)=*full;
+            copy->layer=full->layer;
+            copy->sliding=full->sliding;
+            copy->value_equals_key=full->value_equals_key;
+            copy->attention_heads=full->attention_heads;
+            copy->kv_heads=full->kv_heads;
+            copy->attention_head_dim=full->attention_head_dim;
+            copy->attention_rotary_dim=full->attention_rotary_dim;
+            copy->attention_window=full->attention_window;
+            copy->max_position_embeddings=full->max_position_embeddings;
+            copy->attention_scale=full->attention_scale;
+            copy->rms_norm_eps=full->rms_norm_eps;
+            copy->norm_weight_offset=full->norm_weight_offset;
+            copy->official_bf16=full->official_bf16;
+            copy->no_rope=full->no_rope;
+            copy->attention_rope=full->attention_rope;
+            copy->attn_norm=full->attn_norm;
+            copy->ffn_norm=full->ffn_norm;
+            copy->q_norm=full->q_norm;
+            copy->k_norm=full->k_norm;
+            copy->v_norm=full->v_norm;
+            copy->qkv=full->qkv;
+            copy->attention_output_gate=full->attention_output_gate;
+            copy->split_q_kv_projections=full->split_q_kv_projections;
+            copy->q_projection=full->q_projection;
+            copy->k_projection=full->k_projection;
+            copy->v_projection=full->v_projection;
+            copy->o=full->o;
+            copy->kv_quantization=full->kv_quantization;
+            copy->ffn.gate_up=full->ffn.gate_up;
+            copy->ffn.down=full->ffn.down;
+            copy->ffn.geglu=full->ffn.geglu;
+            copy->ffn.activation=full->ffn.activation;
+            copy->ffn.swiglu_limit=full->ffn.swiglu_limit;
+            session->blocks.push_back(std::move(copy));
+        }
+        return session;
+    }
+
     void reset(int64_t batch = 1) override {
         if(batch!=1){predictor_graphs.reset();target_graphs.reset();}
         cache_pos = 0;
@@ -140,15 +192,17 @@ struct Qwen35Mtp final : MtpModule {
         return &registry;
     }
 
+    enum class StepOutput { WithLogits, HistoryOnly, HistoryAndLastLogits, Hidden };
+
     std::optional<MtpStep> graph_step(const MtpTarget& target,
             const mfq_tensor_backend::Tensor& hidden,const mfq_tensor_backend::Tensor& ids,
-            const mfq_tensor_backend::Tensor& positions, int history_mode = 0) {
+            const mfq_tensor_backend::Tensor& positions,StepOutput output_mode=StepOutput::WithLogits) {
         namespace tb=mfq_tensor_backend;
         auto* graphs=graph_registry(target,hidden,ids,positions);
         if(!graphs)return {};
         auto& registry=*graphs;
         const auto tokens=ids.size(1);
-        auto& owner=registry.cells[{int(hidden.scalar_type()),tokens,history_mode}];
+        auto& owner=registry.cells[{int(hidden.scalar_type()),tokens,int(output_mode)}];
         if(!owner)owner=std::make_unique<PredictorGraphs::Cell>(registry.stream);
         auto& cell=*owner;const auto start=cache_pos;
         auto physical=tb::arange(start,start+tokens,ids.options());
@@ -162,18 +216,19 @@ struct Qwen35Mtp final : MtpModule {
         }
         if(!cell.graph.valid()) {
             cell.graph.capture([&] {
-                if(history_mode==2 && tokens>1) {
+                if(output_mode==StepOutput::HistoryAndLastLogits && tokens>1) {
                     (void)evaluate(target,cell.hidden.narrow(1,0,tokens-1),cell.ids.narrow(1,0,tokens-1),
                         cell.positions.narrow(0,0,tokens-1),cell.physical_positions.narrow(0,0,tokens-1),{},true);
                     cell.output=evaluate(target,cell.hidden.narrow(1,tokens-1,1),cell.ids.narrow(1,tokens-1,1),
                         cell.positions.narrow(0,tokens-1,1),cell.physical_positions.narrow(0,tokens-1,1),cell.lengths);
                 } else cell.output=evaluate(target,cell.hidden,cell.ids,cell.positions,
-                    cell.physical_positions,cell.lengths,history_mode==1);
-                if(history_mode!=1)cell.logits=target.logits(cell.output.narrow(1,cell.output.size(1)-1,1)
+                    cell.physical_positions,cell.lengths,output_mode==StepOutput::HistoryOnly);
+                if(output_mode==StepOutput::WithLogits || output_mode==StepOutput::HistoryAndLastLogits)
+                    cell.logits=target.logits(cell.output.narrow(1,cell.output.size(1)-1,1)
                     .to(tb::kFloat16).contiguous()).reshape({1,-1});
             },[&]{cache_pos=start;},[&]{cell.output={};cell.logits={};});
             ++registry.captures;graph_initialized=true;
-            std::cerr<<"runtime_qwen35_predictor_graph_capture rows="<<tokens<<" history_mode="<<history_mode
+            std::cerr<<"runtime_qwen35_predictor_graph_capture rows="<<tokens<<" output_mode="<<int(output_mode)
                 <<" nodes="<<cell.graph.nodes()<<'\n';
         }
         // Input copies, sampling and the next predictor step use this stream.
@@ -181,7 +236,7 @@ struct Qwen35Mtp final : MtpModule {
         // host. Graphs with CPU work or I/O retain their synchronous replay.
         if(!cell.graph.enqueue_if_device_only())cell.graph.run();
         ++registry.replays;cache_pos=start+tokens;
-        if(history_mode==1)return MtpStep{};
+        if(output_mode==StepOutput::HistoryOnly)return MtpStep{};
         auto output=cell.output.clone();
         return MtpStep{output,output,cell.logits};
     }
@@ -196,7 +251,7 @@ struct Qwen35Mtp final : MtpModule {
         if(!cache_only_history_supported()) {
             (void)step_positioned(target,std::move(hidden),std::move(ids),std::move(positions));return;
         }
-        if(graph_step(target,hidden,ids,positions,1))return;
+        if(graph_step(target,hidden,ids,positions,StepOutput::HistoryOnly))return;
         (void)evaluate(target,std::move(hidden),std::move(ids),std::move(positions),{},{},true);
     }
 
@@ -204,7 +259,13 @@ struct Qwen35Mtp final : MtpModule {
             const mfq_tensor_backend::Tensor& hidden,const mfq_tensor_backend::Tensor& ids,
             const mfq_tensor_backend::Tensor& positions = {}) {
         if(!cache_only_history_supported() || ids.size(1)<=1)return {};
-        return graph_step(target,hidden,ids,positions,2);
+        return graph_step(target,hidden,ids,positions,StepOutput::HistoryAndLastLogits);
+    }
+
+    mfq_tensor_backend::Tensor step_hidden(const MtpTarget& target,mfq_tensor_backend::Tensor hidden,
+            mfq_tensor_backend::Tensor ids) {
+        if(auto graph=graph_step(target,hidden,ids,{},StepOutput::Hidden))return std::move(graph->chain_hidden);
+        return evaluate(target,std::move(hidden),std::move(ids),{});
     }
 
     // Keep proposals on the ordered device stream so target verification can

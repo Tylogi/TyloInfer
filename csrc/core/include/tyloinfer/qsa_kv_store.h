@@ -69,6 +69,10 @@ struct QsaKvSequenceSnapshot {
     QsaKvStore::BlockPtr tail_block;
     QsaKvSequenceSnapshot prefix(std::size_t rows) const;
     void read_rows(std::size_t start, std::size_t rows, std::uint8_t* output) const;
+    // Gather selected groups in caller order. The last visible group is
+    // clipped at the query boundary even when later rows share its block.
+    std::size_t read_groups(const std::vector<std::size_t>& groups, std::size_t visible_rows,
+                            std::uint8_t* output, std::size_t capacity) const;
 };
 
 class QsaKvSequence {

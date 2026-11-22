@@ -60,4 +60,21 @@ void qsa_affine16_score_pair_avx2(const float* query, const float* sums, const s
     dot_rows<true>(query, sums, codes, width, zero, scale, next_zero, next_scale, scores);
 }
 
+float index_pool_affine16_score_avx2(const float* query,const float* sums,const float* weights,int heads,
+    const std::int16_t* codes,int width,int zero,float scale) {
+    float score=0;
+    for (int head=0;head<heads;head+=4) {
+        __m256 accumulators[4]{_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()};
+        const int count=std::min(4,heads-head);
+        for (int col=0;col<width;col+=8) {
+            const auto key=unpack(codes+col);
+            for (int i=0;i<count;++i)
+                accumulators[i]=_mm256_fmadd_ps(key,_mm256_loadu_ps(query+(head+i)*width+col),accumulators[i]);
+        }
+        for (int i=0;i<count;++i) score+=weights[head+i]*std::max(
+            (sum(accumulators[i])-float(zero)*sums[head+i])*scale,0.f);
+    }
+    return score;
+}
+
 } // namespace mfq::cpu

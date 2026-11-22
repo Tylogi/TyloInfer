@@ -68,6 +68,8 @@ struct FFN {
     bool moe_shared_ungated = false;
     double moe_router_scale = 1.0;
     double swiglu_limit = 0.0;
+    float situ_beta = 0.0f;
+    float situ_linear_beta = 0.0f;
     int moe_layer = -1;
     mutable bool moe_pipeline_initialized=false;
     mutable std::function<mfq_tensor_backend::Tensor(CudaExecutionContext&,

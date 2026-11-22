@@ -98,14 +98,18 @@ def checkpoint_kv_budget(artifact: DiscoveredModel, context: int,
     return KvTierBudget(indexer, raw, plan.gpu_budget_bytes, required, plan.fraction)
 
 
-def check_ssd_capacity(directory: Path, required: int) -> None:
+def available_ssd_bytes(directory: Path) -> int:
     # Check the containing volume without creating/preallocating a spill file.
     existing = directory
     while not existing.exists() and existing != existing.parent:
         existing = existing.parent
     try:
-        free = shutil.disk_usage(existing).free
+        return shutil.disk_usage(existing).free
     except OSError as error:
         raise ValueError(f"kv_ssd_insufficient: cannot inspect SSD KV volume: {error}") from error
+
+
+def check_ssd_capacity(directory: Path, required: int) -> None:
+    free = available_ssd_bytes(directory)
     if free < required:
         raise ValueError(f"kv_ssd_insufficient: SSD KV needs {required} bytes; {free} bytes available")

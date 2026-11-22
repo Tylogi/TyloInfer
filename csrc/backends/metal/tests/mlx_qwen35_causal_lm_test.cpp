@@ -1,5 +1,6 @@
 #include "mlx_qwen35_causal_lm.h"
 #include "grammar_fixture.h"
+#include "mlx_eval_timing.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1271,15 +1272,21 @@ void test_output_prefix_checkpoints() {
         auto model = make_model(false, false, mtp);
         std::vector<MlxQwen35TextSessionState> snapshots;
         std::vector<std::int64_t> tokens = prompt;
+        double checkpoint_eval_ms = 0.0, prefill_ms = 0.0;
         MlxPrefixCacheHooks hooks{4, prompt.size(), true, [&](std::size_t position) {
             require(position <= tokens.size(), "checkpoint contains an uncommitted token");
+            const auto* evaluation_ms = detail::active_mlx_evaluation_ms;
+            const double before = evaluation_ms ? *evaluation_ms : 0.0;
             snapshots.push_back(model.capture_text_session_state(
                 {tokens.begin(), tokens.begin() + position}));
+            if (evaluation_ms) checkpoint_eval_ms += *evaluation_ms - before;
         }};
         const auto generated = model.generate(prompt, sampling, 8, [&](std::int64_t token) {
             tokens.push_back(token);
             return true;
-        }, {}, {}, prompt.size(), 2, hooks);
+        }, [&](std::size_t, double ms) { prefill_ms = ms; }, {}, prompt.size(), 2, hooks);
+        require(checkpoint_eval_ms > 0.0 && prefill_ms >= checkpoint_eval_ms,
+            "prefill timing omitted model evaluation during checkpoint capture");
         require(generated == 8 && !snapshots.empty() && snapshots.front().tokens.size() == 3 &&
             snapshots.back().tokens.size() == tokens.size() - 1,
             "prefill/output/tail checkpoints were not captured");

@@ -128,6 +128,12 @@ mlx::core::array mlx_circular_cache_history(
     const mlx::core::array& cache,
     int position);
 
+// Append contiguous absolute positions, retaining only the newest window.
+// Pass an earlier reader when its graph must consume the old ring first.
+mlx::core::array mlx_circular_cache_append(
+    const mlx::core::array& cache, const mlx::core::array& values, int position,
+    const std::optional<mlx::core::array>& earlier_reader = std::nullopt);
+
 class MlxKvCache {
 public:
     MlxKvCache(

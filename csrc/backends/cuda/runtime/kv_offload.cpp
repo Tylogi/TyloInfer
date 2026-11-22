@@ -14,6 +14,7 @@
 #include <tuple>
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
+#include "tyloinfer/host_memory.h"
 
 namespace mfq::cuda {
 namespace tb = mfq_tensor_backend;
@@ -56,10 +57,17 @@ struct KvOffloadStore::Block {
     tb::TensorOptions options;
     int64_t rows = 0, width = 0;
     cache::QsaKvStore::BlockPtr cold;
+    std::unique_ptr<std::uint8_t[]> unfinished;
     std::size_t gpu_offset = no_offset, ram_offset = no_offset;
+    std::list<std::weak_ptr<Block>>::iterator ram_order;
 };
 
 struct KvOffloadStore::Impl {
+    struct RamArena {
+        explicit RamArena(std::size_t capacity):data(capacity) {}
+        std::vector<std::uint8_t> data;
+        std::size_t used=0;
+    };
     std::function<void(std::size_t)> reserve_ram;
     explicit Impl(KvOffloadConfig value) : config(std::move(value)) {
         if (config.buffer_bytes < 4096 || config.gpu_budget_bytes < config.buffer_bytes)
@@ -68,15 +76,51 @@ struct KvOffloadStore::Impl {
             ResidentAllocationScope resident;
             gpu_arena=tb::empty({int64_t(hot_limit())},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
             gpu_slots=Slots(hot_limit());
-            if(config.ram_preallocated && config.ram_budget_bytes) {
-                ram_arena.resize(config.ram_budget_bytes);
-                charge_tensor_host_bytes(config.ram_budget_bytes);
-            }
-            ram_slots=Slots(config.ram_preallocated?config.ram_budget_bytes:0);
+            if(config.ram_preallocated && config.ram_budget_bytes) add_ram_arena(config.ram_budget_bytes);
             if(!config.ram_preallocated)initialize_disk();
         } else initialize_disk();
     }
-    ~Impl() {if(config.preallocate)tensor_host_bytes.fetch_sub(ram_arena.size());}
+    ~Impl() {if(config.preallocate)tensor_host_bytes.fetch_sub(ram_allocated);}
+
+    void add_ram_arena(std::size_t bytes) {
+        if (bytes>=no_offset-ram_end) throw std::bad_alloc();
+        auto [arena,inserted]=ram_arenas.try_emplace(ram_end,bytes);
+        if (!inserted) throw std::logic_error("RAM KV arena address collision");
+        try {ram_slots.give(ram_end,bytes);}
+        catch (...) {ram_arenas.erase(arena);throw;}
+        // Distinct backing allocations cannot share one free range.
+        ram_end+=bytes+1;
+        ram_allocated+=bytes;
+        charge_tensor_host_bytes(bytes);
+    }
+    std::uint8_t* ram_address(std::size_t offset) {
+        const auto arena=std::prev(ram_arenas.upper_bound(offset));
+        return arena->second.data.data()+(offset-arena->first);
+    }
+    void release_ram_slot(std::size_t offset,std::size_t bytes,bool reuse_arena=false) {
+        const auto arena=std::prev(ram_arenas.upper_bound(offset));
+        ram_slots.give(offset,bytes);
+        arena->second.used-=bytes;
+        if (reuse_arena || arena->second.used || (!arena->first && config.ram_budget_bytes)) return;
+        const auto capacity=arena->second.data.size();
+        ram_slots.free.erase(arena->first);
+        ram_arenas.erase(arena);
+        ram_allocated-=capacity;
+        tensor_host_bytes.fetch_sub(capacity);
+    }
+    bool grow_ram(std::size_t bytes) {
+        if (config.ram_growth_limit<=ram_allocated || bytes>config.ram_growth_limit-ram_allocated) return false;
+        const auto wanted=std::min(config.ram_growth_limit-ram_allocated,std::max(bytes,config.buffer_bytes));
+        auto available=mfq::host_memory_headroom(mfq::sample_host_memory());
+        if (available<wanted && !config.ssd_enabled && reserve_ram) {
+            reserve_ram(wanted);
+            available=mfq::host_memory_headroom(mfq::sample_host_memory());
+        }
+        if (available<bytes) return false;
+        try {add_ram_arena(std::min(wanted,available));}
+        catch (const std::bad_alloc&) {return false;}
+        return true;
+    }
     void initialize_disk() {
         if(ram)return;
         if(!config.ssd_enabled)throw std::runtime_error("kv_memory_insufficient: available VRAM and RAM cannot hold the configured KV cache; choose automatic with SSD KV or reduce context length");
@@ -87,38 +131,77 @@ struct KvOffloadStore::Impl {
         ram = std::make_shared<cache::QsaKvStore>(std::move(cold));
     }
     std::size_t hot_limit() const { return config.gpu_budget_bytes - config.buffer_bytes; }
-    void spill_ram() {
+    BlockPtr make_block(const tb::Tensor& rows,tb::TensorOptions options,const std::shared_ptr<Impl>& self) {
+        std::weak_ptr<Impl> owner=self;
+        auto block=BlockPtr(new Block,[owner](Block* value) {
+            if (auto state=owner.lock()) state->release(value);
+            delete value;
+        });
+        block->id=++next_id;
+        block->bytes=rows.nbytes();
+        block->rows=rows.size(0);
+        block->width=rows.size(1);
+        block->options=std::move(options);
+        return block;
+    }
+    void store_unfinished(const BlockPtr& block,const void* rows) {
+        block->unfinished=std::make_unique_for_overwrite<std::uint8_t[]>(block->bytes);
+        std::memcpy(block->unfinished.get(),rows,block->bytes);
+    }
+    bool spill_ram() {
         while(!ram_lru.empty()) {
             auto weak=ram_lru.back();auto block=weak.lock();
             if(!block || block->ram_offset==no_offset){ram_lru.pop_back();continue;}
             initialize_disk();
             if(!block->cold) {
                 std::vector<std::uint8_t> payload(block->bytes);
-                std::memcpy(payload.data(),ram_arena.data()+block->ram_offset,block->bytes);
+                std::memcpy(payload.data(),ram_address(block->ram_offset),block->bytes);
                 block->cold=ram->write(std::move(payload));
             }
-            ram_lru.pop_back();ram_slots.give(block->ram_offset,block->bytes);block->ram_offset=no_offset;
-            ram_bytes-=block->bytes;return;
+            ram_lru.pop_back();release_ram_slot(block->ram_offset,block->bytes,true);block->ram_offset=no_offset;
+            ram_bytes-=block->bytes;return true;
         }
-        throw std::runtime_error("kv_memory_insufficient: no free RAM KV blocks");
+        return false;
     }
-    void store_cold(const BlockPtr& block) {
+    void store_cold(const BlockPtr& block,const void* host_data=nullptr) {
         if(block->ram_offset!=no_offset || block->cold)return;
-        if(config.preallocate && config.ram_preallocated && block->bytes<=config.ram_budget_bytes) {
-            auto offset=ram_slots.take(block->bytes);
-            while(offset==no_offset){spill_ram();offset=ram_slots.take(block->bytes);}
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(ram_arena.data()+offset,block->gpu.data_ptr(),block->bytes,cudaMemcpyDeviceToHost,current_stream().stream()));
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
-            block->ram_offset=offset;ram_bytes+=block->bytes;ram_lru.push_front(block);
+        auto offset=no_offset;
+        if(config.preallocate && config.ram_preallocated &&
+                block->bytes<=std::max(config.ram_budget_bytes,config.ram_growth_limit)) {
+            offset=ram_slots.take(block->bytes);
+            if (offset==no_offset && grow_ram(block->bytes)) offset=ram_slots.take(block->bytes);
+            while(offset==no_offset && spill_ram())offset=ram_slots.take(block->bytes);
+        }
+        if (offset!=no_offset) {
+            try {
+                if (host_data) std::memcpy(ram_address(offset),host_data,block->bytes);
+                else {
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(ram_address(offset),block->gpu.data_ptr(),block->bytes,cudaMemcpyDeviceToHost,current_stream().stream()));
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+                }
+                ram_lru.push_front(block);
+            } catch (...) {
+                ram_slots.give(offset,block->bytes);
+                throw;
+            }
+            block->ram_offset=offset;ram_bytes+=block->bytes;block->ram_order=ram_lru.begin();
+            std::prev(ram_arenas.upper_bound(offset))->second.used+=block->bytes;
         } else {
             initialize_disk();
             if(reserve_ram)reserve_ram(block->bytes*2);
-            auto cpu=block->gpu.to(tb::kCPU).contiguous();
             std::vector<std::uint8_t> payload(block->bytes);
-            std::memcpy(payload.data(),cpu.data_ptr(),payload.size());
+            if (host_data) std::memcpy(payload.data(),host_data,payload.size());
+            else {
+                const auto cpu=block->gpu.to(tb::kCPU).contiguous();
+                std::memcpy(payload.data(),cpu.data_ptr(),payload.size());
+            }
             block->cold=ram->write(std::move(payload));
         }
-        d2h_bytes+=block->bytes;
+        if (!host_data) d2h_bytes+=block->bytes;
+    }
+    void touch_ram(const BlockPtr& block) {
+        ram_lru.splice(ram_lru.begin(),ram_lru,block->ram_order);
+        ++ram_hits;
     }
     bool evict_one() {
         while(!lru.empty()) {
@@ -185,7 +268,9 @@ struct KvOffloadStore::Impl {
         }
         if(config.preallocate) {
             gpu_slots.give(block->gpu_offset,block->bytes);
-            if(block->ram_offset!=no_offset){ram_slots.give(block->ram_offset,block->bytes);ram_bytes-=block->bytes;}
+            if(block->ram_offset!=no_offset){
+                ram_lru.erase(block->ram_order);release_ram_slot(block->ram_offset,block->bytes);ram_bytes-=block->bytes;
+            }
         }
     }
     struct Hot { std::weak_ptr<Block> block; std::list<std::uint64_t>::iterator order; };
@@ -194,7 +279,8 @@ struct KvOffloadStore::Impl {
     tb::Tensor gpu_arena;
     std::shared_ptr<KvExpertLoan> expert_loan;
     std::size_t loan_region=0;
-    std::vector<std::uint8_t> ram_arena;
+    std::map<std::size_t,RamArena> ram_arenas;
+    std::size_t ram_end=0,ram_allocated=0;
     Slots gpu_slots,ram_slots;
     std::list<std::weak_ptr<Block>> ram_lru;
     std::size_t ram_bytes=0;
@@ -220,11 +306,13 @@ std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspac
         fresh->heads=heads;fresh->key_width=key_width;
         const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(dtype);
         fresh->rows=tb::zeros({rows,width},options);
-        fresh->upload=tb::empty({rows,width},options);
         fresh->host=tb::empty({rows,width},options.device(tb::kCPU).pinned_memory(true));
-        const auto fields=key_width?2*heads:1;
-        fresh->descriptors=tb::zeros({4+rows*fields*4},options.device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true));
-        fresh->device_descriptors=tb::zeros({4+rows*fields*4},options.dtype(tb::kInt64));
+        if(key_width || impl_->hot_limit()) {
+            fresh->upload=tb::empty({rows,width},options);
+            const auto fields=key_width?2*heads:1;
+            fresh->descriptors=tb::zeros({4+rows*fields*4},options.device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true));
+            fresh->device_descriptors=tb::zeros({4+rows*fields*4},options.dtype(tb::kInt64));
+        }
         workspace=std::move(fresh);
     }
     return workspace;
@@ -232,7 +320,10 @@ std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspac
 std::size_t KvOffloadStore::graph_workspace_bytes() const {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     std::size_t bytes=0;
-    for(const auto& [key,work]:impl_->gather_workspaces)bytes+=work->rows.nbytes()+work->upload.nbytes()+work->device_descriptors.nbytes();
+    for(const auto& [key,work]:impl_->gather_workspaces) {
+        bytes+=work->rows.nbytes();
+        if(work->upload.defined())bytes+=work->upload.nbytes()+work->device_descriptors.nbytes();
+    }
     return bytes;
 }
 const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
@@ -244,14 +335,7 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
     if (bytes > impl_->config.buffer_bytes / 2)
         throw std::invalid_argument("CUDA KV microblock exceeds its write staging buffer");
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
-    std::weak_ptr<Impl> owner = impl_;
-    auto block = BlockPtr(new Block, [owner](Block* value) {
-        if (auto impl = owner.lock()) impl->release(value);
-        delete value;
-    });
-    block->id = ++impl_->next_id;
-    block->bytes = bytes; block->rows = rows.size(0); block->width = rows.size(1);
-    block->options = rows.options();
+    auto block=impl_->make_block(rows,rows.options(),impl_);
     if(impl_->config.preallocate && bytes>impl_->hot_limit()) {
         block->gpu=rows.contiguous();impl_->store_cold(block);block->gpu={};++impl_->evictions;
         return block;
@@ -267,16 +351,22 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
 tb::Tensor KvOffloadStore::read(const BlockPtr& block) {
     if (!block) throw std::invalid_argument("missing CUDA KV block");
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    if (block->unfinished) {
+        auto cpu=tb::empty({block->rows,block->width},block->options.device(tb::kCPU));
+        std::memcpy(cpu.data_ptr(),block->unfinished.get(),block->bytes);
+        auto result=cpu.to(block->options);
+        impl_->h2d_bytes+=block->bytes;
+        return result;
+    }
     if (block->gpu.defined()) { ++impl_->hits; impl_->touch(block); return block->gpu; }
     if(impl_->config.preallocate) {
         // Keep read results outside the eviction arena: a gather may retain
         // this tensor while subsequent reads recycle other arena slots.
         auto result=tb::empty({block->rows,block->width},block->options);
         if(block->ram_offset!=no_offset) {
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(result.data_ptr(),impl_->ram_arena.data()+block->ram_offset,block->bytes,cudaMemcpyHostToDevice,current_stream().stream()));
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(result.data_ptr(),impl_->ram_address(block->ram_offset),block->bytes,cudaMemcpyHostToDevice,current_stream().stream()));
             TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
-            impl_->ram_lru.remove_if([&](const auto& weak){auto value=weak.lock();return !value || value==block;});
-            impl_->ram_lru.push_front(block);++impl_->ram_hits;
+            impl_->touch_ram(block);
         } else {
             if(!impl_->ram || !block->cold)throw std::runtime_error("missing spilled KV block");
             auto payload=impl_->ram->read(block->cold);
@@ -318,8 +408,10 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
         {"qsa_kv_graph_workspace_bytes",double(graph_workspace_bytes())},
         {"qsa_kv_resident_bytes", double((impl_->config.preallocate?impl_->hot_limit():impl_->gpu_bytes)-expert_loan_bytes())},
         {"qsa_kv_budget_bytes", double(impl_->config.gpu_budget_bytes)},
-        {"qsa_kv_ram_enabled", impl_->config.ram_budget_bytes ? 1.0 : 0.0},
-        {"qsa_kv_ram_bytes", double(impl_->config.preallocate && impl_->config.ram_preallocated?impl_->ram_arena.size():cold.hot_bytes)}, {"qsa_kv_ram_limit_bytes", double(impl_->config.ram_budget_bytes)},
+        {"qsa_kv_ram_enabled", impl_->config.ram_budget_bytes || impl_->config.ram_growth_limit ? 1.0 : 0.0},
+        {"qsa_kv_ram_bytes", double(impl_->config.preallocate && impl_->config.ram_preallocated?impl_->ram_allocated:cold.hot_bytes)},
+        {"qsa_kv_ram_limit_bytes", double(impl_->config.ram_growth_limit && impl_->config.ram_growth_limit!=no_offset
+            ?impl_->config.ram_growth_limit:std::max(impl_->ram_allocated,impl_->config.ram_budget_bytes))},
         {"qsa_kv_ssd_bytes", double(cold.disk_bytes)}, {"qsa_kv_pending_bytes", double(cold.pending_bytes)},
         {"qsa_kv_ssd_reads", double(cold.reads)}, {"qsa_kv_ram_hits", double(cold.hits+impl_->ram_hits)},
         {"qsa_kv_gpu_hits", double(impl_->hits)}, {"qsa_kv_ssd_read_bytes", double(cold.read_bytes)},
@@ -339,6 +431,13 @@ void KvOffloadSequence::reset() { blocks_.clear(); position_ = 0; }
 void KvOffloadSequence::append(const tb::Tensor& source) {
     if (!source.is_cuda() || source.dim() != 2 || source.size(1) != width_ || source.size(0) <= 0)
         throw std::invalid_argument("invalid CUDA KV rows");
+    if (!store_->impl_->hot_limit()) {
+        auto host=source.to(dtype_).contiguous().to(tb::kCPU);
+        const std::lock_guard<std::recursive_mutex> lock(store_->impl_->mutex);
+        store_->impl_->d2h_bytes+=host.nbytes();
+        append_host(host,source.device());
+        return;
+    }
     const auto offset = position_;
     const auto previous_count = blocks_.size();
     const auto previous_tail = position_ % block_rows_ ? blocks_.back() : KvOffloadStore::BlockPtr{};
@@ -357,12 +456,54 @@ void KvOffloadSequence::append(const tb::Tensor& source) {
         position_ = offset; throw;
     }
 }
+void KvOffloadSequence::append_host(const tb::Tensor& source,tb::Device device) {
+    if (!source.is_cpu() || source.dim()!=2 || source.size(1)!=width_ ||
+        source.size(0)<=0 || source.scalar_type()!=dtype_)
+        throw std::invalid_argument("invalid host KV rows");
+    auto& impl=*store_->impl_;
+    if (impl.hot_limit()) {
+        // Limit transient uploads when restoring long host checkpoints.
+        const auto chunk=std::max(block_rows_,int64_t(impl.config.buffer_bytes/(width_*source.element_size())));
+        for (int64_t start=0;start<source.size(0);start+=chunk)
+            append(source.narrow(0,start,std::min(chunk,source.size(0)-start)).to(device));
+        return;
+    }
+    auto rows=source.contiguous();
+    if (const auto tail=position_%block_rows_;tail)
+        rows=tb::cat({range_host(position_-tail,tail),rows},0);
+    std::vector<KvOffloadStore::BlockPtr> added;
+    added.reserve((rows.size(0)+block_rows_-1)/block_rows_);
+    const std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+    for (int64_t start=0;start<rows.size(0);start+=block_rows_) {
+        const auto part=rows.narrow(0,start,std::min(block_rows_,rows.size(0)-start));
+        auto block=impl.make_block(part,part.options().device(device),store_->impl_);
+        // A sequence owns at most one unfinished block. Keep it in host
+        // staging until the next append completes the block for storage.
+        if (part.size(0)<block_rows_) impl.store_unfinished(block,part.data_ptr());
+        else impl.store_cold(block,part.data_ptr());
+        added.push_back(std::move(block));
+    }
+    blocks_.reserve(position_/block_rows_+added.size());
+    blocks_.resize(position_/block_rows_);
+    blocks_.insert(blocks_.end(),std::make_move_iterator(added.begin()),std::make_move_iterator(added.end()));
+    position_+=source.size(0);
+}
 void KvOffloadSequence::truncate(int64_t position) {
     if (position < 0 || position > position_) throw std::out_of_range("CUDA KV trim exceeds its sequence");
     if (position == position_) return;
     const auto full = position / block_rows_, tail = position % block_rows_;
     KvOffloadStore::BlockPtr remainder;
-    if (tail) remainder = store_->write(store_->read(blocks_.at(full)).narrow(0, 0, tail));
+    if (tail) {
+        auto& impl=*store_->impl_;
+        if (impl.hot_limit()) {
+            remainder=store_->write(store_->read(blocks_.at(full)).narrow(0,0,tail));
+        } else {
+            const std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+            auto rows=range_host(position-tail,tail);
+            remainder=impl.make_block(rows,blocks_.at(full)->options,store_->impl_);
+            impl.store_unfinished(remainder,rows.data_ptr());
+        }
+    }
     blocks_.resize(full);
     if (remainder) blocks_.push_back(std::move(remainder));
     position_ = position;
@@ -385,59 +526,121 @@ tb::Tensor KvOffloadSequence::gather(const std::vector<int64_t>& rows) const {
     return result;
 }
 void KvOffloadSequence::gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& work) const {
-    if(rows.empty() || int64_t(rows.size())>work.rows.size(0) || work.rows.size(1)!=width_ || work.rows.scalar_type()!=dtype_)
+    if (rows.empty()) throw std::invalid_argument("empty fixed CUDA KV gather");
+    const GatherSlice slice{this,rows,0};
+    gather_into(std::span(&slice,1),work);
+}
+
+void KvOffloadSequence::gather_into(std::span<const GatherSlice> slices,const KvOffloadStore::GatherWorkspace& work) const {
+    if(work.rows.size(1)!=width_ || work.rows.scalar_type()!=dtype_)
         throw std::invalid_argument("invalid fixed CUDA KV gather workspace");
     auto& impl=*store_->impl_;
     std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+    const bool host_only=!work.upload.defined();
     const auto row_bytes=std::size_t(width_)*work.rows.element_size();
     auto* host=static_cast<uint8_t*>(work.host.data_ptr());
-    auto* upload=static_cast<uint8_t*>(work.upload.data_ptr());
+    auto* upload=host_only?nullptr:static_cast<uint8_t*>(work.upload.data_ptr());
     auto* destination=static_cast<uint8_t*>(work.rows.data_ptr());
-    auto* header=work.descriptors.data_ptr<int64_t>();
-    auto* copies=reinterpret_cast<MoeMappedCopyDescriptor*>(header+4);
-    std::map<int64_t,std::vector<std::pair<int64_t,std::size_t>>> groups;
-    for(std::size_t i=0;i<rows.size();++i) {
-        if(rows[i]<0 || rows[i]>=position_)throw std::out_of_range("CUDA KV selected row exceeds its sequence");
-        groups[rows[i]/block_rows_].emplace_back(rows[i]%block_rows_,i);
-    }
+    auto* header=host_only?nullptr:work.descriptors.data_ptr<int64_t>();
+    auto* copies=host_only?nullptr:reinterpret_cast<MoeMappedCopyDescriptor*>(header+4);
     std::size_t cold_bytes=0,count=0,total=0;
-    for(const auto& [index,selected]:groups) {
-        const auto& block=blocks_.at(index);
-        const uint8_t* source=nullptr;
-        std::shared_ptr<const std::vector<uint8_t>> payload;
-        const bool hot=block->gpu.defined();
-        if(hot) {source=static_cast<const uint8_t*>(block->gpu.data_ptr());impl.touch(block);++impl.hits;}
-        else if(block->ram_offset!=no_offset) {
-            source=impl.ram_arena.data()+block->ram_offset;++impl.ram_hits;
-            impl.ram_lru.remove_if([&](const auto& weak){auto value=weak.lock();return !value || value==block;});
-            impl.ram_lru.push_front(block);
-        } else {
-            if(!impl.ram || !block->cold)throw std::runtime_error("missing spilled KV block");
-            payload=impl.ram->read(block->cold);source=payload->data();
+    std::vector<cache::QsaKvStore::ReadRequest> disk_reads;
+    struct SelectedRow {int64_t block,row;std::size_t output;};
+    std::vector<SelectedRow> ordered;
+    const auto capacity=work.rows.size(0);
+    int64_t previous_end=0;
+    for (const auto& [sequence,rows,output_offset]:slices) {
+        if (!sequence || sequence->store_!=store_ || sequence->width_!=width_ || sequence->dtype_!=dtype_ ||
+            output_offset<previous_end || output_offset>capacity || int64_t(rows.size())>capacity-output_offset)
+            throw std::invalid_argument("invalid CUDA KV gather slice");
+        previous_end=output_offset+int64_t(rows.size());
+        ordered.clear();
+        ordered.reserve(rows.size());
+        const auto block_rows=sequence->block_rows_;
+        for (std::size_t i=0;i<rows.size();++i) {
+            if (rows[i]<0 || rows[i]>=sequence->position_)
+                throw std::out_of_range("CUDA KV selected row exceeds its sequence");
+            ordered.push_back({rows[i]/block_rows,rows[i]%block_rows,std::size_t(output_offset)+i});
         }
-        for(const auto& [row,output]:selected) {
-            const auto* input=source+std::size_t(row)*row_bytes;
-            if(!hot) {std::memcpy(host+cold_bytes,input,row_bytes);input=upload+cold_bytes;cold_bytes+=row_bytes;}
-            const auto add=[&](uint8_t* target,const uint8_t* source,std::size_t bytes) {
-                copies[count++]={reinterpret_cast<uint64_t>(target),reinterpret_cast<uint64_t>(source),total,bytes};
-                total+=(bytes+15)&~std::size_t(15);
-            };
-            if(!work.key_width)add(destination+output*row_bytes,input,row_bytes);
-            else {
-                const auto keys=std::size_t(work.key_width)*work.rows.element_size();
-                const auto values=row_bytes/work.heads-keys,capacity=std::size_t(work.rows.size(0));
-                for(int64_t head=0;head<work.heads;++head) {
-                    add(destination+(head*capacity+output)*keys,input+head*keys,keys);
-                    add(destination+capacity*work.heads*keys+(head*capacity+output)*values,
-                        input+work.heads*keys+head*values,values);
+        std::sort(ordered.begin(),ordered.end(),[](const auto& left,const auto& right) {
+            return std::pair{left.block,left.output}<std::pair{right.block,right.output};
+        });
+        for (std::size_t begin=0;begin<ordered.size();) {
+            const auto index=ordered[begin].block;
+            auto end=begin+1;
+            while (end<ordered.size() && ordered[end].block==index) ++end;
+            const std::span selected(ordered.data()+begin,end-begin);
+            begin=end;
+            const auto& block=sequence->blocks_.at(index);
+            const uint8_t* source=nullptr;
+            std::shared_ptr<const std::vector<uint8_t>> payload;
+            const bool hot=block->gpu.defined();
+            bool direct_read=false;
+            if(hot) {source=static_cast<const uint8_t*>(block->gpu.data_ptr());impl.touch(block);++impl.hits;}
+            else if (block->unfinished) source=block->unfinished.get();
+            else if(block->ram_offset!=no_offset) {
+                source=impl.ram_address(block->ram_offset);impl.touch_ram(block);
+            } else {
+                if(!impl.ram || !block->cold)throw std::runtime_error("missing spilled KV block");
+                if (int64_t(selected.size())==block->rows) {
+                    int64_t next=0;
+                    const auto first=selected.front().output;
+                    direct_read=std::all_of(selected.begin(),selected.end(),[&](const auto& item){
+                        const auto row=next++;
+                        return item.row==row && (!host_only || item.output==first+std::size_t(row));
+                    });
+                }
+                if (direct_read) {
+                    const auto offset=host_only?selected.front().output*row_bytes:cold_bytes;
+                    disk_reads.push_back({block->cold,host+offset,block->bytes});
+                }
+                else {payload=impl.ram->read(block->cold);source=payload->data();}
+            }
+            for(const auto& item:selected) {
+                const auto row=item.row;
+                const auto output=item.output;
+                const auto* input=direct_read?nullptr:source+std::size_t(row)*row_bytes;
+                if(host_only) {
+                    if(!direct_read)std::memcpy(host+output*row_bytes,input,row_bytes);
+                    cold_bytes+=row_bytes;
+                    continue;
+                }
+                if(!hot) {
+                    if (!direct_read) std::memcpy(host+cold_bytes,input,row_bytes);
+                    input=upload+cold_bytes;
+                    cold_bytes+=row_bytes;
+                }
+                const auto add=[&](uint8_t* target,const uint8_t* source,std::size_t bytes) {
+                    copies[count++]={reinterpret_cast<uint64_t>(target),reinterpret_cast<uint64_t>(source),total,bytes};
+                    total+=(bytes+15)&~std::size_t(15);
+                };
+                if(!work.key_width)add(destination+output*row_bytes,input,row_bytes);
+                else {
+                    const auto keys=std::size_t(work.key_width)*work.rows.element_size();
+                    const auto values=row_bytes/work.heads-keys;
+                    for(int64_t head=0;head<work.heads;++head) {
+                        add(destination+(head*capacity+output)*keys,input+head*keys,keys);
+                        add(destination+capacity*work.heads*keys+(head*capacity+output)*values,
+                            input+work.heads*keys+head*values,values);
+                    }
                 }
             }
         }
     }
-    header[0]=int64_t(count);header[1]=int64_t(total);header[2]=header[3]=0;
-    const auto stream=current_stream().stream();
-    if(cold_bytes)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(upload,host,cold_bytes,cudaMemcpyHostToDevice,stream));
+    if (!disk_reads.empty()) impl.ram->read_into_batch(disk_reads);
+    if (!count && !cold_bytes) return;
     impl.h2d_bytes+=cold_bytes;
+    const auto stream=current_stream().stream();
+    if (host_only) {
+        for (const auto& slice:slices) if (!slice.rows.empty()) {
+            const auto offset=std::size_t(slice.output_offset)*row_bytes;
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(destination+offset,host+offset,slice.rows.size()*row_bytes,
+                cudaMemcpyHostToDevice,stream));
+        }
+        return;
+    }
+    header[0]=int64_t(count);header[1]=int64_t(total);header[2]=header[3]=0;
+    if(cold_bytes)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(upload,host,cold_bytes,cudaMemcpyHostToDevice,stream));
     TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(work.device_descriptors.data_ptr(),header,(4+count*4)*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
     moe_copy_mapped(work.device_descriptors.data_ptr(),reinterpret_cast<const uint32_t*>(work.device_descriptors.data_ptr<int64_t>()+2),
         int(std::min<std::size_t>(256,(total+4095)/4096)),256,stream);
@@ -455,5 +658,46 @@ tb::Tensor KvOffloadSequence::range(int64_t start, int64_t count) const {
         written += n;
     }
     return result;
+}
+
+tb::Tensor KvOffloadSequence::range_host(int64_t start,int64_t count) const {
+    if (start<0 || count<=0 || start>position_ || count>position_-start)
+        throw std::out_of_range("CUDA KV host range exceeds its sequence");
+    auto& impl=*store_->impl_;
+    const std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+    auto out=tb::empty({count,width_},blocks_.front()->options.device(tb::kCPU));
+    auto* destination=static_cast<std::uint8_t*>(out.data_ptr());
+    const auto row_bytes=size_t(width_)*out.element_size();
+    const auto stream=current_stream().stream();
+    std::vector<cache::QsaKvStore::ReadRequest> disk_reads;
+    bool queued=false;
+    for (int64_t finished=0;finished<count;) {
+        const auto index=start+finished,row=index%block_rows_;
+        const auto& block=blocks_.at(index/block_rows_);
+        const auto copied=std::min(count-finished,block->rows-row);
+        auto* output=destination+finished*row_bytes;
+        const auto offset=row*row_bytes,bytes=copied*row_bytes;
+        if (block->gpu.defined()) {
+            auto* data=static_cast<const std::uint8_t*>(block->gpu.data_ptr());
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(output,data+offset,bytes,cudaMemcpyDeviceToHost,stream));
+            impl.d2h_bytes+=bytes;
+            queued=true;
+        } else if (block->unfinished) {
+            std::memcpy(output,block->unfinished.get()+offset,bytes);
+        } else if (block->ram_offset!=no_offset) {
+            std::memcpy(output,impl.ram_address(block->ram_offset)+offset,bytes);
+        } else {
+            if (!impl.ram || !block->cold) throw std::runtime_error("missing spilled KV block");
+            if (!offset && bytes==block->bytes) disk_reads.push_back({block->cold,output,bytes});
+            else {
+                const auto payload=impl.ram->read(block->cold);
+                std::memcpy(output,payload->data()+offset,bytes);
+            }
+        }
+        finished+=copied;
+    }
+    if (queued) TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!disk_reads.empty()) impl.ram->read_into_batch(disk_reads);
+    return out;
 }
 }

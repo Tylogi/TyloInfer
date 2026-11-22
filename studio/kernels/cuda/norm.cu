@@ -344,16 +344,10 @@ __global__ void minicpm_qk_norm_rope_cache_write_bf16_kernel(
     }
 }
 
-template <int BD,class Input=float>
-__global__ void rms_norm_kernel(const Input* __restrict__ x, const float* __restrict__ w,
-                                float* __restrict__ out, int N, int D, float eps, float weight_offset)
+template <int BD,class Input>
+__device__ __forceinline__ void rms_norm_row(const Input* xr,const float* w,float* out,
+                                            int D,float eps,float weight_offset)
 {
-    int row = blockIdx.x;
-    if (row >= N) {
-        return;
-    }
-    const Input* xr = x + (size_t)row * D;
-    float* or_ = out + (size_t)row * D;
     int tid = threadIdx.x;
 
     float ssq = 0.0f;
@@ -365,8 +359,24 @@ __global__ void rms_norm_kernel(const Input* __restrict__ x, const float* __rest
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
-        or_[i] = float(xr[i]) * rinv * (w[i] + weight_offset);
+        out[i] = float(xr[i]) * rinv * (w[i] + weight_offset);
     }
+}
+
+template <int BD,class Input>
+__global__ void rms_norm_kernel(const Input* __restrict__ x,const float* __restrict__ w,
+                               float* __restrict__ out,int N,int D,float eps,float weight_offset) {
+    const auto row=blockIdx.x;
+    if (row<unsigned(N)) rms_norm_row<BD>(x+size_t(row)*D,w,out+size_t(row)*D,D,eps,weight_offset);
+}
+
+template <int BD>
+__global__ void rms_norm_concat_pair(const float* first,const float* second,const float* weight,float* output,
+    int width,int tokens,int64_t first_batch,int64_t first_token,int64_t second_batch,int64_t second_token,float eps) {
+    const int64_t row=blockIdx.x,batch=row/tokens,token=row%tokens;
+    const bool other=blockIdx.y;
+    const auto* input=other?second+batch*second_batch+token*second_token:first+batch*first_batch+token*first_token;
+    rms_norm_row<BD>(input,weight,output+(2*row+other)*width,width,eps,0.f);
 }
 
 template <int BD>
@@ -507,6 +517,31 @@ static int rms_row_threads(int rows,int width) {
         cached_device=device;
     }
     return rows<processors?1024:NORM_BD;
+}
+
+mfq_tensor_backend::Tensor rms_norm_concat_pair_cuda(const mfq_tensor_backend::Tensor& first,
+    const mfq_tensor_backend::Tensor& second,const mfq_tensor_backend::Tensor& weight,double eps) {
+    namespace tb=mfq_tensor_backend;
+    TYLOINFER_RUNTIME_CHECK(first.dim()==3 && first.sizes()==second.sizes() && first.is_cuda() &&
+        second.device()==first.device() && weight.device()==first.device() &&
+        first.scalar_type()==tb::kFloat32 && second.scalar_type()==tb::kFloat32 &&
+        weight.scalar_type()==tb::kFloat32 && weight.is_contiguous() && first.stride(2)==1 && second.stride(2)==1 &&
+        first.size(2)>0 && first.size(2)<=std::numeric_limits<int>::max() && weight.numel()==first.size(2),
+        "invalid RMSNorm pair geometry");
+    MfqCudaGuard guard(first.device());
+    const auto batch=first.size(0),tokens=first.size(1),width=first.size(2),rows=batch*tokens;
+    TYLOINFER_RUNTIME_CHECK(rows<=std::numeric_limits<int>::max(),"RMSNorm pair grid overflow");
+    auto output=tb::empty({batch,tokens,2*width},first.options());
+    if (!rows) return output;
+    const auto launch=[&]<int Threads>() {
+        rms_norm_concat_pair<Threads><<<dim3(unsigned(rows),2),Threads,0,mfq_current_cuda_stream()>>>(
+            first.data_ptr<float>(),second.data_ptr<float>(),weight.data_ptr<float>(),output.data_ptr<float>(),
+            int(width),int(tokens),first.stride(0),first.stride(1),second.stride(0),second.stride(1),float(eps));
+    };
+    if (rms_row_threads(int(rows),int(width))==1024) launch.template operator()<1024>();
+    else launch.template operator()<NORM_BD>();
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }
 
 mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps)

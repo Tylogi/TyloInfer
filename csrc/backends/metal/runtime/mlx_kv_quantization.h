@@ -21,6 +21,20 @@ std::string mlx_kv_quantization_tag();
 mlx::core::array mlx_kv_encode(const mlx::core::array& input, int bits, bool value);
 mlx::core::array mlx_kv_decode(const mlx::core::array& input, int dimension, int bits,
     bool value, mlx::core::Dtype dtype = mlx::core::float16);
+
+// In MLA the low-rank value is also the non-rotary part of each key.
+// Store that shared vector once and encode the rotary coordinates separately.
+struct MlxMlaKvFormat {
+    int latent_dimension;
+    int rotary_dimension;
+    MlxKvQuantization quantization;
+
+    int width() const;
+    mlx::core::Dtype dtype() const noexcept;
+    mlx::core::array pack(const mlx::core::array& rows) const;
+    mlx::core::array unpack(const mlx::core::array& rows) const;
+};
+
 mlx::core::array mlx_kv_sparse_attention(const mlx::core::array& query,
     const mlx::core::array& key, const mlx::core::array& value,
     const std::optional<mlx::core::array>& blocks, MlxKvQuantization quantization,

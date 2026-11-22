@@ -299,7 +299,7 @@ __global__ void kv_cache_write_ring_positions_kernel(
     scalar_t* __restrict__ k_cache,
     scalar_t* __restrict__ v_cache,
     const int64_t* __restrict__ positions,
-    int B, int H, int T, int D, int capacity, int source_start)
+    int B, int H, int T, int D, int capacity, int source_start, bool separate_positions)
 {
     const int kept = T - source_start;
     const size_t n = (size_t)B * H * kept * D;
@@ -313,7 +313,7 @@ __global__ void kv_cache_write_ring_positions_kernel(
         const size_t h0 = t0 / kept;
         const int h = (int)(h0 % H);
         const int b = (int)(h0 / H);
-        const int slot = (int)(positions[t] % capacity);
+        const int slot = (int)(positions[(separate_positions ? size_t(b) * T : 0) + t] % capacity);
         const size_t src = (((size_t)b * H + h) * T + t) * D + d;
         const size_t dst = (((size_t)b * H + h) * capacity + slot) * D + d;
         k_cache[dst] = k[src];
@@ -334,8 +334,8 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
     TYLOINFER_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && v.is_cuda() && v.is_contiguous(),
                 "kv_cache_write_ring_positions: inputs must be cuda contiguous");
     TYLOINFER_RUNTIME_CHECK(positions.is_cuda() && positions.is_contiguous() &&
-                positions.scalar_type() == mfq_tensor_backend::kInt64 && positions.dim() == 1,
-                "kv_cache_write_ring_positions: positions must be cuda contiguous int64[T]");
+                positions.scalar_type() == mfq_tensor_backend::kInt64,
+                "kv_cache_write_ring_positions: positions must be CUDA contiguous int64");
     TYLOINFER_RUNTIME_CHECK(k_cache.scalar_type() == v_cache.scalar_type() &&
                 k_cache.scalar_type() == k.scalar_type() && k_cache.scalar_type() == v.scalar_type(),
                 "kv_cache_write_ring_positions: k/v/cache dtype mismatch");
@@ -355,8 +355,10 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
     const int capacity = (int)k_cache.size(2);
     TYLOINFER_RUNTIME_CHECK(capacity > 0 && k_cache.size(0) == B && k_cache.size(1) == H && k_cache.size(3) == D,
                 "kv_cache_write_ring_positions: cache shape mismatch");
-    TYLOINFER_RUNTIME_CHECK(positions.size(0) == T,
-                "kv_cache_write_ring_positions: positions length mismatch");
+    const bool separate_positions=positions.dim()==2;
+    TYLOINFER_RUNTIME_CHECK((positions.dim()==1 && positions.size(0)==T) ||
+                (separate_positions && positions.size(0)==B && positions.size(1)==T),
+                "kv_cache_write_ring_positions: positions must have shape [T] or [B,T]");
     if (T == 0) return {k_cache, v_cache};
 
     const int source_start = std::max(0, T - capacity);
@@ -370,7 +372,7 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
             grid, block, 0, mfq_current_cuda_stream()>>>(
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
             k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
-            positions.data_ptr<int64_t>(), B, H, T, D, capacity, source_start);
+            positions.data_ptr<int64_t>(), B, H, T, D, capacity, source_start, separate_positions);
     });
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return {k_cache, v_cache};

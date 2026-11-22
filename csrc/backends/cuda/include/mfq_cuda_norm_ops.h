@@ -7,6 +7,8 @@
 
 // FP32 output; f16/bf16 inputs are converted inside the normalization kernel.
 mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps);
+mfq_tensor_backend::Tensor rms_norm_concat_pair_cuda(const mfq_tensor_backend::Tensor& first,
+    const mfq_tensor_backend::Tensor& second,const mfq_tensor_backend::Tensor& weight,double eps);
 mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
 mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps,
                                 double weight_offset);

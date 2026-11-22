@@ -74,6 +74,50 @@ def test_dflash2_catalog_reports_the_target_independently_of_the_local_directory
     asyncio.run(run())
 
 
+def test_model_specific_drafts_are_discovered_and_bound_to_the_matching_cuda_target(tmp_path):
+    def gguf_string(value: bytes) -> bytes:
+        return struct.pack("<Q", len(value)) + value
+
+    dspark = tmp_path / "auxiliary.gguf"
+    gguf_header = (
+        b"GGUF" + struct.pack("<IQQ", 3, 1, 2)
+        + gguf_string(b"general.architecture") + struct.pack("<I", 8) + gguf_string(b"dflash")
+        + gguf_string(b"dflash.dspark.markov_rank") + struct.pack("<II", 4, 256)
+        + gguf_string(b"markov_w1.weight") + struct.pack("<IQIQ", 1, 1, 0, 0)
+    )
+    dspark.write_bytes(gguf_header + bytes(-len(gguf_header) % 32 + 4))
+    dfly = tmp_path / "predictor"
+    dfly.mkdir()
+    config = {"model_type": "hy_v4_flash", "dfly_num_hidden_layers": 1}
+    (dfly / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    header = json.dumps({
+        "model.dfly_layers.final_norm.weight": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]},
+    }).encode()
+    (dfly / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + b"\0\0")
+    _model(tmp_path / "target.tq")
+
+    async def run():
+        catalog = ModelCatalog([tmp_path])
+        drafts = {item.architecture: item for item in (await catalog.list(include_components=True)).data
+                  if item.asset_kind == "dflash2"}
+        assert drafts["dfly2"].dflash2_target == "Hy4 Flash"
+        assert drafts["dspark"].dflash2_target == "Inkling 2 Mini"
+        target = await catalog.resolve("target")
+        pool = RuntimePool(catalog, tmp_path / "runtime", backend="cuda")
+        for architecture, kind, path in (("inkling2_loop", "dspark", dspark), ("hy_v4_flash", "dfly2", dfly)):
+            model = replace(target, resource=target.resource.model_copy(update={"architecture": architecture}))
+            draft = await pool._dflash2_artifact(model, drafts[kind].id)
+            request = ModelLoadRequest(model=model.resource.name, dflash2_artifact_id=draft.resource.id)
+            command, _ = pool._launch_configuration(model, request, port=0, dflash2_path=draft.path)
+            assert command[command.index("--dflash2-draft") + 1] == str(path)
+            wrong = drafts["dfly2" if kind == "dspark" else "dspark"]
+            with pytest.raises(JobExecutionError, match="different target architecture"):
+                await pool._dflash2_artifact(model, wrong.id)
+        await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_dflash2_failed_replacement_restores_original_options(tmp_path, monkeypatch):
     async def run():
         _model(tmp_path / "target.tq")

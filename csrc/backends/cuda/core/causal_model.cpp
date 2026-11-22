@@ -86,8 +86,13 @@ CausalResources::adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
 mfq_tensor_backend::Tensor
 CausalResources::adapter_logits(const QuantLinear &lm_head,
                                 mfq_tensor_backend::Tensor hidden) const {
-    auto logits = execution->profiler.measure(
-        "model.lm_head", [&]() { return lm_head.forward(*execution, hidden); });
+    auto logits=execution->profiler.measure("model.lm_head", [&] {
+        if (lm_head.is_gguf() && !lm_head.tensor_parallel()) {
+            auto batched=lm_head.gguf.try_forward_batched_logits(hidden);
+            if (batched.defined()) return batched;
+        }
+        return lm_head.forward(*execution,hidden);
+    });
     return logits;
 }
 

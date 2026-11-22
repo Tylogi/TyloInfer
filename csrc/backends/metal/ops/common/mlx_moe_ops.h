@@ -30,6 +30,9 @@ MlxMoeTopKResult moe_topk(
     float scale = 1.0f,
     bool route_groups = true);
 
+MlxMoeTopKResult moe_sigmoid_topk(const mlx::core::array& logits, int top_k,
+    const std::optional<mlx::core::array>& bias, float scale);
+
 // One-row dense MoE router GEMV. A SIMD group owns each expert row so the
 // small [experts, hidden] projection uses the whole GPU instead of the stock
 // narrow-output matmul schedule. FP16 and BF16 weights are supported.

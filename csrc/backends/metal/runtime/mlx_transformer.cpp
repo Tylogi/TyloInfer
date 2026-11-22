@@ -1,8 +1,10 @@
 #include "mlx_transformer.h"
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
+#include "mlx_dsa.h"
 
 #include "mlx_detached_copy.h"
+#include "mlx_eval_timing.h"
 
 #include <algorithm>
 #include <bit>
@@ -719,6 +721,31 @@ array mlx_circular_cache_history(
     return mlx::core::take(cache, indices, 1);
 }
 
+array mlx_circular_cache_append(const array& cache, const array& values, int position,
+    const std::optional<array>& earlier_reader) {
+    if (cache.ndim() != 3 || values.ndim() != 3 || cache.shape(0) != values.shape(0) ||
+        cache.shape(2) != values.shape(2) || cache.dtype() != values.dtype() ||
+        cache.shape(1) <= 0 || values.shape(1) <= 0 || position < 0 ||
+        position > std::numeric_limits<int>::max() - values.shape(1)) {
+        throw std::invalid_argument("invalid circular cache append");
+    }
+    const int batch = cache.shape(0);
+    const int window = cache.shape(1);
+    const int count = values.shape(1);
+    const int recent = std::min(window, count);
+    const int end = position + count;
+    const auto tail = recent == count ? values :
+        mlx::core::slice(values, {0, count - recent, 0}, values.shape());
+    const auto rows = count == 1 ?
+        mlx::core::full(Shape{batch, 1}, position % window, mlx::core::int32) :
+        mlx::core::broadcast_to(mlx::core::reshape(mlx::core::remainder(
+            mlx::core::arange(end - recent, end, 1, mlx::core::int32), array(window, mlx::core::int32)),
+            Shape{1, recent}), Shape{batch, recent});
+    const auto writable = earlier_reader ?
+        mlx::core::depends(std::vector<array>{cache}, std::vector<array>{*earlier_reader}).front() : cache;
+    return mlx_cache_write_inplace(writable, tail, rows);
+}
+
 MlxKvCache::MlxKvCache(
     int batch,
     int heads,
@@ -904,7 +931,7 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
     auto visible = physical_view();
     auto key = detached ? detached_copy(visible.first) : visible.first;
     auto value = detached ? detached_copy(visible.second) : visible.second;
-    mlx::core::eval(key, value);
+    detail::eval_with_timing({key, value});
     return MlxKvCacheSnapshot{
         batch_,
         heads_,
@@ -1049,7 +1076,8 @@ MlxSequenceCache::MlxSequenceCache(
     if (maximum_sequence_ <= 0 || width_ <= 0 ||
         (dtype_ != mlx::core::float16 &&
          dtype_ != mlx::core::bfloat16 &&
-         dtype_ != mlx::core::float32)) {
+         dtype_ != mlx::core::float32 &&
+         dtype_ != mlx::core::uint32)) {
         throw std::invalid_argument("invalid MLX sequence cache geometry");
     }
 }
@@ -1073,7 +1101,8 @@ void MlxSequenceCache::reset(
 std::pair<array, int> MlxSequenceCache::append(
     const array& value) {
     if (value.ndim() != 3 || value.shape(0) <= 0 ||
-        value.shape(1) <= 0 || value.shape(2) != width_) {
+        value.shape(1) <= 0 || value.shape(2) != width_ ||
+        (dtype_ == mlx::core::uint32 && value.dtype() != dtype_)) {
         throw std::runtime_error("MLX sequence-cache append mismatch");
     }
     if (!values_ || batch_ != value.shape(0)) {

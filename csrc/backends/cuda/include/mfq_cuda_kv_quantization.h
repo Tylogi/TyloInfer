@@ -16,8 +16,13 @@ KvQuantization cuda_kv_quantization();
 int cuda_kv_packed_width(int dimension, int bits);
 std::string cuda_kv_quantization_tag();
 mfq_tensor_backend::Tensor cuda_kv_encode(const mfq_tensor_backend::Tensor&, int bits, bool value);
+mfq_tensor_backend::Tensor cuda_kv_encode_mla(const mfq_tensor_backend::Tensor&, int latent, int rotary, int bits);
 mfq_tensor_backend::Tensor cuda_kv_decode(const mfq_tensor_backend::Tensor&, int dimension, int bits,
     bool value, mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16);
+// MLA rows contain independent latent and RoPE components. Only the populated
+// rows of each compacted batch lane are decoded when lengths are supplied.
+mfq_tensor_backend::Tensor cuda_kv_decode_mla(const mfq_tensor_backend::Tensor&, int latent, int rotary,
+    int bits, const mfq_tensor_backend::Tensor& lengths = {});
 
 // Packed rows contain the FP32 norm followed by bit-packed centroid indices.
 // Both resident and paged attention consume these rows without a floating KV copy.

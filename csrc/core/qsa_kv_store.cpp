@@ -157,9 +157,25 @@ struct QsaKvStore::Impl {
     }
 
     void evict(std::unique_lock<std::recursive_mutex>& guard) {
-        while (hot_bytes > hot_limit() && !hot.empty()) {
+        const auto capacity = hot_limit();
+        const auto pinned_index_capacity = capacity - std::min(config.buffer_bytes, capacity / 4);
+        while (hot_bytes > capacity && !hot.empty()) {
             int priority = 0;
-            while (priority < 2 && lru[priority].empty()) ++priority;
+            if (live_index_bytes <= pinned_index_capacity) {
+                while (priority < 2 && lru[priority].empty()) ++priority;
+            } else {
+                // A large index scan must share the hot tier with the rows
+                // it selects. Leave room for history even when the index fits.
+                auto oldest = std::numeric_limits<std::uint64_t>::max();
+                for (int candidate = 0; candidate < 3; ++candidate) {
+                    if (lru[candidate].empty()) continue;
+                    const auto age = hot.at(lru[candidate].back()).last_access;
+                    if (age < oldest) {
+                        oldest = age;
+                        priority = candidate;
+                    }
+                }
+            }
             auto found = hot.find(lru[priority].back());
             if (auto block = found->second.block.lock(); block && !block->ready && !block->queued) {
                 const auto size = block->bytes;
@@ -192,6 +208,7 @@ struct QsaKvStore::Impl {
         }
         free_offsets[block->bytes].push_back(block->offset);
         if (block->queued) disk_bytes -= block->bytes;
+        if (block->priority == 2) live_index_bytes -= block->bytes;
         if (--live_blocks == 0 && truncate_file(fd,io_mutex) == 0) {
             free_offsets.clear();
             next_offset = 0;
@@ -263,6 +280,7 @@ struct QsaKvStore::Impl {
         std::shared_ptr<const std::vector<std::uint8_t>> bytes;
         std::list<std::uint64_t>::iterator order;
         std::weak_ptr<Block> block;
+        std::uint64_t last_access;
     };
     QsaKvStoreConfig config;
     std::filesystem::path directory;
@@ -276,8 +294,10 @@ struct QsaKvStore::Impl {
     bool stopping = false;
     std::exception_ptr error;
     std::size_t hot_bytes = 0, pending_bytes = 0, disk_bytes = 0;
+    std::size_t live_index_bytes = 0;
     std::size_t next_offset = 0;
     std::uint64_t next_id = 0, reads = 0, hits = 0, live_blocks = 0;
+    std::uint64_t access = 0;
     std::uint64_t read_bytes = 0, written_bytes = 0;
     std::deque<std::shared_ptr<Block>> queue;
     std::unordered_map<std::uint64_t, Hot> hot;
@@ -317,9 +337,10 @@ QsaKvStore::BlockPtr QsaKvStore::write(std::vector<std::uint8_t> bytes, int prio
         free.pop_back();
     }
     block->bytes = size;
+    if (priority == 2) impl_->live_index_bytes += size;
     auto payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes));
     impl_->lru[priority].push_front(block->id);
-    impl_->hot.emplace(block->id, Impl::Hot{payload, impl_->lru[priority].begin(), block});
+    impl_->hot.emplace(block->id, Impl::Hot{payload, impl_->lru[priority].begin(), block, ++impl_->access});
     impl_->hot_bytes += size;
     impl_->evict(guard);
     return block;
@@ -338,6 +359,7 @@ std::shared_ptr<const std::vector<std::uint8_t>> QsaKvStore::read(const BlockPtr
         ++impl_->hits;
         auto& order = impl_->lru[block->priority];
         order.splice(order.begin(), order, found->second.order);
+        found->second.last_access = ++impl_->access;
         return found->second.bytes;
     }
     if (!block->ready) throw std::runtime_error("QSA KV microblock was not written");
@@ -346,7 +368,7 @@ std::shared_ptr<const std::vector<std::uint8_t>> QsaKvStore::read(const BlockPtr
     if (bytes->size() <= impl_->hot_limit()) {
         auto& order = impl_->lru[block->priority];
         order.push_front(block->id);
-        impl_->hot.emplace(block->id, Impl::Hot{bytes, order.begin(), std::const_pointer_cast<Block>(block)});
+        impl_->hot.emplace(block->id, Impl::Hot{bytes, order.begin(), std::const_pointer_cast<Block>(block), ++impl_->access});
         impl_->hot_bytes += bytes->size();
         impl_->evict(guard);
     }
@@ -364,6 +386,7 @@ void QsaKvStore::read_into(const BlockPtr& block,std::uint8_t* destination,std::
     if(found!=impl_->hot.end()) {
         ++impl_->hits;auto& order=impl_->lru[block->priority];
         order.splice(order.begin(),order,found->second.order);
+        found->second.last_access = ++impl_->access;
         std::memcpy(destination,found->second.bytes->data(),bytes);return;
     }
     if(!block->ready)throw std::runtime_error("QSA KV microblock was not written");
@@ -554,6 +577,52 @@ void QsaKvSequenceSnapshot::read_rows(std::size_t start, std::size_t rows, std::
         start += take;
         rows -= take;
     }
+}
+
+std::size_t QsaKvSequenceSnapshot::read_groups(
+    const std::vector<std::size_t>& groups, std::size_t visible_rows,
+    std::uint8_t* output, std::size_t capacity) const {
+    if (visible_rows > position || (!groups.empty() && (!output || !block_rows || !row_bytes || !store ||
+        blocks.size() != position / block_rows)))
+        throw std::invalid_argument("invalid QSA KV group read geometry");
+    if (groups.empty()) return 0;
+    std::size_t rows = 0;
+    for (const auto group : groups) {
+        if (!visible_rows || group > (visible_rows - 1) / block_rows)
+            throw std::out_of_range("selected QSA KV group is not visible");
+        const auto count = std::min(block_rows, visible_rows - group * block_rows);
+        if (count > capacity / row_bytes - rows)
+            throw std::out_of_range("selected QSA KV groups exceed the destination");
+        rows += count;
+    }
+
+    std::vector<QsaKvStore::ReadRequest> reads;
+    reads.reserve(groups.size());
+    std::vector<std::uint8_t> clipped;
+    for (const auto group : groups) {
+        const auto start = group * block_rows;
+        const auto bytes = std::min(block_rows, visible_rows - start) * row_bytes;
+        const auto block = group < blocks.size() ? blocks[group] : tail_block;
+        if (!block) {
+            if (group < blocks.size() || bytes > tail.size())
+                throw std::runtime_error("missing QSA KV group payload");
+            std::memcpy(output, tail.data(), bytes);
+        } else if (bytes == block->bytes) {
+            reads.push_back({block, output, bytes});
+        } else {
+            if (bytes > block->bytes) throw std::runtime_error("short QSA KV group payload");
+            // A multi-token call can include a query inside a group it also
+            // finishes. Read that one group once and keep only its visible rows.
+            if (clipped.empty()) {
+                clipped.resize(block->bytes);
+                store->read_into(block, clipped.data(), clipped.size());
+            }
+            std::memcpy(output, clipped.data(), bytes);
+        }
+        output += bytes;
+    }
+    if (!reads.empty()) store->read_into_batch(reads);
+    return rows;
 }
 
 }

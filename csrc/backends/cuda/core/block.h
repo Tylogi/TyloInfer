@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rope.h"
+#include "studio/kernels/cuda/independent_hc.h"
 
 #include <cstdint>
 #include <vector>
@@ -21,6 +22,16 @@ mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
     double weight_offset);
 
 struct Block {
+    struct ResidualDepthState {
+        std::vector<mfq_tensor_backend::Tensor> blocks, prelude_blocks, previous_pass;
+        mfq_tensor_backend::Tensor prelude, previous_output;
+    };
+    struct LoopMhcWeights {
+        mfq_tensor_backend::Tensor attention, attention_bias, ffn, ffn_bias;
+        float pre_scale = 1.0f;
+        int iterations = 0;
+        bool fixed_identity = false;
+    };
     struct Context {
         mfq_tensor_backend::Tensor token_ids;
         mfq_tensor_backend::Tensor host_token_ids;
@@ -33,10 +44,36 @@ struct Block {
         MfqOptional<mfq_tensor_backend::Tensor> sequence_lengths = mfq_nullopt;
         MfqOptional<mfq_tensor_backend::Tensor> cache_positions = mfq_nullopt;
         MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt;
+        mfq_tensor_backend::Tensor* loop_streams = nullptr;
+        ResidualDepthState* residual_depth = nullptr;
     };
 
     int cuda_device = 0;
     bool cpu_offloaded = false;
+    std::shared_ptr<const LoopMhcWeights> loop_mhc;
+    bool begins_loop_mhc = false;
+    bool ends_loop_mhc = false;
+
+    template<class Attend, class FeedForward>
+    mfq_tensor_backend::Tensor forward_loop_mhc(const Context& context,
+        const mfq_tensor_backend::Tensor& hidden, Attend attend, FeedForward feed_forward) const {
+        namespace tb = mfq_tensor_backend;
+        TYLOINFER_RUNTIME_CHECK(context.loop_streams && loop_mhc, "loop mHC requires per-forward stream state");
+        auto& streams = *context.loop_streams;
+        if (begins_loop_mhc)
+            streams = hidden.unsqueeze(2).expand({hidden.size(0), hidden.size(1), 2, hidden.size(2)}).contiguous();
+        const auto apply = [&](const tb::Tensor& function, const tb::Tensor& bias, const auto& branch) {
+            const auto route = mfq::cuda::two_stream_mhc_prepare(streams, function, bias, 1e-6f,
+                loop_mhc->pre_scale, loop_mhc->iterations, loop_mhc->fixed_identity);
+            auto output = branch(route.branch).to(streams.scalar_type()).contiguous();
+            streams = mfq::cuda::two_stream_mhc_merge(streams, output, route);
+        };
+        apply(loop_mhc->attention, loop_mhc->attention_bias, attend);
+        apply(loop_mhc->ffn, loop_mhc->ffn_bias, feed_forward);
+        auto output = streams.to(tb::kFloat32).mean(2).to(hidden.scalar_type());
+        if (ends_loop_mhc) streams = {};
+        return output;
+    }
 
     virtual ~Block() = default;
     virtual void reset(int64_t batch) = 0;

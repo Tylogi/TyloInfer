@@ -69,6 +69,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_context(CudaExecutionContext &exec
                                                       const RopeCache &rope) {
     TYLOINFER_RUNTIME_CHECK(context.confirmed_prefix == 0 || supports_speculation(),
                       "block does not support speculative verification");
+    if (loop_mhc) {
+        return forward_loop_mhc(context, x, [&](mfq_tensor_backend::Tensor input) {
+            return forward_impl(execution, std::move(input), context.positions, context.cache_position,
+                context.sequence_lengths, rope, context.cache_positions, context.attention_mask,
+                context.planned_kv_length, context.decode_attention_parts, false, true);
+        }, [&](mfq_tensor_backend::Tensor input) {
+            const auto dims = input.sizes().vec();
+            auto norm = qwen_rms_norm(input.reshape({-1, dims.back()}), ffn_norm, rms_norm_eps, norm_weight_offset);
+            return ffn.forward(execution, std::move(norm)).reshape(dims);
+        });
+    }
     return forward_impl(execution, std::move(x), context.positions, context.cache_position,
                         context.sequence_lengths, rope, context.cache_positions,
                         context.attention_mask, context.planned_kv_length,
@@ -90,7 +101,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
     int64_t cache_pos, const MfqOptional<mfq_tensor_backend::Tensor> &seq_len,
     const RopeCache &rope, const MfqOptional<mfq_tensor_backend::Tensor> &cache_positions,
     const MfqOptional<mfq_tensor_backend::Tensor> &attention_mask, int64_t planned_kv_length,
-    int64_t decode_attention_parts, bool cache_only) {
+    int64_t decode_attention_parts, bool cache_only, bool attention_only) {
     auto &profiler = execution.profiler;
     int64_t B = x.size(0), T = x.size(1), H = x.size(2);
     auto trace_qwen_stage = [&](const char *name, const mfq_tensor_backend::Tensor &value,
@@ -750,11 +761,27 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                 if (dynamic_parts)
                                     parts = decode_attention_parts;
                                 parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
-                                a = attention_paged_cache_decode_cuda(
-                                    typed_query(), cache.k_chunk_ptrs, cache.v_chunk_ptrs, cache.page_table,
-                                    seq_len.value(), attn_scale, cache.page_size,
-                                    cache.pages_per_chunk, cache.paged_heads, decode_partial_o,
-                                    decode_partial_m, decode_partial_l, parts, dynamic_parts);
+                                if (T == 1) {
+                                    a = attention_paged_cache_decode_cuda(
+                                        typed_query(), cache.k_chunk_ptrs, cache.v_chunk_ptrs, cache.page_table,
+                                        seq_len.value(), attn_scale, cache.page_size,
+                                        cache.pages_per_chunk, cache.paged_heads, decode_partial_o,
+                                        decode_partial_m, decode_partial_l, parts, dynamic_parts);
+                                } else {
+                                    namespace tb=mfq_tensor_backend;
+                                    // Each verified token uses its own causal end over the same page table.
+                                    auto query=typed_query().transpose(1,2).reshape({B*T,nh,1,hd}).contiguous();
+                                    auto pages=cache.page_table.narrow(0,0,B).repeat_interleave(T,0).contiguous();
+                                    auto offsets=tb::arange(1-T,1,seq_len.value().options());
+                                    auto lengths=(seq_len.value().reshape({B,1})+offsets).reshape({B*T}).contiguous();
+                                    auto outputs=tb::empty({B*T*nh,parts,hd},decode_partial_o.options());
+                                    auto maxima=tb::empty({B*T*nh,parts},decode_partial_m.options());
+                                    auto sums=tb::empty_like(maxima);
+                                    a=attention_paged_cache_decode_cuda(std::move(query),cache.k_chunk_ptrs,
+                                        cache.v_chunk_ptrs,std::move(pages),std::move(lengths),attn_scale,cache.page_size,
+                                        cache.pages_per_chunk,cache.paged_heads,std::move(outputs),std::move(maxima),
+                                        std::move(sums),parts,dynamic_parts).reshape({B,T,nh,hd}).transpose(1,2);
+                                }
                             } else if (aten_decode_enabled) {
                                 const int64_t visible_len =
                                     sliding ? std::min<int64_t>(attention_window, cache_pos + T)
@@ -897,6 +924,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         },
         [&](mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor oo) {
             if (cache_only) return mfq_tensor_backend::Tensor{};
+            if (attention_only) return oo.reshape({B, T, H});
             return forward_ffn(execution, std::move(residual), std::move(oo), B, T, H);
         });
 }

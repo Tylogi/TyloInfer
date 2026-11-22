@@ -26,7 +26,7 @@ __global__ void gdn_replay_state_kernel(
     const float* __restrict__ initial_conv, float* __restrict__ next_conv,
     const float* __restrict__ qkv, int64_t qkv_batch_stride, int64_t qkv_token_stride,
     int key_heads, int value_heads, int tokens, int history, int channels,
-    int state_blocks, int64_t convolution_elements) {
+    int state_blocks, int64_t convolution_elements,const int64_t* retained_by_sequence) {
     constexpr int COLUMNS = 2, ROWS = D / 32, WARPS = 4;
     if (blockIdx.x >= state_blocks) {
         const int64_t index = int64_t(blockIdx.x - state_blocks) * blockDim.x + threadIdx.x;
@@ -34,7 +34,7 @@ __global__ void gdn_replay_state_kernel(
             const int channel = index % channels;
             const int row = (index / channels) % history;
             const int batch = index / (int64_t(history) * channels);
-            const int source_row = row + tokens;
+            const int source_row = row + (retained_by_sequence ? int(retained_by_sequence[batch]) : tokens);
             next_conv[index] = source_row < history ?
                 initial_conv[(int64_t(batch) * history + source_row) * channels + channel] :
                 qkv[int64_t(batch) * qkv_batch_stride +
@@ -64,7 +64,8 @@ __global__ void gdn_replay_state_kernel(
             state[c][r] = initial_state[state_offset + index];
         }
     }
-    for (int token = 0; token < tokens; ++token) {
+    const int retained=retained_by_sequence?int(retained_by_sequence[batch]):tokens;
+    for (int token = 0; token < retained; ++token) {
         float keys_in_registers[ROWS], kv[COLUMNS] = {};
         #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
@@ -105,7 +106,7 @@ bool try_gdn_replay_state_cuda(
     const tb::Tensor& gate, const tb::Tensor& beta, const tb::Tensor& qkv,
     const tb::Tensor& initial_convolution, const tb::Tensor& initial_recurrent,
     tb::Tensor& convolution, tb::Tensor& recurrent,
-    int64_t retained_tokens, bool transposed, bool tiled_heads) {
+    int64_t retained_tokens, bool transposed, bool tiled_heads,const tb::Tensor& retained_by_sequence) {
     const auto real = [](const tb::Tensor& tensor) {
         return tensor.defined() && tensor.is_cuda() && tensor.scalar_type() == tb::kFloat32;
     };
@@ -130,6 +131,10 @@ bool try_gdn_replay_state_cuda(
         initial_convolution.size(2) != qkv.size(2) ||
         initial_recurrent.sizes().vec() != std::vector<int64_t>{B,Hv,D,D}) return false;
     const int device = key.get_device();
+    if (retained_by_sequence.defined() && (!retained_by_sequence.is_cuda() ||
+        retained_by_sequence.get_device()!=device || retained_by_sequence.scalar_type()!=tb::kInt64 ||
+        !retained_by_sequence.is_contiguous() || retained_by_sequence.dim()!=1 || retained_by_sequence.size(0)!=B))
+        return false;
     const tb::Tensor* operands[] = {&value,&gate,&beta,&qkv,&initial_convolution,&initial_recurrent,&convolution,&recurrent};
     for (const auto* tensor : operands)
         if (tensor->get_device() != device) return false;
@@ -145,7 +150,8 @@ bool try_gdn_replay_state_cuda(
                 initial_recurrent.data_ptr<float>(),recurrent.data_ptr<float>(),
                 initial_convolution.data_ptr<float>(),convolution.data_ptr<float>(),qkv.data_ptr<float>(),
                 qkv.stride(0),qkv.stride(1),Hq,Hv,retained_tokens,convolution.size(1),qkv.size(2),
-                state_blocks,conv_elements);
+                state_blocks,conv_elements,retained_by_sequence.defined()?
+                    retained_by_sequence.data_ptr<int64_t>():nullptr);
     };
     const auto with_width = [&](auto width) {
         if (transposed) {

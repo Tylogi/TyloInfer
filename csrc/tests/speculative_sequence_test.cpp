@@ -1070,6 +1070,27 @@ void run_parked_blockwise_history() {
     }
 }
 
+void run_streamed_batch_depth_probe() {
+    using Policy=mtp::v1::BatchDepthPolicy;
+    auto now=Policy::Clock::time_point{};
+    Policy policy({"first","second"},3,0,true,true);
+    const auto observe=[&](int expected,int milliseconds) {
+        const auto depth=policy.depth();
+        if (depth!=expected) throw std::runtime_error("Unexpected streamed batch probe width");
+        const auto started=now;
+        now+=std::chrono::milliseconds(milliseconds);
+        const std::array<int,2> full{depth,depth};
+        policy.observe(depth,full,started,now,true,false);
+    };
+    for (int i=0;i<5;++i) observe(0,10);
+    for (int i=0;i<3;++i) observe(1,40);
+    if (policy.parks()!=1 || policy.cost(2) || policy.cost(3))
+        throw std::runtime_error("Losing streamed batch initialized extra widths before parking");
+    for (int i=0;i<128;++i) observe(0,10);
+    if (policy.depth()!=2)
+        throw std::runtime_error("Streamed batch did not rotate its next probe after cooling down");
+}
+
 void run_queued_greedy_chain() {
     struct QueuedOps:Ops {
         int* calls;bool available,accept_all,probability;int depth;
@@ -1239,6 +1260,7 @@ int main() try {
     run_bounded_blockwise_prompt();
     run_blockwise_greedy_hook();run_blockwise_final_context();
     run_parked_blockwise_history();
+    run_streamed_batch_depth_probe();
     run(false);
     run(false,true);
     run(false,true,true);

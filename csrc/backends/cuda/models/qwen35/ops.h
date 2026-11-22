@@ -6,6 +6,7 @@
 #include "models/qwen35/config.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -52,6 +53,7 @@ struct Qwen35Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
     mfq::models::qwen35::Config config;
     std::shared_ptr<Qwen35HiddenCapture> hidden_capture;
+    std::map<std::pair<int,int>, const Block*> loop_weight_sources;
 
     void adapter_begin_forward(bool capture_raw_hidden);
     void adapter_capture_hidden(const mfq_tensor_backend::Tensor& hidden);

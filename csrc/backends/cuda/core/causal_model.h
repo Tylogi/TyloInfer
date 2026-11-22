@@ -50,6 +50,12 @@ template <class Backend> struct TtsCausalLm;
 namespace mfq::models::nemotron_h {
 template <class Backend> struct CausalLm;
 }
+namespace mfq::models::inkling2 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::hy4_flash {
+template <class Backend> struct CausalLm;
+}
 
 namespace mfq::cuda {
 
@@ -116,6 +122,8 @@ struct Qwen4Model;
 struct DeepseekV4Model;
 struct DeepseekV41Model;
 struct NemotronHModel;
+struct InklingModel;
+struct Hy4Model;
 
 template <typename Model> struct CudaCausalOps;
 template <typename Model>
@@ -227,6 +235,8 @@ template <typename Model> struct CudaCausalOps : Model {
               primary(model.execution->layer_placement.primary_device()) {}
         int primary;
         Tensor pos, full_positions, cache_positions, cpu_ids, cpu_pos, cpu_cache_positions;
+        Tensor loop_streams;
+        Block::ResidualDepthState residual_depth;
         MfqOptional<Tensor> effective_attention_mask, cpu_attention_mask, cpu_seq_len;
 
         static int64_t size(const Tensor &value, int axis) { return value.size(axis); }
@@ -325,6 +335,9 @@ template <typename Model> struct CudaCausalOps : Model {
                     ? x.to(mfq_tensor_backend::kCPU).contiguous()
                     : tensor_to_cuda_device(model.execution->model_parallel_collectives, x,
                                             b->cuda_device);
+            if (b->loop_mhc && loop_streams.defined() && loop_streams.get_device() != b->cuda_device)
+                loop_streams = tensor_to_cuda_device(model.execution->model_parallel_collectives, loop_streams,
+                                                      b->cuda_device);
             b->set_token_ids(local_ids);
             const RopeCache &active_rope =
                 b->cpu_offloaded
@@ -343,6 +356,8 @@ template <typename Model> struct CudaCausalOps : Model {
             context.decode_attention_parts = plan.attention_parts;
             context.sequence_lengths = local_seq_len;
             context.cache_positions = local_cache_positions;
+            context.loop_streams = &loop_streams;
+            context.residual_depth = &residual_depth;
             if (model.adapter_pass_attention_mask()) {
                 context.attention_mask = local_attention_mask;
             }
@@ -381,5 +396,7 @@ using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>
 using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
 using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
 using NemotronHCausalLm = mfq::models::nemotron_h::CausalLm<CudaCausalOps<NemotronHModel>>;
+using InklingCausalLm = mfq::models::inkling2::CausalLm<CudaCausalOps<InklingModel>>;
+using Hy4CausalLm = mfq::models::hy4_flash::CausalLm<CudaCausalOps<Hy4Model>>;
 
 } // namespace mfq::cuda

@@ -52,10 +52,20 @@ void test_dynamic_store() {
     auto before = store->stats();
     for (int i = 0; i < 4; ++i) require(store->read(index[i])->at(0) == i, "indexer contents changed");
     require(store->stats().reads == before.reads, "raw KV evicted higher-priority indexer keys");
-    for (int i = 4; i < 12; ++i) index.push_back(store->write(std::vector<std::uint8_t>(4096, i), 2));
+    index.push_back(store->write(std::vector<std::uint8_t>(4096, 4), 2));
+    store->flush();
+    for (int i = 0; i < 2; ++i) store->read(raw[i]);
+    const auto history_reads = store->stats().reads;
+    for (int i = 0; i < 2; ++i) require(store->read(raw[i])->at(0) == i + 10, "history block changed");
+    require(store->stats().reads == history_reads, "a large index evicted the active history working set");
+    for (int i = 5; i < 12; ++i) index.push_back(store->write(std::vector<std::uint8_t>(4096, i), 2));
     store->flush();
     require(store->stats().hot_bytes <= 24576 && store->stats().disk_bytes > 8192,
         "indexer did not spill when it exceeded the budget");
+    require(store->read(raw.front())->at(0) == 10, "spilled latent KV cannot be read back");
+    const auto raw_read = store->stats().reads;
+    require(store->read(raw.front())->at(0) == 10 && store->stats().reads == raw_read,
+        "an oversized index evicted the most recently used latent KV");
     for (int i = 0; i < 12; ++i) require(store->read(index[i])->at(0) == i, "spilled indexer cannot be read back");
 }
 
@@ -81,6 +91,46 @@ void test_snapshot_rollback() {
     require(std::equal(read.begin(), read.begin() + 997 * 32, original.begin()), "unaligned snapshot prefix changed");
     sequence.restore(snapshot);
     require(sequence.position() == 1000, "snapshot restore changed position");
+}
+
+void test_hy4_index_prefix() {
+    using Codec = MlxPagedSessionCodec<MlxHy4TextSessionState>;
+    constexpr std::size_t block_size = 5;
+    for (const auto kv_dtype : {float16, uint32}) {
+        const auto key_dtype = kv_dtype == uint32 ? float16 : float32;
+        MlxHy4TextSessionState state;
+        state.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        state.group_size = 4;
+        state.window = 8;
+        state.last_hidden = values({1, 1, 4}, 5);
+        state.last_logits = values({1, 1, 16}, 3, float32);
+        state.layers.resize(1);
+        auto& layer = state.layers.front();
+        layer.latent.resident = reshape(arange(44, kv_dtype), {1, 11, 4});
+        layer.groups.resident = values({1, 2, 4}, 117, key_dtype);
+        layer.index_tail = values({1, 3, 8}, 61, float32);
+        layer.last_indices = reshape(arange(11, int32), {1, 1, 11});
+        std::vector<MlxPagedPayload> pages;
+        for (std::size_t block = 0; block * block_size < state.tokens.size(); ++block)
+            pages.push_back(Codec::encode_block(state, block_size, block));
+        const auto resident = Codec::decode(pages, state.tokens, block_size);
+        const auto& keys = resident.layers.front().groups.resident;
+        require(keys && keys->dtype() == key_dtype && all(*keys == *layer.groups.resident).item<bool>(),
+            "Hy4 prefix lost resident pooled index rows");
+
+        QsaKvStoreConfig config;
+        config.budget_bytes = 32768;
+        config.buffer_bytes = 8192;
+        auto store = std::make_shared<QsaKvStore>(config);
+        mlx_set_qsa_kv_offload_store(store);
+        const auto offloaded = Codec::decode(pages, state.tokens, block_size);
+        mlx_set_qsa_kv_offload_store({});
+        const auto& rows = offloaded.layers.front().groups.offloaded;
+        require(rows && rows->dtype == key_dtype, "Hy4 prefix changed the offloaded index dtype");
+        MlxQsaIndexOffload index(store, 4, key_dtype, kMlxQsaIndexPriority);
+        index.restore(*rows);
+        require(all(index.view(0, 2) == *layer.groups.resident).item<bool>(), "Hy4 prefix lost offloaded index rows");
+    }
 }
 
 void test_store_telemetry() {
@@ -178,22 +228,90 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     auto store = std::make_shared<QsaKvStore>(config);
     MlxQsaIndexOffload cache(store, 32, float32, 2);
     auto keys = values({1, 1024, 32}, 43, float32);
-    auto query = values({1, 6, 4, 32}, 29);
+    constexpr int rows = 17, offset = 4096 - rows;
+    auto query = values({1, rows, 4, 32}, 29);
     cache.append(keys);
+    const auto full_view = cache.try_view();
+    require(bool(full_view) == (keys.nbytes() <= buffer / 2), "offloaded index view exceeded the read buffer");
     require(budget > 32768 ? store->stats().disk_bytes == 0 : store->stats().disk_bytes > 0,
         "indexer residency does not match its byte budget");
-    auto selected = cache.select(query, 4090, 4, 128);
+    require(all(cache.view(0, 32) == slice(keys, {0, 0, 0}, {1, 32, 32})).item<bool>(),
+        "batched offloaded index read differs from resident keys");
+    if (full_view)
+        require(all(cache.view(15, 38) == slice(keys, {0, 15, 0}, {1, 53, 32})).item<bool>(),
+            "batched offloaded index read lost its partial boundaries");
+    const array gathered_ids({101, 102, 103, -1, 302, 16, 15, 16}, Shape{1, 2, 4}, int32);
+    const auto gathered = cache.gather(gathered_ids);
+    const auto gathered_reference = take(keys, maximum(gathered_ids, array(0, int32)), 1);
+    const auto visible_rows = expand_dims(gathered_ids >= array(0, int32), -1);
+    require(all(gathered == where(visible_rows,
+        reshape(gathered_reference, gathered.shape()), array(0.0f))).item<bool>(),
+        "offloaded row gather differs from resident rows or exposes masked rows");
+    const array overlap({101, 102, -1, 102, 302, -1, 16, 101, 103, 16, 102, 103}, Shape{1, 4, 3}, int32);
+    const auto staged = cache.gather_union(overlap);
+    const array union_ids({16, 101, 102, 103, 302}, int32);
+    require(staged && !staged->remapped && all(staged->rows == take(keys, union_ids, 1)).item<bool>() &&
+        all(staged->selection == array({false, true, true, false, false, false, false, true, false, true,
+            true, true, false, true, false, true, false, true, true, false}, Shape{1, 1, 4, 5}, bool_)).item<bool>(),
+        "offloaded row union lost selected rows or per-query visibility");
+    const auto staged_from_view = cache.gather_union(overlap, &keys);
+    require(staged_from_view && all(staged_from_view->rows == staged->rows).item<bool>() &&
+        all(staged_from_view->selection == staged->selection).item<bool>(), "staged view changed sparse row selection");
+    const array wide({101, 15, -1, 16, 302, 302, 77, 102, -1, 0, 23, 64}, Shape{1, 4, 3}, int32);
+    require(!cache.gather_union(wide), "oversized union exceeded the dense mask limit");
+    const array wide_rows({0, 15, 16, 23, 64, 77, 101, 102, 302}, int32);
+    const array remapped_ids({6, 1, -1, 2, 8, 8, 5, 7, -1, 0, 3, 4}, Shape{1, 4, 3}, int32);
+    const array* views[] = {nullptr, &keys};
+    for (const auto* view : views) {
+        const auto remapped = cache.gather_union(wide, view, true);
+        require(remapped && remapped->remapped && all(remapped->selection == remapped_ids).item<bool>() &&
+            all(remapped->rows == take(keys, wide_rows, 1)).item<bool>(),
+            "staging lost the original query order, duplicates or masked rows");
+    }
+    auto selected = cache.select(query, offset, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});
-    auto visible = reshape(floor_divide(arange(4091, 4097, 1, int32), array(4, int32)), Shape{1, 6, 1});
+    auto visible = reshape(floor_divide(arange(offset + 1, 4097, 1, int32), array(4, int32)), Shape{1, rows, 1});
     scores = where(positions < visible, scores, array(-1e30f));
-    auto reference = sort(slice(argpartition(-scores, 31, -1), Shape{0, 0, 0}, Shape{1, 6, 32}), -1);
+    auto reference = sort(slice(argpartition(-scores, 31, -1), Shape{0, 0, 0}, Shape{1, rows, 32}), -1);
     require(all(selected == reference).item<bool>(), "streamed indexer top-k differs from full resident scores");
-    auto tied = cache.select(zeros(query.shape(), float16), 4090, 4, 128);
+    auto tied = cache.select(zeros(query.shape(), float16), offset, 4, 128);
     require(all(tied >= array(0, int32)).item<bool>() && all(tied < visible).item<bool>() &&
         all(slice(tied, Shape{0, 0, 1}, tied.shape()) >
-            slice(tied, Shape{0, 0, 0}, Shape{1, 6, 31})).item<bool>(),
+            slice(tied, Shape{0, 0, 0}, Shape{1, rows, 31})).item<bool>(),
         "tied streamed top-k selected duplicate or invisible blocks");
+
+    const auto weights = values({1, rows, 4}, 113, float32);
+    const auto weighted = cache.select(query, offset, 4, 128, weights, true);
+    const auto keys_transposed = transpose(keys, {0, 2, 1});
+    const auto dots = reshape(matmul(reshape(astype(query, float32), {1, rows * 4, 32}),
+        keys_transposed), {1, rows, 4, 1024});
+    auto weighted_scores = sum(maximum(dots, array(0.0f)) * expand_dims(weights, -1), -2);
+    const auto current_group = reshape(floor_divide(arange(offset, 4096, 1, int32),
+        array(4, int32)), {1, rows, 1});
+    weighted_scores = where(positions < current_group, weighted_scores, array(-1e30f));
+    const auto history = sort(slice(argpartition(-weighted_scores, 30, -1),
+        Shape{0, 0, 0}, Shape{1, rows, 31}), -1);
+    require(all(weighted == concatenate({history, current_group}, -1)).item<bool>(),
+        "weighted streamed index selection disagrees with the reference or duplicates the current group");
+
+    const auto reads = store->stats().reads;
+    const auto early = cache.select(query, 0, 4, 128, weights, true);
+    require(all(slice(early, Shape{0, 0, 0}, Shape{1, 4, 31}) == array(-1, int32)).item<bool>() &&
+            all(slice(early, Shape{0, 0, 31}, Shape{1, 4, 32}) == array(0, int32)).item<bool>(),
+        "weighted streamed index selected invisible history at the start of the sequence");
+    require(store->stats().reads == reads, "an unranked early prefix recalled offloaded index rows");
+
+    const auto wide_queries = values({1, 3, 16, 128}, 59);
+    const auto wide_keys = values({1, 517, 128}, 47, float32);
+    const auto wide_weights = values({1, 3, 16}, 97, float32);
+    const auto reference_scores = sum(maximum(mlx_sparse_indexer_head_scores(wide_queries, wide_keys), array(0.f)) *
+        expand_dims(wide_weights, -1), -2);
+    near(mlx_sparse_indexer_weighted_scores(wide_queries, wide_keys, wide_weights), reference_scores);
+    cache.trim(17);
+    const auto pooled = cache.try_view();
+    require(pooled && all(*pooled == slice(keys, {0, 0, 0}, {1, 17, 32})).item<bool>(),
+        "bounded offloaded index view differed from resident keys");
 }
 
 void test_quantized_attention(double bits, int queries, std::size_t buffer) {
@@ -407,6 +525,7 @@ int main(int argc, char** argv) {
         if (argc >= 2) { test_model(argv[1], argc >= 3 ? std::stoull(argv[2]) : 131072); return 0; }
         test_dynamic_store();
         test_snapshot_rollback();
+        test_hy4_index_prefix();
         test_store_telemetry();
         test_shared_resident_guard();
         test_indexer();

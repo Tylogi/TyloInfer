@@ -962,6 +962,9 @@ if (shared) {
 }
 }
 uint live = MAX_ROWS == 1 ? 1u : uint(descriptors[tile * descriptor_stride + 1u]);
+// Routes for an expert are assigned to tiles by atomics. Keep the same
+// accumulation path when one route lands in a trailing tile.
+const bool continuation = MAX_ROWS > 1 && tile > 0u && descriptors[(tile - 1u) * descriptor_stride] == int(e);
 uint row_map = 0u;
 if constexpr (SOURCE_ROWS) for (uint r = 0u; r < live; ++r)
     row_map |= (uint(slots[row0 + r]) / (params[6] & 0x7fffffffu)) << (r * 3u);
@@ -988,11 +991,11 @@ if constexpr (Q8_COLUMNS) if (live <= 2u) {
         }
     };
     if constexpr (MAX_ROWS == 1) run(integral_constant<int, 1>{});
-    else if (live == 1u) run(integral_constant<int, 1>{});
+    else if (live == 1u && !continuation) run(integral_constant<int, 1>{});
     else run(integral_constant<int, 2>{});
     return;
 }
-if (MAX_ROWS <= 8 || (live <= 2u && (tile == 0u || descriptors[(tile - 1u) * descriptor_stride] != int(e)))) {
+if (MAX_ROWS <= 8 || (live <= 2u && !continuation)) {
     auto columns = [&](auto rows) {
     const auto source = [&] {
         if constexpr (SOURCE_ROWS) return GgufColumnInput{input, row_map};
@@ -1006,9 +1009,9 @@ if (MAX_ROWS <= 8 || (live <= 2u && (tile == 0u || descriptors[(tile - 1u) * des
         gate_table, up_table, reinterpret_cast<threadgroup T*>(stages), y + ulong(row0) * n);
     };
     if constexpr (MAX_ROWS == 1) columns(integral_constant<int, 1>{});
-    else if (live == 1u) columns(integral_constant<int, 1>{});
+    else if (live == 1u && !continuation) columns(integral_constant<int, 1>{});
     else if constexpr (MAX_ROWS == 8 && !COLUMN_ONLY) {
-        if (live == 2u) columns(integral_constant<int, 2>{});
+        if (live <= 2u) columns(integral_constant<int, 2>{});
         else columns(integral_constant<int, 8>{});
     } else columns(integral_constant<int, 2>{});
     return;
@@ -1254,13 +1257,13 @@ else {
 const fast::CustomKernelFunction& weighted_down_kernel() {
     static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_down_reduce",
         {"packed", "aux", "meta", "x", "ids", "probabilities", "params"}, {"y"}, R"METAL(
-uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+uint tid = thread_index_in_threadgroup, lane = tid % COLUMNS, group = tid / COLUMNS;
 uint k = params[0], n = params[1], experts = params[2], routes = params[3], groups = params[4];
-uint column = threadgroup_position_in_grid.x * 32u + lane;
+uint column = threadgroup_position_in_grid.x * COLUMNS + lane;
 threadgroup uint table[1];
-threadgroup float partial[16 * 32];
+threadgroup float partial[16 * COLUMNS];
 float result = 0.f;
-for (uint route = sg; route < routes; route += groups) {
+for (uint route = group; route < routes; route += groups) {
     int expert = ids[route];
     float value = 0.f;
     if (expert >= 0 && uint(expert) < experts) {
@@ -1271,11 +1274,11 @@ for (uint route = sg; route < routes; route += groups) {
     }
     result += value * probabilities[route];
 }
-partial[sg * 32u + lane] = result;
+partial[tid] = result;
 threadgroup_barrier(mem_flags::mem_threadgroup);
-if (sg == 0u) {
+if (group == 0u) {
     float total = 0.f;
-    for (uint group = 0u; group < groups; ++group) total += partial[group * 32u + lane];
+    for (uint i = 0u; i < groups; ++i) total += partial[i * COLUMNS + lane];
     y[column] = T(total);
 }
 )METAL", header());
@@ -1701,13 +1704,16 @@ array MlxGgufStagedPrefill::weighted_down(const MlxGgufWeight& weight, const arr
     int groups = 1;
     while (groups < 8 && groups < ids.shape(1)) groups *= 2;
     if (weight.format_ < 144) groups = std::min(16, ids.shape(1));
-    const int threads = groups * 32;
+    // Split each SIMD group across routes to keep more threadgroups in flight.
+    const int columns = weight.format_ == 12 && weight.input_size() == 1536 && n == 1536 &&
+        ids.shape(1) == 16 && metal_apple_gpu_core_count() >= 32 ? 8 : 32;
+    const int threads = groups * columns;
     return weighted_down_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1],
         contiguous(astype(input, float16)), contiguous(reshape(astype(ids, int32), {-1})),
         contiguous(reshape(astype(probabilities, float32), {-1})),
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(weight.expert_count()), uint32_t(ids.shape(1)), uint32_t(groups)})},
-        {{1, n}}, {dtype}, {n / 32 * threads, 1, 1}, {threads, 1, 1},
-        {{"F", weight.format_}, {"T", dtype}}, std::nullopt, false, {}).front();
+        {{1, n}}, {dtype}, {n / columns * threads, 1, 1}, {threads, 1, 1},
+        {{"F", weight.format_}, {"T", dtype}, {"COLUMNS", columns}}, std::nullopt, false, {}).front();
 }
 
 bool MlxGgufStagedPrefill::prefers_weighted_down(const MlxGgufWeight& weight) noexcept {

@@ -163,6 +163,8 @@ public:
                 auto hidden=model_.adapter_prepare_hidden(model_.embed_forward(cell.ids),1,tokens);
                 model_.adapter_begin_forward(true);
                 Block::Context context;
+                Tensor loop_streams;
+                context.loop_streams=&loop_streams;
                 context.token_ids=cell.ids;context.positions=cell.positions;
                 context.full_positions=cell.positions;context.cache_positions=cell.positions;
                 context.cache_position=start;context.confirmed_prefix=confirmed;

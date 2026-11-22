@@ -87,6 +87,26 @@ __global__ void prepare_sparse_indices_kernel(
     }
 }
 
+std::pair<Tensor,Tensor> prepare_indices(const Tensor& indices,int64_t cache_length,int tile,mfq::cuda::HotKvView hot) {
+    TYLOINFER_RUNTIME_CHECK(indices.is_cuda() && indices.is_contiguous() && indices.dim()==3 &&
+        indices.scalar_type()==tb::kInt32 && indices.size(0)>0 && indices.size(1)>0 && indices.size(2)>0 &&
+        tile>0 && indices.size(2)<=std::numeric_limits<int>::max()-tile && cache_length>0 &&
+        cache_length<=std::numeric_limits<int>::max(),"invalid selected attention index geometry");
+    const int64_t source=indices.size(2);
+    const int64_t padded=(source+tile-1)/tile*tile;
+    const auto rows=indices.numel()/source;
+    TYLOINFER_RUNTIME_CHECK(rows<=std::numeric_limits<int64_t>::max()/padded,"selected attention index workspace is too large");
+    const std::vector<int64_t> shape{indices.size(0),indices.size(1),padded};
+    auto safe=tb::empty(shape,indices.options());
+    auto mask=tb::empty(shape,indices.options().dtype(tb::kFloat16));
+    const int blocks=int(std::min<int64_t>(65535,(rows*padded-1)/256+1));
+    prepare_sparse_indices_kernel<<<blocks,256,0,mfq_current_cuda_stream()>>>(indices.data_ptr<int32_t>(),
+        safe.data_ptr<int32_t>(),reinterpret_cast<half*>(mask.data_ptr<mfq_half>()),rows,int(source),int(padded),
+        int(cache_length),hot);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    return {std::move(safe),std::move(mask)};
+}
+
 // Each CTA retains the Metal kernel's eight warp partials and online-softmax
 // recurrence. The generic wide-D path stores accumulators in its output only;
 // it imposes no extra head-width limit. Published D=256/512 stay in registers.
@@ -263,34 +283,7 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         // the running kernel's key tile, including devices using 64-key MMA.
         const int index_tile=mfq_sparse_attn_mma::selection_alignment(
             use_qsa_mma?256:512,use_qsa_mma?256:512,16,q.get_device());
-        const int64_t source_count = indices.size(2);
-        TYLOINFER_RUNTIME_CHECK(
-            source_count <= std::numeric_limits<int>::max() - index_tile &&
-            key.size(2) <= std::numeric_limits<int>::max(),
-            "sparse attention exceeds 32-bit index geometry");
-        const int64_t padded_count =
-            ((source_count + index_tile - 1) / index_tile) * index_tile;
-        auto shape = indices.sizes().vec();
-        shape[2] = padded_count;
-        auto safe_indices = tb::empty(shape, indices.options());
-        auto mask = tb::empty(shape, query.options().dtype(tb::kFloat16));
-        TYLOINFER_RUNTIME_CHECK(
-            indices.size(0) <= std::numeric_limits<int64_t>::max() /
-                indices.size(1),
-            "sparse attention row count is too large");
-        const int64_t rows = indices.size(0) * indices.size(1);
-        TYLOINFER_RUNTIME_CHECK(
-            rows <= std::numeric_limits<int64_t>::max() / padded_count,
-            "sparse attention index workspace is too large");
-        const int64_t total = rows * padded_count;
-        const int blocks = static_cast<int>(std::min<int64_t>(
-            65535, std::max<int64_t>(1, (total + 255) / 256)));
-        prepare_sparse_indices_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
-            indices.data_ptr<int32_t>(), safe_indices.data_ptr<int32_t>(),
-            reinterpret_cast<half *>(mask.data_ptr<mfq_half>()), rows,
-            static_cast<int>(source_count), static_cast<int>(padded_count),
-            static_cast<int>(key.size(2)),use_qsa_mma?hot:mfq::cuda::HotKvView{});
-        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+        auto [safe_indices,mask]=prepare_indices(indices,key.size(2),index_tile,use_qsa_mma?hot:mfq::cuda::HotKvView{});
         if (use_qsa_mma) {
             if(hot.mapping)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true,true>(
                 query,key,value,safe_indices,mask,Tensor{},Tensor{},scale,

@@ -1,4 +1,5 @@
 #include "tyloinfer/gguf_model_source.h"
+#include "tyloinfer/loop_layer_plan.h"
 #include "tyloinfer/mapped_tensor_reader.h"
 #include "tyloinfer/mirrored_file_reader.h"
 #include "tyloinfer/hf_model_source.h"
@@ -219,15 +220,77 @@ json metadata_value(const gguf_context* ctx, int64_t id) {
 }
 
 std::string canonical_name(const std::string& name, const json* meta = nullptr) {
+    const json* arch = meta && meta->contains("general.architecture") ? &meta->at("general.architecture") : nullptr;
+    const bool hy4 = arch && *arch == "hy_v4_flash";
+    const bool inkling = arch && (*arch == "inkling2" || *arch == "inkling2_loop");
     if (name == "token_embd.weight") return "model.token_embedding.weight";
     if (name == "output.weight") return "model.output.weight";
     if (name == "output_norm.weight") return "model.output_norm.weight";
     if (name == "output_hc_norm.weight") return "model.mhc.pre.norm.weight";
     if (name == "output_hc_down.weight") return "model.mhc.pre.down.weight";
     if (name == "output_hc_up.weight") return "model.mhc.pre.up.weight";
+    if (inkling) {
+        if (name == "token_embd_norm.weight") return "model.token_embedding_norm.weight";
+        if (name == "output_res_query.weight") return "model.residual.output_query.weight";
+    }
+    if (hy4) {
+        if (name == "output_hc_fn.weight") return "model.mhc.pre.function";
+        if (name == "output_hc_base.weight") return "model.mhc.pre.base";
+        if (name == "output_hc_scale.weight") return "model.mhc.pre.scale";
+    }
     if (name.rfind("blk.", 0) != 0) return name;
     const auto dot = name.find('.', 4);
     if (dot == std::string::npos) return name;
+    if (inkling) {
+        static const std::map<std::string, std::string> roles{
+            {"attn_gate.weight", "attention.gate.weight"},
+            {"attn_q_clip.weight", "attention.query_clip.weight"},
+            {"attn_q_inp_norm.weight", "attention.query_input_norm.weight"},
+            {"attn_k_inp_norm.weight", "attention.key_input_norm.weight"},
+            {"attn_v_inp_norm.weight", "attention.value_input_norm.weight"},
+            {"attn_rel.weight", "attention.relative.query.weight"},
+            {"attn_rel_bias.weight", "attention.relative.bias.weight"},
+            {"attn_rel_clip.weight", "attention.relative.clip.weight"},
+            {"attn_sink_proj.weight", "attention.sink_projection.weight"},
+            {"attn_res_query.weight", "attention.residual_query.weight"},
+            {"ffn_res_query.weight", "mlp.residual_query.weight"},
+            {"attn_k_conv.weight", "attention.key_conv.weight"},
+            {"attn_v_conv.weight", "attention.value_conv.weight"},
+            {"attn_k_conv_proj.weight", "attention.key_conv_projection.weight"},
+            {"attn_v_conv_proj.weight", "attention.value_conv_projection.weight"},
+            {"attn_post_conv.weight", "attention.output_conv.weight"},
+            {"ffn_post_conv.weight", "mlp.output_conv.weight"},
+            {"exp_probs_b.bias", "mlp.router.bias"},
+            {"ffn_gate_up_exps.weight", "mlp.experts.gate_up.weight"},
+        };
+        const auto local=name.substr(dot+1);
+        const auto prefix="model.block."+name.substr(4,dot-4)+".";
+        if (const auto found = roles.find(local); found != roles.end()) return prefix+found->second;
+        if (local.rfind("loop_",0)==0) return prefix+local;
+    }
+    if (hy4) {
+        static const std::map<std::string, std::string> roles{
+            {"attn_gate.weight", "attention.gate.weight"},
+            {"attn_kv_a_mqa.weight", "attention.key_value_a.weight"},
+            {"attn_k_b.weight", "attention.key_b.weight"},
+            {"attn_v_b.weight", "attention.value_b.weight"},
+            {"post_attention_norm.weight", "attention.output_norm.weight"},
+            {"post_ffw_norm.weight", "mlp.output_norm.weight"},
+            {"ffn_routed_down.weight", "mlp.latent.down.weight"},
+            {"ffn_routed_up.weight", "mlp.latent.up.weight"},
+            {"indexer_compressor_ape.weight", "attention.indexer.pool.position_bias"},
+            {"indexer_compressor_gate.weight", "attention.indexer.pool.gate.weight"},
+            {"indexer_compressor_value.weight", "attention.indexer.pool.value.weight"},
+            {"indexer_compressor_norm.weight", "attention.indexer.pool.norm.weight"},
+            {"engram_gate.weight", "associative_memory.gate.weight"},
+            {"engram_hc_scale.weight", "associative_memory.hc_scale.weight"},
+            {"engram_lookup_norm.weight", "associative_memory.lookup_norm.weight"},
+            {"engram_kv_b.weight", "associative_memory.projection.bias"},
+            {"engram_pre_gamma.weight", "associative_memory.output_norm.weight"},
+        };
+        const auto found = roles.find(name.substr(dot + 1));
+        if (found != roles.end()) return "model.block." + name.substr(4, dot - 4) + "." + found->second;
+    }
     static const std::map<std::string, std::string> names{
         {"attn_norm.weight", "attention.norm.weight"},
         {"attn_q.weight", "attention.query.weight"},
@@ -291,9 +354,11 @@ std::string canonical_name(const std::string& name, const json* meta = nullptr) 
         {"indexer.attn_k.weight", "attention.indexer.key.weight"},
         {"indexer.proj.weight", "attention.indexer.score.weight"},
         {"hc_attn_fn.weight", "attention.mhc.pre.function"},
+        {"hc_attn_fn.bias", "attention.mhc.pre.bias"},
         {"hc_attn_base.weight", "attention.mhc.pre.base"},
         {"hc_attn_scale.weight", "attention.mhc.pre.scale"},
         {"hc_ffn_fn.weight", "mlp.mhc.pre.function"},
+        {"hc_ffn_fn.bias", "mlp.mhc.pre.bias"},
         {"hc_ffn_base.weight", "mlp.mhc.pre.base"},
         {"hc_ffn_scale.weight", "mlp.mhc.pre.scale"},
         {"exp_probs_b.bias", "mlp.router.bias"},
@@ -352,7 +417,7 @@ struct QwenNextn {
         if(blocks<=0 || layers>=blocks)throw std::runtime_error("invalid GGUF NextN layer count: no backbone layers");
         backbone=blocks-layers;
     }
-    std::optional<std::string> name(const std::string& stored) const {
+    std::optional<std::string> name(const std::string& stored, const json* meta = nullptr) const {
         if(stored.rfind("predictor.",0)==0)return stored;
         if(!layers || stored.rfind("blk.",0)!=0)return {};
         const auto dot=stored.find('.',4);
@@ -372,7 +437,7 @@ struct QwenNextn {
             {"nextn.embed_tokens.weight","predictor.token_embedding.weight"},
             {"nextn.shared_head_head.weight","predictor.output.weight"}};
         if(const auto found=inputs.find(suffix);found!=inputs.end())return found->second;
-        const auto canonical=canonical_name(stored);
+        const auto canonical=canonical_name(stored, meta);
         const auto prefix="model.block."+std::to_string(layer)+".";
         if(canonical.rfind(prefix,0)!=0)throw std::runtime_error("unsupported Qwen GGUF nextn tensor: "+stored);
         return "predictor.block."+std::to_string(layer-backbone)+"."+canonical.substr(prefix.size());
@@ -402,6 +467,19 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         const auto it = meta.find(key(suffix));
         return it == meta.end() ? fallback : *it;
     };
+    const auto integer = [&](const char* suffix) {
+        const auto& value = meta.at(key(suffix));
+        if (!value.is_number_integer())
+            throw std::runtime_error("GGUF metadata must be an integer: " + key(suffix));
+        return value.get<int64_t>();
+    };
+    const auto pattern = [&](const char* suffix, int64_t count) -> const json& {
+        const auto& values = meta.at(key(suffix));
+        if (count < 0 || !values.is_array() || values.size() != static_cast<uint64_t>(count) ||
+            !std::all_of(values.begin(), values.end(), [](const json& value) { return value.is_boolean(); }))
+            throw std::runtime_error("invalid GGUF layer pattern: " + key(suffix));
+        return values;
+    };
     json config;
     config["model_type"] = arch == "qwen35" ? "qwen3_5_text" : arch;
     for (const auto& [dst, src] : std::map<std::string, std::string>{
@@ -416,7 +494,166 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
     if (shapes.contains("model.token_embedding.weight"))
         config["vocab_size"] = shapes["model.token_embedding.weight"][0];
     config["tie_word_embeddings"] = !shapes.contains("model.output.weight");
-    if (arch == "qwen35" || arch == "qwen4exp") {
+    if (arch == "sensenova_loop" || arch == "inkling2_loop") {
+        const bool expanded = arch == "sensenova_loop";
+        const auto blocks = integer("block_count");
+        const auto predictors = expanded ? number("nextn_predict_layers", 0) : json(0);
+        if (!predictors.is_number_integer() || predictors.get<int64_t>() < 0 ||
+            predictors.get<int64_t>() >= blocks)
+            throw std::runtime_error("invalid GGUF loop predictor count");
+        const auto first = integer("loop.start");
+        const auto end = integer("loop.end");
+        const auto passes = integer("loop.count");
+        const auto numbering = expanded ? LoopLayerNumbering::execution : LoopLayerNumbering::physical;
+        const LoopLayerPlan plan(blocks - predictors.get<int64_t>(), first, end, passes, numbering);
+        const auto& attention_pattern = pattern(expanded ? "attention.recurrent_layers" :
+                                                          "attention.sliding_window_pattern", blocks);
+        if (expanded) {
+            for (int64_t visit = end; visit < plan.execution_layers(); ++visit) {
+                if (attention_pattern[visit] != attention_pattern[plan.source_layer(visit)])
+                    throw std::runtime_error("GGUF loop visits use different attention types for shared weights");
+            }
+        }
+        config["num_hidden_layers"] = plan.execution_layers();
+        config["num_weight_layers"] = plan.weight_layers();
+        config["loop"] = {{"start", first}, {"end", end}, {"count", passes},
+                          {"block_numbering", expanded ? "execution" : "physical"},
+                          {"varying", number("loop.varying", false)}};
+        auto& layer_pattern = config[expanded ? "recurrent_layer_pattern" : "sliding_window_pattern"];
+        layer_pattern = attention_pattern;
+        if (expanded && predictors.get<int64_t>())
+            layer_pattern.erase(layer_pattern.begin() + plan.execution_layers(), layer_pattern.end());
+        config["mtp_num_hidden_layers"] = predictors;
+        if (expanded) {
+            const auto mhc_start = integer("mhc.start");
+            const auto mhc_end = integer("mhc.end");
+            const auto streams = integer("mhc.streams");
+            const auto iterations = integer("mhc.iterations");
+            const auto pre_scale = number("mhc.pre_scale", 1.0).get<double>();
+            const auto fixed_identity = number("mhc.fixed_identity", false);
+            const bool inside_one_section = mhc_end <= first ||
+                (mhc_start >= first && mhc_end <= end) || mhc_start >= end;
+            if (mhc_start < 0 || mhc_end <= mhc_start || mhc_end > plan.weight_layers() ||
+                !inside_one_section || streams != 2 || iterations <= 0 || iterations > 20 ||
+                !std::isfinite(pre_scale) || pre_scale <= 0 || !fixed_identity.is_boolean() ||
+                (predictors.get<int64_t>() && attention_pattern[plan.execution_layers()] == true))
+                throw std::runtime_error("invalid SenseNova GGUF mHC or predictor geometry");
+            config["loop"]["mhc"] = {{"start", mhc_start}, {"end", mhc_end}, {"streams", streams},
+                                      {"iterations", iterations}, {"pre_scale", pre_scale},
+                                      {"fixed_identity", fixed_identity}};
+        } else {
+            config["sliding_window"] = integer("attention.sliding_window");
+            config["loop"]["gate_rank"] = integer("loop.gate_rank");
+            const auto residual_block_size = integer("attn_res.block_size");
+            if (config["sliding_window"].get<int64_t>() <= 0 || config["loop"]["gate_rank"].get<int64_t>() <= 0 ||
+                residual_block_size <= 0 || first <= 0 || first % residual_block_size || end % residual_block_size ||
+                !config["loop"]["varying"].is_boolean() || (!config["loop"]["varying"].get<bool>() && passes < 2))
+                throw std::runtime_error("invalid Inkling GGUF loop or sliding-window geometry");
+            auto layers = json::array();
+            for (int64_t visit = 0; visit < plan.execution_layers(); ++visit)
+                layers.push_back(attention_pattern[plan.source_layer(visit)] == true ? "sliding_attention" : "full_attention");
+            config["layer_types"] = std::move(layers);
+            config["rotary_dim"] = 0;
+            config["loop"]["residual_block_size"] = residual_block_size;
+            config["visible_vocab_size"] = number("vocab_size_unpadded", config.value("vocab_size", int64_t{0}));
+            config["head_dim"] = integer("attention.key_length");
+            config["relative_attention"] = {{"key_dim", integer("attention.relative_length")},
+                {"extent", integer("attention.relative_extent")}, {"clip", number("attention.relative_clip")},
+                {"query_key_clip", number("attention.qk_clip")}, {"log_scale_floor", integer("attention.log_scale_floor")},
+                {"log_scale_alpha", number("attention.log_scale_alpha")}};
+            config["short_convolution_width"] = integer("shortconv.l_cache");
+            config["num_experts"] = integer("expert_count");
+            config["num_experts_per_tok"] = number("expert_used_count");
+            config["moe_intermediate_size"] = number("expert_feed_forward_length");
+            config["routed_scaling_factor"] = number("expert_weights_scale");
+            config["situ_beta"] = number("activation.situ_beta");
+            config["situ_linear_beta"] = number("activation.situ_linear_beta");
+            config["final_logit_softcapping"] = number("final_logit_softcapping", 0.0);
+            for (const auto* name : {"num_attention_heads", "num_key_value_heads"}) {
+                const auto heads = config.value(name, json());
+                if (heads.is_array() && !heads.empty() &&
+                    std::all_of(heads.begin(), heads.end(), [&](const json& value) { return value == heads.front(); }))
+                    config[name] = heads.front();
+            }
+            int64_t convolution_elements = 0;
+            for (int64_t visit = 0; visit < plan.execution_layers(); ++visit) {
+                const auto prefix = "model.block." + std::to_string(plan.source_layer(visit)) + ".";
+                for (const auto* name : {"attention.key_conv.weight", "attention.value_conv.weight",
+                                        "attention.output_conv.weight", "mlp.output_conv.weight"}) {
+                    const auto weight = shapes.find(prefix + name);
+                    if (weight != shapes.end() && weight->size() == 2)
+                        convolution_elements += weight->at(0).get<int64_t>() * (weight->at(1).get<int64_t>() - 1);
+                }
+            }
+            config["shortconv_state_elements"] = convolution_elements;
+        }
+    }
+    if (arch == "hy_v4_flash") {
+        const auto blocks = integer("block_count");
+        const auto predictors = number("nextn_predict_layers", 0);
+        if (!predictors.is_number_integer() || predictors.get<int64_t>() < 0 ||
+            predictors.get<int64_t>() >= blocks)
+            throw std::runtime_error("invalid Hy4 GGUF predictor count");
+        const auto backbone = blocks - predictors.get<int64_t>();
+        const auto& window = pattern("attention.sliding_window_pattern", blocks);
+        const auto& sparse = pattern("attention.indexer.types", backbone);
+        const auto top_k = integer("attention.indexer.top_k");
+        const auto pool_size = integer("attention.indexer.kpool");
+        const auto keep_tail = number("attention.indexer.kpool_select_tail", false);
+        const auto index_width = integer("attention.indexer.key_length");
+        const auto rotary_width = integer("rope.dimension_count");
+        const auto sliding_window = integer("attention.sliding_window");
+        if (pool_size < 2 || top_k < pool_size || top_k % pool_size || !keep_tail.is_boolean() ||
+            (keep_tail.get<bool>() && top_k / pool_size < 2) ||
+            rotary_width < 0 || index_width <= rotary_width || sliding_window <= 0)
+            throw std::runtime_error("invalid Hy4 GGUF sliding window or IndexPool geometry");
+        auto layers = json::array();
+        for (int64_t layer = 0; layer < backbone; ++layer) {
+            if (window[layer] == true && sparse[layer] == true)
+                throw std::runtime_error("Hy4 GGUF sliding-window layer cannot own an indexer");
+            layers.push_back(window[layer] == true ? "sliding_attention" :
+                             sparse[layer] == true ? "index_pool_attention" : "full_attention");
+        }
+        config["num_hidden_layers"] = backbone;
+        config["mtp_num_hidden_layers"] = predictors;
+        config["layer_types"] = std::move(layers);
+        config["sliding_window"] = sliding_window;
+        const auto copy_if_present=[&](const char* target,const char* field) {
+            if (meta.contains(key(field))) config[target]=number(field);
+        };
+        copy_if_present("q_lora_rank","attention.q_lora_rank");
+        copy_if_present("kv_lora_rank","attention.kv_lora_rank");
+        copy_if_present("head_dim","attention.key_length_mla");
+        copy_if_present("value_head_dim","attention.value_length_mla");
+        config["rotary_dim"] = rotary_width;
+        config["sliding_rope_theta"] = number("rope.freq_base_swa");
+        copy_if_present("num_experts","expert_count");
+        config["num_experts_per_tok"] = number("expert_used_count");
+        config["moe_intermediate_size"] = number("expert_feed_forward_length");
+        config["routed_latent_size"] = number("expert_latent_length",0);
+        config["dense_layers"] = number("leading_dense_block_count",0);
+        config["routed_scaling_factor"] = number("expert_weights_scale",1.0);
+        config["routed_weight_normalization"] = number("expert_weights_norm",false);
+        config["router_activation"] = number("expert_gating_func");
+        config["swiglu_clamp_exp"] = number("swiglu_clamp_exp",0.0);
+        if (meta.contains(key("hyper_connection.count")))
+            config["hyper_connection"] = {{"streams",integer("hyper_connection.count")},
+                {"epsilon",number("hyper_connection.epsilon")},{"magnitude",number("hyper_connection.magnitude")}};
+        if (meta.contains(key("ple.layers"))) {
+            config["engram"] = {{"layers",number("ple.layers")},{"ngram_size",integer("ple.ngram_size")},
+                {"heads_per_ngram",integer("ple.heads_per_ngram")},
+                {"row_width",integer("embedding_length_per_layer_input")},
+                {"multipliers",number("ple.layer_multipliers")},{"head_offsets",number("ple.head_offsets")},
+                {"head_vocab_sizes",number("ple.head_vocab_sizes")},{"pad_token",integer("engram.pad_token_id")},
+                {"token_map",number("engram.token_map")}};
+        }
+        config["index_pool"] = {{"group_size", pool_size}, {"token_budget", top_k},
+                                 {"select_tail", keep_tail}, {"key_head_dim", index_width},
+                                 {"num_heads", integer("attention.indexer.head_count")}};
+        if (config["index_pool"]["num_heads"].get<int64_t>() <= 0)
+            throw std::runtime_error("invalid Hy4 GGUF indexer head count");
+    }
+    if (arch == "qwen35" || arch == "qwen4exp" || arch == "sensenova_loop") {
         const auto heads = config.value("num_attention_heads", int64_t{0});
         const auto hidden = config.value("hidden_size", int64_t{0});
         if (heads <= 0 || hidden <= 0) throw std::runtime_error("GGUF is missing attention geometry");
@@ -434,6 +671,22 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         config["linear_value_head_dim"] = number("ssm.state_size", 128);
         config["linear_num_key_heads"] = number("ssm.group_count", 0);
         config["linear_num_value_heads"] = number("ssm.time_step_rank", 0);
+        if (arch == "sensenova_loop") {
+            config["mtp_use_dedicated_embeddings"] = shapes.contains("predictor.token_embedding.weight");
+            config["rope_parameters"] = {
+                {"rope_type", number("rope.scaling.type", "default")},
+                {"factor", number("rope.scaling.factor", 1.0)},
+                {"original_max_position_embeddings", number("rope.scaling.original_context_length",
+                    config.value("max_position_embeddings", json(0)))},
+            };
+            if (const auto sections = number("rope.dimension_sections"); sections.is_array()) {
+                std::vector<int64_t> active;
+                for (const auto& section : sections)
+                    if (section.get<int64_t>() > 0) active.push_back(section.get<int64_t>());
+                config["rope_parameters"]["mrope_section"] = active;
+                config["rope_parameters"]["mrope_interleaved"] = true;
+            }
+        }
         if (arch == "qwen35") {
             const auto nextn = number("nextn_predict_layers", 0);
             if (!nextn.is_number_integer()) throw std::runtime_error("invalid GGUF NextN layer count");
@@ -469,7 +722,9 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         const auto count = config.value("num_hidden_layers", int64_t{0});
         for (int64_t i = 0; i < count; ++i) {
             const auto prefix = "model.block." + std::to_string(i) + ".";
-            layers.push_back(shapes.contains(prefix + "linear_attention.qkv.weight") ? "linear_attention" : "full_attention");
+            const bool recurrent = arch == "sensenova_loop" ? config.at("recurrent_layer_pattern")[i] == true :
+                shapes.contains(prefix + "linear_attention.qkv.weight");
+            layers.push_back(recurrent ? "linear_attention" : "full_attention");
         }
         config["layer_types"] = std::move(layers);
         if (arch == "qwen4exp") {
@@ -758,7 +1013,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             }
             if (!meta.contains("general.architecture")) throw std::runtime_error("GGUF has no architecture");
             impl_->arch = meta["general.architecture"].get<std::string>();
-            if(impl_->arch=="qwen35")model_nextn=QwenNextn(ctx.get());
+            if (impl_->arch == "qwen35" || impl_->arch == "sensenova_loop" || impl_->arch == "hy_v4_flash")
+                model_nextn = QwenNextn(ctx.get(), impl_->arch);
             Gguf tokenizer(gguf_init_empty(), gguf_free);
             gguf_set_kv(tokenizer.get(), ctx.get());
             auto& asset = impl_->asset_data[kTokenizerGgufAsset];
@@ -772,6 +1028,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         const bool qwen35_file=shard<model_shards?impl_->arch=="qwen35":
             architecture_key>=0 && scalar(ctx.get(),architecture_key)=="qwen35";
         const QwenNextn nextn=qwen35_file?(shard<model_shards?model_nextn:QwenNextn(ctx.get())):QwenNextn();
+        const bool sensenova_file = shard < model_shards && impl_->arch == "sensenova_loop";
+        const bool hy4_file = shard < model_shards && impl_->arch == "hy_v4_flash";
         const bool qwen35_companion=shard>=model_shards && qwen35_file && nextn.layers>0;
         const bool qwen4_companion=shard>=model_shards && architecture_key>=0 &&
             scalar(ctx.get(),architecture_key)=="qwen4exp" &&
@@ -823,6 +1081,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx.get()); ++i) {
             const auto* original = gguf_get_tensor_name(ctx.get(), i);
             const auto predictor_name=qwen4_companion?qwen4_nextn.name(original):
+                (sensenova_file || hy4_file)?model_nextn.name(original, &meta):
                 qwen35_file?nextn.name(original):std::optional<std::string>{};
             if((qwen35_companion || qwen4_companion) && !predictor_name)continue;
             const auto* tensor = ggml_get_tensor(tensors.get(), original);
@@ -834,6 +1093,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             std::vector<int64_t> shape;
             for (int d = ggml_n_dims(tensor) - 1; d >= 0; --d) shape.push_back(tensor->ne[d]);
             auto name = raw_predictor ? predictor_names.at(original) : predictor_name?*predictor_name:canonical_name(original, &meta);
+            const bool hy4_table = impl_->arch == "hy_v4_flash" && name == "per_layer_token_embd.weight";
+            if (hy4_table) name = "model.associative_memory.embedding.weight";
             if (impl_->arch == "qwen4exp") {
                 if (name == "per_layer_token_embd.weight") {
                     const auto layers = meta.at("qwen4exp.ple.layers").get<std::vector<int64_t>>();
@@ -844,8 +1105,6 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                     shape.insert(shape.begin(), 1);
             }
             if (impl_->records.count(name)) throw std::runtime_error("duplicate GGUF tensor: " + name);
-            const auto inserted=impl_->stored_names.emplace(original,name);
-            if(!inserted.second && inserted.first->second!=name)inserted.first->second.clear();
             Impl::Record record;
             record.file = file;
             record.path = impl_->paths[shard];
@@ -859,7 +1118,13 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 throw std::runtime_error("truncated GGUF tensor: " + name);
             const bool engram = impl_->arch == "deepseek41" && name.find(".associative_memory.embedding.weight") != std::string::npos;
             std::string dtype;
-            if (engram) {
+            if (hy4_table && type == GGML_TYPE_F8_E4M3) {
+                const auto width = meta.at("hy_v4_flash.embedding_length_per_layer_input").get<int64_t>();
+                if (shape.size() != 2 || width <= 0 || shape.back() != width)
+                    throw std::runtime_error("invalid Hy4 GGUF Engram row width");
+                // The table is stored without per-row scales or a dense layout header.
+                dtype = "F8_E4M3";
+            } else if (engram) {
                 if (type != GGML_TYPE_I8 || shape.size() != 2 || shape.back() != 264 ||
                     meta.value("deepseek41.engram.encoding", std::string{}) != "e4m3_e8m0_32_row264")
                     throw std::runtime_error("unsupported DeepSeek GGUF Engram row encoding");
@@ -873,7 +1138,53 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             else if (ggml_is_quantized(type)) dtype = "GGUF_" + std::string(ggml_type_name(type));
             else throw std::runtime_error("unsupported GGUF tensor type: " + std::string(ggml_type_name(type)));
             std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) { return std::toupper(c); });
-            if (!ggml_is_quantized(type) && !engram) record.prefix = dense_prefix(shape);
+            const std::string_view stored(original);
+            const auto end = stored.rfind("blk.", 0) == 0 ? stored.find('.', 4) : std::string_view::npos;
+            const auto role = end != std::string_view::npos ? stored.substr(end + 1) : std::string_view{};
+            const bool packed_qkv = role == "attn_qkv_gate.weight";
+            if (sensenova_file && !predictor_name && (packed_qkv || role == "ssm_beta_alpha.weight")) {
+                const auto hidden = meta.at("sensenova_loop.embedding_length").get<int64_t>();
+                const auto value_heads = meta.at("sensenova_loop.ssm.time_step_rank").get<int64_t>();
+                const auto key_heads = meta.at("sensenova_loop.ssm.group_count").get<int64_t>();
+                const auto state = meta.at("sensenova_loop.ssm.state_size").get<int64_t>();
+                if (hidden <= 0 || value_heads <= 0 || key_heads <= 0 || state <= 0 ||
+                    shape.size() != 2 || shape.back() != hidden || shape.front() <= 0 || shape.front() % 2 ||
+                    (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16 &&
+                     !ggml_is_quantized(type)))
+                    throw std::runtime_error("invalid SenseNova GGUF packed GDN dimensions or type");
+                const auto half_rows = shape.front() / 2;
+                const bool matches_rows = packed_qkv ? half_rows % state == 0 &&
+                    key_heads < half_rows / state && value_heads == half_rows / state - key_heads :
+                    half_rows == value_heads;
+                if (!matches_rows || hidden % ggml_blck_size(type))
+                    throw std::runtime_error("SenseNova GGUF packed GDN tensor disagrees with its metadata: " + name);
+                const int64_t second_rows = packed_qkv ? value_heads * state : value_heads;
+                const int64_t first_rows = shape.front() - second_rows;
+                const auto row_bytes = ggml_row_size(type, hidden);
+                if (!row_bytes || size % row_bytes || size / row_bytes != uint64_t(shape.front()))
+                    throw std::runtime_error("SenseNova GGUF packed GDN tensor has an invalid size: " + name);
+                const auto root = "model.block." + std::string(stored.substr(4, end - 4)) + ".linear_attention.";
+                // Publish file views in their native QKV/Z and beta/alpha row order.
+                const auto add_view = [&](const char* suffix, int64_t row_start, int64_t rows) {
+                    auto piece = record;
+                    const auto canonical = root + suffix;
+                    const std::vector<int64_t> dimensions{rows, hidden};
+                    if (impl_->records.count(canonical)) throw std::runtime_error("duplicate GGUF tensor: " + canonical);
+                    piece.offset += row_start * row_bytes;
+                    if (!ggml_is_quantized(type)) piece.prefix = dense_prefix(dimensions);
+                    piece.tensor = {canonical, dtype, dtype, dimensions, rows * row_bytes + piece.prefix.size()};
+                    shapes.emplace(canonical, dimensions);
+                    impl_->tensors.push_back(piece.tensor);
+                    impl_->records.emplace(canonical, std::move(piece));
+                };
+                add_view(packed_qkv ? "qkv.weight" : "beta.weight", 0, first_rows);
+                add_view(packed_qkv ? "gate.weight" : "alpha.weight", first_rows, second_rows);
+                continue;
+            }
+            const auto inserted=impl_->stored_names.emplace(original,name);
+            if(!inserted.second && inserted.first->second!=name)inserted.first->second.clear();
+            if (!ggml_is_quantized(type) && !engram && type != GGML_TYPE_F8_E4M3)
+                record.prefix = dense_prefix(shape);
             record.tensor = {name, dtype, dtype, shape, size + record.prefix.size()};
             if(qwen4_companion && name=="predictor.fusion.weight") {
                 const auto hidden=meta.at("qwen4exp.embedding_length").get<int64_t>();
@@ -1271,7 +1582,7 @@ const std::unordered_map<std::string, std::string>& GgufModelSource::metadata() 
 const HadamardTransforms* GgufModelSource::hadamard_transforms() const noexcept { return &impl_->hadamard; }
 
 const MfqLegacyTensorAliases& GgufModelSource::legacy_tensor_compatibility() const noexcept {
-    if(impl_->arch!="qwen35")return ModelSource::legacy_tensor_compatibility();
+    if(impl_->arch!="qwen35" && impl_->arch!="sensenova_loop")return ModelSource::legacy_tensor_compatibility();
     // Canonical names retain the original GGUF numeric/layout conventions:
     // RMS weights include their offset, A is already negative, and GDN value
     // heads are tiled. The tensor payload itself is intentionally unchanged.

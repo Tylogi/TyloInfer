@@ -87,6 +87,8 @@ enum class HybridBlockSessionStateKind {
     Recurrent,
     // The block keeps no cache state, so a checkpoint only records position.
     Stateless,
+    AttentionConvolution,
+    LatentAttention,
 };
 
 struct HybridBlockSessionState {
@@ -95,6 +97,9 @@ struct HybridBlockSessionState {
     FullBlockSessionState full_attention;
     mfq_tensor_backend::Tensor convolution_state;
     mfq_tensor_backend::Tensor recurrent_state;
+    mfq_tensor_backend::Tensor index_pool, pending_values, pending_logits;
+    int64_t group_size = 0;
+    int latent_device = -1;
 };
 
 struct Qwen4BlockSessionState {
@@ -169,6 +174,7 @@ public:
 
     void raw(const void* data, size_t size);
     void tensor(const mfq_tensor_backend::Tensor& source);
+    void tensor(const mfq_tensor_backend::Tensor& source,int device);
     CudaPagedPayload finish() &&;
 
 private:
@@ -282,6 +288,10 @@ void restore_session_prefix_tensor(
     const mfq_tensor_backend::Tensor& source,
     int64_t dimension,
     int64_t capacity);
+
+// Retain the latest visible rows in the physical slots of a smaller ring.
+mfq_tensor_backend::Tensor capture_session_ring_tensor(
+    const mfq_tensor_backend::Tensor& source,int64_t dimension,int64_t position,int64_t window);
 
 FullBlockSessionState capture_full_attention_session_state(
     const FullBlock& block,

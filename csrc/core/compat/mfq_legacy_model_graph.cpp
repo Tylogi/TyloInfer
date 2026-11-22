@@ -69,7 +69,14 @@ MfqModelGraph synthesize_legacy_model_graph(
 
     std::string family;
     std::string backbone;
-    if (starts_with(text_family, "qwen3_5") ||
+    if (stored_family == "sensenova_loop" && text_family == "sensenova_loop") {
+        family = "sensenova_loop";
+        backbone = "qwen3_5";
+    } else if (stored_family == "inkling2_loop" && text_family == "inkling2_loop") {
+        family = backbone = "inkling2_loop";
+    } else if (stored_family == "hy_v4_flash" && text_family == "hy_v4_flash") {
+        family = backbone = "hy_v4_flash";
+    } else if (starts_with(text_family, "qwen3_5") ||
         starts_with(stored_family, "qwen3_5") ||
         starts_with(stored_family, "qwen35") ||
         starts_with(stored_family, "qwen3_6") ||
@@ -174,7 +181,7 @@ MfqModelGraph synthesize_legacy_model_graph(
             std::to_string(graph.topology.text_layers) + ".eh_proj.weight";
         has_predictor = has_predictor || contains_tensor(prefix);
     }
-    if ((qwen_grid || glm_grid) && has_predictor) {
+    if ((qwen_grid || glm_grid || family == "sensenova_loop") && has_predictor) {
         graph.topology.predictor_layers = std::max<std::int64_t>(
             1, predictor_layers);
         add_optional(

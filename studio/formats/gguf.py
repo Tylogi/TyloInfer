@@ -239,6 +239,25 @@ def gguf_is_table_component(path: str | Path) -> bool:
         return True
 
 
+def gguf_dspark_tensor_count(path: Path) -> int:
+    with _metadata_stream(path) as (stream, size):
+        reader = _MetadataReader(stream, size)
+        architecture = None
+        has_rank = False
+        for _ in range(reader.fields):
+            name, kind = reader.string(keep=True), reader.integer('<I')
+            value = reader.value(kind, keep=name == b'general.architecture')
+            if name == b'general.architecture':
+                if value != b'dflash':
+                    return 0
+                architecture = value
+            elif name == b'dflash.dspark.markov_rank':
+                has_rank = True
+            if architecture and has_rank:
+                return reader.tensors
+        return 0
+
+
 def gguf_table_metadata(path: str | Path, *, include_mixed: bool = False) -> dict | None:
     with _metadata_stream(Path(path)) as (stream, size):
         reader = _MetadataReader(stream, size)

@@ -42,6 +42,8 @@ export interface ModelLoadPlanQuery {
   preallocate: boolean;
   device?: string;
   streamed_jev: boolean;
+  ssd_kv?: boolean;
+  ram_preallocated?: boolean;
 }
 
 export interface DownloadDirectoryStatus {

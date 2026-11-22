@@ -26,7 +26,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_verify_window_cuda(
     const mfq_tensor_backend::Tensor& a_log,const mfq_tensor_backend::Tensor& norm_weight,
     int key_heads,int value_heads,double convolution_eps,double norm_eps,
     bool silu_gate,bool output_half,bool transposed_state,bool tiled_heads=false,
-    bool quantize_output=false,bool position_major=false);
+    bool quantize_output=false,bool position_major=false,bool batch_journal=false);
 // Apply verification's recorded rank-one updates and convolution history in
 // one state-only launch. Exact input/output aliases are supported; partial
 // aliases and unsupported geometry return false before modifying outputs.
@@ -34,7 +34,8 @@ bool try_gdn_replay_updates_cuda(
     const mfq_tensor_backend::Tensor& qkv,const mfq_tensor_backend::Tensor& updates,
     const mfq_tensor_backend::Tensor& initial_convolution,const mfq_tensor_backend::Tensor& initial_recurrent,
     mfq_tensor_backend::Tensor& convolution,mfq_tensor_backend::Tensor& recurrent,
-    std::int64_t retained_tokens,bool transposed_state);
+    std::int64_t retained_tokens,bool transposed_state,
+    const mfq_tensor_backend::Tensor& retained_by_sequence={});
 // The descriptors and next-convolution buffers persist across windows. State
 // commits run across layers, followed by one convolution-history copy.
 void gdn_replay_commit_layers_cuda(const mfq_tensor_backend::Tensor& descriptors,

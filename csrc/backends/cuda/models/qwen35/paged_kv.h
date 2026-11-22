@@ -3,6 +3,7 @@
 #include "paged_kv_allocator.h"
 #include "batch_state.h"
 #include "core/full_block.h"
+#include "mfq_cuda_paged_kv.h"
 #include "runtime/execution_options.h"
 
 #include <cuda_runtime_api.h>
@@ -175,6 +176,34 @@ public:
 
     void detach() {
         for (auto & layer : layers_) layer.block->cache = KVCache();
+    }
+
+    void import_prefix(QwenPagedKvSequence& sequence,int64_t position,int64_t tokens) {
+        namespace tb=mfq_tensor_backend;
+        std::vector<KVCache> sources;
+        sources.reserve(layers_.size());
+        for (auto& layer:layers_) {
+            auto& cache=layer.block->cache;
+            TYLOINFER_RUNTIME_CHECK(cache.defined() && !cache.is_paged() && !cache.ring &&
+                cache.k.size(2)>=position && cache.v.size(2)>=position,
+                "paged KV restore requires a contiguous causal prefix");
+            sources.push_back(std::move(cache));
+        }
+        ensure_tokens(sequence,tokens);
+        bind({&sequence});
+        for (std::size_t i=0;i<layers_.size();++i) {
+            auto& layer=layers_[i];
+            const MfqCudaGuard guard(layer.device);
+            const auto& target=layer.block->cache;
+            const auto keys=sources[i].k.narrow(2,0,position).contiguous();
+            const auto values=sources[i].v.narrow(2,0,position).contiguous();
+            const auto at=tb::arange(position,keys.options().dtype(tb::kInt64));
+            if (target.quantization.enabled())
+                cuda_kv_write_paged(target.quantized_pages(),keys,values,at);
+            else
+                paged_kv_cache_write_cuda(target.k_chunk_ptrs,target.v_chunk_ptrs,target.page_table,keys,values,at,
+                    kPageSize,kPagesPerChunk);
+        }
     }
 
     int64_t page_size() const noexcept { return kPageSize; }
