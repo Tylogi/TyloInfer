@@ -281,12 +281,12 @@ async def model_load_plan(service: ServiceDependency, model_id: str,
     context_size: Annotated[int | None, Query(ge=512, le=2147483647)] = None,
     precision: float | None = None, preallocate: bool = True,
     device: Annotated[str | None, Query(max_length=64, pattern=r"^[A-Za-z0-9_-]+$")] = None,
-    streamed_jev: bool = True) -> ModelLoadPlan:
+    streamed_jev: bool = True, ssd_kv: bool = False, ram_preallocated: bool = True) -> ModelLoadPlan:
     if reserve not in (5, 10, 20):
         raise ServiceError(422, "invalid_memory_reserve", "Memory reserve must be 5, 10 or 20 percent")
     return await service.model_load_plan(model_id, requested=context_size, reserve=reserve,
         precision=precision, preallocate=preallocate, device_ids=[device] if device else [],
-        streamed_jev=streamed_jev)
+        streamed_jev=streamed_jev, ssd_kv=ssd_kv, ram_preallocated=ram_preallocated)
 
 
 @router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,

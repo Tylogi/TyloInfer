@@ -62,6 +62,17 @@ def test_hy4_load_plans_latent_kv_and_index_pool_separately():
     plan = plan_model_load(artifact, status, maximum=262144, requested=262144, reserve=10,
         precision=8, preallocate=True, device_id='0', streamed_jev=True)
     assert plan.usable and plan.precision == 8 and plan.precisions == [8, 6, 4, 3, 2, 16]
+    mib = 1 << 20
+    status['host_memory_available_bytes'] = 64*mib
+    status['gpu_devices'][0]['memory_available_bytes'] = 7*gib + 64*mib
+    options = dict(maximum=262144, requested=262144, reserve=10, precision=8,
+        preallocate=True, device_id='0', streamed_jev=True)
+    assert plan_model_load(artifact, status, **options).reason == 'memory_limit'
+    assert plan_model_load(artifact, status, ssd_bytes=512*mib, ram_preallocated=False, **options).usable
+    assert not plan_model_load(artifact, status, ssd_bytes=224*mib, ram_preallocated=False, **options).usable
+    status['host_memory_available_bytes'] = 4*mib
+    status['gpu_devices'][0]['memory_available_bytes'] = 7*gib + 8*mib
+    assert not plan_model_load(artifact, status, ssd_bytes=gib, **options).usable
 
 
 def test_explicit_settings_survive_context_defaults_and_legacy_requests_are_unchanged():

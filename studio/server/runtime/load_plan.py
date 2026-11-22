@@ -40,7 +40,8 @@ def _after_reserve(available: int, reserve: int) -> int:
 
 def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | None,
                     reserve: int, precision: float | None, preallocate: bool,
-                    device_id: str, streamed_jev: bool) -> ModelLoadPlan:
+                    device_id: str, streamed_jev: bool, ssd_bytes: int = 0,
+                    ram_preallocated: bool = True) -> ModelLoadPlan:
     resource = artifact.resource
     backend = status.get('backend')
     cuda = backend == 'cuda'
@@ -127,8 +128,13 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
         if cuda and kind == 'hy_v4_flash' and separate:
             index_bytes = sum(math.ceil(tokens / item.tokens_per_row) * item.bytes_per_row
                               for item in components if item.subgroup == 'indexer')
-            return (index_bytes <= max(room_gpu, room_ram)
-                    and _cache_bytes(profile, tokens, bits, contiguous=True) <= room_gpu + room_ram)
+            index_on_gpu = index_bytes <= room_gpu
+            if not index_on_gpu and index_bytes > room_ram:
+                return False
+            gpu_raw = room_gpu - index_bytes if index_on_gpu else room_gpu
+            ram_raw = (room_ram if index_on_gpu else room_ram - index_bytes) if ram_preallocated else 0
+            raw_bytes = _cache_bytes(profile, tokens, bits, contiguous=True) - index_bytes
+            return raw_bytes <= gpu_raw + ram_raw + ssd_bytes
         if fixed_qsa:
             settings = KvMemorySettings(qsa_mode={8: 'affine8', 4: 'tq4'}[bits],
                                         placement='auto_ssd')

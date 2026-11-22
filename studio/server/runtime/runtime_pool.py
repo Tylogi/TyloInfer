@@ -728,6 +728,10 @@ class RuntimePool:
                 precision=defaults.precision, preallocate=defaults.vram_preallocated,
                 device_ids=request.device_ids, streamed_jev=request.jev_weights == 'stream',
                 yarn_enabled=request.yarn_enabled,
+                ssd_kv=(request.kv_memory.placement == 'auto_ssd' if 'kv_memory' in request.model_fields_set
+                        else not defaults.automatic and defaults.ssd_kv),
+                ram_preallocated=(request.kv_memory.ram_preallocated if 'kv_memory' in request.model_fields_set
+                                  else defaults.automatic or defaults.ram_preallocated),
             )
             if not plan.usable:
                 reason = plan.reason or "memory_limit"
@@ -2770,7 +2774,8 @@ class RuntimePool:
 
     async def model_load_plan(self, artifact: DiscoveredModel, *, requested: int | None, reserve: int,
             precision: float | None, preallocate: bool, device_ids: list[str], streamed_jev: bool,
-            yarn_enabled: bool | None = None):
+            yarn_enabled: bool | None = None, ssd_kv: bool = False, ram_preallocated: bool = True):
+        from server.runtime.kv_budget import available_ssd_bytes
         from server.runtime.load_plan import plan_model_load
         maximum = self._context_limit(artifact, yarn_enabled) or self.context_policy.fallback_context_size
         if self.context_policy.max_context_size is not None and requested is None:
@@ -2778,6 +2783,7 @@ class RuntimePool:
         selection_request = ModelLoadRequest(model=artifact.resource.name, device_ids=device_ids)
         selected = self._cuda_device_ids(selection_request)
         status = await self.runtime_status()
+        ssd_bytes = 0
         if self.backend == "cuda":
             # Use physical availability even when an active worker reports its own allocator budget.
             gpu_devices = await asyncio.to_thread(gpu_memory_status)
@@ -2785,9 +2791,15 @@ class RuntimePool:
                 status["gpu_devices"] = gpu_devices
             if self.runtime_environment.get("TYLOINFER_CUDA_VRAM_LIMIT_GIB", os.environ.get("TYLOINFER_CUDA_VRAM_LIMIT_GIB")):
                 status["load_plan_vram_ceiling"] = self._cuda_device_vram_limit(selection_request)
+            if ssd_kv and artifact.resource.architecture.casefold() == "hy_v4_flash":
+                try:
+                    ssd_bytes = await asyncio.to_thread(available_ssd_bytes, self._prefix_cache_directory())
+                except ValueError:
+                    pass
         return await asyncio.to_thread(plan_model_load, artifact, status, maximum=maximum,
             requested=requested, reserve=reserve, precision=precision, preallocate=preallocate,
-            device_id=selected[0] if selected else "0", streamed_jev=streamed_jev)
+            device_id=selected[0] if selected else "0", streamed_jev=streamed_jev,
+            ssd_bytes=ssd_bytes, ram_preallocated=ram_preallocated)
 
     def resolve_context_size(self, artifact: DiscoveredModel, explicit: int | None = None,
         *, ignore_override: bool = False, yarn_enabled: bool | None = None) -> int:
