@@ -11,9 +11,10 @@
 #include "storage/weight_loader.h"
 #include "tyloinfer/hf_model_source.h"
 
-#include <cmath>
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 
@@ -45,14 +46,14 @@ struct DraftLayer {
         const auto& c=target.config.metadata;
         const auto& geometry=target.config;
         auto& execution=*target.execution;
-        const auto heads=config.heads,tokens=hidden.size(1),nope=c.head_dim-c.rotary_dim;
+        const auto batch=hidden.size(0),heads=config.heads,tokens=hidden.size(1),nope=c.head_dim-c.rotary_dim;
         const auto& rope_cache=hy4_full_rope(target);
         const auto rotate=[&](const Tensor& x) {
             return dsv4_tail_rope_cuda(x.transpose(1,2),positions,rope_cache.cos,rope_cache.sin,c.rotary_dim);
         };
         auto input=rms_norm_cuda(hidden.contiguous(),input_norm,c.rms_norm_eps);
         auto low_query=rms_norm_cuda(project(execution,query_a,input,"query A").contiguous(),query_norm,c.rms_norm_eps);
-        auto query=project(execution,query_b,low_query,"query B").to(tb::kFloat32).reshape({1,tokens,heads,c.head_dim});
+        auto query=project(execution,query_b,low_query,"query B").to(tb::kFloat32).reshape({batch,tokens,heads,c.head_dim});
         auto q_nope=query.narrow(-1,0,nope).transpose(1,2).to(key_b.scalar_type());
         if (q_nope.size(-1)!=key_b.size(1))
             throw std::invalid_argument("DFly2 MLA absorbed query width differs from the key projection");
@@ -65,12 +66,13 @@ struct DraftLayer {
 
         const auto& [history,indices]=selected_history;
         auto local=tb::arange(tokens,indices.options());
-        auto causal=tb::where(local.unsqueeze(1)>=local.unsqueeze(0),local+history.size(1),-1).unsqueeze(0);
-        auto selected=tb::cat({indices.unsqueeze(1).expand({1,tokens,indices.size(1)}),causal},2).contiguous();
+        auto causal=tb::where(local.unsqueeze(1)>=local.unsqueeze(0),local+history.size(1),-1)
+            .unsqueeze(0).expand({batch,tokens,tokens});
+        auto selected=tb::cat({indices.unsqueeze(1).expand({batch,tokens,indices.size(1)}),causal},2).contiguous();
         auto kv=tb::cat({history,suffix},1).contiguous();
         auto attended=attention_mla_latent_selected_cuda(q,kv,selected,sinks,1/std::sqrt(double(c.head_dim)));
         auto expanded=tb::matmul(attended.transpose(1,2).to(value_b.scalar_type()),value_b.transpose(1,2))
-            .transpose(1,2).reshape({1,tokens,heads*geometry.value_head_dim});
+            .transpose(1,2).reshape({batch,tokens,heads*geometry.value_head_dim});
         auto projected=project(execution,output,expanded*tb::sigmoid(project(execution,gate,input,"attention gate")),
             "attention output");
         if (output_norm.defined()) projected=rms_norm_cuda(projected.contiguous(),output_norm,c.rms_norm_eps);
@@ -177,6 +179,66 @@ public:
     } catch (const std::exception& error) {
         throw std::runtime_error("DFly2 draft block: "+std::string(error.what()));
     }
+
+    std::vector<Tensor> draft_blocks(const MtpTarget& target,std::span<const DraftLane> lanes) const override {
+        const auto* setting=std::getenv("TYLOINFER_DFLASH2_GRAPH");
+        if (lanes.size()<2 || !mfq_cuda_graph_capture_supported() || (setting && setting[0]=='0'))
+            return MtpModule::draft_blocks(target,lanes);
+        auto& model=*std::get<Hy4CausalLm*>(target.model);
+        const auto batch=int64_t(lanes.size()),requested=int64_t(lanes.front().depth)+1;
+        auto rows=requested;
+        if (batch_graph_ && batch_graph_->embeddings.size(0)==batch) {
+            const auto previous=batch_graph_->embeddings.size(1);
+            if (previous>rows && std::all_of(lanes.begin(),lanes.end(),[&](const auto& lane) {
+                return static_cast<const Dfly2&>(*lane.session).position_+previous<=model.max_position_embeddings();
+            })) rows=previous;
+        }
+        const auto stream=mfq_current_cuda_stream();
+        int64_t capacity=0;
+        std::vector<Tensor> anchors,hidden;
+        std::vector<int64_t> offsets;
+        anchors.reserve(batch);hidden.reserve(batch);offsets.reserve(batch*rows);
+        for (const auto& lane:lanes) {
+            auto& session=static_cast<Dfly2&>(*lane.session);
+            if (lane.depth+1!=requested || !session.last_hidden_.defined() ||
+                session.position_+rows>model.max_position_embeddings())
+                return MtpModule::draft_blocks(target,lanes);
+            anchors.push_back(lane.anchor);
+            hidden.push_back(session.last_hidden_);
+            for (int64_t i=0;i<rows;++i) offsets.push_back(session.position_+i);
+            capacity=std::max(capacity,session.graph_capacity(model,lane.slot));
+        }
+        const auto options=anchors.front().options();
+        auto ids=tb::cat({tb::cat(anchors,0),tb::full({batch,rows-1},weights_->config.mask_token_id,options)},1);
+        auto embeddings=target.embed(std::move(ids)).to(tb::kBFloat16);
+        auto anchor_states=tb::cat(hidden,0);
+        auto positions=tb::tensor(offsets,options.dtype(tb::kInt64)).reshape({batch,rows});
+        auto& graph=prepare_graph(batch_graph_,model,embeddings,anchor_states,positions,capacity);
+        for (size_t i=0;i<weights_->layers.size();++i) {
+            auto& [fixed_rows,fixed_indices]=graph.history[i];
+            fixed_indices.fill_(-1);
+            for (int64_t row=0;row<batch;++row) {
+                auto& session=static_cast<Dfly2&>(*lanes[row].session);
+                const auto [values,indices]=session.history_for(model,i,lanes[row].slot);
+                fixed_rows.narrow(0,row,1).narrow(1,0,values.size(1)).copy_(values);
+                fixed_indices.narrow(0,row,1).narrow(1,0,indices.size(1)).copy_(indices);
+            }
+        }
+        const bool initialized=!graph.window->valid();
+        replay_graph(graph,model,-1);
+        std::vector<Tensor> result;
+        result.reserve(batch);
+        auto binding=target;
+        for (int64_t row=0;row<batch;++row) {
+            auto& session=static_cast<Dfly2&>(*lanes[row].session);
+            binding.batch_row=lanes[row].slot;
+            session.active_target_=std::as_const(binding);
+            session.graph_initialized_|=initialized;
+            ++session.graph_replays_;
+            result.push_back(graph.output.narrow(0,row,1).narrow(1,0,requested-1));
+        }
+        return result;
+    }
     Tensor draft_next(Tensor hidden,Tensor previous) override {
         auto projected=draft_next_hidden(std::move(hidden),std::move(previous));
         return active_target_->logits(std::move(projected));
@@ -214,9 +276,9 @@ private:
     }
 
     Tensor block_hidden(Hy4CausalLm& model,Tensor embeddings,const Tensor& hidden,const Tensor& positions,
-                        const std::vector<DraftHistory>* prepared,int64_t slot) {
+                        const std::vector<DraftHistory>* prepared,int64_t slot) const {
         if (weights_->config.fusion=="slot0") {
-            auto anchor=embeddings.narrow(1,0,1);
+            auto anchor=embeddings.narrow(1,0,1).contiguous();
             auto normalized=tb::cat({rms_norm_cuda(anchor,weights_->anchor_norm,weights_->epsilon),
                 rms_norm_cuda(hidden,weights_->anchor_hidden_norm,weights_->epsilon)},-1);
             auto delta=weights_->fuse.forward(*model.execution,normalized);
@@ -242,31 +304,36 @@ private:
         return int64_t(std::bit_ceil(uint64_t(selected+weights_->config.recent_window)));
     }
 
-    Tensor graph_block(Hy4CausalLm& model,const Tensor& embeddings,const Tensor& positions,int requested,int64_t capacity,int64_t slot) {
+    Graph& prepare_graph(std::unique_ptr<Graph>& item,Hy4CausalLm& model,const Tensor& embeddings,
+                         const Tensor& hidden,const Tensor& positions,int64_t capacity) const {
         const auto stream=mfq_current_cuda_stream();
-        auto& item=graphs_[requested];
-        if (!item || item->capacity!=capacity || item->stream!=stream) {
+        if (!item || item->capacity!=capacity || item->stream!=stream || item->embeddings.sizes()!=embeddings.sizes()) {
             ResidentAllocationScope resident;
             item.reset();
             auto graph=std::make_unique<Graph>();
             graph->capacity=capacity;
             graph->stream=stream;
             graph->embeddings=tb::empty(embeddings.sizes(),embeddings.options());
-            graph->hidden=tb::empty(last_hidden_.sizes(),last_hidden_.options());
+            graph->hidden=tb::empty_like(hidden);
             graph->positions=tb::empty(positions.sizes(),positions.options());
-            const auto width=model.config.kv_rank+model.metadata.rotary_dim;
+            const auto batch=embeddings.size(0),width=model.config.kv_rank+model.metadata.rotary_dim;
             for (size_t i=0;i<weights_->layers.size();++i)
                 graph->history.emplace_back(
-                    tb::zeros({1,capacity,width},embeddings.options().dtype(tb::kFloat16)),
-                    tb::empty({1,capacity},positions.options().dtype(tb::kInt32)));
+                    tb::zeros({batch,capacity,width},embeddings.options().dtype(tb::kFloat16)),
+                    tb::empty({batch,capacity},positions.options().dtype(tb::kInt32)));
             graph->pool=GraphPoolLease::acquire(default_context(embeddings.get_device()),stream);
             graph->window=std::make_unique<DecodeWindow>(stream);
             item=std::move(graph);
         }
         auto& graph=*item;
         graph.embeddings.copy_(embeddings);
-        graph.hidden.copy_(last_hidden_);
+        graph.hidden.copy_(hidden);
         graph.positions.copy_(positions);
+        return graph;
+    }
+
+    Tensor graph_block(Hy4CausalLm& model,const Tensor& embeddings,const Tensor& positions,int requested,int64_t capacity,int64_t slot) {
+        auto& graph=prepare_graph(graphs_[requested],model,embeddings,last_hidden_,positions,capacity);
         for (size_t i=0;i<weights_->layers.size();++i) {
             const auto [rows,indices]=history_for(model,i,slot);
             auto& [fixed_rows,fixed_indices]=graph.history[i];
@@ -274,15 +341,19 @@ private:
             fixed_indices.fill_(-1);
             fixed_indices.narrow(1,0,indices.size(1)).copy_(indices);
         }
+        graph_initialized_|=!graph.window->valid();
+        replay_graph(graph,model,slot);
+        ++graph_replays_;
+        return graph.output;
+    }
+
+    void replay_graph(Graph& graph,Hy4CausalLm& model,int64_t slot) const {
         if (!graph.window->valid()) {
             graph.window->capture([&] {
                 graph.output=block_hidden(model,graph.embeddings,graph.hidden,graph.positions,&graph.history,slot);
             },[]{},[&]{graph.output={};});
-            graph_initialized_=true;
         }
         if (!graph.window->enqueue_if_device_only()) graph.window->run();
-        ++graph_replays_;
-        return graph.output;
     }
 
     bool valid_hidden(const Tensor& hidden) const {
@@ -301,6 +372,7 @@ private:
     uint64_t graph_replays_=0;
     int64_t context_horizon_=0;
     int maximum_request_depth_=1;
+    mutable std::unique_ptr<Graph> batch_graph_;
     std::array<std::unique_ptr<Graph>,mfq::engine::mtp::kMaximumBlockwiseDraftDepth+1> graphs_;
 };
 

@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 
 struct RopeCache;
 int cuda_fixed_mtp_draft_depth();
@@ -47,6 +48,13 @@ struct MtpGreedyChain {
 
 // Architecture-specific predictors implement device math and cache state only.
 struct MtpModule {
+    struct DraftLane {
+        MtpModule* session;
+        mfq_tensor_backend::Tensor anchor;
+        int64_t slot;
+        int depth;
+    };
+
     virtual ~MtpModule() = default;
     virtual std::unique_ptr<MtpModule> fork_session() const { return {}; }
     virtual void reset(int64_t batch = 1) = 0;
@@ -143,6 +151,17 @@ struct MtpModule {
         mfq_tensor_backend::Tensor,
         mfq_tensor_backend::Tensor) {
         throw std::runtime_error("this CUDA MTP predictor has no block-draft adapter");
+    }
+    virtual std::vector<mfq_tensor_backend::Tensor> draft_blocks(
+        const MtpTarget& target,std::span<const DraftLane> lanes) const {
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(lanes.size());
+        auto binding=target;
+        for (const auto& lane:lanes) {
+            binding.batch_row=lane.slot;
+            result.push_back(lane.session->draft_block(binding,lane.anchor,lane.depth));
+        }
+        return result;
     }
     virtual mfq_tensor_backend::Tensor draft_next_hidden(
         mfq_tensor_backend::Tensor,

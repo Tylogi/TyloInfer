@@ -323,6 +323,8 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         std::vector<spec::CompactDistribution> probabilities;
     };
     std::vector<Proposals> drafts(batch);
+    std::vector<MtpModule::DraftLane> draft_lanes;
+    draft_lanes.reserve(batch);
     int64_t mtp_rows=0,top_k=1;
     const auto draft_started=mfq::engine::Clock::now();
     for (const auto& request:state.active) {
@@ -340,8 +342,11 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         proposal.depth=std::min<int64_t>({cap,width-1,request->generation_limit-request->produced-1});
         if (proposal.depth<=0) continue;
         proposal.previous=tb::full({1,1},request->pending_token,options);
-        proposal.hidden=predictor.draft_block(MtpTarget(model_,lane),proposal.previous,int(proposal.depth));
+        draft_lanes.push_back({&predictor,proposal.previous,lane,int(proposal.depth)});
     }
+    auto hidden_blocks=predictor_->draft_blocks(MtpTarget(model_),draft_lanes);
+    for (std::size_t row=0;row<draft_lanes.size();++row)
+        drafts[draft_lanes[row].slot].hidden=std::move(hidden_blocks[row]);
     for (int64_t step=0;step+1<width;++step) {
         std::vector<Tensor> hidden;
         std::vector<int64_t> lanes;
