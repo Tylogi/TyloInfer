@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from server.protocol.models import ModelLoadRequest
 from server.runtime.load_context import apply_load_context
 from server.runtime.load_plan import plan_model_load
+from server.runtime.qsa_kv_policy import qsa_index_requirement
 from server.services.service import ServerService
 
 
@@ -38,6 +39,29 @@ def test_non_sparse_model_ignores_sparse_only_invalid_combination():
     assert apply_load_context(request, 'qwen3_5', 'cuda').kv_memory.ram_preallocated
     with pytest.raises(ValidationError, match='kv_ssd_required'):
         apply_load_context(request, 'qwen4_exp', 'cuda')
+
+def test_hy4_load_plans_latent_kv_and_index_pool_separately():
+    gib = 1 << 30
+    architecture = 'hy_v4_flash'
+    artifact = SimpleNamespace(resource=SimpleNamespace(complete=True, architecture=architecture,
+        estimated_resident_weight_bytes=6*gib, estimated_weight_bytes_by_role={}, structured_decisions=False),
+        routed_expert_bytes=0, source_tensors={},
+        source_config=dict(model_type=architecture, max_position_embeddings=262144, num_hidden_layers=3,
+            layer_types=['index_pool_attention', 'sliding_attention', 'full_attention'],
+            kv_lora_rank=512, rotary_dim=64, sliding_window=2048,
+            index_pool=dict(key_head_dim=128, group_size=4, token_budget=2048)))
+    request = ModelLoadRequest(model='test', context_management={'automatic': False, 'ssd_kv': True,
+        'reserve_percent': 10, 'precision': 8, 'ram_preallocated': False})
+    loaded = apply_load_context(request, architecture, 'cuda')
+    assert loaded.kv_memory.placement == 'auto_ssd' and not loaded.kv_memory.ram_preallocated
+    assert loaded.kv_quantization.enabled and loaded.kv_quantization.bits == 8
+    assert qsa_index_requirement(artifact, 8193, cuda=True) == 2049 * 130 * 2
+
+    status = dict(backend='cuda', memory_architecture='discrete', host_memory_available_bytes=4*gib,
+        gpu_devices=[dict(id='0', memory_available_bytes=8*gib)])
+    plan = plan_model_load(artifact, status, maximum=262144, requested=262144, reserve=10,
+        precision=8, preallocate=True, device_id='0', streamed_jev=True)
+    assert plan.usable and plan.precision == 8 and plan.precisions == [8, 6, 4, 3, 2, 16]
 
 
 def test_explicit_settings_survive_context_defaults_and_legacy_requests_are_unchanged():

@@ -735,21 +735,28 @@ class RuntimePool:
             saved_memory = self.context_policy.model_kv_memory.get(artifact.resource.name)
             if saved_memory is not None:
                 request = request.model_copy(update={"kv_memory": saved_memory})
-        cuda_qsa = self.backend == "cuda" and artifact.resource.architecture.casefold().startswith("qwen4_exp")
+        architecture = artifact.resource.architecture.casefold()
+        cuda_qsa = self.backend == "cuda" and architecture.startswith("qwen4_exp")
+        cuda_hy4 = self.backend == "cuda" and architecture == "hy_v4_flash"
         if request.kv_memory.allocation == "dynamic" and request.kv_memory.placement in {"ram", "auto_ssd"}:
             raise _job_error("kv_dynamic_unavailable", "Experimental dynamic KV requires VRAM or automatic without SSD")
-        if request.kv_memory != KvMemorySettings() and not cuda_qsa:
+        if request.kv_memory != KvMemorySettings() and not (cuda_qsa or cuda_hy4):
             raise _job_error("kv_memory_unsupported", "Configurable KV placement currently requires the CUDA QSA backend")
         if 'kv_quantization' not in request.model_fields_set:
             saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
             if saved_quantization is not None:
                 request = request.model_copy(update={"kv_quantization": saved_quantization})
-            elif not cuda_qsa and self.backend in {"cuda", "metal"} and artifact.resource.architecture.casefold().startswith(
-                    ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35")):
+            elif not cuda_qsa and self.backend in {"cuda", "metal"} and architecture.startswith(
+                    ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35", "sensenova_loop")):
                 request = request.model_copy(update={"kv_quantization": KvQuantizationSettings(enabled=True, bits=8)})
-        if request.kv_quantization.enabled and (self.backend not in {"cuda", "metal"} or not artifact.resource.architecture.casefold().startswith(
-            ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35"))):
-            raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
+        if request.kv_quantization.enabled:
+            if cuda_hy4:
+                if (request.kv_memory.placement == 'vram' or request.kv_memory.allocation == 'dynamic'
+                        or request.kv_quantization.bits not in {2, 3, 4, 6, 8}):
+                    raise _job_error("kv_quantization_unsupported", "Hy4 packed latent KV requires preallocated automatic or RAM placement and a whole-bit precision")
+            elif self.backend not in {"cuda", "metal"} or not architecture.startswith(
+                    ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35", "sensenova_loop")):
+                raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
         if request.yarn_enabled and (self.backend not in {"cuda", "metal"} or artifact.resource.yarn_context_capacity is None):
             raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
         resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
@@ -4890,7 +4897,8 @@ class RuntimePool:
 
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
         if (self.backend == 'cuda' and artifact.resource.format == 'gguf'
-                and RuntimePool._qsa_cache_mode(self, artifact, request) != 'legacy'):
+                and (artifact.resource.architecture.casefold() == 'hy_v4_flash'
+                     or RuntimePool._qsa_cache_mode(self, artifact, request) != 'legacy')):
             # Optional expert RAM can retreat as independent request stores
             # grow. Do not freeze the initial single-context complement into
             # a shared multi-request KV ceiling. Explicit user caps still hold.
@@ -4913,6 +4921,8 @@ class RuntimePool:
         return limit
 
     def _validate_kv_memory_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest):
+        if self.backend == 'cuda' and artifact.resource.architecture.casefold() == 'hy_v4_flash':
+            return None  # Native IndexPool validates its live cache tiers after loading weights.
         try:
             plan = RuntimePool._checkpoint_kv_budget(self, artifact, request)
             if plan.cache_mode != 'legacy':
@@ -5104,6 +5114,10 @@ class RuntimePool:
             process_environment["TYLOINFER_QSA_KV_BUDGET_BYTES"] = str(request.qsa_kv_offload.budget_bytes)
             if self.backend == "cuda":
                 ram_budget = request.qsa_kv_offload.ram_budget_bytes
+                if artifact.resource.architecture.casefold() == "hy_v4_flash":
+                    process_environment["TYLOINFER_KV_PLACEMENT"] = "auto_ssd"
+                    if ram_budget is not None:
+                        process_environment["TYLOINFER_KV_RAM_LIMIT_BYTES"] = str(ram_budget)
                 if memory_topology()["memory_architecture"] == "unified":
                     ram_budget = 0
                 elif ram_budget is None:

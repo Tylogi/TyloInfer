@@ -540,13 +540,14 @@ struct CudaEngineState {
         if constexpr (std::is_same_v<Model,Qwen35CausalLm>) {
             const auto& input=request.input;
             const auto& sampling=input.sampling;
-            if (language.config.sensenova_loop && sampling.enable_mtp && components.mtp)
-                return batching && !input.media && input.cache_plan.session_id.empty() &&
-                    !(cache.persistent_prefix_enabled() && input.prefix_cache_enabled) &&
-                    qwen_continuous_batch_cuda_graph_enabled(language,config.continuous_batch) &&
+            if (language.config.sensenova_loop) {
+                if (!batching || input.media || !input.cache_plan.session_id.empty()) return false;
+                if (!sampling.enable_mtp || !components.mtp) return true;
+                return qwen_continuous_batch_cuda_graph_enabled(language,config.continuous_batch) &&
                     (!input.chat_input || input.chat_input->template_inputs.json_schema.empty()) &&
                     sampling.presence_penalty==0 && sampling.frequency_penalty==0 && sampling.repetition_penalty==1 &&
                     (sampling.temperature==0 || (sampling.top_k>0 && sampling.top_k<=64));
+            }
         }
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
@@ -794,6 +795,12 @@ struct CudaEngineState {
         } else if constexpr (std::is_same_v<T, RuntimeMetrics>) {
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
+            constexpr bool supports_standard_kv_quantization=
+                std::is_same_v<Model,Qwen4CausalLm> || std::is_same_v<Model,Qwen35CausalLm>;
+            const auto kv_precision=[&]{
+                if constexpr (std::is_same_v<Model,Hy4CausalLm>) return double(language.cold_kv_bits());
+                else return supports_standard_kv_quantization?cuda_kv_quantization().bits:0.0;
+            }();
             Metrics metrics{
                 {"mtp_graph_prepared_depth",double(graph_draft_depth)},
                 {"mtp_flexible_expert_capacity_bytes",double(graph_expert_storage.defined()?graph_expert_storage.nbytes():0)},
@@ -802,9 +809,9 @@ struct CudaEngineState {
                 {"prefill_workspace_expert_capacity_bytes",double(workspace_expert_capacity())},
                 {"prefill_workspace_expert_used_bytes",double(workspace_expert_used())},
                 {"prefill_workspace_expert_reclaimed_used_bytes",double(workspace_expert_reclaimed_used_bytes)},
-                {"kv_memory_supported",std::is_same_v<Model,Qwen4CausalLm>?1.0:0.0},
-                {"kv_quantization_supported",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?1.0:0.0},
-                {"kv_quantization_bits",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?cuda_kv_quantization().bits:0.0},
+                {"kv_memory_supported",std::is_same_v<Model,Qwen4CausalLm> || std::is_same_v<Model,Hy4CausalLm>?1.0:0.0},
+                {"kv_quantization_supported",supports_standard_kv_quantization || std::is_same_v<Model,Hy4CausalLm>?1.0:0.0},
+                {"kv_quantization_bits",kv_precision},
                 {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
                 {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};

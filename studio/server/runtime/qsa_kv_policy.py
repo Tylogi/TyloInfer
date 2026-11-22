@@ -27,6 +27,19 @@ def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes:
     *, maximum_context: int | None = None, cuda: bool = False) -> int:
     config, has_predictor = _configuration(artifact)
     text = config.get("text_config", config)
+    if cuda and isinstance(text, dict) and text.get("model_type") == "hy_v4_flash":
+        from server.services.model_memory import cache_profile
+        profile = cache_profile(config, cuda=True)
+        if profile is None or not 512 <= context <= (maximum_context or profile.max_context):
+            raise ValueError("IndexPool target context exceeds the model capacity")
+        index = next((item for item in profile.components if item.subgroup == 'indexer'), None)
+        if index is None:
+            raise ValueError("the model has no IndexPool layers")
+        width = text['kv_lora_rank'] + text['rotary_dim']
+        staging = max(4096, min(context, text['index_pool']['token_budget']) * width * 2)
+        if budget_bytes is not None and min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < staging:
+            raise ValueError(f"IndexPool KV budget needs at least {staging * 4} bytes for selected rows")
+        return (context + index.tokens_per_row - 1) // index.tokens_per_row * index.bytes_per_row
     if not isinstance(text, dict) or text.get("model_type") not in {"qwen4_exp", "qwen4_exp_text"}:
         raise ValueError("KV offload currently supports QSA only")
 

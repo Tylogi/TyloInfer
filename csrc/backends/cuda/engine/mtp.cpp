@@ -45,6 +45,16 @@
 
 using mfq::cuda::internal::PrefillCudaTimer;
 
+int cuda_fixed_mtp_draft_depth() {
+    const auto* setting=std::getenv("TYLOINFER_MTP_FIXED_DRAFT_DEPTH");
+    if(!setting || !*setting)return 0;
+    char* end=nullptr;
+    const long depth=std::strtol(setting,&end,10);
+    if(*end || depth<1 || depth>mfq::engine::mtp::kMaximumReportedDraftDepth)
+        throw std::invalid_argument("TYLOINFER_MTP_FIXED_DRAFT_DEPTH requires a supported positive draft depth");
+    return int(depth);
+}
+
 mfq_tensor_backend::Tensor MtpTarget::embed(mfq_tensor_backend::Tensor ids) const {
     return std::visit([&](auto* target) { return target->embed_forward(std::move(ids)); }, model);
 }
@@ -203,13 +213,7 @@ template <class Model> struct CudaMtpOps {
     return mfq::engine::mtp::DraftProbabilityOptions::from_environment();
   }
   int fixed_mtp_draft_depth() const {
-    const auto* setting=std::getenv("TYLOINFER_MTP_FIXED_DRAFT_DEPTH");
-    if(!setting || !*setting)return 0;
-    char* end=nullptr;
-    const long depth=std::strtol(setting,&end,10);
-    if(*end || depth<1 || depth>mfq::engine::mtp::kMaximumReportedDraftDepth)
-      throw std::invalid_argument("TYLOINFER_MTP_FIXED_DRAFT_DEPTH requires a supported positive draft depth");
-    return int(depth);
+    return cuda_fixed_mtp_draft_depth();
   }
   bool metal_mtp_policy() const {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {

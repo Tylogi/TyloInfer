@@ -1,4 +1,5 @@
 #pragma once
+#include "mfq_cuda_paged_kv.h"
 
 void kv_quantization_case() {
     using namespace mfq::cuda;
@@ -64,6 +65,16 @@ void kv_quantization_case() {
         }
         QuantizedKvPages pages{tb::tensor(kp).to(tb::kCUDA),tb::tensor(vp).to(tb::kCUDA),table.to(tb::kCUDA),page_size,chunk_pages,kh};
         cuda_kv_write_paged(pages,pk,pv,tb::arange(length,pos.options()));
+        if (pk.size(-1)!=pv.size(-1)) {
+            auto keys=tb::empty_like(pk),values=tb::empty_like(pv);
+            paged_kv_cache_gather_cuda(pages.keys,pages.values,pages.table,keys,values,page_size,chunk_pages);
+            const auto equal_bytes=[](const Tensor& first,const Tensor& second) {
+                const auto a=first.to(tb::kCPU),b=second.to(tb::kCPU);
+                return a.nbytes()==b.nbytes() && std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes())==0;
+            };
+            if (!equal_bytes(keys,pk) || !equal_bytes(values,pv))
+                throw std::runtime_error("Paged prefix changed packed TurboQuant rows");
+        }
         auto resident=cuda_kv_attention(q,pk,pv,quant,{},pos,0,{},length,lengths,mask);
         auto paged=cuda_kv_attention(q,{},{},quant,{},pos,0,pages,length,lengths,mask);
         equal(paged,resident,"TurboQuant paged attention",1e-6,1e-6);

@@ -217,6 +217,7 @@ void StatefulCudaBatchOperations<Model,Adapter>::discard_prefill(const std::shar
 
 template<class Model,class Adapter>
 void StatefulCudaBatchOperations<Model,Adapter>::suspend_decode() {
+    speculation_.interrupt();
     if (!decode_bound_) return;
     decode_cache_=Adapter::take(model_);
     decode_bound_=false;
@@ -284,12 +285,18 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     const auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kInt64);
     const auto host=options.device(tb::kCPU).pinned_memory(true);
     const auto batch=int64_t(slots_.size());
-    auto width=verification_width_;
+    const auto cycle_start=CudaBatchSpeculation::Clock::now();
+    const auto budget=speculation_.depth(state);
+    const auto parked_before=speculation_.parked_rounds();
+    int64_t width=1,remaining=planned_length_;
     int64_t position=0;
     for (const auto& request:state.active) {
-        width=std::min(width,planned_length_-request->cache_length);
+        remaining=std::min(remaining,planned_length_-request->cache_length);
         position=std::max(position,request->cache_length);
+        if (request->eligible && request->predictor) width=std::max<int64_t>(width,1+std::min(
+            budget,std::clamp(request->sampling.mtp_max_draft_tokens,1,request->predictor->maximum_draft_depth())));
     }
+    width=std::min(width,remaining);
     if (width<1) throw std::logic_error("CUDA batch verification exceeds the model context");
     auto& graph=speculative_graphs_[width];
     if (!graph) {
@@ -378,7 +385,8 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     const auto ends=graph->metadata.narrow(0,2*batch*width,batch);
     model_.cache_pos=position;
     const auto target_started=mfq::engine::Clock::now();
-    if (!graph->window) {
+    const bool graph_ready=bool(graph->window);
+    if (!graph_ready) {
         const auto context=default_context(device);
         const auto reserve=runtime_options::workspace_reserve_bytes();
         const bool returned=has_routed_expert_cache(execution_) && context->available_memory()<reserve;
@@ -425,6 +433,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     ++graph_replays_;
     const auto candidates=rank_cuda_batch_logits(graph->logits,top_k);
     std::vector<int64_t> kept(batch);
+    std::vector<int> observed;
     int64_t decoded=0;
     const auto target_ms=std::chrono::duration<double,std::milli>(mfq::engine::Clock::now()-target_started).count();
     for (const auto& request:state.active) if (request->eligible) {
@@ -466,12 +475,21 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         stats.drafted_tokens+=proposed.tokens.size();
         stats.standard_tokens+=proposed.tokens.empty();
         for (size_t i=0;i<proposed.tokens.size();++i) ++stats.position_drafted[i];
+        observed.push_back(int(accepted));
     }
     auto lengths_kept=tb::tensor(kept,options);
     if constexpr (std::is_same_v<Model,Hy4CausalLm>) {
         hy4::retain_batch_prefix(model_,graph->journals,lengths_kept,host_positions,kept,width);
         hy4::commit_batch_engram(model_,host_ids,host_positions,kept,width);
     } else inkling::retain_batch_prefix(model_,graph->journals,lengths_kept);
+    speculation_.observe(int(width-1),observed,cycle_start,graph_ready,!state.prefilling.empty());
+    const auto parked_after=speculation_.parked_rounds();
+    const auto cycle_ms=std::chrono::duration<double,std::milli>(CudaBatchSpeculation::Clock::now()-cycle_start).count();
+    for (const auto& request:state.active) if (request->eligible && request->predictor) {
+        request->mtp_stats.measured_depth_ms[request->mtp_stats.selected_depth]+=cycle_ms;
+        request->mtp_stats.park_count+=!parked_before && parked_after;
+        request->mtp_stats.reentry_probes+=parked_before && !parked_after;
+    }
     ++speculative_batches_;
     speculative_maximum_batch_=std::max(speculative_maximum_batch_,mtp_rows);
     ++decode_steps_;
@@ -487,6 +505,7 @@ typename StatefulCudaBatchOperations<Model,Adapter>::Decoded StatefulCudaBatchOp
     restore_workspace_=false;
     if (std::any_of(state.active.begin(),state.active.end(),[](const auto& request){return request->eligible && request->predictor;}))
         return verify_speculative(state);
+    speculation_.interrupt();
     const auto batch=int64_t(slots_.size());
     auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kInt64);
     if (!metadata_.defined()) {

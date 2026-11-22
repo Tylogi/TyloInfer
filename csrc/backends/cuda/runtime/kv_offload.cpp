@@ -252,11 +252,13 @@ std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspac
         fresh->heads=heads;fresh->key_width=key_width;
         const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(dtype);
         fresh->rows=tb::zeros({rows,width},options);
-        fresh->upload=tb::empty({rows,width},options);
         fresh->host=tb::empty({rows,width},options.device(tb::kCPU).pinned_memory(true));
-        const auto fields=key_width?2*heads:1;
-        fresh->descriptors=tb::zeros({4+rows*fields*4},options.device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true));
-        fresh->device_descriptors=tb::zeros({4+rows*fields*4},options.dtype(tb::kInt64));
+        if(key_width || impl_->hot_limit()) {
+            fresh->upload=tb::empty({rows,width},options);
+            const auto fields=key_width?2*heads:1;
+            fresh->descriptors=tb::zeros({4+rows*fields*4},options.device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true));
+            fresh->device_descriptors=tb::zeros({4+rows*fields*4},options.dtype(tb::kInt64));
+        }
         workspace=std::move(fresh);
     }
     return workspace;
@@ -264,7 +266,10 @@ std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspac
 std::size_t KvOffloadStore::graph_workspace_bytes() const {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     std::size_t bytes=0;
-    for(const auto& [key,work]:impl_->gather_workspaces)bytes+=work->rows.nbytes()+work->upload.nbytes()+work->device_descriptors.nbytes();
+    for(const auto& [key,work]:impl_->gather_workspaces) {
+        bytes+=work->rows.nbytes();
+        if(work->upload.defined())bytes+=work->upload.nbytes()+work->device_descriptors.nbytes();
+    }
     return bytes;
 }
 const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
@@ -465,12 +470,13 @@ void KvOffloadSequence::gather_into(std::span<const GatherSlice> slices,const Kv
         throw std::invalid_argument("invalid fixed CUDA KV gather workspace");
     auto& impl=*store_->impl_;
     std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+    const bool host_only=!work.upload.defined();
     const auto row_bytes=std::size_t(width_)*work.rows.element_size();
     auto* host=static_cast<uint8_t*>(work.host.data_ptr());
-    auto* upload=static_cast<uint8_t*>(work.upload.data_ptr());
+    auto* upload=host_only?nullptr:static_cast<uint8_t*>(work.upload.data_ptr());
     auto* destination=static_cast<uint8_t*>(work.rows.data_ptr());
-    auto* header=work.descriptors.data_ptr<int64_t>();
-    auto* copies=reinterpret_cast<MoeMappedCopyDescriptor*>(header+4);
+    auto* header=host_only?nullptr:work.descriptors.data_ptr<int64_t>();
+    auto* copies=host_only?nullptr:reinterpret_cast<MoeMappedCopyDescriptor*>(header+4);
     std::size_t cold_bytes=0,count=0,total=0;
     std::vector<cache::QsaKvStore::ReadRequest> disk_reads;
     const auto capacity=work.rows.size(0);
@@ -500,13 +506,25 @@ void KvOffloadSequence::gather_into(std::span<const GatherSlice> slices,const Kv
                 if(!impl.ram || !block->cold)throw std::runtime_error("missing spilled KV block");
                 if (int64_t(selected.size())==block->rows) {
                     int64_t next=0;
-                    direct_read=std::all_of(selected.begin(),selected.end(),[&](const auto& item){return item.first==next++;});
+                    const auto first=selected.front().second;
+                    direct_read=std::all_of(selected.begin(),selected.end(),[&](const auto& item){
+                        const auto row=next++;
+                        return item.first==row && (!host_only || item.second==first+std::size_t(row));
+                    });
                 }
-                if (direct_read) disk_reads.push_back({block->cold,host+cold_bytes,block->bytes});
+                if (direct_read) {
+                    const auto offset=host_only?selected.front().second*row_bytes:cold_bytes;
+                    disk_reads.push_back({block->cold,host+offset,block->bytes});
+                }
                 else {payload=impl.ram->read(block->cold);source=payload->data();}
             }
             for(const auto& [row,output]:selected) {
                 const auto* input=direct_read?nullptr:source+std::size_t(row)*row_bytes;
+                if(host_only) {
+                    if(!direct_read)std::memcpy(host+output*row_bytes,input,row_bytes);
+                    cold_bytes+=row_bytes;
+                    continue;
+                }
                 if(!hot) {
                     if (!direct_read) std::memcpy(host+cold_bytes,input,row_bytes);
                     input=upload+cold_bytes;
@@ -529,12 +547,20 @@ void KvOffloadSequence::gather_into(std::span<const GatherSlice> slices,const Kv
             }
         }
     }
-    if (!count) return;
     if (!disk_reads.empty()) impl.ram->read_into_batch(disk_reads);
-    header[0]=int64_t(count);header[1]=int64_t(total);header[2]=header[3]=0;
-    const auto stream=current_stream().stream();
-    if(cold_bytes)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(upload,host,cold_bytes,cudaMemcpyHostToDevice,stream));
+    if (!count && !cold_bytes) return;
     impl.h2d_bytes+=cold_bytes;
+    const auto stream=current_stream().stream();
+    if (host_only) {
+        for (const auto& slice:slices) if (!slice.rows.empty()) {
+            const auto offset=std::size_t(slice.output_offset)*row_bytes;
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(destination+offset,host+offset,slice.rows.size()*row_bytes,
+                cudaMemcpyHostToDevice,stream));
+        }
+        return;
+    }
+    header[0]=int64_t(count);header[1]=int64_t(total);header[2]=header[3]=0;
+    if(cold_bytes)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(upload,host,cold_bytes,cudaMemcpyHostToDevice,stream));
     TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(work.device_descriptors.data_ptr(),header,(4+count*4)*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
     moe_copy_mapped(work.device_descriptors.data_ptr(),reinterpret_cast<const uint32_t*>(work.device_descriptors.data_ptr<int64_t>()+2),
         int(std::min<std::size_t>(256,(total+4095)/4096)),256,stream);

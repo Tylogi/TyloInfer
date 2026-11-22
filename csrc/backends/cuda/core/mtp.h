@@ -15,6 +15,7 @@
 #include <optional>
 
 struct RopeCache;
+int cuda_fixed_mtp_draft_depth();
 
 struct MtpTarget {
     std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,

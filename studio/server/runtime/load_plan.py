@@ -24,6 +24,12 @@ def _cache_bytes(profile, tokens: int, precision: float, *, contiguous: bool) ->
             dim = 1 << (item.head_dimension - 1).bit_length()
             words = 2 + math.ceil(dim * math.floor(precision) / 32) + math.ceil(dim * math.ceil(precision) / 32)
             width = item.layers * item.kv_heads * words * 4
+        elif precision != 16 and item.name == 'latent_kv':
+            rank = item.head_dimension
+            rotary = width // (2 * item.layers) - rank
+            words = sum(1 + math.ceil((1 << (dimension - 1).bit_length()) * precision / 32)
+                        for dimension in (rank, rotary))
+            width = item.layers * words * 4
         total += rows * width
     return total
 
@@ -47,9 +53,12 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
                  and resolve_qsa_cache_mode(artifact, KvMemorySettings(), KvQuantizationSettings(), {}) != 'legacy'
                  and getattr(artifact, 'source_cache_layout', None))
     raw = [item for item in components if item.name == 'raw_kv']
-    quantized = (backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35'))
+    quantized = (backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35', 'sensenova_loop'))
                  and raw and all(item.head_dimension and item.kv_heads and item.layers for item in raw))
-    precisions = (8, 4) if fixed_qsa else STANDARD_PRECISIONS if quantized else (16,)
+    if cuda and kind == 'hy_v4_flash':
+        precisions = (8, 6, 4, 3, 2, 16)
+    else:
+        precisions = (8, 4) if fixed_qsa else STANDARD_PRECISIONS if quantized else (16,)
     default = precisions[0]
     selected = precision if precision is not None else default
     separate = status.get('memory_architecture') == 'discrete'
@@ -115,6 +124,11 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
         device_budget = pool if gqa and not artifact.routed_expert_bytes else fixed + room_gpu
 
     def fits(tokens: int, bits: float) -> bool:
+        if cuda and kind == 'hy_v4_flash' and separate:
+            index_bytes = sum(math.ceil(tokens / item.tokens_per_row) * item.bytes_per_row
+                              for item in components if item.subgroup == 'indexer')
+            return (index_bytes <= max(room_gpu, room_ram)
+                    and _cache_bytes(profile, tokens, bits, contiguous=True) <= room_gpu + room_ram)
         if fixed_qsa:
             settings = KvMemorySettings(qsa_mode={8: 'affine8', 4: 'tq4'}[bits],
                                         placement='auto_ssd')

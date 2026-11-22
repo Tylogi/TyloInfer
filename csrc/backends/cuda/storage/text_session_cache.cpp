@@ -3,6 +3,7 @@
 #include "storage/qsa_ram_session.h"
 #include "runtime/qsa_tq_cache.h"
 #include "core/full_block.h"
+#include "mfq_cuda_paged_kv.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -1284,6 +1285,22 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
 
 FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
                                                            int64_t cache_pos, size_t &bytes) {
+    const auto& cache=block.cache;
+    if (cache.is_paged() && cache.defined() && cache.paged_batch==1 && cache_pos>0 &&
+        cache_pos<=cache.page_table.size(1)*cache.page_size) {
+        namespace tb=mfq_tensor_backend;
+        const auto quantization=cache.quantization;
+        const auto dimension=cache.paged_head_dim;
+        const auto key_width=quantization.enabled()?mfq::cuda::cuda_kv_packed_width(int(dimension),quantization.key_bits()):dimension;
+        const auto value_width=quantization.enabled()?mfq::cuda::cuda_kv_packed_width(int(dimension),quantization.value_bits()):dimension;
+        const auto options=cache.page_table.options().dtype(quantization.enabled()?tb::kInt32:cache.paged_dtype);
+        auto keys=tb::empty({1,cache.paged_heads,cache_pos,key_width},options);
+        auto values=tb::empty({1,cache.paged_heads,cache_pos,value_width},options);
+        paged_kv_cache_gather_cuda(cache.k_chunk_ptrs,cache.v_chunk_ptrs,cache.page_table,keys,values,
+            cache.page_size,cache.pages_per_chunk);
+        bytes+=session_tensor_bytes(keys)+session_tensor_bytes(values);
+        return {std::move(keys),std::move(values),cache_pos,false};
+    }
     if (!block.cache.k.defined() || !block.cache.v.defined() || block.cache.k.dim() != 4 ||
         !session_kv_geometry_matches(block.cache.k,block.cache.v) || block.cache.k.size(0) != 1) {
         throw std::runtime_error("full-attention KV cache is unavailable");

@@ -245,6 +245,43 @@ QwenBatchOperations::QwenBatchOperations(Qwen35CausalLm &model, CudaExecutionCon
 
 QwenBatchOperations::~QwenBatchOperations() = default;
 
+void QwenBatchOperations::set_prefix_cache(internal::TextSessionCache& cache) {
+    if (model_.config.sensenova_loop) prefix_cache_=&cache;
+}
+
+std::size_t QwenBatchOperations::prepare(const std::shared_ptr<Request>& request) {
+    if (predictor_ && request->sampling.enable_mtp) {
+        request->predictor=predictor_->fork_session();
+        if (!request->predictor) throw std::logic_error("Qwen batch predictor cannot create a request session");
+        request->mtp_stats.available=request->mtp_stats.used=true;
+    }
+    if (!prefix_cache_ || !prefix_cache_->persistent_prefix_enabled() || request->prompt.size()<2) {
+        request->prefix_limit=0;
+        return 0;
+    }
+    request->prefix_limit=std::min(request->prefix_limit,request->prompt.size()-1);
+    if (!request->prefix_limit) return 0;
+    const MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    const auto active=model_.cache_pos;
+    state_adapter_.suspend_decode();
+    std::size_t reused=0;
+    try {
+        auto restored=prefix_cache_->restore_best(model_,request->predictor.get(),{},request->prompt,request->prefix_limit);
+        reused=restored.tokens;
+        if (reused) {
+            state_adapter_.adopt_prefix(request->cache,reused,request->prompt.size());
+            request->predictor_hidden=std::move(restored.mtp_last_target_hidden);
+            if (reused==request->prefix_limit) request->prefix_limit=0;
+        }
+    } catch (...) {
+        state_adapter_.discard_prefill(request->cache);
+        state_adapter_.resume_decode(active);
+        throw;
+    }
+    state_adapter_.resume_decode(active);
+    return reused;
+}
+
 int64_t QwenBatchOperations::vocab_size() const { return model_.vocab_size(); }
 
 int64_t QwenBatchOperations::max_context() const { return model_.max_position_embeddings(); }
@@ -289,6 +326,7 @@ void QwenBatchOperations::initialize_sampling(Request &request, const Tensor &pr
 
 void QwenBatchOperations::suspend_decode() {
     invalidate_decode_graph();
+    speculation_.interrupt();
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     state_adapter_.suspend_decode();
 }
@@ -298,7 +336,7 @@ QwenBatchOperations::Sample QwenBatchOperations::prefill(
     const int primary = execution_.layer_placement.primary_device();
     MfqCudaGuard guard(primary);
     state_adapter_.prepare_prefill(request->cache, chunk.offset, request->prompt.size());
-    if (chunk.offset == 0) {
+    if (!request->prefill_ids.defined()) {
         request->prefill_ids =
             mfq_tensor_backend::tensor(
                 request->prompt,
@@ -308,11 +346,6 @@ QwenBatchOperations::Sample QwenBatchOperations::prefill(
                 .reshape({1, -1})
                 .contiguous();
         initialize_sampling(*request, request->prefill_ids);
-        if (predictor_ && request->sampling.enable_mtp) {
-            request->predictor=predictor_->fork_session();
-            if (!request->predictor) throw std::logic_error("Qwen batch predictor cannot create a request session");
-            request->mtp_stats.available=request->mtp_stats.used=true;
-        }
     }
     Tensor hidden;
     std::unique_ptr<PrefillCudaTimer> final_timer;
@@ -340,6 +373,19 @@ QwenBatchOperations::Sample QwenBatchOperations::prefill(
         final_timer = std::move(chunk_timer);
     }
     if (end < static_cast<int64_t>(request->prompt.size())) {
+        if (end==int64_t(request->prefix_limit)) {
+            try {
+                const std::vector<int64_t> prefix(request->prompt.begin(),request->prompt.begin()+end);
+                auto state=model_.capture_text_session_state(prefix);
+                if (request->predictor && end>1) {
+                    state.mtp=request->predictor->capture_session_state(end,request->predictor_hidden);
+                    state.bytes+=state.mtp->bytes;
+                }
+                prefix_cache_->store({},std::move(state));
+            } catch (const std::exception& error) {
+                std::cerr<<"runtime_cuda_batch_prefix_store action=skip error="<<error.what()<<'\n';
+            }
+        }
         state_adapter_.pause_prefill(request->cache);
         return {};
     }
@@ -425,13 +471,16 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
     const auto device=execution_.layer_placement.primary_device();
     const auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kInt64);
     const auto batch=int64_t(max_sequences_);
+    const auto cycle_start=CudaBatchSpeculation::Clock::now();
+    const auto budget=speculation_.depth(state);
+    const auto parked_before=speculation_.parked_rounds();
     int64_t position=0,requested=0,width=1,remaining=max_context();
     for (const auto& request:state.active) {
         position=std::max(position,request->cache_length);
         requested=std::max(requested,request->cache_length+request->generation_limit-request->produced);
         remaining=std::min(remaining,max_context()-request->cache_length);
-        if (request->eligible && request->predictor) width=std::max<int64_t>(width,1+std::clamp(
-            request->sampling.mtp_max_draft_tokens,1,request->predictor->maximum_draft_depth()));
+        if (request->eligible && request->predictor) width=std::max<int64_t>(width,1+std::min(
+            budget,std::clamp(request->sampling.mtp_max_draft_tokens,1,request->predictor->maximum_draft_depth())));
     }
     width=std::min(width,remaining);
     if (width<1) throw std::logic_error("Qwen batch verification exceeds the model context");
@@ -440,7 +489,9 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
         state_adapter_.ensure_decode_tokens(request->cache,request->cache_length+width);
     state_adapter_.prepare_decode(position);
     if (!mtp_graphs_.empty() && mtp_graphs_.begin()->first.first!=planned) mtp_graphs_.clear();
-    auto& entry=mtp_graphs_[{planned,width}];
+    const bool commit_single_row=width==1 && int64_t(state.active.size())==batch &&
+        std::all_of(state.active.begin(),state.active.end(),[](const auto& request){return request->eligible;});
+    auto& entry=mtp_graphs_[{planned,commit_single_row?0:width}];
     auto addresses=state_adapter_.decode_state_addresses();
     if (entry && entry->addresses!=addresses) entry.reset();
     if (!entry) {
@@ -523,7 +574,8 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
     auto positions=graph.metadata.narrow(0,batch*width,batch*width).reshape({batch,width});
     auto lengths=graph.metadata.narrow(0,2*batch*width,batch);
     const auto started=mfq::engine::Clock::now();
-    if (!graph.window) {
+    const bool graph_ready=bool(graph.window);
+    if (!graph_ready) {
         const auto stream=mfq_current_cuda_stream();
         graph.pool=GraphPoolLease::acquire(default_context(device),stream);
         graph.window=std::make_unique<DecodeWindow>(stream);
@@ -533,13 +585,14 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
         const auto before=state_adapter_.capture_recurrent_slots(slots);
         struct Verification {
             std::vector<qwen35::LinearAttentionBlock*> blocks;
-            explicit Verification(Qwen35CausalLm& model) {
+            Verification(Qwen35CausalLm& model,bool capture_prefix) {
+                if (!capture_prefix) return;
                 for (const auto& owned:model.blocks)
                     if (auto* block=dynamic_cast<qwen35::LinearAttentionBlock*>(owned.get())) blocks.push_back(block);
                 for (auto* block:blocks) block->batch_verification=true;
             }
             ~Verification(){for (auto* block:blocks) block->batch_verification=false;}
-        } capture(model_);
+        } capture(model_,!commit_single_row);
         bool recorded=false;
         graph.window->capture([&] {
             cudaStreamCaptureStatus status;
@@ -605,6 +658,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
         if (!replayed)
             throw std::logic_error("Qwen batch GDN verification records have incompatible geometry");
     }
+    std::vector<int> observed;
     for (const auto& request:state.active) if (request->eligible && request->predictor) {
         const auto slot=request->cache.slot();
         const auto accepted=kept[slot]-1,depth=int64_t(drafts[slot].tokens.size());
@@ -625,6 +679,15 @@ QwenBatchOperations::Decoded QwenBatchOperations::verify_mtp(State& state) {
         stats.drafted_tokens+=depth;
         stats.standard_tokens+=depth==0;
         for (int64_t i=0;i<depth;++i) ++stats.position_drafted[i];
+        observed.push_back(int(accepted));
+    }
+    speculation_.observe(int(width-1),observed,cycle_start,graph_ready,!state.prefilling.empty());
+    const auto parked_after=speculation_.parked_rounds();
+    const auto cycle_ms=std::chrono::duration<double,std::milli>(CudaBatchSpeculation::Clock::now()-cycle_start).count();
+    for (const auto& request:state.active) if (request->eligible && request->predictor) {
+        request->mtp_stats.measured_depth_ms[request->mtp_stats.selected_depth]+=cycle_ms;
+        request->mtp_stats.park_count+=!parked_before && parked_after;
+        request->mtp_stats.reentry_probes+=parked_before && !parked_after;
     }
     ++mtp_batches_;
     mtp_maximum_batch_=std::max(mtp_maximum_batch_,mtp_rows);
@@ -639,6 +702,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     if (std::any_of(state.active.begin(),state.active.end(),
             [](const auto& request){return request->eligible && request->predictor;}))
         return verify_mtp(state);
+    speculation_.interrupt();
     for (const auto &request : state.active)
         state_adapter_.ensure_decode_tokens(request->cache, request->cache_length + 1);
     int64_t max_position = 0;

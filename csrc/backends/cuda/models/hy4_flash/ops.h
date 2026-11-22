@@ -19,6 +19,7 @@ struct Hy4Model : CausalResources {
     void adapter_validate_load_options() const;
     void adapter_load_final_state(const mfq::ModelSource&,mfq_tensor_backend::Tensor&);
     void configure_kv_tiers();
+    int cold_kv_bits() const noexcept;
     bool adapter_prefetch_token_rows(Hy4CausalLm&,const mfq_tensor_backend::Tensor&);
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource&,int,int,const std::string&);
     mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor,int64_t,int64_t) const;

@@ -776,14 +776,16 @@ void Hy4Model::configure_kv_tiers() {
     const auto option=kv_memory_options();
     if (!option.ram_preallocated && option.placement!="auto_ssd")
         throw std::invalid_argument("kv_ssd_required: disabling RAM preallocation requires SSD KV");
-    size_t layers=0;
-    for (const auto& type:metadata.layer_types) layers+=type!="sliding_attention";
+    const auto layers=std::count_if(metadata.layer_types.begin(),metadata.layer_types.end(),
+        [](const auto& type){return type!="sliding_attention";});
+    const auto indexed=std::count(metadata.layer_types.begin(),metadata.layer_types.end(),"index_pool_attention");
     if (!layers) return;
     const size_t width=config.kv_rank+metadata.rotary_dim;
     const size_t context=metadata.max_position_embeddings;
     const auto kv_bytes=layers*context*width*sizeof(uint16_t);
-    const auto index_bytes=layers*(context+config.group_size-1)/config.group_size*
-        (config.index_width+2)*sizeof(int16_t);
+    const auto index_blocks=(context+config.group_size-1)/config.group_size;
+    const auto index_bytes=indexed*(index_blocks*(config.index_width+2)*sizeof(int16_t)+
+        2*config.group_size*config.index_width*sizeof(float));
     const auto sliding_rows=std::min(context,size_t(config.window)+mfq::engine::mtp::kMaximumBlockwiseDraftDepth);
     const auto sliding_bytes=(metadata.layer_types.size()-layers)*sliding_rows*width*sizeof(uint16_t);
     const auto staging=std::max(size_t(4096),size_t(config.index_budget)*width*sizeof(uint16_t));
@@ -817,13 +819,15 @@ void Hy4Model::configure_kv_tiers() {
             ?size_t(std::ceil(kv_bytes*kv_resident_fraction(context))):kv_bytes;
     if (option.gpu_budget && option.placement!="ram" && desired>available)
         throw std::invalid_argument("kv_vram_insufficient: explicit KV VRAM budget exceeds available capacity after workspace");
-    if (option.placement!="ram" && kv_bytes<=std::min(desired,available)) return;
+    const auto quantization=cuda_kv_quantization();
+    if (!std::getenv("TYLOINFER_QSA_KV_BUDGET_BYTES") &&
+        option.placement!="ram" && kv_bytes<=std::min(desired,available) &&
+        (!quantization.enabled() || option.placement=="vram")) return;
     if (option.placement=="vram")
         throw std::invalid_argument("kv_vram_insufficient: configured Hy4 KV does not fit in VRAM");
     if (option.dynamic)
         throw std::invalid_argument("kv_dynamic_unavailable: dynamic Hy4 KV requires a resident cache");
     const auto gpu=option.placement=="ram"?size_t(0):std::min(desired,available>staging?available-staging:0);
-    const auto quantization=cuda_kv_quantization();
     shared->cold_bits=quantization.key_bits();
     const auto row_bytes=std::size_t(shared->storage_width())*(shared->cold_bits?sizeof(int32_t):sizeof(uint16_t));
     const auto encoded=layers*context*row_bytes;
@@ -851,6 +855,8 @@ void Hy4Model::configure_kv_tiers() {
     if (shared->cold_bits)
         std::fprintf(stderr,"native_hy4_cold_kv bits=%d row_bytes=%zu\n",shared->cold_bits,row_bytes);
 }
+
+int Hy4Model::cold_kv_bits() const noexcept {return shared?shared->cold_bits:0;}
 
 std::unique_ptr<Block> Hy4Model::adapter_load_block(const mfq::ModelSource& source,int index,int device,
                                                   const std::string& type) {

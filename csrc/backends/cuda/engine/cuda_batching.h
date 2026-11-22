@@ -4,11 +4,13 @@
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
+#include "mtp_batch_policy_v1.h"
 #include "models/hy4_flash/batch_state.h"
 #include "models/inkling2/batch_state.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/qwen4_exp/ops.h"
+#include <bit>
 #include <map>
 #include <type_traits>
 #include <variant>
@@ -30,6 +32,47 @@ struct CudaBatchMtpState {
     int64_t first_token=0;
 };
 
+class CudaBatchSpeculation {
+public:
+    using Clock=mfq::engine::mtp::v1::BatchDepthPolicy::Clock;
+
+    template<class Request>
+    int depth(const mfq::engine::BatchState<Request>& state) {
+        if (!fixed_depth_) fixed_depth_=cuda_fixed_mtp_draft_depth();
+        std::vector<std::string> predicting;
+        std::size_t ordinary=0;
+        int64_t context=1;
+        int maximum=0;
+        for (const auto& request:state.active) if (request->eligible) {
+            context=std::max(context,request->cache_length+request->generation_limit-request->produced);
+            if (request->predictor) {
+                predicting.push_back(request->id);
+                maximum=std::max(maximum,std::clamp(request->sampling.mtp_max_draft_tokens,1,
+                    request->predictor->maximum_draft_depth()));
+            } else ++ordinary;
+        }
+        if (*fixed_depth_ || predicting.empty()) return std::min(*fixed_depth_,maximum);
+        const auto key=std::tuple{predicting.size(),ordinary,maximum,std::bit_ceil(uint64_t(context))};
+        auto& policy=policies_.try_emplace(key,std::move(predicting),maximum,ordinary).first->second;
+        if (policy_!=&policy) interrupt();
+        policy_=&policy;
+        return policy_->depth();
+    }
+
+    void observe(int depth,std::span<const int> accepted,Clock::time_point start,bool stable,bool interrupted) {
+        if (!policy_ || accepted.empty()) return;
+        policy_->observe(depth,accepted,start,Clock::now(),stable,interrupted);
+    }
+
+    void interrupt() noexcept {if (policy_) policy_->interrupt();}
+    uint64_t parked_rounds() const noexcept {return policy_?policy_->remaining():0;}
+
+private:
+    std::optional<int> fixed_depth_;
+    std::map<std::tuple<std::size_t,std::size_t,int,uint64_t>,mfq::engine::mtp::v1::BatchDepthPolicy> policies_;
+    mfq::engine::mtp::v1::BatchDepthPolicy* policy_=nullptr;
+};
+
 struct BatchLogitCandidates {
     mfq_tensor_backend::Tensor values,indices;
     int32_t best(int64_t row) const;
@@ -41,12 +84,14 @@ mfq::engine::Generation publish_cuda_batch_mtp(std::shared_ptr<mfq::engine::Batc
     mfq::engine::InferenceOutput&,std::function<void()>,std::function<bool()>,std::function<void()>);
 
 struct QwenBatchRequest : mfq::engine::BatchRequest,CudaBatchMtpState {
-    using BatchRequest::BatchRequest;
+    QwenBatchRequest(std::string id,const mfq::engine::InferenceRequest& input)
+        : BatchRequest(std::move(id),input),prefix_limit(input.cache_plan.stable_prefix_tokens) {}
     std::optional<Sampler> sampler;
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     qwen35::QwenBatchRequestState cache;
+    std::size_t prefix_limit=0;
 };
 
 // Native operations consumed directly by engine::ContinuousBatch.
@@ -71,6 +116,9 @@ class QwenBatchOperations {
     int64_t vocab_size() const;
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
+    void set_prefix_cache(internal::TextSessionCache&);
+    std::size_t prepare(const std::shared_ptr<Request>&);
+    std::size_t prefix_tokens(const std::shared_ptr<Request>& request) const {return request->prefix_limit;}
     void suspend_decode();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request> &, mfq::engine::PrefillChunk);
@@ -93,8 +141,10 @@ class QwenBatchOperations {
     Decoded verify_mtp(State&);
     struct MtpGraph;
     const Qwen35Mtp* predictor_;
+    internal::TextSessionCache* prefix_cache_=nullptr;
     std::map<std::pair<int64_t,int64_t>,std::unique_ptr<MtpGraph>> mtp_graphs_;
     int64_t mtp_batches_=0,mtp_maximum_batch_=0;
+    CudaBatchSpeculation speculation_;
 
     Qwen35CausalLm &model_;
     qwen35::Qwen35BatchStateAdapter state_adapter_;
@@ -297,6 +347,7 @@ private:
     struct SpeculativeGraph;
     std::map<int64_t,std::unique_ptr<SpeculativeGraph>> speculative_graphs_;
     int64_t speculative_batches_=0,speculative_maximum_batch_=0;
+    CudaBatchSpeculation speculation_;
 };
 
 using InklingBatchOperations=StatefulCudaBatchOperations<InklingCausalLm,InklingBatchAdapter>;
