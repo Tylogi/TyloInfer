@@ -250,7 +250,8 @@ void QwenBatchOperations::set_prefix_cache(internal::TextSessionCache& cache) {
 }
 
 std::size_t QwenBatchOperations::prepare(const std::shared_ptr<Request>& request) {
-    if (predictor_ && request->sampling.enable_mtp) {
+    if (predictor_ && request->sampling.enable_mtp && qwen_continuous_batch_cuda_graph_enabled(model_,config_) &&
+        batch_mtp_sampling_supported(request->sampling,request->token_constraint)) {
         request->predictor=predictor_->fork_session();
         if (!request->predictor) throw std::logic_error("Qwen batch predictor cannot create a request session");
         request->mtp_stats.available=request->mtp_stats.used=true;
@@ -908,9 +909,7 @@ FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;
 bool FlashNextBatchOperations::supports_mtp(const MfqSamplingParams& sampling,const MfqTokenConstraintPtr& constraint) {
-    return sampling.max_tokens>1 && (sampling.temperature<=0.0 || sampling.top_k==1) &&
-        sampling.presence_penalty==0.0 && sampling.frequency_penalty==0.0 &&
-        sampling.repetition_penalty==1.0 && !constraint;
+    return batch_mtp_sampling_supported(sampling,constraint) && (sampling.temperature<=0.0 || sampling.top_k==1);
 }
 static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure);
 std::size_t FlashNextBatchOperations::prepare(const std::shared_ptr<Request>& request) {

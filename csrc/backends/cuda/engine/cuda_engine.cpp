@@ -529,25 +529,13 @@ struct CudaEngineState {
         }
         if constexpr (std::is_same_v<Model,InklingCausalLm> || std::is_same_v<Model,Hy4CausalLm>) {
             const auto& input=request.input;
-            if (!batching || input.media || !input.cache_plan.session_id.empty()) return false;
-            if (!input.sampling.enable_mtp || !components.mtp) return true;
-            const auto& sampling=input.sampling;
-            return config.continuous_batch.cuda_graph && mfq_cuda_graph_capture_supported() &&
-                (!input.chat_input || input.chat_input->template_inputs.json_schema.empty()) &&
-                sampling.presence_penalty==0 && sampling.frequency_penalty==0 && sampling.repetition_penalty==1 &&
-                (sampling.temperature==0 || (sampling.top_k>0 && sampling.top_k<=64));
+            return batching && !input.media && input.cache_plan.session_id.empty();
         }
         if constexpr (std::is_same_v<Model,Qwen35CausalLm>) {
             const auto& input=request.input;
             const auto& sampling=input.sampling;
-            if (language.config.sensenova_loop) {
-                if (!batching || input.media || !input.cache_plan.session_id.empty()) return false;
-                if (!sampling.enable_mtp || !components.mtp) return true;
-                return qwen_continuous_batch_cuda_graph_enabled(language,config.continuous_batch) &&
-                    (!input.chat_input || input.chat_input->template_inputs.json_schema.empty()) &&
-                    sampling.presence_penalty==0 && sampling.frequency_penalty==0 && sampling.repetition_penalty==1 &&
-                    (sampling.temperature==0 || (sampling.top_k>0 && sampling.top_k<=64));
-            }
+            if (language.config.sensenova_loop)
+                return batching && !input.media && input.cache_plan.session_id.empty();
         }
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }

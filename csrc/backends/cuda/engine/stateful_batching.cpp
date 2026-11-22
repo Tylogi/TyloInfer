@@ -67,7 +67,8 @@ mfq::engine::Metrics StatefulCudaBatchOperations<Model,Adapter>::metrics() const
 
 template<class Model,class Adapter>
 std::size_t StatefulCudaBatchOperations<Model,Adapter>::prepare(const std::shared_ptr<Request>& request) {
-    if (predictor_ && request->sampling.enable_mtp) {
+    if (predictor_ && request->sampling.enable_mtp && config_.cuda_graph && mfq_cuda_graph_capture_supported() &&
+        batch_mtp_sampling_supported(request->sampling,request->token_constraint)) {
         request->predictor=predictor_->fork_session();
         if (!request->predictor) throw std::logic_error("CUDA batch predictor cannot create a request session");
         request->predictor->prepare_request(std::min<int64_t>(max_context(),request->prompt.size()+request->generation_limit),

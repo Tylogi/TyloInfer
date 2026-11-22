@@ -32,6 +32,11 @@ struct CudaBatchMtpState {
     int64_t first_token=0;
 };
 
+inline bool batch_mtp_sampling_supported(const MfqSamplingParams& sampling,const MfqTokenConstraintPtr& constraint) {
+    return sampling.max_tokens>1 && !constraint && sampling.presence_penalty==0.0 &&
+        sampling.frequency_penalty==0.0 && sampling.repetition_penalty==1.0;
+}
+
 class CudaBatchSpeculation {
 public:
     using Clock=mfq::engine::mtp::v1::BatchDepthPolicy::Clock;
