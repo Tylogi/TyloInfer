@@ -795,10 +795,11 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
         dense_rows = g.indexed_kv.unpack(*resident);
     auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
     if (pooled && pooled->dtype() != float32) pooled = astype(*pooled, float32);
+    const bool dense_prefill = dense_rows && !verified && !quantization.enabled() && default_device() == Device::gpu;
     // Packed recalls can share more SSD blocks across queries within one gather.
-    const int query_tile = cache.offloaded_latent && end > 2 * g.index_budget &&
-        quantization.enabled() && quantization.value_bits() <= 4
-        ? 32 : selected_query_tile;
+    const bool packed_recall = cache.offloaded_latent && end > 2 * g.index_budget &&
+        quantization.enabled() && quantization.value_bits() <= 4;
+    const int query_tile = dense_prefill ? 64 : (packed_recall ? 32 : selected_query_tile);
     std::vector<array> output;
     for (int start = 0; start < count; start += query_tile) {
         const int stop = std::min(count, start + query_tile);
