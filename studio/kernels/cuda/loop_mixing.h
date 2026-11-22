@@ -13,6 +13,9 @@ mfq_tensor_backend::Tensor residual_depth_mix(const std::vector<mfq_tensor_backe
 
 mfq_tensor_backend::Tensor normalize_loop_attention_projection(const mfq_tensor_backend::Tensor& input,
     const mfq_tensor_backend::Tensor& weights,float threshold_or_epsilon,bool clip);
+mfq_tensor_backend::Tensor blend_loop_message(const mfq_tensor_backend::Tensor& current,
+    const mfq_tensor_backend::Tensor& message,const mfq_tensor_backend::Tensor& gain,
+    const mfq_tensor_backend::Tensor& forget);
 
 // Causal depthwise convolution with a residual and optional learned taps per head.
 // History [batch, taps-1, channels] advances by input.size(1) tokens.

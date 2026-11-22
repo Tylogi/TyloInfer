@@ -103,10 +103,9 @@ struct InklingBlock final : Block {
     Tensor control(CudaExecutionContext& execution,Tensor current,const Tensor& message,int branch) const {
         const auto& w=*weights;
         const auto& c=w.controls[branch];
-        auto joined=tb::cat({rms_norm_cuda(current.contiguous(),w.unit,1e-6),
-            rms_norm_cuda(message.contiguous(),w.unit,1e-6)},-1);
+        auto joined=rms_norm_concat_pair_cuda(current,message,w.unit,1e-6);
         const auto outputs=c.gain_forget.forward(execution,c.down.forward(execution,joined));
-        return current*(1.0-tb::tanh(outputs[1]))+message*tb::tanh(outputs[0]);
+        return blend_loop_message(current,message,outputs[0],outputs[1]);
     }
 
     Tensor conv(Tensor input,int slot,const Tensor& dynamic={}) {

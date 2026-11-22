@@ -108,6 +108,28 @@ __global__ void normalize_projection(const float* input,const float* multiplier,
         output[i]=input[i]*(multiplier?multiplier[i]:1.f)*scale;
 }
 
+struct LoopRows {
+    const float* values;
+    int64_t batch_stride,token_stride;
+    __device__ const float* row(int batch,int token) const {
+        return values+int64_t(batch)*batch_stride+int64_t(token)*token_stride;
+    }
+};
+
+__global__ void blend_message(LoopRows current,LoopRows message,LoopRows gain,LoopRows forget,
+    float* output,int width,int tokens,int64_t elements,bool contiguous_gain,bool contiguous_forget) {
+    const auto at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (at>=elements) return;
+    const auto row=at/width;
+    const int batch=int(row/tokens),token=int(row%tokens),column=int(at%width);
+    // Match the native tensor tanh precision for contiguous and strided inputs.
+    const auto keep=forget.row(batch,token)[column],add=gain.row(batch,token)[column];
+    const auto retained=__fsub_rn(1.f,contiguous_forget?::tanhf(keep):float(::tanh(double(keep))));
+    const auto added=contiguous_gain?::tanhf(add):float(::tanh(double(add)));
+    output[at]=__fadd_rn(__fmul_rn(current.row(batch,token)[column],retained),
+        __fmul_rn(message.row(batch,token)[column],added));
+}
+
 template<bool Decode> __global__ void convolve_residual(float* history, const float* input,
     const float* weights, const float* dynamic, float* output, int channels, int tokens,
     int taps, int heads, float scale) {
@@ -211,6 +233,30 @@ tb::Tensor normalize_loop_attention_projection(const tb::Tensor& input,const tb:
     normalize_projection<<<unsigned(rows),kMixThreads,0,mfq_current_cuda_stream()>>>(input.data_ptr<float>(),
         weights.defined()?weights.data_ptr<float>():nullptr,output.data_ptr<float>(),
         rows,int(heads),int(width),per_head?int(width):0,value,clip);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+tb::Tensor blend_loop_message(const tb::Tensor& current,const tb::Tensor& message,
+    const tb::Tensor& gain,const tb::Tensor& forget) {
+    const auto valid=[&](const tb::Tensor& tensor) {
+        return tensor.dim()==3 && tensor.sizes()==current.sizes() && tensor.device()==current.device() &&
+            tensor.scalar_type()==tb::kFloat32 && tensor.stride(2)==1;
+    };
+    if (!current.is_cuda() || !valid(current) || !valid(message) || !valid(gain) || !valid(forget))
+        return current*(1.0-tb::tanh(forget))+message*tb::tanh(gain);
+    MfqCudaGuard guard(current.device());
+    auto output=tb::empty(current.sizes(),current.options());
+    const auto elements=output.numel(),blocks=(elements+kMixThreads-1)/kMixThreads;
+    TYLOINFER_RUNTIME_CHECK(blocks<=INT_MAX && current.size(1)<=INT_MAX && current.size(2)<=INT_MAX,
+        "loop blend grid overflow");
+    if (!elements) return output;
+    const auto rows=[](const tb::Tensor& tensor) {
+        return LoopRows{tensor.data_ptr<float>(),tensor.stride(0),tensor.stride(1)};
+    };
+    blend_message<<<unsigned(blocks),kMixThreads,0,mfq_current_cuda_stream()>>>(rows(current),rows(message),
+        rows(gain),rows(forget),output.data_ptr<float>(),int(current.size(2)),int(current.size(1)),elements,
+        gain.is_contiguous(),forget.is_contiguous());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
