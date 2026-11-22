@@ -32,8 +32,8 @@ import zipfile
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT = SCRIPT_DIR.parent
-STUDIO = PROJECT / "studio" / "web"
-PYTHON_PROJECT = PROJECT / "studio"
+STUDIO = PROJECT / "app" / "studio" / "web"
+PYTHON_PROJECT = PROJECT / "app" / "studio"
 SERVER_ENTRY = PYTHON_PROJECT / "serve.py"
 SERVER_NAME = "tyloinfer-server"
 
@@ -564,7 +564,7 @@ def build_studio(context: Context) -> None:
                "--config", f"src-tauri/tauri.release-{'windows' if context.windows else 'macos'}.conf.json"]
     if not context.windows and context.signing_identity != "-":
         command += ["--config", '{"bundle":{"macOS":{"hardenedRuntime":true}}}']
-    # studio/web is pnpm-managed (pnpm-lock.yaml); npm ci cannot install from it.
+    # app/studio/web is pnpm-managed (pnpm-lock.yaml); npm ci cannot install from it.
     pnpm = "pnpm.cmd" if context.windows else "pnpm"
     run([pnpm, "install", "--frozen-lockfile"], cwd=STUDIO, env=environment)
     run([pnpm, "run", "check"], cwd=STUDIO, env=environment)
@@ -616,7 +616,7 @@ def collect_installer(context: Context) -> Path:
 # --- Windows single-file app ---------------------------------------------
 
 def portable_payload(project: Path, executable: Path) -> dict[str, Path]:
-    tauri = project / "studio" / "web" / "src-tauri"
+    tauri = project / "app" / "studio" / "web" / "src-tauri"
     bundle = json.loads((tauri / "tauri.release-windows.conf.json").read_text())["bundle"]
     files: dict[str, Path] = {}
     names: set[str] = set()
@@ -657,7 +657,7 @@ def nsis_string(value: str) -> str:
 def build_single_file_app(project: Path, executable: Path, output: Path,
                           makensis: Path) -> Path:
     files = portable_payload(project, executable)
-    tauri = project / "studio" / "web" / "src-tauri"
+    tauri = project / "app" / "studio" / "web" / "src-tauri"
     packaging = project / "packaging"
     version = json.loads((tauri / "tauri.conf.json").read_text())["version"]
     digest = hashlib.sha256()

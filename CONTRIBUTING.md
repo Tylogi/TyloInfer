@@ -7,7 +7,7 @@ This file holds rules about the repository itself. It currently covers ignore fi
 The root `.gitignore` records two kinds of paths, and only those two:
 
 1. Files that this repository's own tooling produces — the Python toolchain in
-   `studio/pyproject.toml`, the Node toolchain in `studio/web`, the CMake
+   `app/studio/pyproject.toml`, the Node toolchain in `app/studio/web`, the CMake
    build in `csrc/`, and the packaging scripts in `packaging/`.
 2. Editor and OS noise that nobody working in this repository can avoid.
 
@@ -46,12 +46,12 @@ rule would hide real files.
   it, the entry does not belong here.
 - Anchor the pattern (`/models/`) when the same name is used for source
   directories. `csrc/backends/cuda/models/` and
-  `studio/web/src/features/models/` are source.
+  `app/studio/web/src/features/models/` are source.
 - Keep nested `.gitignore` files for paths that only that subtree's tooling
   creates and the root file does not already cover. See `packaging/.gitignore`
-  and `studio/web/.gitignore`.
+  and `app/studio/web/.gitignore`.
 - Do not add un-ignore (`!`) rules for source directories. The two that covered
-  `studio/web/src/features/models/` were dead and were removed.
+  `app/studio/web/src/features/models/` were dead and were removed.
 
 ### Checking an ignore change
 

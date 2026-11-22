@@ -17,8 +17,8 @@
 #include "runtime/kv_memory.h"
 #include "storage/transformer_loader.h"
 #include "storage/weight_loader.h"
-#include "studio/kernels/cuda/index_pool.h"
-#include "studio/kernels/cuda/qwen4_exp.h"
+#include "app/studio/kernels/cuda/index_pool.h"
+#include "app/studio/kernels/cuda/qwen4_exp.h"
 #include "tyloinfer/host_memory.h"
 
 #include <cmath>

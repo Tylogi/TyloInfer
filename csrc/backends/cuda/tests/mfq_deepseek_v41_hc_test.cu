@@ -1,6 +1,6 @@
-#include "studio/kernels/cuda/deepseek_v4_hc.h"
-#include "studio/kernels/cuda/deepseek_v4_attention.h"
-#include "studio/kernels/cuda/deepseek_v41.h"
+#include "app/studio/kernels/cuda/deepseek_v4_hc.h"
+#include "app/studio/kernels/cuda/deepseek_v4_attention.h"
+#include "app/studio/kernels/cuda/deepseek_v41.h"
 #include "mfq_cuda_context.h"
 #include "mfq_native_tensor.h"
 

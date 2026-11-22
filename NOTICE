@@ -7,7 +7,7 @@ Every third-party component below keeps its own license text; the texts live in
 
 LiquidAI d1 text compatibility and optional reference
 ----------------------------------------------------
-The text prompt/readout compatibility in studio/runtime/d1_reference.py,
+The text prompt/readout compatibility in app/studio/runtime/d1_reference.py,
 reused by the native CUDA and managed System One adapters, is adapted from
 LiquidAI/d1-2B prompt.py and api.py at revision
  a6bce774e6dde338dcc3036ceb5d91f78bf4c19e, with a modified text-only API and
@@ -140,7 +140,7 @@ Source: https://github.com/ml-explore/mlx
 Strata
 ------
 TyloInfer's CUDA multi-row warp reduction in
-`studio/kernels/cuda/warp_multi_sum.cuh`
+`app/studio/kernels/cuda/warp_multi_sum.cuh`
 is adapted from Strata's s26_tsum.cuh, with TyloInfer-specific dispatch and packed
 weight integration.
 The Flash-Next expert ranking is derived from Strata's `data/expert-profile.bin`.
@@ -193,7 +193,7 @@ The Qwen, DeepSeek, Z.ai and Gemma vector paths in the Studio web UI are
 adapted from LobeHub Icons. Their notice travels with the icons in the web
 bundle.
 Copyright (c) 2023 LobeHub
-License: MIT (`studio/web/public/model-vendor-icons.LICENSE.txt`)
+License: MIT (`app/studio/web/public/model-vendor-icons.LICENSE.txt`)
 Source: https://github.com/lobehub/lobe-icons
 
 Gyro trellis reference search and codebook
@@ -201,7 +201,7 @@ Gyro trellis reference search and codebook
 Copyright 2026 AgentionAI (Laurent Zuijdwijk).
 License: Apache License 2.0 (`csrc/third_party/agention-gyro/LICENSE`).
 See `csrc/third_party/agention-gyro/NOTICE` and
-`studio/_gyro/NOTICE` for the two copies that ship with the native and
+`app/studio/_gyro/NOTICE` for the two copies that ship with the native and
 Python packages.
 
 Splash

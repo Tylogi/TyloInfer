@@ -1,7 +1,7 @@
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
-#include "studio/kernels/hip/fp8_sq.h"
-#include "studio/kernels/hip/mxfp4_sq.h"
+#include "app/studio/kernels/hip/fp8_sq.h"
+#include "app/studio/kernels/hip/mxfp4_sq.h"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>

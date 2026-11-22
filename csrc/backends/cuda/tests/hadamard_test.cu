@@ -1,4 +1,4 @@
-#include "../../../../studio/kernels/cuda/nepq.h"
+#include "../../../../app/studio/kernels/cuda/nepq.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>

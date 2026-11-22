@@ -7,7 +7,7 @@
 #include "mfq_cuda_attention_ops.h"
 #include "tyloinfer/runtime.h"
 #include "cuda_execution.h"
-#include "studio/kernels/cuda/loop_mixing.h"
+#include "app/studio/kernels/cuda/loop_mixing.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "../../../tests/nint_row_fixture.h"
 #include "nint.h"

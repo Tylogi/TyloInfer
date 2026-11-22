@@ -14,7 +14,7 @@ npm --prefix dsh ls --depth=0
 
 这三条核对的是同一组事实：CLI／base／Web 版本一致、产品 bundle 的 `engines.dsh` 声明、Host／Client 入口产物存在。它们不启动Host、不推理、不打开浏览器、不写profile，也不重建、删除或替换链接。
 
-仓库现在没有自动拒绝：版本不一致或缺少 `plugins/lib/client.js` 时，官方 CLI 仍会启动。核对是人工步骤，结果不一致就停止升级。
+仓库现在没有自动拒绝：版本不一致或缺少 `app/plugins/lib/client.js` 时，官方 CLI 仍会启动。核对是人工步骤，结果不一致就停止升级。
 
 当前插件只声明0.2.2-rc.2。未测的新版本应被拒绝安装，不应为了通过核对把兼容声明改成任意版本，或仅修改候选manifest版本。缺少客户端产物时须重新构建，不从另一安装补读。
 

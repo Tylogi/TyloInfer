@@ -1,7 +1,7 @@
 // Nemotron-H Metal correctness bridge.
 //
 // Loads a synthetic MFQ fixture and prints the same JSON documents the CUDA
-// diagnostics emit, so studio/tests/test_metal_nemotron_*.py can compare the native
+// diagnostics emit, so app/studio/tests/test_metal_nemotron_*.py can compare the native
 // Metal graph against the shared NumPy oracle.
 #include "mlx_nemotron_h_causal_lm.h"
 #include "mlx_linear_attention.h"

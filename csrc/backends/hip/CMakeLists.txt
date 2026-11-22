@@ -15,7 +15,7 @@ endif()
 enable_language(HIP)
 
 set(TYLOINFER_HIP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(TYLOINFER_HIP_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/hip")
+set(TYLOINFER_HIP_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/hip")
 
 set(TYLOINFER_HIP_ARCHITECTURES "gfx942" CACHE STRING
     "HIP architectures compiled into MFQ HIP targets")

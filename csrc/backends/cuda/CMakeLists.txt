@@ -6,7 +6,7 @@ if(NOT TARGET mfq-runtime-communication)
 endif()
 
 set(TYLOINFER_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(TYLOINFER_CUDA_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/cuda")
+set(TYLOINFER_CUDA_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/cuda")
 
 set(TYLOINFER_CUDA_ARCHITECTURES "" CACHE STRING
     "Optional CUDA architecture override; otherwise use CMAKE_CUDA_ARCHITECTURES, CUDAARCHS or native")

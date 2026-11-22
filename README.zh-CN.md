@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
+  <img src="app/studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
 </p>
 
 <h1 align="center">TyloInfer</h1>
@@ -114,24 +114,24 @@ API 请求与鉴权配置见[服务部署指南](docs/serve.md#first-api-request
 
 ```sh
 # Python 服务
-uv run --project studio --extra dev pytest studio/tests
+uv run --project app/studio --extra dev pytest app/studio/tests
 
 # 与钉住版本的参考实现对拍需要 PyTorch：
 uv run --project studio --extra dev --extra d1-reference \
-  pytest studio/tests/test_d1_reference.py
+  pytest app/studio/tests/test_d1_reference.py
 
 # 原生运行时：按上文配置并构建后执行
 ctest --test-dir build
 
-# 浏览器界面（首次需安装 studio/web 依赖）
-pnpm --dir studio/web install --frozen-lockfile
-pnpm --dir studio/web test
+# 浏览器界面（首次需安装 app/studio/web 依赖）
+pnpm --dir app/studio/web install --frozen-lockfile
+pnpm --dir app/studio/web test
 
 # DSH 插件工作区
 npm --prefix plugins ci
 npm --prefix plugins run build
 npm --prefix plugins run typecheck
-node --test plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
+node --test app/plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
 ```
 
 `csrc/tests/` 下的 C++ 用例任意机器都能跑；CUDA 与 Metal 用例需要对应硬件。详见[构建指南](docs/build.md#testing)。

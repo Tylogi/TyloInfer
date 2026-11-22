@@ -1,11 +1,11 @@
-// Native ABI numerical-test bridge: studio/tests/test_cuda_flash_next.py supplies the
+// Native ABI numerical-test bridge: app/studio/tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "mfq_hip_attention_ops.h"
 #include "quant_kv_check.h"
 #include "hot_kv_check.h"
-#include "studio/kernels/hip/selected_attention.h"
-#include "studio/kernels/hip/glm5_next.h"
-#include "studio/kernels/hip/qwen4_exp.h"
+#include "app/studio/kernels/hip/selected_attention.h"
+#include "app/studio/kernels/hip/glm5_next.h"
+#include "app/studio/kernels/hip/qwen4_exp.h"
 #include "glm5_next/model.h"
 #include "qwen4_exp/model.h"
 #include "hip_execution.h"
@@ -18,11 +18,11 @@
 #include "mfq_hip_norm_ops.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"
-#include "studio/kernels/hip/deepseek_v41.h"
-#include "studio/kernels/hip/tq_moe.h"
-#include "studio/kernels/hip/deepseek_v4_attention.h"
-#include "studio/kernels/hip/deepseek_v4_fp4.h"
-#include "studio/kernels/hip/deepseek_v4_hc.h"
+#include "app/studio/kernels/hip/deepseek_v41.h"
+#include "app/studio/kernels/hip/tq_moe.h"
+#include "app/studio/kernels/hip/deepseek_v4_attention.h"
+#include "app/studio/kernels/hip/deepseek_v4_fp4.h"
+#include "app/studio/kernels/hip/deepseek_v4_hc.h"
 #include "tq.h"
 extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "tyloinfer/model_source.h"

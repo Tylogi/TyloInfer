@@ -34,3 +34,7 @@ through the inference API.
 
 - [HTTP API](api/http.md)
 - [WebSocket and realtime API](api/websocket.md)
+
+## Migration plans
+
+- [Application layout and unified frontend build (中文, not yet implemented)](plans/app-layout-migration.md)

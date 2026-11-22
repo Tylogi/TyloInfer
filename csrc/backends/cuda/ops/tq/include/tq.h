@@ -1,7 +1,7 @@
 #pragma once
 #include "cuda_execution.h"
 #include "tyloinfer/model_source.h"
-#include "studio/kernels/cuda/tq_ops.h"
+#include "app/studio/kernels/cuda/tq_ops.h"
 #include "runtime/row_stage.h"
 #include <array>
 #include <functional>

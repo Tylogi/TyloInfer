@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
+  <img src="app/studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
 </p>
 
 <h1 align="center">TyloInfer</h1>
@@ -114,24 +114,24 @@ For API requests and authentication, see the [serving guide](docs/serve.md#first
 
 ```sh
 # Python server
-uv run --project studio --extra dev pytest studio/tests
+uv run --project app/studio --extra dev pytest app/studio/tests
 
 # Numerical parity against the pinned reference needs PyTorch:
 uv run --project studio --extra dev --extra d1-reference \
-  pytest studio/tests/test_d1_reference.py
+  pytest app/studio/tests/test_d1_reference.py
 
 # Native runtime: configure and build as above, then
 ctest --test-dir build
 
 # Browser UI (installs its pnpm dependencies on first run)
-pnpm --dir studio/web install --frozen-lockfile
-pnpm --dir studio/web test
+pnpm --dir app/studio/web install --frozen-lockfile
+pnpm --dir app/studio/web test
 
 # DSH plugin workspace
 npm --prefix plugins ci
 npm --prefix plugins run build
 npm --prefix plugins run typecheck
-node --test plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
+node --test app/plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
 ```
 
 The C++ cases under `csrc/tests/` run anywhere; the CUDA and Metal cases need that hardware. Full notes are in the [build guide](docs/build.md#testing).

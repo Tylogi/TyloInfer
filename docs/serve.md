@@ -180,7 +180,7 @@ root, such as `http://127.0.0.1:8090/`. Asset selection follows this order:
 3. `TYLOINFER_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
 4. Packaged Studio servers use their bundled `web-ui` assets without Node.js/pnpm.
-5. Otherwise, TyloInfer looks for `studio/web` in the source checkout.
+5. Otherwise, TyloInfer looks for `app/studio/web` in the source checkout.
 
 Studio starts both the API and Web UI on the same listener; it does not open a
 browser automatically. The desktop client and browsers share that server.
@@ -521,5 +521,5 @@ does not need configuration.
 
 ### Web UI assets are missing
 
-Install Node.js/pnpm so TyloInfer can build `studio/web`, pass a valid
+Install Node.js/pnpm so TyloInfer can build `app/studio/web`, pass a valid
 `--web-root`, or use `--no-web-ui` for an API-only process.

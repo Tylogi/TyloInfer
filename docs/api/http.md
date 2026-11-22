@@ -2,7 +2,7 @@
 
 TyloInfer Server provides a persistent HTTP API for TyloInfer, scripts, and SDKs.
 The machine-readable contract is
-[`studio/server/protocol/openapi.json`](../../studio/server/protocol/openapi.json); it
+[`app/studio/server/protocol/openapi.json`](../../app/studio/server/protocol/openapi.json); it
 defines all fields, constraints, and response schemas.
 
 Default server address:

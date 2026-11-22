@@ -257,8 +257,8 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_mfe_prefill_embedded.h"
     @ONLY)
 
-file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_decode.h" TYLOINFER_TQ_DECODE_SOURCE)
-file(READ "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_matmul.h" TYLOINFER_TQ_MATMUL_SOURCE)
+file(READ "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/metal/tq_decode.h" TYLOINFER_TQ_DECODE_SOURCE)
+file(READ "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/metal/tq_matmul.h" TYLOINFER_TQ_MATMUL_SOURCE)
 set(_TYLOINFER_NAX_FRAGMENT_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/tyloinfer_nax_fragment_entry.h")
 file(WRITE "${_TYLOINFER_NAX_FRAGMENT_ENTRY}"
     "#include \"mlx/backend/metal/kernels/steel/gemm/nax.h\"\n")
@@ -275,8 +275,8 @@ if(NOT _TYLOINFER_NAX_FRAGMENT_EXPAND_RESULT EQUAL 0)
     message(FATAL_ERROR "Failed to embed NAX fragment headers: ${_TYLOINFER_NAX_FRAGMENT_EXPAND_ERROR}")
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_decode.h"
-    "${TYLOINFER_REPOSITORY_ROOT}/studio/kernels/metal/tq_matmul.h")
+    "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/metal/tq_decode.h"
+    "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/metal/tq_matmul.h")
 configure_file(kernels/tq/mfq_tq_embedded.h.in mfq_tq_embedded.h @ONLY)
 file(READ "${PROJECT_SOURCE_DIR}/components/ggml/src/ggml-common.h" TYLOINFER_GGUF_COMMON_SOURCE)
 function(tyloinfer_gguf_table type name count pattern output)
