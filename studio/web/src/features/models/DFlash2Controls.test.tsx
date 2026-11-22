@@ -51,3 +51,21 @@ it('confirms the reload of a running model and offers a separate switch after lo
   fireEvent.click(control);
   expect(toggle).toHaveBeenCalledWith(false);
 });
+
+it.each([
+  ['inkling2_loop', 'Inkling 2 Mini', 'dspark', 'DSpark'],
+  ['hy_v4_flash', 'Hy4 Flash', 'dfly2', 'DFly2'],
+])('binds a local draft to %s on CUDA', async (architecture, target, draftKind, title) => {
+  const targetModel = { ...model, architecture };
+  const localDraft = { ...draft, id: 'd'.repeat(32), architecture: draftKind, dflash2_target: target };
+  const load = vi.fn(async () => undefined);
+  const props = { model: targetModel, artifacts: [draft, localDraft],
+    tr: (_zh: string, en: string) => en, onDownload: vi.fn(), onLoad: load };
+  const { rerender } = render(<DFlash2Controls {...props} backend="cuda" />);
+  expect(screen.getByText(`${target} · Draft`)).toBeVisible();
+  expect(screen.queryByRole('button', { name: /download/i })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: `Load ${title} draft` }));
+  await waitFor(() => expect(load).toHaveBeenCalledWith(localDraft.id));
+  rerender(<DFlash2Controls {...props} backend="metal" />);
+  expect(screen.queryByText(`${target} · Draft`)).toBeNull();
+});

@@ -164,6 +164,12 @@ def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecut
     return JobExecutionError(ErrorDetail(code=code, message=message, retryable=retryable))
 
 
+def _draft_display_name(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return path.stem if path.suffix.casefold() == '.gguf' else path.name
+
+
 class _Runtime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -580,14 +586,26 @@ class RuntimePool:
                         self._resident_load_owners.pop(name, None)
 
     async def _dflash2_artifact(self, target: DiscoveredModel, draft_id: str) -> DiscoveredModel:
-        if self.backend not in {"metal", "cuda"} or not target.resource.architecture.casefold().startswith("qwen4_exp"):
-            raise _job_error("dflash2_unsupported", "Managed DFlash2 binding requires a Flash-Next target on Metal or CUDA")
+        architecture = target.resource.architecture.casefold()
+        draft_type = {"hy_v4_flash": "dfly2", "inkling2_loop": "dspark"}.get(architecture)
+        if self.backend not in {"metal", "cuda"} or (
+            draft_type is None and not architecture.startswith("qwen4_exp")
+        ) or (draft_type is not None and self.backend != "cuda"):
+            raise _job_error("dflash2_unsupported", "The target architecture does not support an external draft on this backend")
         try:
             draft = await self.catalog.get(draft_id)
         except ModelArtifactNotFoundError as error:
             raise _job_error("dflash2_not_found", "The DFlash2 draft is no longer registered") from error
-        if draft.resource.asset_kind != "dflash2" or not draft.resource.complete or not draft.path.is_dir():
+        if draft.resource.asset_kind != "dflash2" or not draft.resource.complete:
             raise _job_error("dflash2_invalid", "Select a complete, registered DFlash2 checkpoint")
+        if draft.resource.architecture != (draft_type or "dflash2"):
+            raise _job_error("dflash2_incompatible", "The external draft uses a different target architecture")
+        path_exists = draft.path.is_file() if draft_type == "dspark" else draft.path.is_dir()
+        if not path_exists:
+            raise _job_error("dflash2_invalid", "Select a complete, registered DFlash2 checkpoint")
+        if draft_type is not None:
+            # The native loader validates the target geometry and projection tensors.
+            return draft
         config = target.source_config or {}
         if isinstance(config.get("text_config"), dict):
             config = config["text_config"]
@@ -1991,7 +2009,7 @@ class RuntimePool:
                     pinned=item.pinned,
                     mtp_supported=item.mtp_supported,
                     mtp_available=item.mtp_available,
-                    dflash2_draft=item.dflash2_path.name if item.dflash2_path is not None else None,
+                    dflash2_draft=_draft_display_name(item.dflash2_path),
                     dflash2_enabled=item.dflash2_enabled,
                     qsa_kv_offload_supported=item.qsa_kv_offload_supported,
                     kv_quantization_supported=item.kv_quantization_supported,
@@ -2068,7 +2086,7 @@ class RuntimePool:
                 pinned=instance.pinned,
                 mtp_supported=instance.mtp_supported,
                 mtp_available=instance.mtp_available,
-                dflash2_draft=instance.dflash2_path.name if instance.dflash2_path is not None else None,
+                dflash2_draft=_draft_display_name(instance.dflash2_path),
                 dflash2_enabled=instance.dflash2_enabled,
                 qsa_kv_offload_supported=instance.qsa_kv_offload_supported,
                 kv_quantization_supported=instance.kv_quantization_supported,
