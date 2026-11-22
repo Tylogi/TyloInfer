@@ -1,0 +1,53 @@
+.studio-dialog.studio-settings-panel {
+  display: flex;
+  flex-direction: column;
+  width: 840px;
+  max-width: calc(100vw - 48px);
+  height: min(690px, calc(100dvh - 64px));
+  padding: 0;
+  overflow: hidden;
+  border-radius: 16px;
+}
+.studio-settings-panel > header {
+  flex: none;
+  margin: 0;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.studio-settings-panel > header h2 { font-size: 16px; font-weight: 550; }
+.studio-settings-layout { display: grid; grid-template-columns: 172px minmax(0, 1fr); flex: 1; min-height: 0; }
+.studio-settings-layout > nav { display: flex; flex-direction: column; gap: 4px; overflow: auto; padding: 16px 10px; border-right: 1px solid var(--line-soft); background: var(--canvas); }
+.studio-settings-layout > nav button { display: flex; flex: none; align-items: center; gap: 10px; min-height: 40px; padding: 9px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font: inherit; font-size: 13px; text-align: left; white-space: nowrap; }
+.studio-settings-layout > nav button:hover, .studio-settings-layout > nav button[aria-current] { background: var(--surface-active); color: var(--ink); }
+.studio-settings-content { min-width: 0; overflow: auto; padding: 24px 28px; overscroll-behavior: contain; }
+.studio-settings-content h3 { margin: 0 0 12px; color: var(--ink); font-size: 16px; font-weight: 550; }
+.studio-settings-scope, .studio-settings-hint { margin: 8px 0 16px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.studio-settings-error { color: var(--danger); font-size: 12px; line-height: 1.6; }
+.studio-settings-content .studio-settings-row { display: flex; align-items: center; justify-content: space-between; min-height: 58px; gap: 16px; margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line-soft); color: var(--ink-soft); font-size: 13px; }
+.studio-settings-row > span:first-child { flex: none; }
+.studio-settings-row :is(input:not([type='checkbox']), select) { width: 190px; min-width: 0; max-width: 58%; min-height: 32px; margin: 0; padding: 5px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-control); color: var(--ink); font: inherit; font-size: 12px; }
+.studio-settings-row .studio-settings-size { display: flex; align-items: center; justify-content: flex-end; gap: 8px; width: 190px; max-width: 58%; }
+.studio-settings-size input[type='range'] { width: 120px; flex: 1; min-width: 36px; max-width: 100%; padding: 0; border: 0; box-shadow: none; accent-color: #4176e6; }
+.studio-settings-size output { flex: none; min-width: 36px; font-size: 12px; color: var(--muted); }
+.studio-settings-details { margin-top: 16px; }
+.studio-settings-details > summary { padding: 8px 0; color: var(--ink-soft); font-size: 13px; cursor: pointer; }
+.studio-settings-details fieldset { min-width: 0; margin: 12px 0 0; padding: 0; border: 0; }
+.studio-settings-details legend { color: var(--muted); font-size: 12px; }
+.studio-settings-details :disabled { cursor: not-allowed; opacity: .6; }
+.studio-settings-font-preview { margin: 12px 0; padding: 12px; border-radius: 8px; background: var(--surface-subtle); overflow-wrap: anywhere; }
+.studio-settings-font-preview p { margin: 0 0 8px; font-size: var(--studio-content-font-size, 14px); }
+.studio-settings-font-preview code { font-size: var(--studio-code-font-size, 11px); font-family: var(--studio-code-font-family, ui-monospace, monospace); }
+.studio-settings-unavailable { margin-top: 40px; color: var(--muted); font-size: 13px; line-height: 1.8; }
+.studio-settings-layout :is(button, input, select, summary):focus-visible { outline: 2px solid #4176e6; outline-offset: 2px; }
+.agent-workspace :is(.agent-message, .rich-text, .agent-composer textarea) { font-size: var(--studio-content-font-size, 14px); }
+.agent-workspace .rich-text :is(pre.code-block, pre[class*='language-']) { font-size: var(--studio-code-font-size, 11px); font-family: var(--studio-code-font-family, 'SFMono-Regular', 'Cascadia Code', Consolas, monospace); }
+.agent-workspace .rich-text :not(pre) > code { font-size: calc(var(--studio-code-font-size, 11px) + 1px); font-family: var(--studio-code-font-family, 'SFMono-Regular', 'Cascadia Code', Consolas, monospace); }
+@media (max-width: 680px) {
+  .studio-dialog.studio-settings-panel { max-width: 100vw; width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; border: 0; border-radius: 0; }
+  .dialog-backdrop:has(.studio-settings-panel) { padding: 0; }
+  .studio-settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .studio-settings-layout > nav { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line-soft); padding: 8px; }
+  .studio-settings-layout > nav button { padding: 8px 10px; min-height: 36px; }
+  .studio-settings-content { padding: 20px; }
+  .studio-settings-row { gap: 10px; }
+}

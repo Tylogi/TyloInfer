@@ -1,0 +1,3291 @@
+#include "qwen4_ops.h"
+#include "mlx_platform.h"
+#include "mlx_nint_metadata.h"
+#include "mlx_kernel_prepare.h"
+#include "mlx_cached_kernel.h"
+
+#include "mlx_transformer.h"
+#include "mlx_sparse_attention.h"
+
+#include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/backend/metal/utils.h>
+#include <mlx/primitives.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace mfq::metal {
+namespace {
+
+using mlx::core::Shape;
+using mlx::core::array;
+using mlx::core::CompileOptions;
+using mlx::core::MathMode;
+
+constexpr int kGatedHcProjectionThreads = 256;
+constexpr int kGatedHcUpThreads = 320;
+
+// The online softmax reduction order follows MLX vector SDPA.
+// Copyright © 2024 Apple Inc. See LICENSES/MLX-MIT.txt.
+class QsaDenseDecodeBatch final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    QsaDenseDecodeBatch(mlx::core::Stream stream, bool gate) : Primitive(stream), gate_(gate) {}
+
+    std::string preparation_key() const override {
+        return gate_ ? "mfq_qsa_dense_decode_batch_gated" : "mfq_qsa_dense_decode_batch";
+    }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+    const char* name() const override { return "QsaDenseDecodeBatch"; }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [&] {
+            std::string source = "#include <metal_stdlib>\nusing namespace metal;\n";
+            source += "[[kernel, max_total_threads_per_threadgroup(1024)]] void " + name + R"METAL((
+                device const bfloat *query [[buffer(0)]],
+                device bfloat *output [[buffer(1)]],
+                constant ulong *params [[buffer(2)]],
+            )METAL";
+            for (int row = 0; row < 8; ++row) {
+                const auto suffix = std::to_string(row);
+                source += "device const half *key" + suffix + " [[buffer(" + std::to_string(3 + row * 2) + ")]],";
+                source += "device const half *value" + suffix + " [[buffer(" + std::to_string(4 + row * 2) + ")]],";
+            }
+            if (gate_) source += "device const bfloat* gate [[buffer(19)]],";
+            source += R"METAL(
+                uint2 group [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+                const uint row = group.y, head = group.x;
+            )METAL";
+            for (const auto* name : {"key", "value"}) {
+                source += "device const half *" + std::string(name) + " = ";
+                for (int row = 0; row < 7; ++row)
+                    source += "row == " + std::to_string(row) + "u ? " + name + std::to_string(row) + " : ";
+                source += std::string(name) + "7;\n";
+            }
+            // Match MLX vector SDPA's ordering. Convert FP16 cache elements to
+            // BF16 at the load instead of materializing the converted prefix.
+            source += R"METAL(
+                constexpr uint HD = 256, E = HD / 32;
+                constant ulong *info = params + 1 + row * 5;
+                const uint count = uint(info[0]), kv_head = head / 12;
+                const uint rows = uint(params[0]);
+                query += (head * rows + row) * HD + lane * E;
+                key += kv_head * info[1] + simdgroup * info[2] + lane * E;
+                value += kv_head * info[3] + simdgroup * info[4] + lane * E;
+                output += (row * 24 + head) * HD + simdgroup * E;
+                float q[E], k[E], sums[E];
+                for (uint i = 0; i < E; ++i) {
+                    q[i] = float(query[i]) * (1.0f / 16.0f);
+                    sums[i] = 0.f;
+                }
+                float maximum = -3.402823466e+38f, total = 0.f;
+                for (uint i = simdgroup; i < count; i += 32) {
+                    for (uint j = 0; j < E; ++j) k[j] = float(bfloat(float(key[j])));
+                    float score = 0.f;
+                    for (uint j = 0; j < E; ++j) score += q[j] * k[j];
+                    score = simd_sum(score);
+                    const float next = max(maximum, score);
+                    const float rescale = fast::exp(maximum - next), weight = fast::exp(score - next);
+                    maximum = next;
+                    total = total * rescale + weight;
+                    for (uint j = 0; j < E; ++j)
+                        sums[j] = sums[j] * rescale + weight * float(bfloat(float(value[j])));
+                    key += 32 * info[2];
+                    value += 32 * info[4];
+                }
+                threadgroup float maxima[32], totals[32];
+                constexpr uint Pitch = 33, Pack = 4;
+                threadgroup float partials[Pack][32 * Pitch];
+                if (lane == 0) {
+                    maxima[simdgroup] = maximum;
+                    totals[simdgroup] = total;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maximum = maxima[lane];
+                const float scale = fast::exp(maximum - simd_max(maximum));
+                total = simd_sum(totals[lane] * scale);
+                // Transpose the partials in groups of four to share the
+                // barriers while keeping the per-feature reduction order.
+                for (uint base = 0; base < E; base += Pack) {
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j)
+                        partials[j][lane * Pitch + simdgroup] = sums[base + j];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+                    for (uint j = 0; j < Pack; ++j) {
+                        const float sum = simd_sum(partials[j][simdgroup * Pitch + lane] * scale);
+                        sums[base + j] = total == 0.f ? sum : sum / total;
+                    }
+                    if (base + Pack < E) threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            )METAL";
+            if (gate_) source += R"METAL(
+                if (lane < E) {
+                    float reduced = 0.f;
+#pragma unroll
+                    for (uint j = 0; j < E; ++j)
+                        if (lane == j) reduced = sums[j];
+                    const float z = float(gate[(row * 24 + head) * HD + simdgroup * E + lane]);
+                    const float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+                    const float probability = z < 0.0f ? tail : 1.0f - tail;
+                    output[lane] = bfloat(float(bfloat(reduced)) * probability);
+                }
+            )METAL";
+            else source += "if (lane == 0) for (uint j = 0; j < E; ++j) output[j] = bfloat(sums[j]);\n";
+            source += "}\n";
+            return source;
+        });
+        return device.get_kernel(name, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA dense decode batch requires Metal");
+    }
+
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(prepared_kernel());
+        encoder.set_input_array(inputs.front(), 0);
+        encoder.set_output_array(output, 1);
+        const int rows = output.shape(1);
+        std::array<std::uint64_t, 1 + 5 * 8> params{};
+        params[0] = rows;
+        for (int row = 0; row < 8; ++row) {
+            const int index = std::min(row, rows - 1) * 2 + 1;
+            const auto& key = inputs[index];
+            const auto& value = inputs[index + 1];
+            encoder.set_input_array(key, 3 + row * 2);
+            encoder.set_input_array(value, 4 + row * 2);
+            const int offset = 1 + row * 5;
+            params[offset] = key.shape(2);
+            params[offset+1] = key.strides(1);
+            params[offset+2] = key.strides(2);
+            params[offset+3] = value.strides(1);
+            params[offset+4] = value.strides(2);
+        }
+        encoder.set_bytes(params, 2);
+        if (gate_) encoder.set_input_array(inputs.back(), 19);
+        encoder.dispatch_threadgroups(MTL::Size(24, rows, 1), MTL::Size(1024, 1, 1));
+    }
+private:
+    bool gate_;
+};
+
+class QsaJoinHalfHistory final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    explicit QsaJoinHalfHistory(mlx::core::Stream stream) : Primitive(stream) {}
+    std::string preparation_key() const override { return "mfq_qsa_join_half_history"; }
+    const char* name() const override { return "QsaJoinHalfHistory"; }
+    void prepare_gpu() override { (void)kernel(); }
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA half-history join requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel());
+        std::array<std::uint64_t, 10> params{
+            std::uint64_t(inputs[0].shape(2)), std::uint64_t(output.shape(2))};
+        for (unsigned i = 0; i < inputs.size(); ++i) {
+            encoder.set_input_array(inputs[i], i);
+            params[2 + i * 2] = inputs[i].strides(1);
+            params[3 + i * 2] = inputs[i].strides(2);
+        }
+        encoder.set_output_array(output, 4);
+        encoder.set_bytes(params, 5);
+        encoder.dispatch_threads(MTL::Size(output.size() / 8, 1, 1), MTL::Size(256, 1, 1));
+    }
+private:
+    MTL::ComputePipelineState* kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto name = preparation_key();
+        auto* library = device.get_library(name, CompileOptions(static_cast<int>(MathMode::Safe)), [] {
+            return std::string(R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void mfq_qsa_join_half_history(
+    device const half* history_key [[buffer(0)]], device const half* history_value [[buffer(1)]],
+    device const half* proposal_key [[buffer(2)]], device const half* proposal_value [[buffer(3)]],
+    device bfloat* output [[buffer(4)]], constant ulong* params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint Chunks = 32;
+    const uint rows = uint(params[1]), prefix = uint(params[0]);
+    const uint column = tid % Chunks * 8, row = tid / Chunks % rows;
+    const uint head = tid / (Chunks * rows) % 2, part = tid / (Chunks * rows * 2);
+    const bool proposal = row >= prefix;
+    const uint field = part + 2 * uint(proposal);
+    device const half* input = part
+        ? (proposal ? proposal_value : history_value)
+        : (proposal ? proposal_key : history_key);
+    const ulong index = head * params[2 + 2 * field] +
+        (proposal ? row - prefix : row) * params[3 + 2 * field] + column;
+#pragma unroll
+    for (uint i = 0; i < 8; ++i) output[ulong(tid) * 8 + i] = bfloat(float(input[index + i]));
+}
+)METAL");
+        });
+        return device.get_kernel(name, library);
+    }
+};
+
+class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    QsaOutputGatePrimitive(mlx::core::Stream stream, std::array<mlx::core::Dtype, 3> types,
+        int heads, int dimension)
+        : Primitive(stream), types_(types), heads_(heads), dimension_(dimension) {}
+
+    std::string preparation_key() const override {
+        std::string key = "mfq_qsa_output_gate";
+        for (auto dtype : types_) key += "_" + mlx::core::type_to_name(dtype);
+        return key + "_" + std::to_string(heads_) + "_" + std::to_string(dimension_);
+    }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = kernel_device(stream().device);
+        const auto metal_type = [](mlx::core::Dtype dtype) {
+            return dtype == mlx::core::float16 ? "half" : dtype == mlx::core::bfloat16 ? "bfloat" : "float";
+        };
+        const auto name = preparation_key();
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        auto* library = device.get_library(name, options, [&] {
+            return std::string("#include <metal_stdlib>\nusing namespace metal;\nusing A = ") + metal_type(types_[0]) +
+                "; using G = " + metal_type(types_[1]) + "; using T = " + metal_type(types_[2]) +
+                ";\n#define HEADS " + std::to_string(heads_) +
+                "\n#define DIM " + std::to_string(dimension_) +
+                "\nkernel void " + name + R"METAL((
+                    device const A* attended [[buffer(0)]],
+                    device const G* gate [[buffer(1)]],
+                    device T* output [[buffer(2)]],
+                    constant long* strides [[buffer(3)]],
+                    constant uint2& shape [[buffer(4)]],
+                    uint tid [[thread_position_in_grid]]) {
+                    uint begin = tid * 4u;
+                    #pragma clang loop unroll(full)
+                    for (uint lane = 0u; lane < 4u; ++lane) {
+                        uint index = begin + lane;
+                        if (index >= shape.y) return;
+                        uint row = index / uint(HEADS * DIM);
+                        uint feature = index % uint(HEADS * DIM);
+                        uint batch = row / shape.x, token = row % shape.x;
+                        uint head = feature / uint(DIM), dim = feature % uint(DIM);
+                        long a = long(batch) * strides[0] + long(token) * strides[1] +
+                            long(head) * strides[2] + long(dim) * strides[3];
+                        long g = long(batch) * strides[4] + long(token) * strides[5] +
+                            long(head) * strides[6] + long(dim) * strides[7];
+                        float value = float(gate[g]);
+                        float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(value)));
+                        float probability = value < 0.0f ? tail : 1.0f - tail;
+                        output[index] = T(float(attended[a]) * probability);
+                    }
+                })METAL";
+        });
+        return device.get_kernel(name, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA output gate requires Metal");
+    }
+
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto* kernel = prepared_kernel();
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_input_array(inputs[0], 0);
+        encoder.set_input_array(inputs[1], 1);
+        encoder.set_output_array(output, 2);
+        std::array<std::int64_t, 8> strides;
+        for (int input = 0; input < 2; ++input)
+            for (int axis = 0; axis < 4; ++axis)
+                strides[input * 4 + axis] = inputs[input].strides(axis);
+        const std::array<std::uint32_t, 2> shape{
+            static_cast<std::uint32_t>(output.shape(1)),
+            static_cast<std::uint32_t>(output.size())};
+        encoder.set_bytes(strides, 3);
+        encoder.set_bytes(shape, 4);
+        encoder.dispatch_threads(MTL::Size((output.size() + 3) / 4, 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override { return "QsaOutputGate"; }
+
+private:
+    std::array<mlx::core::Dtype, 3> types_;
+    int heads_;
+    int dimension_;
+};
+
+const std::string kGatedHcWeightHeader = std::string(detail::kNintMetadataSource) + R"METAL(
+#ifndef DOWN_RPS
+#define DOWN_RPS 2
+#endif
+inline uint mfq_hc_load_u32(device const uchar* stream, uint byte) {
+    const packed_uchar4 values =
+        *reinterpret_cast<device const packed_uchar4*>(stream + byte);
+    return as_type<uint>(values);
+}
+
+inline uint mfq_hc_load_u32(constant const uchar* stream, uint byte) {
+    return uint(stream[byte]) | (uint(stream[byte + 1u]) << 8u) |
+        (uint(stream[byte + 2u]) << 16u) | (uint(stream[byte + 3u]) << 24u);
+}
+
+template <typename Stream>
+inline uint4 mfq_hc_decode4(Stream stream, uint byte, uint shift, uint bits) {
+    uint word = mfq_hc_load_u32(stream, byte);
+    if (shift != 0u)
+        word = (word >> shift) | (shift + 4u * bits > 32u
+            ? uint(stream[byte + 4u]) << (32u - shift) : 0u);
+    const uint mask = (1u << bits) - 1u;
+    return uint4(word & mask, (word >> bits) & mask,
+        (word >> (2u * bits)) & mask, (word >> (3u * bits)) & mask);
+}
+
+struct MfqHcCodes8 { uint4 low; uint4 high; };
+
+template <int GS, typename Stream>
+inline MfqHcCodes8 mfq_hc_decode8(Stream stream, uint byte, uint shift, uint bits) {
+    const uint word0 = mfq_hc_load_u32(stream, byte);
+    uint packed0, packed1;
+    if constexpr (GS % 4 == 0) {
+        if constexpr (GS % 8 == 0) shift = 0u;
+        const uint word1 = bits > 4u ? mfq_hc_load_u32(stream, byte + 4u) : 0u;
+        packed0 = shift == 0u ? word0 : (word0 >> 4u) | (word1 << 28u);
+        const uint cursor = 4u * bits + shift;
+        packed1 = cursor == 32u ? word1
+            : (word0 >> cursor) | (word1 << (32u - cursor));
+    } else {
+        const uint word1 = shift + 8u * bits > 32u
+            ? mfq_hc_load_u32(stream, byte + 4u) : 0u;
+        const uint word2 = shift + 8u * bits > 64u ? uint(stream[byte + 8u]) : 0u;
+        packed0 = shift == 0u ? word0
+            : (word0 >> shift) | (word1 << (32u - shift));
+        const uint cursor = shift + 4u * bits;
+        const uint low = cursor >= 32u ? word1 : word0;
+        const uint high = cursor >= 32u ? word2 : word1;
+        const uint bit = cursor & 31u;
+        packed1 = bit == 0u ? low
+            : (low >> bit) | (high << (32u - bit));
+    }
+    const uint mask = (1u << bits) - 1u;
+    return {
+        uint4(packed0 & mask, (packed0 >> bits) & mask,
+            (packed0 >> (2u * bits)) & mask, (packed0 >> (3u * bits)) & mask),
+        uint4(packed1 & mask, (packed1 >> bits) & mask,
+            (packed1 >> (2u * bits)) & mask, (packed1 >> (3u * bits)) & mask)
+    };
+}
+
+template <int GS, int NG, int NR, typename Weight, typename Rows, typename Sub, typename Input>
+inline void mfq_hc_dot_groups(
+    Weight weight, Rows rows, Sub scales, Sub minima,
+    uint row_base, uint begin, uint end, uint first_group, uint group_stride,
+    Input input, uint input_origin, thread float* accumulators) {
+    uint bits[NR], offsets[NR], shifts[NR];
+    uint sub_offsets[NR], sub_shifts[NR], sub_bits[NR];
+    float neuron_scales[NR], neuron_minima[NR];
+    for (uint row = 0u; row < uint(NR); ++row) {
+        const MfqNintRow metadata = mfq_nint_row(rows, row_base + row);
+        bits[row] = metadata.q_bits;
+        shifts[row] = metadata.q_shift;
+        offsets[row] = metadata.q_offset;
+        sub_offsets[row] = metadata.sub_offset;
+        sub_shifts[row] = metadata.sub_shift;
+        sub_bits[row] = metadata.sub_bits;
+        neuron_scales[row] = metadata.scale;
+        neuron_minima[row] = metadata.minimum;
+    }
+    for (uint group = first_group; group * uint(GS) < end; group += group_stride) {
+        uint column = max(begin, group * uint(GS));
+        const uint limit = min(end, (group + 1u) * uint(GS));
+        float activation_sum = 0.0f;
+        float quantized_dots[NR];
+        for (uint row = 0u; row < uint(NR); ++row) quantized_dots[row] = 0.0f;
+        for (; column + 7u < limit; column += 8u) {
+            const uint local = column - input_origin;
+            const float4 activation0 = float4(input[local], input[local + 1u],
+                input[local + 2u], input[local + 3u]);
+            const float4 activation1 = float4(input[local + 4u], input[local + 5u],
+                input[local + 6u], input[local + 7u]);
+            activation_sum += activation0.x + activation0.y + activation0.z + activation0.w
+                + activation1.x + activation1.y + activation1.z + activation1.w;
+            for (uint row = 0u; row < uint(NR); ++row) {
+                const uint bit = shifts[row] + column * bits[row];
+                const auto codes = mfq_hc_decode8<GS>(
+                    weight, offsets[row] + (bit >> 3u), bit & 7u, bits[row]);
+                quantized_dots[row] += dot(activation0, float4(codes.low))
+                    + dot(activation1, float4(codes.high));
+            }
+        }
+        for (; column + 3u < limit; column += 4u) {
+            const uint local = column - input_origin;
+            const float4 activation = float4(input[local], input[local + 1u],
+                input[local + 2u], input[local + 3u]);
+            activation_sum += activation.x + activation.y + activation.z + activation.w;
+            for (uint row = 0u; row < uint(NR); ++row) {
+                const uint bit = shifts[row] + column * bits[row];
+                const auto codes = mfq_hc_decode4(
+                    weight, offsets[row] + (bit >> 3u), bit & 7u, bits[row]);
+                quantized_dots[row] += dot(activation, float4(codes));
+            }
+        }
+        for (; column < limit; ++column) {
+            const float activation = float(input[column - input_origin]);
+            activation_sum += activation;
+            for (uint row = 0u; row < uint(NR); ++row) {
+                const uint bit = shifts[row] + column * bits[row];
+                const uint byte = offsets[row] + (bit >> 3u);
+                const uint shift = bit & 7u;
+                uint packed = uint(weight[byte]);
+                if (shift + bits[row] > 8u) packed |= uint(weight[byte + 1u]) << 8u;
+                const uint code = (packed >> shift) & ((1u << bits[row]) - 1u);
+                quantized_dots[row] += activation * float(code);
+            }
+        }
+        for (uint row = 0u; row < uint(NR); ++row) {
+            const float scale = neuron_scales[row] * float(mfq_nint_sub_value(
+                scales, sub_offsets[row], sub_shifts[row], sub_bits[row], group));
+            const float minimum = neuron_minima[row] * float(mfq_nint_sub_value(
+                minima, sub_offsets[row], sub_shifts[row], sub_bits[row], group));
+            accumulators[row] = fma(scale, quantized_dots[row],
+                fma(-minimum, activation_sum, accumulators[row]));
+        }
+    }
+}
+)METAL";
+
+mlx::core::Dtype hc_weight_dtype(const MlxLinear& weight) {
+    if (const auto* dense = weight.dense_weight_ref()) return dense->dtype();
+    throw std::invalid_argument("Qwen4 fused MHC requires native floating-point weights");
+}
+
+struct HcWeightInputs {
+    array values;
+    array rows;
+    array scales;
+    array minima;
+    int group_size;
+    int groups;
+};
+
+HcWeightInputs hc_weight_inputs(const MlxLinear& weight) {
+    static const auto empty = mlx::core::zeros(Shape{1}, mlx::core::uint32);
+    if (const auto* dense = weight.dense_weight_ref())
+        return {*dense, empty, empty, empty, 0, 0};
+    throw std::invalid_argument("Qwen4 fused MHC requires native floating-point weights");
+}
+
+array hc_project(const MlxLinear& weight, const array& input) {
+
+    return weight(input);
+}
+
+
+constexpr const char* kQsaDecodePrologueSource = R"METAL(
+    constexpr uint VALUES_PER_THREAD = 4u;
+    constexpr uint THREADS = 64u;
+    constexpr uint SIMD_GROUPS = THREADS / 32u;
+    constexpr uint TOTAL_HEADS =
+        uint(QUERY_HEADS + KEY_HEADS + INDEX_HEADS);
+
+    uint head_group = threadgroup_position_in_grid.x;
+    uint token = threadgroup_position_in_grid.y;
+    uint rows = uint(token_count[0]);
+    uint local_thread = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    bool is_query = head_group < uint(QUERY_HEADS);
+    bool is_key = !is_query &&
+        head_group < uint(QUERY_HEADS + KEY_HEADS);
+    uint head = is_query
+        ? head_group
+        : (is_key
+            ? head_group - uint(QUERY_HEADS)
+            : head_group - uint(QUERY_HEADS + KEY_HEADS));
+    uint width = is_query || is_key
+        ? uint(HEAD_DIM)
+        : uint(INDEX_DIM);
+    long column_stride = projected_strides[is_query ? 4 : is_key ? 5 : 6];
+    long source_base = is_query
+        ? token * projected_strides[0] + head * uint((SEPARATE_GATE ? 1 : 2) * HEAD_DIM) * column_stride
+        : (is_key
+            ? token * projected_strides[1] + head * uint(HEAD_DIM) * column_stride
+            : token * projected_strides[2] + head * uint(INDEX_DIM) * column_stride);
+    device const T* source = is_query
+        ? query_gate_input
+        : (is_key ? key_input : index_query_key_input);
+    device const float* norm_weight = is_query
+        ? query_weight
+        : (is_key ? key_weight : index_weight);
+
+    threadgroup float inverse_rms[1];
+    threadgroup float local_sums[32];
+    uint column_base = local_thread * VALUES_PER_THREAD;
+    float sum_squares = 0.0f;
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint column = column_base + item;
+        if (column < width) {
+            float value = float(source[source_base + column * column_stride]);
+            sum_squares += value * value;
+        }
+    }
+    sum_squares = simd_sum(sum_squares);
+    if (simd_group == 0u) local_sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) local_sums[simd_group] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        float total = simd_sum(local_sums[lane]);
+        if (lane == 0u) {
+            inverse_rms[0] = metal::precise::rsqrt(
+                total / float(width) + params[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr uint ROTARY_HALF = uint(ROTARY_DIM / 2);
+    int position = positions[token];
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint column = column_base + item;
+        if (column >= width) continue;
+        float normalized;
+        if (column < uint(ROTARY_DIM)) {
+            uint pair = column < ROTARY_HALF
+                ? column
+                : column - ROTARY_HALF;
+            T first_rounded = T(
+                float(source[source_base + pair * column_stride])
+                * inverse_rms[0] * norm_weight[pair]);
+            T second_rounded = T(
+                float(source[source_base + (pair + ROTARY_HALF) * column_stride])
+                * inverse_rms[0]
+                * norm_weight[pair + ROTARY_HALF]);
+            float exponent =
+                -2.0f * float(pair) / float(ROTARY_DIM);
+            float angle = float(position) * pow(params[1], exponent);
+            float cosine = cos(angle);
+            float sine = sin(angle);
+            normalized = column < ROTARY_HALF
+                ? float(first_rounded) * cosine
+                    - float(second_rounded) * sine
+                : float(second_rounded) * cosine
+                    + float(first_rounded) * sine;
+        } else {
+            normalized = float(T(
+                float(source[source_base + column * column_stride])
+                * inverse_rms[0] * norm_weight[column]));
+        }
+        uint output_index = (head * rows + token) * width + column;
+        if (is_query) {
+            query_output[output_index] = Q(T(normalized));
+#if SEPARATE_GATE
+            output_gate[(token * uint(QUERY_HEADS) + head) * width + column] = gate_input[
+                token * projected_strides[8] + (head * width + column) * projected_strides[9]];
+#else
+            output_gate[(token * uint(QUERY_HEADS) + head) * width + column] = query_gate_input[
+                source_base + (uint(HEAD_DIM) + column) * column_stride];
+#endif
+        } else if (is_key) {
+            key_output[output_index] = C(T(normalized));
+#if CACHE_OUTPUTS
+            value_output[output_index] = half(float(value_input[token * projected_strides[3] + (head * width + column) * projected_strides[7]]));
+#endif
+        } else {
+            index_query_output[(token * uint(INDEX_HEADS) + head) * width + column] = T(normalized);
+#if CACHE_OUTPUTS
+            if (!head) index_key_output[token * uint(INDEX_DIM) + column] = half(float(
+                index_query_key_input[token * projected_strides[2] + (uint(INDEX_HEADS * INDEX_DIM) + column) * column_stride]));
+#endif
+        }
+    }
+)METAL";
+
+constexpr const char* kGroupedRmsAffineSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    constexpr uint VALUES_PER_THREAD = 4u;
+    constexpr uint SIMD_SIZE = 32u;
+    threadgroup float inverse_rms[1];
+    threadgroup float local_sums[SIMD_SIZE];
+
+    uint input_offset = row * uint(GROUP_SIZE);
+    uint weight_offset =
+        (row % uint(GROUP_COUNT)) * uint(GROUP_SIZE);
+    uint column = local_thread * VALUES_PER_THREAD;
+    float values[VALUES_PER_THREAD] = {
+        0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_squares = 0.0f;
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint current = column + item;
+        if (current < uint(GROUP_SIZE)) {
+            float value = float(input[input_offset + current]);
+            values[item] = value;
+            sum_squares += value * value;
+        }
+    }
+
+    // Mirror MLX's non-looped FP32 RMS kernel exactly: four adjacent reads
+    // per thread, SIMD reduction, then a 32-slot cross-SIMD reduction.
+    sum_squares = simd_sum(sum_squares);
+    if (simd_group == 0u)
+        local_sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u)
+        local_sums[simd_group] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        float total = simd_sum(local_sums[lane]);
+        if (lane == 0u) {
+            inverse_rms[0] = metal::precise::rsqrt(
+                total / float(GROUP_SIZE) + epsilon[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint current = column + item;
+        if (current < uint(GROUP_SIZE)) {
+            float scaled = (values[item] * inverse_rms[0]) *
+                (1.0f + float(weight[weight_offset + current]));
+            output[input_offset + current] = T(scaled);
+        }
+    }
+#ifdef MFQ_HC_REMATERIALIZE
+    if (local_thread == 0u) rms[row] = inverse_rms[0];
+#endif
+)METAL";
+
+constexpr const char* kGroupedRmsAffineWriteSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    constexpr uint VALUES_PER_THREAD = 4u;
+    constexpr uint SIMD_SIZE = 32u;
+    threadgroup float inverse_rms[1];
+    threadgroup float local_sums[SIMD_SIZE];
+
+    uint token = row / uint(HC_COUNT);
+    uint stream = row % uint(HC_COUNT);
+    uint input_offset = row * uint(GROUP_SIZE);
+    uint branch_offset = token * uint(GROUP_SIZE);
+    uint weight_offset = stream * uint(GROUP_SIZE);
+    G gate = injection[token * uint(HC_COUNT) + stream];
+    uint column = local_thread * VALUES_PER_THREAD;
+    float values[VALUES_PER_THREAD] = {
+        0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_squares = 0.0f;
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint current = column + item;
+        if (current < uint(GROUP_SIZE)) {
+            // Preserve the standalone residual kernel's promoted multiply,
+            // explicit rounding, and add order before normalizing the result.
+            U update = U(U(branch[branch_offset + current]) * U(gate));
+            O value = O(O(residual[input_offset + current]) + O(update));
+            updated[input_offset + current] = value;
+            values[item] = float(value);
+            sum_squares += values[item] * values[item];
+        }
+    }
+
+    sum_squares = simd_sum(sum_squares);
+    if (simd_group == 0u)
+        local_sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u)
+        local_sums[simd_group] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        float total = simd_sum(local_sums[lane]);
+        if (lane == 0u) {
+            inverse_rms[0] = metal::precise::rsqrt(
+                total / float(GROUP_SIZE) + epsilon[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
+        uint current = column + item;
+        if (current < uint(GROUP_SIZE)) {
+            float scaled = (values[item] * inverse_rms[0]) *
+                (1.0f + float(weight[weight_offset + current]));
+#ifdef MFQ_HC_REMATERIALIZE
+            normalized[input_offset + current] = bfloat(scaled);
+#else
+            normalized[input_offset + current] = O(scaled);
+#endif
+        }
+    }
+#ifdef MFQ_HC_REMATERIALIZE
+    if (local_thread == 0u) rms[row] = inverse_rms[0];
+#endif
+)METAL";
+
+constexpr const char* kGatedHcProjectionSource = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint workgroup = threadgroup_position_in_grid.x;
+    constexpr uint ROWS_PER_WORKGROUP = 4u;
+    constexpr uint DOWN_WORKGROUPS = uint(LOW_RANK) / ROWS_PER_WORKGROUP;
+    constexpr uint SIMD_GROUPS = 8u;
+    threadgroup float partials[SIMD_GROUPS * ROWS_PER_WORKGROUP];
+
+    bool is_injection = workgroup >= DOWN_WORKGROUPS;
+    uint matrix_workgroup = is_injection
+        ? workgroup - DOWN_WORKGROUPS
+        : workgroup;
+    uint row_base = matrix_workgroup * ROWS_PER_WORKGROUP;
+
+    // This is the same 8-way K split and four-adjacent-value traversal used
+    // by MLX's BF16/F16 GEMV for the decode geometry. Both projections share
+    // normalized, so one launch can produce the 320 low-rank values and the
+    // four residual-injection values without a second tiny GEMV dispatch.
+    float accumulators[ROWS_PER_WORKGROUP] = {
+        0.0f, 0.0f, 0.0f, 0.0f};
+    uint column = simd_group * 128u + lane * 4u;
+    for (; column < uint(WIDTH); column += 1024u) {
+        for (uint item = 0u; item < 4u; ++item) {
+            float value = float(normalized[column + item]);
+            for (uint row = 0u; row < ROWS_PER_WORKGROUP; ++row) {
+                uint offset = (row_base + row) * uint(WIDTH) + column + item;
+                float weight = is_injection
+                    ? float(injection_weight[offset])
+                    : float(down_weight[offset]);
+                accumulators[row] += weight * value;
+            }
+        }
+    }
+
+    for (uint row = 0u; row < ROWS_PER_WORKGROUP; ++row) {
+        float value = accumulators[row];
+        for (ushort delta = 16; delta >= 1; delta >>= 1)
+            value += simd_shuffle_down(value, delta);
+        if (lane == 0u)
+            partials[simd_group * ROWS_PER_WORKGROUP + row] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0u && lane < ROWS_PER_WORKGROUP) {
+        float value = partials[lane];
+        for (uint group = 1u; group < SIMD_GROUPS; ++group)
+            value += partials[group * ROWS_PER_WORKGROUP + lane];
+        uint output_row = row_base + lane;
+        if (is_injection) {
+            I projected = I(value);
+            I scaled = I(projected / I(HC_COUNT));
+            I tail = I(1) /
+                (I(1) + metal::exp(metal::abs(scaled)));
+            I sigmoid = scaled < I(0) ? tail : I(1) - tail;
+            injection[output_row] = I(I(2) * sigmoid);
+        } else {
+            down[output_row] = D(value);
+        }
+    }
+)METAL";
+
+constexpr const char* kGatedHcUpCollapseSource = R"METAL(
+    constexpr uint FEATURES_PER_TG = 8u;
+    constexpr uint CHUNK = 32u;
+    constexpr uint CHUNKS = (uint(LOW_RANK) + CHUNK - 1u) / CHUNK;
+    constexpr uint OUTPUT_ROWS = FEATURES_PER_TG * uint(HC_COUNT);
+    constexpr uint PART_STRIDE = CHUNKS + 1u;
+    static_assert(HC_COUNT == 4, "coalesced HC up expects four streams");
+    static_assert(LOW_RANK == 320, "coalesced HC up is tuned for Qwen4");
+    static_assert(CHUNKS * OUTPUT_ROWS == 320,
+                  "one thread per up-projection chunk");
+
+    const uint tid = thread_index_in_threadgroup;
+    const uint chunk = tid % CHUNKS;
+    const uint output_row = tid / CHUNKS;
+    const uint stream = output_row & 3u;
+    const uint local_feature = output_row >> 2u;
+    const uint feature =
+        threadgroup_position_in_grid.x * FEATURES_PER_TG + local_feature;
+
+    // All 320 threads first produce one activated low-rank value.  The old
+    // kernel recomputed these values independently in every SIMD group.
+    threadgroup L activated[LOW_RANK];
+    threadgroup float partials[OUTPUT_ROWS * PART_STRIDE];
+    if (tid < uint(LOW_RANK)) {
+        L value = L(down_projection[tid] / L(HC_COUNT));
+        L tail = L(1) /
+            (L(1) + metal::exp(metal::abs(value)));
+        L sigmoid = value < L(0) ? tail : L(1) - tail;
+        activated[tid] = L(value * sigmoid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float accumulator = 0.0f;
+    const uint low_base = chunk * CHUNK;
+    if (feature < uint(HIDDEN)) {
+        const uint row = stream * uint(HIDDEN) + feature;
+        const uint weight_base = row * uint(LOW_RANK) + low_base;
+        for (uint item = 0u; item < CHUNK; ++item) {
+            const uint low = low_base + item;
+            if (low < uint(LOW_RANK)) {
+                accumulator += float(up_weight[weight_base + item]) *
+                    float(activated[low]);
+            }
+        }
+    }
+    partials[output_row * PART_STRIDE + chunk] = accumulator;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The first SIMD group reduces ten contiguous chunks for 32 projection
+    // rows (four streams by eight features), then performs the stream mix.
+    if (tid < OUTPUT_ROWS) {
+        const uint result_stream = tid & 3u;
+        const uint result_feature =
+            threadgroup_position_in_grid.x * FEATURES_PER_TG + (tid >> 2u);
+        float projected = 0.0f;
+        const uint base = tid * PART_STRIDE;
+        for (uint current = 0u; current < CHUNKS; ++current)
+            projected += partials[base + current];
+        T rounded = T(projected);
+        T tail = T(1) /
+            (T(1) + metal::exp(metal::abs(rounded)));
+        T gate = rounded < T(0) ? tail : T(1) - tail;
+        T product = T(gate * T(normalized[
+            result_stream * uint(HIDDEN) + result_feature]));
+        float mixed = float(product);
+        mixed += simd_shuffle_down(mixed, 1);
+        mixed += simd_shuffle_down(mixed, 2);
+        if (result_stream == 0u && result_feature < uint(HIDDEN))
+            branch[result_feature] = T(mixed / float(HC_COUNT));
+    }
+)METAL";
+
+// Decode-only two-stage hyper-connection path.  The first launch repeats the
+// tiny per-stream norm in each projection row group so the 10240x320 down
+// projection can consume threadgroup-resident values without materializing a
+// separate norm launch.  Four stream-slice sums are joined by the up launch.
+constexpr const char* kGatedHcNormDownSource = R"METAL(
+    constexpr uint STREAMS = 4u;
+    constexpr uint ROWS_PER_SIMD = uint(DOWN_RPS);
+    constexpr uint ROWS_PER_TG = 8u * ROWS_PER_SIMD;
+    constexpr uint DOWN_GROUPS = uint(LOW_RANK) / ROWS_PER_TG;
+    constexpr uint GROUPS = DOWN_GROUPS + uint(HAS_INJECTION);
+    constexpr uint PER = (uint(HIDDEN) + 255u) / 256u;
+    constexpr uint PART_STRIDE = uint(LOW_RANK + HC_COUNT);
+    static_assert(HC_COUNT == 4 && HIDDEN == 2560 && LOW_RANK == 320,
+                  "Qwen4 HC decode geometry changed");
+
+    const ulong token = threadgroup_position_in_grid.y;
+    input += token * uint(HIDDEN * HC_COUNT);
+    normalized += token * uint(HIDDEN * HC_COUNT);
+    parts += token * uint(HC_COUNT) * PART_STRIDE;
+
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint workgroup = threadgroup_position_in_grid.x;
+    const uint stream = workgroup & 3u;
+    const uint group = workgroup >> 2u;
+    const uint input_base = stream * uint(HIDDEN);
+
+    threadgroup N normalized_stream[HIDDEN];
+    threadgroup float norm_partials[8];
+    float values[PER];
+    float scales[PER];
+    float sum_squares = 0.0f;
+    for (uint item = 0u; item < PER; ++item) {
+        const uint feature = tid + item * 256u;
+        float value = 0.0f;
+        float scale = 0.0f;
+        if (feature < uint(HIDDEN)) {
+            value = float(input[input_base + feature]);
+            scale = 1.0f + float(norm_weight[input_base + feature]);
+        }
+        values[item] = value;
+        scales[item] = scale;
+        sum_squares += value * value;
+    }
+    sum_squares = simd_sum(sum_squares);
+    if (lane == 0u) norm_partials[simd_group] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint part = 0u; part < 8u; ++part)
+        total += norm_partials[part];
+    const float inverse_rms = metal::rsqrt(
+        total / float(HIDDEN) + epsilon[0]);
+    N stored = N(0);
+    for (uint item = 0u; item < PER; ++item) {
+        const uint feature = tid + item * 256u;
+        if (feature < uint(HIDDEN)) {
+            const N value = N(values[item] * inverse_rms * scales[item]);
+            normalized_stream[feature] = value;
+            if (item == group) stored = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* output_parts =
+        parts + stream * PART_STRIDE;
+    if (group < DOWN_GROUPS) {
+        const uint first_row =
+            group * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
+        float accumulators[ROWS_PER_SIMD] = {0.0f};
+        if constexpr (DOWN_GS != 0) {
+            mfq_hc_dot_groups<DOWN_GS, DOWN_NG, ROWS_PER_SIMD>(
+                down_weight, down_rows, down_scales, down_minima,
+                first_row, input_base, input_base + uint(HIDDEN),
+                input_base / uint(DOWN_GS) + lane, 32u,
+                normalized_stream, input_base, accumulators);
+        } else {
+            for (uint feature = lane * 4u;
+                 feature < uint(HIDDEN);
+                 feature += 128u) {
+                float inputs[4];
+                for (uint item = 0u; item < 4u; ++item)
+                    inputs[item] = float(normalized_stream[feature + item]);
+                for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                    const uint weight_base =
+                        (first_row + row) * uint(HIDDEN * HC_COUNT) +
+                        input_base + feature;
+                    for (uint item = 0u; item < 4u; ++item)
+                        accumulators[row] +=
+                            float(down_weight[weight_base + item]) * inputs[item];
+                }
+            }
+        }
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            const float value = simd_sum(accumulators[row]);
+            if (lane == 0u) output_parts[first_row + row] = value;
+        }
+    } else if (HAS_INJECTION != 0 && simd_group < uint(HC_COUNT)) {
+        float accumulator = 0.0f;
+        const uint weight_row = simd_group;
+        if constexpr (INJECT_GS != 0) {
+            mfq_hc_dot_groups<INJECT_GS, INJECT_NG, 1>(
+                injection_weight, injection_rows, injection_scales, injection_minima,
+                weight_row, input_base, input_base + uint(HIDDEN),
+                input_base / uint(INJECT_GS) + lane, 32u,
+                normalized_stream, input_base, &accumulator);
+        } else {
+            for (uint feature = lane * 4u;
+                 feature < uint(HIDDEN);
+                 feature += 128u) {
+                const uint weight_base =
+                    weight_row * uint(HIDDEN * HC_COUNT) + input_base + feature;
+                for (uint item = 0u; item < 4u; ++item) {
+                    accumulator += float(injection_weight[weight_base + item]) *
+                        float(normalized_stream[feature + item]);
+                }
+            }
+        }
+        accumulator = simd_sum(accumulator);
+        if (lane == 0u)
+            output_parts[uint(LOW_RANK) + weight_row] = accumulator;
+    }
+
+    // Store after all device weight reads.  This avoids a conservative device
+    // read-after-write fence in Apple's Metal compiler.
+    if (group < PER) {
+        const uint feature = tid + group * 256u;
+        if (feature < uint(HIDDEN))
+            normalized[input_base + feature] = stored;
+    }
+)METAL";
+
+constexpr const char* kGatedHcWriteNormDownSource = R"METAL(
+    constexpr uint STREAMS = 4u;
+    constexpr uint ROWS_PER_SIMD = uint(DOWN_RPS);
+    constexpr uint ROWS_PER_TG = 8u * ROWS_PER_SIMD;
+    constexpr uint DOWN_GROUPS = uint(LOW_RANK) / ROWS_PER_TG;
+    constexpr uint GROUPS = DOWN_GROUPS + uint(HAS_INJECTION);
+    constexpr uint PER = (uint(HIDDEN) + 255u) / 256u;
+    constexpr uint PART_STRIDE = uint(LOW_RANK + HC_COUNT);
+    static_assert(HC_COUNT == 4 && HIDDEN == 2560 && LOW_RANK == 320,
+                  "Qwen4 HC decode geometry changed");
+
+    const ulong token = threadgroup_position_in_grid.y;
+    previous_residual += token * uint(HIDDEN * HC_COUNT);
+    previous_branch += token * uint(HIDDEN);
+    previous_injection += token * uint(HC_COUNT);
+    residual += token * uint(HIDDEN * HC_COUNT);
+    normalized += token * uint(HIDDEN * HC_COUNT);
+    parts += token * uint(HC_COUNT) * PART_STRIDE;
+
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint workgroup = threadgroup_position_in_grid.x;
+    const uint stream = workgroup & 3u;
+    const uint group = workgroup >> 2u;
+    const uint input_base = stream * uint(HIDDEN);
+
+    threadgroup O normalized_stream[HIDDEN];
+    threadgroup float norm_partials[8];
+    float values[PER];
+    float scales[PER];
+    const G gate_value = previous_injection[stream];
+    float sum_squares = 0.0f;
+    O written = O(0);
+    for (uint item = 0u; item < PER; ++item) {
+        const uint feature = tid + item * 256u;
+        float value = 0.0f;
+        float scale = 0.0f;
+        if (feature < uint(HIDDEN)) {
+            #pragma clang fp contract(off)
+            U update = U(U(previous_branch[feature]) * U(gate_value));
+            written = O(O(previous_residual[input_base + feature]) + O(update));
+            value = float(written);
+            scale = 1.0f + float(norm_weight[input_base + feature]);
+        }
+        values[item] = value;
+        scales[item] = scale;
+        sum_squares += value * value;
+    }
+    sum_squares = simd_sum(sum_squares);
+    if (lane == 0u) norm_partials[simd_group] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint part = 0u; part < 8u; ++part)
+        total += norm_partials[part];
+    const float inverse_rms = metal::rsqrt(
+        total / float(HIDDEN) + epsilon[0]);
+    O stored_norm = O(0);
+    O stored_residual = O(0);
+    for (uint item = 0u; item < PER; ++item) {
+        const uint feature = tid + item * 256u;
+        if (feature < uint(HIDDEN)) {
+            const O value = O(values[item]);
+            const O normed = O(float(value) * inverse_rms * scales[item]);
+            normalized_stream[feature] = normed;
+            if (item == group) {
+                stored_norm = normed;
+                stored_residual = value;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* output_parts = parts + stream * PART_STRIDE;
+    if (group < DOWN_GROUPS) {
+        const uint first_row =
+            group * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
+        float accumulators[ROWS_PER_SIMD] = {0.0f};
+        if constexpr (DOWN_GS != 0) {
+            mfq_hc_dot_groups<DOWN_GS, DOWN_NG, ROWS_PER_SIMD>(
+                down_weight, down_rows, down_scales, down_minima,
+                first_row, input_base, input_base + uint(HIDDEN),
+                input_base / uint(DOWN_GS) + lane, 32u,
+                normalized_stream, input_base, accumulators);
+        } else {
+            for (uint feature = lane * 4u;
+                 feature < uint(HIDDEN);
+                 feature += 128u) {
+                float inputs[4];
+                for (uint item = 0u; item < 4u; ++item)
+                    inputs[item] = float(normalized_stream[feature + item]);
+                for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                    const uint weight_base =
+                        (first_row + row) * uint(HIDDEN * HC_COUNT) +
+                        input_base + feature;
+                    for (uint item = 0u; item < 4u; ++item)
+                        accumulators[row] +=
+                            float(down_weight[weight_base + item]) * inputs[item];
+                }
+            }
+        }
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            const float value = simd_sum(accumulators[row]);
+            if (lane == 0u) output_parts[first_row + row] = value;
+        }
+    } else if (HAS_INJECTION != 0 && simd_group < uint(HC_COUNT)) {
+        float accumulator = 0.0f;
+        const uint weight_row = simd_group;
+        if constexpr (INJECT_GS != 0) {
+            mfq_hc_dot_groups<INJECT_GS, INJECT_NG, 1>(
+                injection_weight, injection_rows, injection_scales, injection_minima,
+                weight_row, input_base, input_base + uint(HIDDEN),
+                input_base / uint(INJECT_GS) + lane, 32u,
+                normalized_stream, input_base, &accumulator);
+        } else {
+            for (uint feature = lane * 4u;
+                 feature < uint(HIDDEN);
+                 feature += 128u) {
+                const uint weight_base =
+                    weight_row * uint(HIDDEN * HC_COUNT) + input_base + feature;
+                for (uint item = 0u; item < 4u; ++item) {
+                    accumulator += float(injection_weight[weight_base + item]) *
+                        float(normalized_stream[feature + item]);
+                }
+            }
+        }
+        accumulator = simd_sum(accumulator);
+        if (lane == 0u)
+            output_parts[uint(LOW_RANK) + weight_row] = accumulator;
+    }
+
+    if (group < PER) {
+        const uint feature = tid + group * 256u;
+        if (feature < uint(HIDDEN)) {
+            const uint index = input_base + feature;
+            normalized[index] = stored_norm;
+            residual[index] = stored_residual;
+        }
+    }
+)METAL";
+
+
+constexpr const char* kGatedHcPartsUpSource = R"METAL(
+    constexpr uint FEATURES_PER_TG = 8u;
+    constexpr uint CHUNK = UP_GS == 0 ? 32u
+        : uint(UP_GS) * ((32u + uint(UP_GS) - 1u) / uint(UP_GS));
+    constexpr uint CHUNKS = (uint(LOW_RANK) + CHUNK - 1u) / CHUNK;
+    constexpr uint OUTPUT_ROWS = FEATURES_PER_TG * uint(HC_COUNT);
+    constexpr uint THREADS = OUTPUT_ROWS * CHUNKS;
+    constexpr uint PART_STRIDE = uint(LOW_RANK + HC_COUNT);
+    constexpr uint REDUCE_STRIDE = CHUNKS + 1u;
+    static_assert(HC_COUNT == 4 && LOW_RANK == 320,
+                  "Qwen4 HC up geometry changed");
+
+    const ulong token = threadgroup_position_in_grid.y;
+    normalized += token * uint(HIDDEN * HC_COUNT);
+    parts += token * uint(HC_COUNT) * PART_STRIDE;
+    branch += token * uint(HIDDEN);
+    injection += token * uint(HC_COUNT);
+
+    const uint tid = thread_index_in_threadgroup;
+    const uint chunk = tid % CHUNKS;
+    const uint output_row = tid / CHUNKS;
+    const uint stream = output_row & 3u;
+    const uint local_feature = output_row >> 2u;
+    const uint feature =
+        threadgroup_position_in_grid.x * FEATURES_PER_TG + local_feature;
+
+    threadgroup L activated[LOW_RANK];
+    threadgroup float projection_partials[OUTPUT_ROWS * REDUCE_STRIDE];
+    for (uint low = tid; low < uint(LOW_RANK); low += THREADS) {
+        float value = parts[low] + parts[PART_STRIDE + low] +
+            parts[2u * PART_STRIDE + low] +
+            parts[3u * PART_STRIDE + low];
+        L rounded = L(value / float(HC_COUNT));
+        L tail = L(1) /
+            (L(1) + metal::exp(metal::abs(rounded)));
+        L sigmoid = rounded < L(0) ? tail : L(1) - tail;
+        activated[low] = L(rounded * sigmoid);
+    }
+    if (HAS_INJECTION != 0 && tid < uint(HC_COUNT)) {
+        const uint index = uint(LOW_RANK) + tid;
+        float value = parts[index] + parts[PART_STRIDE + index] +
+            parts[2u * PART_STRIDE + index] +
+            parts[3u * PART_STRIDE + index];
+        I rounded = I(value / float(HC_COUNT));
+        I tail = I(1) /
+            (I(1) + metal::exp(metal::abs(rounded)));
+        I sigmoid = rounded < I(0) ? tail : I(1) - tail;
+        injection[tid] = I(I(2) * sigmoid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float accumulator = 0.0f;
+    const uint low_base = chunk * CHUNK;
+    if (feature < uint(HIDDEN)) {
+        const uint row = stream * uint(HIDDEN) + feature;
+        if constexpr (UP_GS != 0) {
+            mfq_hc_dot_groups<UP_GS, UP_NG, 1>(
+                up_weight, up_rows, up_scales, up_minima,
+                row, low_base, min(low_base + CHUNK, uint(LOW_RANK)),
+                low_base / uint(UP_GS), 1u, activated, 0u, &accumulator);
+        } else {
+            const uint weight_base = row * uint(LOW_RANK) + low_base;
+            for (uint item = 0u; item < CHUNK; ++item) {
+                accumulator += float(up_weight[weight_base + item]) *
+                    float(activated[low_base + item]);
+            }
+        }
+    }
+    projection_partials[output_row * REDUCE_STRIDE + chunk] = accumulator;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < OUTPUT_ROWS) {
+        const uint result_stream = tid & 3u;
+        const uint result_feature =
+            threadgroup_position_in_grid.x * FEATURES_PER_TG + (tid >> 2u);
+        float projected = 0.0f;
+        const uint base = tid * REDUCE_STRIDE;
+        for (uint current = 0u; current < CHUNKS; ++current)
+            projected += projection_partials[base + current];
+        T rounded = T(projected);
+        T tail = T(1) /
+            (T(1) + metal::exp(metal::abs(rounded)));
+        T gate = rounded < T(0) ? tail : T(1) - tail;
+        T product = T(gate * T(normalized[
+            result_stream * uint(HIDDEN) + result_feature]));
+        float mixed = float(product);
+        mixed += simd_shuffle_down(mixed, 1);
+        mixed += simd_shuffle_down(mixed, 2);
+        if (result_stream == 0u && result_feature < uint(HIDDEN))
+            branch[result_feature] = T(mixed / float(HC_COUNT));
+    }
+)METAL";
+
+const mlx::core::fast::CustomKernelFunction& grouped_rms_affine_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_grouped_rms_affine",
+            {"input", "weight", "epsilon"},
+            {"output"},
+            kGroupedRmsAffineSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+grouped_rms_affine_write_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_grouped_rms_affine_write",
+            {
+                "residual",
+                "branch",
+                "injection",
+                "weight",
+                "epsilon",
+            },
+            {"updated", "normalized"},
+            kGroupedRmsAffineWriteSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& grouped_rms_projection_kernel() {
+    static const auto kernel = cached_metal_kernel(
+        "mfq_cpp_qwen_grouped_rms_projection", {"input", "weight", "epsilon"}, {"output", "rms"},
+        kGroupedRmsAffineSource, "#define MFQ_HC_REMATERIALIZE\n");
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& grouped_rms_write_projection_kernel() {
+    static const auto kernel = cached_metal_kernel(
+        "mfq_cpp_qwen_grouped_rms_write_projection", {"residual", "branch", "injection", "weight", "epsilon"},
+        {"updated", "normalized", "rms"}, kGroupedRmsAffineWriteSource, "#define MFQ_HC_REMATERIALIZE\n");
+    return kernel;
+}
+
+struct QsaPrologueConfig {
+    mlx::core::Dtype dtype;
+    std::array<int, 6> geometry;
+    std::array<float, 2> params;
+    bool cache_outputs;
+    bool half_query;
+    bool separate_gate;
+};
+
+class QsaProloguePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    QsaProloguePrimitive(mlx::core::Stream stream, QsaPrologueConfig config)
+        : Primitive(stream), config_(config),
+          kernel_name_("mfq_qsa_decode_prologue_v2") {
+        kernel_name_ += "_" + mlx::core::type_to_name(config_.dtype);
+        for (int value : config_.geometry) {
+            kernel_name_ += "_" + std::to_string(value);
+        }
+        if (config_.cache_outputs) kernel_name_ += "_cache";
+        if (config_.half_query) kernel_name_ += "_qhalf";
+        if (config_.separate_gate) kernel_name_ += "_gate";
+    }
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = kernel_device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        return device.get_kernel(kernel_name_, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA decode prologue requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        for (auto& output : outputs) {
+            output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        auto* kernel = prepared_kernel();
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            kernel);
+        for (int index = 0; index < 7; ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(config_.params, 7);
+        const int rows = inputs[0].shape(1);
+        encoder.set_bytes(rows, 12);
+        const auto* gate = config_.separate_gate ? &inputs[7 + int(config_.cache_outputs)] : nullptr;
+        const std::array<std::int64_t, 10> strides{
+            inputs[0].strides()[1], inputs[1].strides()[1],
+            inputs[2].strides()[1], config_.cache_outputs ? inputs[7].strides()[1] : 0u,
+            inputs[0].strides()[2], inputs[1].strides()[2],
+            inputs[2].strides()[2], config_.cache_outputs ? inputs[7].strides()[2] : 0u,
+            gate ? gate->strides()[1] : 0u, gate ? gate->strides()[2] : 0u};
+        encoder.set_bytes(strides, 16);
+        if (gate) encoder.set_input_array(*gate, 17);
+        for (int index = 0; index < 4; ++index) {
+            encoder.set_output_array(outputs[index], index + 8);
+        }
+        if (config_.cache_outputs) {
+            encoder.set_input_array(inputs[7], 13);
+            encoder.set_output_array(outputs[4], 14);
+            encoder.set_output_array(outputs[5], 15);
+        }
+        encoder.dispatch_threadgroups(
+            MTL::Size(config_.geometry[0] + config_.geometry[1] +
+                config_.geometry[2], rows, 1),
+            MTL::Size(64, 1, 1));
+    }
+
+    const char* name() const override { return "QsaDecodePrologue"; }
+
+private:
+    std::string source() const {
+        std::string code =
+            "#include <metal_stdlib>\nusing namespace metal;\n";
+        const char* type = config_.dtype == mlx::core::float16
+            ? "half" : config_.dtype == mlx::core::bfloat16 ? "bfloat" : "float";
+        code += "using T = " + std::string(type) + ";\n";
+        code += "using C = " + std::string(config_.cache_outputs ? "half" : type) + ";\n";
+        code += "using Q = " + std::string(config_.half_query ? "half" : type) + ";\n";
+        code += "#define CACHE_OUTPUTS " + std::to_string(int(config_.cache_outputs)) + "\n";
+        code += "#define SEPARATE_GATE " + std::to_string(int(config_.separate_gate)) + "\n";
+        const std::array<const char*, 6> names{
+            "QUERY_HEADS", "KEY_HEADS", "INDEX_HEADS",
+            "HEAD_DIM", "INDEX_DIM", "ROTARY_DIM"};
+        for (int index = 0; index < 6; ++index) {
+            code += "#define " + std::string(names[index]) + " " +
+                std::to_string(config_.geometry[index]) + "\n";
+        }
+        code += "kernel void " + kernel_name_ + "("
+            "device const T* query_gate_input [[buffer(0)]], "
+            "device const T* key_input [[buffer(1)]], "
+            "device const T* index_query_key_input [[buffer(2)]], "
+            "device const float* query_weight [[buffer(3)]], "
+            "device const float* key_weight [[buffer(4)]], "
+            "device const float* index_weight [[buffer(5)]], "
+            "device const int* positions [[buffer(6)]], "
+            "constant float* params [[buffer(7)]], "
+            "device Q* query_output [[buffer(8)]], "
+            "device T* output_gate [[buffer(9)]], "
+            "device C* key_output [[buffer(10)]], "
+            "device T* index_query_output [[buffer(11)]], "
+            "constant int* token_count [[buffer(12)]], "
+            "constant long* projected_strides [[buffer(16)]], ";
+        if (config_.separate_gate) code += "device const T* gate_input [[buffer(17)]], ";
+        if (config_.cache_outputs) code +=
+            "device const T* value_input [[buffer(13)]], "
+            "device half* value_output [[buffer(14)]], "
+            "device half* index_key_output [[buffer(15)]], ";
+        code +=
+            "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
+            "uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], "
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]]) {\n";
+        code += kQsaDecodePrologueSource;
+        code += "}\n";
+        return code;
+    }
+
+    QsaPrologueConfig config_;
+    std::string kernel_name_;
+};
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_post_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_post",
+            {"branch", "residual", "injection"},
+            {"output"},
+            R"METAL(
+                uint index = thread_position_in_grid.x;
+                if (index >= uint(residual_shape[0])) return;
+                uint row = index / uint(HIDDEN * HC_COUNT);
+                uint stream = (index / uint(HIDDEN)) % uint(HC_COUNT);
+                uint feature = index % uint(HIDDEN);
+                // Preserve the multiply's promoted rounding before the add;
+                // do not replace this with a fused multiply-add.
+                U update = U(U(branch[row * uint(HIDDEN) + feature]) *
+                    U(injection[row * uint(HC_COUNT) + stream]));
+                output[index] = T(T(residual[index]) + T(update));
+            )METAL",
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_projection_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_projection",
+            {"normalized", "down_weight", "injection_weight"},
+            {"down", "injection"},
+            kGatedHcProjectionSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_up_collapse_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_up_collapse",
+            {"down_projection", "up_weight", "normalized"},
+            {"branch"},
+            kGatedHcUpCollapseSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_mix_kernel() {
+    static const auto kernel = cached_metal_kernel(
+        "mfq_cpp_qwen_gated_hc_mix",
+        {"logits", "normalized"},
+        {"branch"},
+        R"METAL(
+            uint index = thread_position_in_grid.x;
+            if (index >= uint(normalized_shape[0]) * uint(HIDDEN)) return;
+            uint row = index / uint(HIDDEN), feature = index % uint(HIDDEN);
+            float total = 0.0f;
+#pragma clang loop unroll(full)
+            for (uint group = 0u; group < uint(HC_COUNT); ++group) {
+                uint location = (row * uint(HC_COUNT) + group) * uint(HIDDEN) + feature;
+                P logit = logits[location];
+                auto inverse = 1 / (1 + metal::precise::exp(metal::abs(logit)));
+                P probability = logit < 0 ? inverse : 1 - inverse;
+                T product = T(probability) * T(normalized[location]);
+                total += float(product);
+            }
+            branch[index] = T(total / float(HC_COUNT));
+        )METAL");
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_recomputed_mix_kernel() {
+    static const auto kernel = cached_metal_kernel(
+        "mfq_cpp_qwen_gated_hc_recomputed_mix", {"logits", "residual", "weight", "rms"}, {"branch"}, R"METAL(
+uint index = thread_position_in_grid.x;
+if (index >= uint(residual_shape[0]) * uint(HIDDEN)) return;
+uint row = index / uint(HIDDEN), feature = index % uint(HIDDEN);
+float total = 0.f;
+#pragma clang loop unroll(full)
+for (uint group = 0u; group < uint(HC_COUNT); ++group) {
+    uint location = (row * uint(HC_COUNT) + group) * uint(HIDDEN) + feature;
+    P logit = logits[location];
+    auto inverse = 1 / (1 + metal::precise::exp(metal::abs(logit)));
+    P probability = logit < 0 ? inverse : 1 - inverse;
+    float normalized = (float(residual[location]) * rms[row * uint(HC_COUNT) + group]) *
+        (1.f + float(weight[group * uint(HIDDEN) + feature]));
+    T product = T(probability) * T(normalized);
+    total += float(product);
+}
+branch[index] = T(total / float(HC_COUNT));
+)METAL");
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_norm_down_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_norm_down",
+            {
+                "input",
+                "norm_weight",
+                "down_weight",
+                "down_rows",
+                "down_scales",
+                "down_minima",
+                "injection_weight",
+                "injection_rows",
+                "injection_scales",
+                "injection_minima",
+                "epsilon",
+            },
+            {"normalized", "parts"},
+            kGatedHcNormDownSource,
+            kGatedHcWeightHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+gated_hc_write_norm_down_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_write_norm_down",
+            {
+                "previous_residual",
+                "previous_branch",
+                "previous_injection",
+                "norm_weight",
+                "down_weight",
+                "down_rows",
+                "down_scales",
+                "down_minima",
+                "injection_weight",
+                "injection_rows",
+                "injection_scales",
+                "injection_minima",
+                "epsilon",
+            },
+            {"residual", "normalized", "parts"},
+            kGatedHcWriteNormDownSource,
+            kGatedHcWeightHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_parts_up_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return cached_metal_kernel(
+            "mfq_cpp_qwen_gated_hc_parts_up",
+            {"normalized", "parts", "up_weight", "up_rows", "up_scales", "up_minima"},
+            {"branch", "injection"},
+            kGatedHcPartsUpSource,
+            kGatedHcWeightHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+bool gated_hc_fast_path_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting =
+            std::getenv("TYLOINFER_METAL_QWEN_GATED_HC_FAST");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
+}
+
+bool gated_hc_float_dtype(mlx::core::Dtype dtype) noexcept {
+    return dtype == mlx::core::float16 ||
+        dtype == mlx::core::bfloat16 || dtype == mlx::core::float32;
+}
+
+bool can_fuse_grouped_rms_affine(
+    const array& value,
+    const array& weight,
+    int group_size) {
+    return gated_hc_fast_path_enabled() &&
+        gated_hc_float_dtype(value.dtype()) &&
+        gated_hc_float_dtype(weight.dtype()) &&
+        value.ndim() >= 1 &&
+        group_size > 0 && group_size <= 4096 &&
+        value.shape(-1) % group_size == 0 &&
+        weight.ndim() == 1 &&
+        weight.shape(0) == value.shape(-1);
+}
+
+array fused_grouped_rms_affine(
+    const array& value,
+    const array& weight,
+    int group_size,
+    float eps,
+    std::optional<array>* statistics = nullptr) {
+    constexpr int values_per_thread = 4;
+    constexpr int simd_size = 32;
+    const int threads_needed =
+        (group_size + values_per_thread - 1) / values_per_thread;
+    const int simdgroups =
+        (threads_needed + simd_size - 1) / simd_size;
+    const int threads = simdgroups * simd_size;
+    const int rows = static_cast<int>(value.size() / group_size);
+    const int group_count = value.shape(-1) / group_size;
+    const array epsilon({eps}, Shape{1});
+    std::vector<Shape> shapes{value.shape()};
+    const auto dtype = statistics ? mlx::core::bfloat16 : value.dtype();
+    std::vector<mlx::core::Dtype> dtypes{dtype};
+    if (statistics) { shapes.push_back(Shape{rows}); dtypes.push_back(mlx::core::float32); }
+    auto outputs = (statistics ? grouped_rms_projection_kernel() : grouped_rms_affine_kernel())(
+        {value, weight, epsilon},
+        shapes,
+        dtypes,
+        {rows * threads, 1, 1},
+        {threads, 1, 1},
+        {
+            {"T", dtype},
+            {"GROUP_SIZE", group_size},
+            {"GROUP_COUNT", group_count},
+        },
+        std::nullopt,
+        false,
+        {});
+    if (statistics) *statistics = std::move(outputs[1]);
+    return std::move(outputs.front());
+}
+
+struct GatedHcWriteNorm {
+    array residual;
+    array normalized;
+    std::optional<array> statistics;
+};
+
+bool can_fuse_grouped_rms_affine_write(
+    const array& branch,
+    const array& residual,
+    const array& injection,
+    const array& weight,
+    int group_size,
+    int hc_count) {
+    if (!gated_hc_fast_path_enabled() ||
+        !gated_hc_float_dtype(branch.dtype()) ||
+        !gated_hc_float_dtype(residual.dtype()) ||
+        !gated_hc_float_dtype(injection.dtype()) ||
+        !gated_hc_float_dtype(weight.dtype()) ||
+        branch.ndim() < 2 || residual.ndim() != branch.ndim() ||
+        injection.ndim() != branch.ndim() ||
+        group_size <= 0 || group_size > 4096 || hc_count <= 1 ||
+        residual.shape(-1) != group_size * hc_count ||
+        weight.shape() != Shape{group_size * hc_count}) {
+        return false;
+    }
+    auto branch_shape = residual.shape();
+    branch_shape.back() = group_size;
+    auto injection_shape = residual.shape();
+    injection_shape.back() = hc_count;
+    return branch.shape() == branch_shape &&
+        injection.shape() == injection_shape &&
+        residual.size() > 0 &&
+        residual.size() <= static_cast<std::size_t>(
+            std::numeric_limits<int>::max());
+}
+
+GatedHcWriteNorm fused_grouped_rms_affine_write(
+    const array& branch,
+    const array& residual,
+    const array& injection,
+    const array& weight,
+    int group_size,
+    int hc_count,
+    float eps,
+    bool rematerialize = false) {
+    constexpr int values_per_thread = 4;
+    constexpr int simd_size = 32;
+    const int threads_needed =
+        (group_size + values_per_thread - 1) / values_per_thread;
+    const int simdgroups =
+        (threads_needed + simd_size - 1) / simd_size;
+    const int threads = simdgroups * simd_size;
+    const int rows = static_cast<int>(residual.size() / group_size);
+    const auto update_dtype = mlx::core::promote_types(
+        branch.dtype(), injection.dtype());
+    const auto output_dtype = mlx::core::promote_types(
+        residual.dtype(), update_dtype);
+    const array epsilon({eps}, Shape{1});
+    std::vector<Shape> shapes{residual.shape(), residual.shape()};
+    std::vector<mlx::core::Dtype> dtypes{output_dtype, rematerialize ? mlx::core::bfloat16 : output_dtype};
+    if (rematerialize) { shapes.push_back(Shape{rows}); dtypes.push_back(mlx::core::float32); }
+    auto outputs = (rematerialize ? grouped_rms_write_projection_kernel() : grouped_rms_affine_write_kernel())(
+        {residual, branch, injection, weight, epsilon},
+        shapes,
+        dtypes,
+        {rows * threads, 1, 1},
+        {threads, 1, 1},
+        {
+            {"R", residual.dtype()},
+            {"B", branch.dtype()},
+            {"G", injection.dtype()},
+            {"W", weight.dtype()},
+            {"U", update_dtype},
+            {"O", output_dtype},
+            {"GROUP_SIZE", group_size},
+            {"HC_COUNT", hc_count},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs[0]),
+        std::move(outputs[1]),
+        rematerialize ? std::optional(std::move(outputs[2])) : std::nullopt,
+    };
+}
+
+bool can_fuse_gated_hc_projections(
+    const array& normalized,
+    const array& down_weight,
+    const array& injection_weight,
+    int hc_count) {
+    if (!gated_hc_fast_path_enabled() ||
+        !gated_hc_float_dtype(normalized.dtype()) ||
+        normalized.ndim() != 3 ||
+        normalized.shape(0) != 1 ||
+        normalized.shape(1) != 1 ||
+        down_weight.ndim() != 2 ||
+        injection_weight.ndim() != 2 ||
+        !gated_hc_float_dtype(down_weight.dtype()) ||
+        !gated_hc_float_dtype(injection_weight.dtype()) ||
+        hc_count != 4) {
+        return false;
+    }
+    const int width = normalized.shape(2);
+    const int low_rank = down_weight.shape(0);
+    return width > 0 && width % 1024 == 0 &&
+        low_rank > 0 && low_rank % 4 == 0 &&
+        down_weight.shape(1) == width &&
+        injection_weight.shape() == Shape{hc_count, width} &&
+        width >= 16 * low_rank;
+}
+
+struct GatedHcProjections {
+    array down;
+    array injection;
+};
+
+GatedHcProjections fused_gated_hc_projections(
+    const array& normalized,
+    const array& down_weight,
+    const array& injection_weight,
+    int hc_count) {
+    const int width = normalized.shape(2);
+    const int low_rank = down_weight.shape(0);
+    const int workgroups = low_rank / 4 + hc_count / 4;
+    // Keep storage types independent and match matmul's promotion without
+    // materializing full FP32 copies of the BF16/FP16 projection matrices.
+    const auto down_dtype = mlx::core::promote_types(
+        normalized.dtype(), down_weight.dtype());
+    const auto injection_dtype = mlx::core::promote_types(
+        normalized.dtype(), injection_weight.dtype());
+    auto outputs = gated_hc_projection_kernel()(
+        {normalized, down_weight, injection_weight},
+        {Shape{1, 1, low_rank}, Shape{1, 1, hc_count}},
+        {down_dtype, injection_dtype},
+        {workgroups * kGatedHcProjectionThreads, 1, 1},
+        {kGatedHcProjectionThreads, 1, 1},
+        {
+            {"D", down_dtype},
+            {"I", injection_dtype},
+            {"WIDTH", width},
+            {"LOW_RANK", low_rank},
+            {"HC_COUNT", hc_count},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs[0]),
+        std::move(outputs[1]),
+    };
+}
+
+bool can_fuse_gated_hc_up_collapse(
+    const array& down_projection,
+    const array& up_weight,
+    const array& normalized,
+    int hidden_size,
+    int hc_count) {
+    return gated_hc_fast_path_enabled() &&
+        gated_hc_float_dtype(normalized.dtype()) &&
+        gated_hc_float_dtype(down_projection.dtype()) &&
+        gated_hc_float_dtype(up_weight.dtype()) &&
+        normalized.ndim() == 3 &&
+        normalized.shape(0) == 1 &&
+        normalized.shape(1) == 1 &&
+        normalized.shape(2) == hidden_size * hc_count &&
+        down_projection.ndim() == 3 &&
+        down_projection.shape(0) == 1 &&
+        down_projection.shape(1) == 1 &&
+        down_projection.shape(2) == 320 &&
+        up_weight.ndim() == 2 &&
+        up_weight.shape(0) == hidden_size * hc_count &&
+        up_weight.shape(1) == down_projection.shape(2) &&
+        hc_count == 4;
+}
+
+array fused_gated_hc_up_collapse(
+    const array& down_projection,
+    const array& up_weight,
+    const array& normalized,
+    int hidden_size,
+    int hc_count) {
+    const int workgroups = (hidden_size + 7) / 8;
+    const auto dtype = mlx::core::promote_types(
+        down_projection.dtype(), up_weight.dtype());
+    auto outputs = gated_hc_up_collapse_kernel()(
+        {down_projection, up_weight, normalized},
+        {Shape{1, 1, hidden_size}},
+        {dtype},
+        {workgroups * kGatedHcUpThreads, 1, 1},
+        {kGatedHcUpThreads, 1, 1},
+        {
+            {"T", dtype},
+            {"L", down_projection.dtype()},
+            {"HIDDEN", hidden_size},
+            {"LOW_RANK", down_projection.shape(2)},
+            {"HC_COUNT", hc_count},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+bool can_fuse_gated_hc_two_stage(
+    const array& input,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& injection_weight,
+    int hidden_size,
+    int hc_count) {
+    if (!down_weight.dense_weight_ref() || !up_weight.dense_weight_ref()
+        || (injection_weight && !injection_weight->dense_weight_ref())) return false;
+    if (!gated_hc_fast_path_enabled() ||
+        hidden_size != 2560 || hc_count != 4 ||
+        input.ndim() != 3 || input.shape(0) < 1 || input.shape(1) < 1 || input.shape(2) != 10240 ||
+        input.size() / 10240 > 8 ||
+        norm_weight.shape() != Shape{10240} ||
+        (down_weight.output_size() != 320 || down_weight.input_size() != 10240) ||
+        (up_weight.output_size() != 10240 || up_weight.input_size() != 320) ||
+        !gated_hc_float_dtype(input.dtype()) ||
+        !gated_hc_float_dtype(norm_weight.dtype()) ||
+        !gated_hc_float_dtype(hc_weight_dtype(down_weight)) ||
+        !gated_hc_float_dtype(hc_weight_dtype(up_weight))) {
+        return false;
+    }
+    return !injection_weight ||
+        (injection_weight->output_size() == 4 && injection_weight->input_size() == 10240 &&
+         gated_hc_float_dtype(hc_weight_dtype(*injection_weight)));
+}
+
+struct GatedHcNormDown {
+    array normalized;
+    array parts;
+};
+
+
+GatedHcNormDown fused_gated_hc_norm_down(
+    const array& input,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const std::optional<MlxLinear>& injection_weight,
+    float eps) {
+    constexpr int hidden_size = 2560;
+    constexpr int hc_count = 4;
+    constexpr int low_rank = 320;
+    constexpr int rows_per_group = 16;
+    const bool has_injection = injection_weight.has_value();
+    const int groups = low_rank / rows_per_group +
+        static_cast<int>(has_injection);
+    const int tokens = static_cast<int>(input.size() / (hidden_size * hc_count));
+    const array epsilon({eps}, Shape{1});
+    const auto down = hc_weight_inputs(down_weight);
+    const auto injection = hc_weight_inputs(has_injection ? *injection_weight : down_weight);
+    auto outputs = gated_hc_norm_down_kernel()(
+        {input, norm_weight, down.values, down.rows, down.scales, down.minima,
+         injection.values, injection.rows, injection.scales, injection.minima, epsilon},
+        {input.shape(), Shape{tokens, hc_count, low_rank + hc_count}},
+        {input.dtype(), mlx::core::float32},
+        {groups * hc_count * kGatedHcProjectionThreads, tokens, 1},
+        {kGatedHcProjectionThreads, 1, 1},
+        {
+            {"N", input.dtype()},
+            {"DOWN_GS", down.group_size},
+            {"DOWN_NG", down.groups},
+            {"INJECT_GS", injection.group_size},
+            {"INJECT_NG", injection.groups},
+            {"HIDDEN", hidden_size},
+            {"LOW_RANK", low_rank},
+            {"HC_COUNT", hc_count},
+            {"HAS_INJECTION", static_cast<int>(has_injection)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {std::move(outputs[0]), std::move(outputs[1])};
+}
+
+struct GatedHcWriteNormDown {
+    array residual;
+    array normalized;
+    array parts;
+};
+
+GatedHcWriteNormDown fused_gated_hc_write_norm_down(
+    const array& previous_branch,
+    const array& previous_residual,
+    const array& previous_injection,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const std::optional<MlxLinear>& injection_weight,
+    float eps) {
+    constexpr int hidden_size = 2560;
+    constexpr int hc_count = 4;
+    constexpr int low_rank = 320;
+    constexpr int rows_per_group = 16;
+    const bool has_injection = injection_weight.has_value();
+    const int groups = low_rank / rows_per_group +
+        static_cast<int>(has_injection);
+    const int tokens = static_cast<int>(previous_residual.size() / (hidden_size * hc_count));
+    const auto update_dtype = mlx::core::promote_types(
+        previous_branch.dtype(), previous_injection.dtype());
+    const auto output_dtype = mlx::core::promote_types(
+        previous_residual.dtype(), update_dtype);
+    const array epsilon({eps}, Shape{1});
+    const auto down = hc_weight_inputs(down_weight);
+    const auto injection = hc_weight_inputs(has_injection ? *injection_weight : down_weight);
+    auto outputs = gated_hc_write_norm_down_kernel()(
+        {
+            previous_residual,
+            previous_branch,
+            previous_injection,
+            norm_weight,
+            down.values, down.rows, down.scales, down.minima,
+            injection.values, injection.rows, injection.scales, injection.minima,
+            epsilon,
+        },
+        {
+            previous_residual.shape(),
+            previous_residual.shape(),
+            Shape{tokens, hc_count, low_rank + hc_count},
+        },
+        {output_dtype, output_dtype, mlx::core::float32},
+        {groups * hc_count * kGatedHcProjectionThreads, tokens, 1},
+        {kGatedHcProjectionThreads, 1, 1},
+        {
+            {"G", previous_injection.dtype()},
+            {"U", update_dtype},
+            {"O", output_dtype},
+            {"DOWN_GS", down.group_size},
+            {"DOWN_NG", down.groups},
+            {"INJECT_GS", injection.group_size},
+            {"INJECT_NG", injection.groups},
+            {"HIDDEN", hidden_size},
+            {"LOW_RANK", low_rank},
+            {"HC_COUNT", hc_count},
+            {"HAS_INJECTION", static_cast<int>(has_injection)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs[0]),
+        std::move(outputs[1]),
+        std::move(outputs[2]),
+    };
+}
+
+struct GatedHcPartsUp {
+    array branch;
+    array injection;
+};
+
+GatedHcPartsUp fused_gated_hc_parts_up(
+    const array& normalized,
+    const array& parts,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& injection_weight) {
+    constexpr int hidden_size = 2560;
+    constexpr int hc_count = 4;
+    constexpr int low_rank = 320;
+    const bool has_injection = injection_weight.has_value();
+    const auto down_dtype = mlx::core::promote_types(
+        normalized.dtype(), hc_weight_dtype(down_weight));
+    const auto branch_dtype = mlx::core::promote_types(
+        down_dtype, hc_weight_dtype(up_weight));
+    const auto injection_dtype = has_injection
+        ? mlx::core::promote_types(
+              normalized.dtype(), hc_weight_dtype(*injection_weight))
+        : normalized.dtype();
+    const auto up = hc_weight_inputs(up_weight);
+    const int workgroups = hidden_size / 8;
+    const int chunk = up.group_size == 0 ? 32
+        : up.group_size * ((32 + up.group_size - 1) / up.group_size);
+    const int threads = 32 * ((low_rank + chunk - 1) / chunk);
+    const int tokens = static_cast<int>(normalized.size() / (hidden_size * hc_count));
+    auto branch_shape = normalized.shape(), injection_shape = normalized.shape();
+    branch_shape.back() = hidden_size;
+    injection_shape.back() = hc_count;
+    auto outputs = gated_hc_parts_up_kernel()(
+        {normalized, parts, up.values, up.rows, up.scales, up.minima},
+        {branch_shape, injection_shape},
+        {branch_dtype, injection_dtype},
+        {workgroups * threads, tokens, 1},
+        {threads, 1, 1},
+        {
+            {"T", branch_dtype},
+            {"L", down_dtype},
+            {"I", injection_dtype},
+            {"UP_GS", up.group_size},
+            {"UP_NG", up.groups},
+            {"HIDDEN", hidden_size},
+            {"LOW_RANK", low_rank},
+            {"HC_COUNT", hc_count},
+            {"HAS_INJECTION", static_cast<int>(has_injection)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {std::move(outputs[0]), std::move(outputs[1])};
+}
+
+MlxQwen4GatedResidualPre fused_gated_hc_two_stage(
+    const array& input,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& injection_weight,
+    float eps) {
+    auto first = fused_gated_hc_norm_down(
+        input, norm_weight, down_weight, injection_weight, eps);
+    auto second = fused_gated_hc_parts_up(
+        first.normalized,
+        first.parts,
+        down_weight,
+        up_weight,
+        injection_weight);
+    std::optional<array> injection;
+    if (injection_weight) injection = std::move(second.injection);
+    return {
+        std::move(second.branch),
+        input,
+        std::move(injection),
+    };
+}
+
+MlxQwen4GatedResidualPre fused_gated_hc_two_stage_after(
+    const array& previous_branch,
+    const array& previous_residual,
+    const array& previous_injection,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& injection_weight,
+    float eps) {
+    auto first = fused_gated_hc_write_norm_down(
+        previous_branch,
+        previous_residual,
+        previous_injection,
+        norm_weight,
+        down_weight,
+        injection_weight,
+        eps);
+    auto second = fused_gated_hc_parts_up(
+        first.normalized,
+        first.parts,
+        down_weight,
+        up_weight,
+        injection_weight);
+    std::optional<array> injection;
+    if (injection_weight) injection = std::move(second.injection);
+    return {
+        std::move(second.branch),
+        std::move(first.residual),
+        std::move(injection),
+    };
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_activation_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return cached_metal_kernel("mfq_gated_hc_activation",
+            {"down", "inject"}, {"low", "injection"}, R"METAL(
+uint index = thread_position_in_grid.x;
+if (index < uint(down_shape[0])) {
+    T scaled = down[index] / T(GROUPS);
+    low[index] = scaled * gr_sigmoid(scaled);
+}
+if (index < uint(inject_shape[0])) {
+    T scaled = inject[index] / T(GROUPS);
+    injection[index] = T(2.f) * gr_sigmoid(scaled);
+}
+)METAL", R"METAL(
+template <typename T> inline T gr_sigmoid(T value) {
+    auto tail = 1 / (1 + metal::precise::exp(metal::abs(value)));
+    return value < 0 ? tail : 1 - tail;
+}
+)METAL", true, false, options);
+    }();
+    return kernel;
+}
+
+bool can_rematerialize_hc_prefill(const array& input, const array& norm_weight,
+    const MlxLinear& down, const MlxLinear& up, const std::optional<MlxLinear>& injection,
+    int hidden_size, int hc_count) {
+    const auto bf16 = [](const MlxLinear& weight) {
+        const auto* dense = weight.dense_weight_ref();
+        return dense && dense->dtype() == mlx::core::bfloat16;
+    };
+    return input.dtype() == mlx::core::float32 && hc_count > 1 &&
+        can_fuse_grouped_rms_affine(input, norm_weight, hidden_size) &&
+        input.size() / (hidden_size * hc_count) >= 64 &&
+        bf16(down) && bf16(up) && (!injection || bf16(*injection));
+}
+
+MlxQwen4GatedResidualPre gated_hc_from_normalized(
+    array normalized,
+    array residual,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    const array* normalization_scale = nullptr,
+    const array* norm_weight = nullptr) {
+    const int width = hidden_size * hc_count;
+    const auto normalized_dtype = normalization_scale ? residual.dtype() : normalized.dtype();
+    const auto* dense_down = down_weight.dense_weight_ref();
+    const auto* dense_up = up_weight.dense_weight_ref();
+    const auto* dense_inject = inject_weight ? inject_weight->dense_weight_ref() : nullptr;
+    if (const auto* down = down_weight.tq_weight_ref(); down && inject_weight) {
+        const auto* up = up_weight.tq_weight_ref();
+        const auto* inject = inject_weight->tq_weight_ref();
+        if (up && inject) if (auto values = down->gated_projections(*inject, normalized, hc_count))
+            return {up->gated_mix((*values)[0], normalized, hc_count), std::move(residual), std::move((*values)[1])};
+    }
+    const auto projection_input = dense_down && dense_inject && normalized.size() / width >= 64 &&
+        dense_down->dtype() == dense_inject->dtype()
+        ? mlx::core::astype(normalized, dense_down->dtype()) : normalized;
+    if (const auto* down = down_weight.gguf_weight_ref(); down &&
+        (normalized.size() / width > 1 || normalized.dtype() == mlx::core::float32)) {
+        const auto* up = up_weight.gguf_weight_ref();
+        if (up && (!inject_weight || dense_inject)) {
+            if (auto values = down->gated_residual(normalized, *up, dense_inject, hc_count))
+                return {std::move((*values)[0]), std::move(residual),
+                    dense_inject ? std::optional(std::move((*values)[1])) : std::nullopt};
+        }
+    }
+    if (const auto* down = down_weight.affine_weight_ref()) {
+        const auto* up = up_weight.affine_weight_ref();
+        const auto* inject = inject_weight ? inject_weight->affine_weight_ref() : nullptr;
+        if (up && (!inject_weight || inject)) {
+            if (auto values = down->gated_residual(normalized, *up, inject, hc_count))
+                return {std::move((*values)[0]), std::move(residual),
+                    inject ? std::optional(std::move((*values)[1])) : std::nullopt};
+        }
+    }
+    std::optional<array> fused_injection;
+    std::optional<array> activated_low;
+    array down_projection = [&] {
+        if (const auto* down = down_weight.tq_weight_ref(); down && inject_weight) {
+            if (const auto* injection = inject_weight->tq_weight_ref()) {
+                auto projections = MlxTqWeight::matmul_many({*down, *injection}, normalized);
+                if (normalized.size() / static_cast<std::size_t>(width) <= 16) {
+                    auto activations = gated_hc_activation_kernel()(
+                        {mlx::core::reshape(projections[0], {-1}), mlx::core::reshape(projections[1], {-1})},
+                        {projections[0].shape(), projections[1].shape()}, {normalized.dtype(), normalized.dtype()},
+                        {static_cast<int>(std::max(projections[0].size(), projections[1].size())), 1, 1}, {128, 1, 1},
+                        {{"T", normalized.dtype()}, {"GROUPS", hc_count}}, std::nullopt, false, {});
+                    activated_low = std::move(activations[0]);
+                    fused_injection = std::move(activations[1]);
+                } else {
+                    fused_injection = array(2.0f, normalized.dtype()) * mlx::core::sigmoid(
+                        projections[1] / array(float(hc_count), normalized.dtype()));
+                }
+                return std::move(projections[0]);
+            }
+        }
+        if (dense_down && dense_inject && can_fuse_gated_hc_projections(
+                normalized,
+                *dense_down,
+                *dense_inject,
+                hc_count)) {
+            auto projections = fused_gated_hc_projections(
+                normalized,
+                *dense_down,
+                *dense_inject,
+                hc_count);
+            fused_injection = std::move(projections.injection);
+            return std::move(projections.down);
+        }
+        return hc_project(down_weight, projection_input);
+    }();
+    const array connection_count(
+        static_cast<float>(hc_count), normalized_dtype);
+    array mixed = [&] {
+        if (dense_up && can_fuse_gated_hc_up_collapse(
+                down_projection,
+                *dense_up,
+                normalized,
+                hidden_size,
+                hc_count)) {
+            return fused_gated_hc_up_collapse(
+                down_projection,
+                *dense_up,
+                normalized,
+                hidden_size,
+                hc_count);
+        }
+        auto low = activated_low ? *activated_low : down_projection / connection_count;
+        if (!activated_low) low = low * mlx::core::sigmoid(low);
+        const auto rows = normalized.size() / static_cast<std::size_t>(width);
+        if (const auto* tq = up_weight.tq_weight_ref(); tq && tq->can_fuse_gated_mix(low)
+            && low.dtype() == normalized.dtype())
+            return tq->gated_mix(low, normalized, hc_count);
+        auto logits = hc_project(up_weight, low);
+        const auto elements = rows * static_cast<std::size_t>(hidden_size);
+        if (normalization_scale) {
+            auto shape = residual.shape(); shape.back() = hidden_size;
+            const auto dtype = mlx::core::promote_types(logits.dtype(), normalized_dtype);
+            return gated_hc_recomputed_mix_kernel()(
+                {logits, mlx::core::reshape(residual, Shape{static_cast<int>(rows), width}),
+                    *norm_weight, *normalization_scale}, {shape}, {dtype},
+                {static_cast<int>(elements), 1, 1}, {256, 1, 1},
+                {{"P", logits.dtype()}, {"T", dtype}, {"HIDDEN", hidden_size}, {"HC_COUNT", hc_count}},
+                std::nullopt, false, {}).front();
+        }
+        if (gated_hc_fast_path_enabled() && rows >= 64 &&
+            gated_hc_float_dtype(logits.dtype()) && gated_hc_float_dtype(normalized.dtype()) &&
+            elements <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            auto shape = residual.shape();
+            shape.back() = hidden_size;
+            const auto dtype = mlx::core::promote_types(logits.dtype(), normalized.dtype());
+            return gated_hc_mix_kernel()(
+                {logits, mlx::core::reshape(normalized,
+                    Shape{static_cast<int>(rows), width})}, {shape}, {dtype},
+                {static_cast<int>(elements), 1, 1}, {256, 1, 1},
+                {{"P", logits.dtype()}, {"T", dtype},
+                 {"HIDDEN", hidden_size}, {"HC_COUNT", hc_count}},
+                std::nullopt, false, {}).front();
+        }
+        auto mixing = mlx::core::sigmoid(logits);
+        auto stream_shape = residual.shape();
+        stream_shape.back() = hc_count;
+        stream_shape.push_back(hidden_size);
+        return mlx::core::mean(
+            mlx::core::reshape(mixing, stream_shape) *
+                mlx::core::reshape(normalized, stream_shape),
+            -2);
+    }();
+    std::optional<array> injection;
+    if (inject_weight) {
+        if (inject_weight->output_size() != hc_count ||
+            inject_weight->input_size() != width) {
+            throw std::invalid_argument("Qwen4 residual injection mismatch");
+        }
+        if (fused_injection) {
+            injection = std::move(*fused_injection);
+        } else {
+            auto projected = hc_project(*inject_weight, projection_input);
+            injection = array(2.0f, normalized_dtype) *
+                mlx::core::sigmoid(projected / connection_count);
+        }
+    }
+    return {
+        std::move(mixed),
+        std::move(residual),
+        std::move(injection),
+    };
+}
+
+array floating(const array& value, mlx::core::Dtype dtype) {
+    auto result = value.dtype() == dtype ? value : mlx::core::astype(value, dtype);
+    return mlx::core::contiguous(result);
+}
+
+void require_rank(const array& value, int rank, const char* name) {
+    if (value.ndim() != rank) {
+        throw std::invalid_argument(std::string(name) + " has an invalid rank");
+    }
+}
+
+
+} // namespace
+
+array qwen4_stream_mean(const array& streams, int hidden, int count) {
+    if (streams.ndim() != 3 || hidden <= 0 || count <= 0 ||
+        std::int64_t(hidden) * count != streams.shape(2) || streams.shape(0) <= 0 || streams.shape(1) <= 0)
+        throw std::invalid_argument("invalid Qwen4 stream capture geometry");
+    static const auto kernel = cached_metal_kernel("tinfer_qwen4_stream_mean_capture",
+        {"input", "params"}, {"output"}, R"METAL(
+uint index = thread_position_in_grid.x;
+uint hidden = params[0], groups = params[1], rows = params[2];
+if (index >= hidden * rows) return;
+uint row = index / hidden, column = index % hidden;
+float total = 0.f;
+for (uint group = 0u; group < groups; ++group) total += float(input[(ulong(row) * groups + group) * hidden + column]);
+output[index] = bfloat(total / float(groups));
+)METAL");
+    const auto rows = streams.size() / streams.shape(2);
+    if (rows * hidden > std::numeric_limits<int>::max()) throw std::invalid_argument("Qwen4 capture exceeds Metal grid limits");
+    return kernel({streams, array({uint32_t(hidden), uint32_t(count), uint32_t(rows)})},
+        {{streams.shape(0), streams.shape(1), hidden}}, {mlx::core::bfloat16},
+        {int(rows * hidden), 1, 1}, {256, 1, 1}, {}, std::nullopt, false, {})[0];
+}
+
+array qwen4_grouped_rms_norm(
+    const array& value,
+    const array& weight,
+    int group_size,
+    float eps) {
+    if (value.ndim() == 0 || group_size <= 0 ||
+        value.shape(-1) % group_size != 0 ||
+        weight.ndim() != 1 || weight.shape(0) != value.shape(-1) ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument("Qwen4 grouped RMSNorm dimensions disagree");
+    }
+    if (can_fuse_grouped_rms_affine(value, weight, group_size)) {
+        return fused_grouped_rms_affine(
+            value, weight, group_size, eps);
+    }
+    const auto source_dtype = value.dtype();
+    auto shape = value.shape();
+    const int width = shape.back();
+    shape.pop_back();
+    shape.push_back(width / group_size);
+    shape.push_back(group_size);
+    auto source = mlx::core::reshape(
+        mlx::core::astype(value, mlx::core::float32), shape);
+    // Treat every hyper-connection stream as an independent RMSNorm row.
+    // MLX's fast primitive keeps the reduction and normalization in one
+    // dispatch; the per-stream centred weights remain a separate affine so
+    // all groups can retain their own parameters.
+    auto normalized = mlx::core::fast::rms_norm(
+        source, std::nullopt, eps);
+    normalized = mlx::core::reshape(normalized, value.shape()) *
+        (array(1.0f) + mlx::core::astype(weight, mlx::core::float32));
+    return normalized.dtype() == source_dtype
+        ? normalized : mlx::core::astype(normalized, source_dtype);
+}
+
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre(
+    const array& hyper_input,
+    const array& norm_weight,
+    const array& down_weight,
+    const array& up_weight,
+    const std::optional<array>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps) {
+    std::optional<MlxLinear> injection;
+    if (inject_weight) injection.emplace(*inject_weight);
+    return qwen4_gated_residual_pre(
+        hyper_input, norm_weight, MlxLinear(down_weight), MlxLinear(up_weight),
+        injection, hidden_size, hc_count, eps);
+}
+
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre(
+    const array& hyper_input,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps) {
+    const int width = hidden_size * hc_count;
+    if (hidden_size <= 0 || hc_count <= 1 || hyper_input.ndim() < 2 ||
+        hyper_input.shape(-1) != width ||
+        down_weight.input_size() != width || up_weight.output_size() != width ||
+        up_weight.input_size() != down_weight.output_size()) {
+        throw std::invalid_argument("Qwen4 gated-residual projection mismatch");
+    }
+    if (std::isfinite(eps) && eps > 0.0f &&
+        can_fuse_gated_hc_two_stage(
+            hyper_input,
+            norm_weight,
+            down_weight,
+            up_weight,
+            inject_weight,
+            hidden_size,
+            hc_count)) {
+        return fused_gated_hc_two_stage(
+            hyper_input,
+            norm_weight,
+            down_weight,
+            up_weight,
+            inject_weight,
+            eps);
+    }
+    std::optional<array> statistics;
+    auto normalized = std::isfinite(eps) && eps > 0.0f &&
+        can_rematerialize_hc_prefill(hyper_input, norm_weight, down_weight, up_weight,
+            inject_weight, hidden_size, hc_count)
+        ? fused_grouped_rms_affine(hyper_input, norm_weight, hidden_size, eps, &statistics)
+        : qwen4_grouped_rms_norm(hyper_input, norm_weight, hidden_size, eps);
+    return gated_hc_from_normalized(
+        std::move(normalized),
+        hyper_input,
+        down_weight,
+        up_weight,
+        inject_weight,
+        hidden_size,
+        hc_count,
+        statistics ? &*statistics : nullptr,
+        &norm_weight);
+}
+
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre_after(
+    const array& previous_branch,
+    const array& previous_residual,
+    const array& previous_injection,
+    const array& norm_weight,
+    const array& down_weight,
+    const array& up_weight,
+    const std::optional<array>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps) {
+    std::optional<MlxLinear> injection;
+    if (inject_weight) injection.emplace(*inject_weight);
+    return qwen4_gated_residual_pre_after(
+        previous_branch, previous_residual, previous_injection, norm_weight,
+        MlxLinear(down_weight), MlxLinear(up_weight), injection, hidden_size, hc_count, eps);
+}
+
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre_after(
+    const array& previous_branch,
+    const array& previous_residual,
+    const array& previous_injection,
+    const array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps) {
+    const int width = hidden_size * hc_count;
+    if (hidden_size <= 0 || hc_count <= 1 ||
+        previous_residual.ndim() < 2 ||
+        previous_residual.shape(-1) != width ||
+        norm_weight.shape() != Shape{width} ||
+        down_weight.input_size() != width || up_weight.output_size() != width ||
+        up_weight.input_size() != down_weight.output_size() ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument(
+            "Qwen4 chained gated-residual projection mismatch");
+    }
+
+    if (can_fuse_gated_hc_two_stage(
+            previous_residual,
+            norm_weight,
+            down_weight,
+            up_weight,
+            inject_weight,
+            hidden_size,
+            hc_count) &&
+        previous_branch.shape() == Shape{previous_residual.shape(0), previous_residual.shape(1), hidden_size} &&
+        previous_injection.shape() == Shape{previous_residual.shape(0), previous_residual.shape(1), hc_count} &&
+        (previous_residual.size() == static_cast<std::size_t>(width) ||
+         (previous_branch.flags().row_contiguous && previous_injection.flags().row_contiguous)) &&
+        gated_hc_float_dtype(previous_branch.dtype()) &&
+        gated_hc_float_dtype(previous_injection.dtype())) {
+        return fused_gated_hc_two_stage_after(
+            previous_branch,
+            previous_residual,
+            previous_injection,
+            norm_weight,
+            down_weight,
+            up_weight,
+            inject_weight,
+            eps);
+    }
+
+    array updated = previous_residual;
+    array normalized = previous_residual;
+    std::optional<array> statistics;
+    if (can_fuse_grouped_rms_affine_write(
+            previous_branch,
+            previous_residual,
+            previous_injection,
+            norm_weight,
+            hidden_size,
+            hc_count)) {
+        auto result = fused_grouped_rms_affine_write(
+            previous_branch,
+            previous_residual,
+            previous_injection,
+            norm_weight,
+            hidden_size,
+            hc_count,
+            eps,
+            can_rematerialize_hc_prefill(previous_residual, norm_weight, down_weight, up_weight,
+                inject_weight, hidden_size, hc_count));
+        updated = std::move(result.residual);
+        normalized = std::move(result.normalized);
+        statistics = std::move(result.statistics);
+    } else {
+        updated = qwen4_gated_residual_post(
+            previous_branch,
+            previous_residual,
+            previous_injection,
+            hc_count);
+        normalized = qwen4_grouped_rms_norm(
+            updated,
+            norm_weight,
+            hidden_size,
+            eps);
+    }
+    return gated_hc_from_normalized(
+        std::move(normalized),
+        std::move(updated),
+        down_weight,
+        up_weight,
+        inject_weight,
+        hidden_size,
+        hc_count,
+        statistics ? &*statistics : nullptr,
+        &norm_weight);
+}
+
+array qwen4_gated_residual_post(
+    const array& branch,
+    const array& residual,
+    const array& injection,
+    int hc_count) {
+    if (branch.ndim() < 2 || hc_count <= 1 ||
+        residual.shape(-1) != hc_count * branch.shape(-1)) {
+        throw std::invalid_argument("Qwen4 gated-residual post mismatch");
+    }
+    auto expected = branch.shape();
+    expected.back() = hc_count;
+    if (injection.shape() != expected) {
+        throw std::invalid_argument("Qwen4 gated-residual gate mismatch");
+    }
+    if (gated_hc_fast_path_enabled() &&
+        gated_hc_float_dtype(branch.dtype()) &&
+        gated_hc_float_dtype(residual.dtype()) &&
+        gated_hc_float_dtype(injection.dtype()) &&
+        residual.size() == branch.size() * static_cast<std::size_t>(hc_count) &&
+        residual.size() > 0 &&
+        residual.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        const auto update_dtype = mlx::core::promote_types(
+            branch.dtype(), injection.dtype());
+        const auto dtype = mlx::core::promote_types(residual.dtype(), update_dtype);
+        auto outputs = gated_hc_post_kernel()(
+            {branch, mlx::core::reshape(residual,
+                Shape{static_cast<int>(residual.size())}), injection},
+            {residual.shape()},
+            {dtype},
+            {static_cast<int>(residual.size()), 1, 1},
+            {256, 1, 1},
+            {
+                {"T", dtype},
+                {"U", update_dtype},
+                {"HIDDEN", branch.shape(-1)},
+                {"HC_COUNT", hc_count},
+            },
+            std::nullopt,
+            false,
+            {});
+        return std::move(outputs.front());
+    }
+    auto update = mlx::core::expand_dims(branch, -2) *
+        mlx::core::expand_dims(injection, -1);
+    return residual + mlx::core::reshape(update, residual.shape());
+}
+
+MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
+    const array& query_gate,
+    const array& key,
+    const array& index_query_key,
+    const array& query_norm_weight,
+    const array& key_norm_weight,
+    const array& index_query_norm_weight,
+    const array& positions,
+    int query_heads,
+    int key_heads,
+    int index_heads,
+    int head_dimension,
+    int index_dimension,
+    int rotary_dimension,
+    float rope_theta,
+    float eps,
+    const array* cache_value,
+    bool half_query,
+    const array* separate_gate) {
+    const auto dtype = query_gate.dtype();
+    half_query = half_query && dtype != mlx::core::float16;
+    const int rows = query_gate.ndim() == 3 ? query_gate.shape(1) : 0;
+    if ((dtype != mlx::core::float16 &&
+         dtype != mlx::core::bfloat16 &&
+         dtype != mlx::core::float32) ||
+        key.dtype() != dtype || index_query_key.dtype() != dtype ||
+        (cache_value && (cache_value->dtype() != dtype ||
+            cache_value->shape() != Shape{1, rows, key_heads * head_dimension})) ||
+        (separate_gate && (separate_gate->dtype() != dtype ||
+            separate_gate->shape() != Shape{1, rows, query_heads * head_dimension})) ||
+        query_heads <= 0 || key_heads <= 0 || index_heads <= 0 ||
+        head_dimension <= 0 || index_dimension <= 0 ||
+        head_dimension > 256 || index_dimension > 256 ||
+        rotary_dimension <= 0 || rotary_dimension % 2 != 0 ||
+        rotary_dimension > std::min(head_dimension, index_dimension) ||
+        !std::isfinite(rope_theta) || rope_theta <= 0.0f ||
+        !std::isfinite(eps) || eps <= 0.0f ||
+        rows < 1 ||
+        query_gate.shape() != Shape{1, rows, query_heads * (separate_gate ? 1 : 2) * head_dimension} ||
+        key.shape() != Shape{1, rows, key_heads * head_dimension} ||
+        index_query_key.shape() !=
+            Shape{1, rows, (index_heads + 1) * index_dimension} ||
+        query_norm_weight.dtype() != mlx::core::float32 ||
+        query_norm_weight.shape() != Shape{head_dimension} ||
+        key_norm_weight.dtype() != mlx::core::float32 ||
+        key_norm_weight.shape() != Shape{head_dimension} ||
+        index_query_norm_weight.dtype() != mlx::core::float32 ||
+        index_query_norm_weight.shape() != Shape{index_dimension} ||
+        positions.dtype() != mlx::core::int32 ||
+        positions.shape() != Shape{rows}) {
+        throw std::invalid_argument(
+            "Qwen4 QSA decode prologue geometry disagrees");
+    }
+    const QsaPrologueConfig config{
+        dtype,
+        {query_heads, key_heads, index_heads,
+         head_dimension, index_dimension, rotary_dimension},
+        {eps, rope_theta}, cache_value != nullptr, half_query, separate_gate != nullptr};
+    std::vector<Shape> shapes{
+        Shape{1, query_heads, rows, head_dimension},
+        Shape{1, rows, query_heads * head_dimension},
+        Shape{1, key_heads, rows, head_dimension},
+        Shape{1, rows, index_heads, index_dimension},
+    };
+    std::vector<mlx::core::Dtype> types{half_query ? mlx::core::float16 : dtype, dtype, cache_value ? mlx::core::float16 : dtype, dtype};
+    std::vector<array> inputs{
+        query_gate,
+        key,
+        index_query_key,
+        query_norm_weight,
+        key_norm_weight,
+        index_query_norm_weight,
+        mlx::core::contiguous(positions),
+    };
+    if (cache_value) {
+        shapes.insert(shapes.end(), {Shape{1, key_heads, rows, head_dimension}, Shape{1, rows, index_dimension}});
+        types.insert(types.end(), {mlx::core::float16, mlx::core::float16});
+        inputs.push_back(*cache_value);
+    }
+    if (separate_gate) inputs.push_back(*separate_gate);
+    auto outputs = array::make_arrays(shapes, types,
+        std::make_shared<QsaProloguePrimitive>(mlx::core::default_stream(mlx::core::default_device()), config), std::move(inputs));
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+        std::move(outputs.at(2)),
+        std::move(outputs.at(3)),
+        cache_value ? std::optional<array>(std::move(outputs.at(4))) : std::nullopt,
+        cache_value ? std::optional<array>(std::move(outputs.at(5))) : std::nullopt,
+    };
+}
+
+array qwen4_qsa_pool_index_keys(const array& raw_keys, const array& norm_weight, const array& positions,
+    int begin, int end, int position_offset, int rotary_dimension, float rope_theta, float eps) {
+    if (raw_keys.ndim() != 3 || raw_keys.shape(0) <= 0 || raw_keys.shape(2) != 128 ||
+        !gated_hc_float_dtype(raw_keys.dtype()) || norm_weight.shape() != Shape{128} || norm_weight.dtype() != mlx::core::float32 ||
+        positions.ndim() != 1 || positions.dtype() != mlx::core::int32 || begin < 0 || end <= begin || position_offset < 0 ||
+        std::int64_t(end) * 4 > raw_keys.shape(1) || std::int64_t(position_offset) + std::int64_t(end) * 4 > positions.size() ||
+        rotary_dimension <= 0 || rotary_dimension > 128 || rotary_dimension % 2 ||
+        !std::isfinite(rope_theta) || rope_theta <= 0.f || !std::isfinite(eps) || eps <= 0.f)
+        throw std::invalid_argument("QSA index pool geometry disagrees");
+    static const auto kernel = [] {
+        CompileOptions options; options.math_mode = MathMode::Fast;
+        return cached_metal_kernel("mfq_qsa_index_pool", {"raw", "weight", "positions", "params", "scalars"},
+            {"output"}, R"METAL(
+    const uint block = threadgroup_position_in_grid.x, batch = threadgroup_position_in_grid.y;
+    const uint lane = thread_index_in_simdgroup;
+    threadgroup T normalized[128];
+    T means[4];
+    float squares = 0.f;
+    for (uint j = 0; j < 4; ++j) {
+        const uint column = lane * 4 + j;
+        T sum = T(0);
+        for (uint r = 0; r < 4; ++r)
+            sum = T(sum + raw[long(batch) * raw_strides[0] +
+                long(params[0] + block * 4 + r) * raw_strides[1] + long(column) * raw_strides[2]]);
+        means[j] = T(sum * T(.25f));
+        squares += float(means[j]) * float(means[j]);
+    }
+    const float inverse = metal::precise::rsqrt(simd_sum(squares) / 128.f + scalars[1]);
+    for (uint j = 0; j < 4; ++j) {
+        const uint column = lane * 4 + j;
+        normalized[column] = T(float(means[j]) * inverse * weight[column * weight_strides[0]]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int position = positions[long(params[1] + params[0] + block * 4) * positions_strides[0]];
+    for (uint j = 0; j < 4; ++j) {
+        const uint column = lane * 4 + j;
+        float value = float(normalized[column]);
+        if (column < ROTARY) {
+            const uint pair = column % uint(ROTARY / 2);
+            const float angle = float(position) * pow(scalars[0], -2.f * float(pair) / float(ROTARY));
+            const float a = float(normalized[pair]), b = float(normalized[pair + ROTARY / 2]);
+            value = column < ROTARY / 2 ? a * cos(angle) - b * sin(angle) : b * cos(angle) + a * sin(angle);
+        }
+        output[(batch * uint(params[2]) + block) * 128 + column] = T(value);
+    }
+    )METAL", "", false, false, options);
+    }();
+    return kernel({raw_keys, norm_weight, positions, array({begin * 4, position_offset, end - begin}, mlx::core::int32),
+            array({rope_theta, eps}, mlx::core::float32)},
+        {{raw_keys.shape(0), end - begin, 128}}, {mlx::core::float32},
+        {(end - begin) * 32, raw_keys.shape(0), 1}, {32, 1, 1},
+        {{"T", raw_keys.dtype()}, {"ROTARY", rotary_dimension}}, std::nullopt, false, {})[0];
+}
+
+array qwen4_qsa_output_gate(const array& attended, const array& gate,
+    std::optional<mlx::core::Dtype> output_dtype) {
+    const auto dtype = output_dtype.value_or(attended.dtype());
+    if (attended.ndim() != 4 || attended.shape() != gate.shape() ||
+        !gated_hc_float_dtype(attended.dtype()) || !gated_hc_float_dtype(gate.dtype()) || !gated_hc_float_dtype(dtype) ||
+        attended.size() == 0 || attended.size() > std::numeric_limits<std::uint32_t>::max() ||
+        static_cast<std::int64_t>(attended.shape(2)) * attended.shape(3) >
+            std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("QSA output gate geometry disagrees");
+    }
+    return array(Shape{attended.shape(0), attended.shape(1),
+        attended.shape(2) * attended.shape(3)}, dtype,
+        std::make_shared<QsaOutputGatePrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()), std::array{attended.dtype(), gate.dtype(), dtype},
+            attended.shape(2), attended.shape(3)), {attended, gate});
+}
+
+array qwen4_qsa_block_scores(
+    const array& query,
+    const array& pooled_keys) {
+    auto scores = mlx_sparse_indexer_head_scores(query, pooled_keys);
+    scores = mlx::core::maximum(scores, array(0.0f));
+    return mlx::core::sum(scores, -2) /
+        std::sqrt(static_cast<float>(query.shape(3)));
+}
+
+array qwen4_qsa_select_blocks(
+    const array& query,
+    const array& pooled_keys,
+    int query_offset,
+    int block_size) {
+    return mlx_sparse_indexer_topk512(
+        mlx_sparse_indexer_head_scores(query, pooled_keys), query_offset, block_size);
+}
+
+array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,
+    const std::vector<array>& values, const array* gate) {
+    const int rows = static_cast<int>(keys.size());
+    if (rows < 2 || rows > 8 || keys.size() != values.size() ||
+        query.dtype() != mlx::core::bfloat16 || query.shape() != Shape{1, 24, rows, 256} ||
+        (gate && (gate->dtype() != mlx::core::bfloat16 || gate->shape() != Shape{1, rows, 24 * 256})))
+        throw std::invalid_argument("invalid grouped QSA decode query");
+    std::vector<array> inputs{mlx::core::contiguous(query)};
+    inputs.reserve(1 + 2 * rows + int(gate != nullptr));
+    const auto with_contiguous_features = [](const array& input) {
+        return input.strides(3) == 1 && input.strides(1) >= 0 && input.strides(2) >= 0
+            ? input : mlx::core::contiguous(input);
+    };
+    for (int row = 0; row < rows; ++row) {
+        const auto& key = keys[row];
+        const auto& value = values[row];
+        if (key.ndim() != 4 || key.shape(0) != 1 || key.shape(1) != 2 || key.shape(2) <= 0 ||
+            key.shape(2) > kQsaGroupedDecodeMaxKeys || key.shape(3) != 256 ||
+            key.shape() != value.shape() || key.dtype() != mlx::core::float16 || value.dtype() != mlx::core::float16)
+            throw std::invalid_argument("invalid grouped QSA decode KV state");
+        inputs.push_back(with_contiguous_features(key));
+        inputs.push_back(with_contiguous_features(value));
+    }
+    if (gate) inputs.push_back(mlx::core::contiguous(*gate));
+    const auto shape = gate ? Shape{1, rows, 24 * 256} : Shape{1, rows, 24, 256};
+    return array(shape, mlx::core::bfloat16,
+        std::make_shared<QsaDenseDecodeBatch>(mlx::core::default_stream(mlx::core::Device::gpu), gate != nullptr),
+        std::move(inputs));
+}
+
+std::pair<mlx::core::array, mlx::core::array> qwen4_qsa_join_half_history(
+    const mlx::core::array& history_key, const mlx::core::array& history_value,
+    const mlx::core::array& proposal_key, const mlx::core::array& proposal_value) {
+    const auto supported = [](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == 2 &&
+            value.shape(2) > 0 && value.shape(3) == 256 && value.dtype() == mlx::core::float16 &&
+            value.strides(1) >= 0 && value.strides(2) >= 0 && value.strides(3) == 1;
+    };
+    if (!supported(history_key) || !supported(history_value) || !supported(proposal_key) ||
+        !supported(proposal_value) || history_key.shape() != history_value.shape() ||
+        proposal_key.shape() != proposal_value.shape())
+        throw std::invalid_argument("invalid QSA half-history join");
+    const auto length = std::int64_t(history_key.shape(2)) + proposal_key.shape(2);
+    if (length > std::numeric_limits<int>::max() / 128)
+        throw std::invalid_argument("QSA history exceeds Metal dispatch size");
+    const int rows = static_cast<int>(length);
+    // The attention kernel consumes two views of the joined BF16 allocation.
+    auto joined = array(Shape{2, 2, rows, 256}, mlx::core::bfloat16,
+        std::make_shared<QsaJoinHalfHistory>(mlx::core::default_stream(mlx::core::Device::gpu)),
+        {history_key, history_value, proposal_key, proposal_value});
+    return {mlx::core::slice(joined, {0, 0, 0, 0}, {1, 2, rows, 256}),
+        mlx::core::slice(joined, {1, 0, 0, 0}, {2, 2, rows, 256})};
+}
+
+array qwen4_dense_gqa_attention(
+    const array& query,
+    const array& key,
+    const array& value,
+    int query_offset) {
+    require_rank(query, 4, "Qwen4 attention query");
+    require_rank(key, 4, "Qwen4 attention key");
+    if (value.shape() != key.shape() || query.shape(0) != key.shape(0) ||
+        query.shape(1) % key.shape(1) != 0 ||
+        query.shape(3) != key.shape(3) || query_offset < 0 ||
+        query_offset + query.shape(2) > key.shape(2)) {
+        throw std::invalid_argument("Qwen4 dense GQA dimensions disagree");
+    }
+    const int tokens = query.shape(2);
+    const int keys = key.shape(2);
+    if (query_offset + tokens == keys) {
+        auto output = scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            tokens > 1,
+            1.0f / std::sqrt(static_cast<float>(query.shape(3))));
+        return mlx::core::transpose(output, {0, 2, 1, 3});
+    }
+    auto key_positions = mlx::core::reshape(
+        mlx::core::arange(0, keys, 1, mlx::core::int32), Shape{1, keys});
+    auto query_positions = mlx::core::reshape(
+        mlx::core::arange(
+            query_offset, query_offset + tokens, 1, mlx::core::int32),
+        Shape{tokens, 1});
+    auto mask = mlx::core::expand_dims(
+        mlx::core::expand_dims(key_positions <= query_positions, 0), 0);
+    auto output = scaled_dot_product_attention(
+        query, key, value, false,
+        1.0f / std::sqrt(static_cast<float>(query.shape(3))), mask);
+    return mlx::core::transpose(output, {0, 2, 1, 3});
+}
+
+namespace {
+class QsaTreeCacheLayout final : public mlx::core::UnaryPrimitive {
+public:
+    QsaTreeCacheLayout(mlx::core::Stream stream, std::vector<std::uint32_t> geometry)
+        : UnaryPrimitive(stream), geometry_(std::move(geometry)) {}
+    const char* name() const override { return "QsaTreeCacheLayout"; }
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("QSA tree cache layout requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, array& output) override { fill(inputs, output); }
+
+private:
+    void fill(const std::vector<array>& inputs, array& output) const {
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        // Lazy cache views only expose their physical strides after evaluation.
+        auto* values = output.data<std::uint32_t>();
+        std::copy(geometry_.begin(), geometry_.end(), values);
+        constexpr std::size_t Words = 19;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& kv = inputs[i];
+            if (kv.strides(1) < 0 || kv.strides(2) < 0 || kv.strides(3) != 1)
+                throw std::invalid_argument("invalid QSA tree cache stride");
+            const std::size_t offset = (i / 4) * Words + 3 + 2 * (i % 4);
+            values[offset] = static_cast<std::uint32_t>(kv.strides(1));
+            values[offset + 1] = static_cast<std::uint32_t>(kv.strides(2));
+        }
+    }
+    std::vector<std::uint32_t> geometry_;
+};
+}
+
+namespace {
+array qwen4_qsa_tiled_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    using namespace mlx::core;
+    constexpr int QueryHeads = 24, HeadDim = 256, KvHeads = 2, Rows = 8;
+    constexpr int Fused = Rows * QueryHeads / KvHeads, MaxSplits = 32;
+    constexpr int Params = 19;
+    const int width = int(lanes.size()), total = query.shape(2);
+    if (width < 2 || width > 4 || query.shape() != Shape{1, QueryHeads, total, HeadDim} ||
+        query.dtype() != bfloat16)
+        throw std::invalid_argument("invalid tiled QSA tree query");
+    const auto supported = [&](const array& kv) {
+        return kv.ndim() == 4 && kv.shape(0) == 1 && kv.shape(1) == KvHeads &&
+            kv.shape(2) > 0 && kv.shape(3) == HeadDim && kv.dtype() == float16;
+    };
+    std::vector<std::uint32_t> params;
+    std::vector<array> cache_inputs;
+    int begin = 0, grid_splits = 1;
+    for (const auto& l : lanes) {
+        const int rows = int(l.parents.size()), history = l.history_keys.shape(2);
+        if (!supported(l.history_keys) || !supported(l.history_values) ||
+            !supported(l.tree_keys) || !supported(l.tree_values) || rows < 3 || rows > Rows ||
+            l.history_keys.shape() != l.history_values.shape() || l.tree_keys.shape() != l.tree_values.shape() ||
+            l.tree_keys.shape(2) != rows || history + rows > kQsaGroupedDecodeMaxKeys)
+            throw std::invalid_argument("invalid tiled QSA tree cache");
+        params.insert(params.end(), {std::uint32_t(begin),std::uint32_t(rows),std::uint32_t(history)});
+        params.insert(params.end(), 8, 0);
+        cache_inputs.insert(cache_inputs.end(), {l.history_keys,l.history_values,l.tree_keys,l.tree_values});
+        std::array<std::uint32_t, Rows> mask{};
+        for (int r = 0; r < rows; ++r) {
+            const int parent = l.parents[r];
+            if (parent < (r == 0 ? -1 : 0) || parent >= r) throw std::invalid_argument("invalid tiled QSA tree parent");
+            mask[r] = (1u << r) | (parent < 0 ? 0u : mask[parent]);
+        }
+        params.insert(params.end(), mask.begin(), mask.end());
+        begin += rows;
+        grid_splits = std::max(grid_splits, std::min(MaxSplits, (history + rows + 31) / 32));
+    }
+    if (begin != total) throw std::invalid_argument("invalid tiled QSA tree layout");
+    const auto layout = array(Shape{width, Params}, uint32,
+        std::make_shared<QsaTreeCacheLayout>(default_stream(Device::gpu),std::move(params)),std::move(cache_inputs));
+    static const auto pack = cached_metal_kernel("tylo_splash_qsa_pack", {"query","layout"}, {"packed"}, R"METAL(
+constexpr uint D = 256, G = 12, M = 96, P = 19;
+const uint3 g = threadgroup_position_in_grid;
+const uint f = thread_index_in_threadgroup + g.x * 256u;
+const uint row = f / (G*D), head = (f / D) % G, dim = f % D;
+const uint first = layout[g.z * P], rows = layout[g.z * P + 1];
+const long src = long(g.y*G+head)*query_strides[1] + long(first+row)*query_strides[2] + long(dim)*query_strides[3];
+packed[((g.z*2u+g.y)*M*D)+f] = row < rows ? query[src] : bfloat(0);
+)METAL", "", false);
+    auto prepared = pack({query,layout},
+        {{width, KvHeads, Fused, HeadDim}}, {bfloat16}, {Fused*HeadDim,KvHeads,width},{256,1,1},
+        {}, std::nullopt, false, {})[0];
+    // The ordered split reduction is adapted from Splash 1.7.0 (Apache-2.0). See NOTICE.
+    static const std::string header = R"METAL(
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+inline uint qsa_split_chunk(uint kv) {
+    const uint units = (kv + 31u) / 32u;
+    const uint parts = min(units, 32u);
+    return ((units + parts - 1u) / parts) * 32u;
+}
+// Partials are [slot][fused row][dimension]; statistics are
+// [slot][fused row]{max, sum}. The callers lay a sequence's slots out from its
+// first_slot as [tile][KV head][part][split], a sparse tile being one part.
+// Combines the first `written` splits of one fused row in split order, a
+// threadgroup of HeadDim threads, one per output dimension. The statistics
+// are shared by all output dimensions: their weights are computed once per
+// row, the splits' maxima by the threads at their split's index (written
+// never exceeds HeadDim), then each lane streams one dimension of the
+// partials; the row's value comes back to each thread, its dimension's, and a
+// row past the tile's active rows is zero. A threadgroup owns one fused row,
+// so it returns uniformly.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
+inline bfloat qsa_combine_splits(
+    device const float *partials, device const float *statistics, uint active_rows, uint written,
+    ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = HeadDim;
+  if (fused_row / QueryHeadsPerKVHead >= active_rows)
+    return bfloat(0.0f);
+  const uint lane = thread_index % 32, sg = thread_index / 32;
+  const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
+  const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
+  const float group_maximum = simd_max(maximum);
+  if (lane == 0) group_values[sg] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
+  if (thread_index < written)
+    weights[thread_index] = fast::exp(maximum - row_maximum);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  // Keep both accumulations in the original split order. A parallel sum of
+  // the denominator changes speculative acceptance on real model prompts.
+  for (uint split = 0; split < written; ++split) {
+    const float weight = weights[split];
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    numerator += weight *
+        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+    denominator += weight * statistics[stat + 1];
+  }
+  return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
+
+
+)METAL";
+    static const auto split = cached_metal_kernel("tylo_splash_qsa_tiled_split",
+        {"query","layout","hk0","hk1","hk2","hk3","hv0","hv1","hv2","hv3",
+         "pk0","pk1","pk2","pk3","pv0","pv1","pv2","pv3"}, {"partials","statistics"}, R"METAL(
+constexpr ushort M = 96, D = 256, N = 16;
+constexpr uint P = 19, G = 12, Splits = 32;
+const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+const uint2 group = threadgroup_position_in_grid.xy;
+const uint req = group.y, kv = group.x % 2u, split = group.x / 2u;
+const device uint* p = layout + req * P;
+const uint rows = p[1], history = p[2], count = rows + history;
+const uint chunk = qsa_split_chunk(count);
+const uint first = chunk * split, limit = min(count, first + chunk);
+if (first >= count) return;
+const device half* old_key = req==0?hk0:req==1?hk1:req==2?hk2:hk3;
+const device half* old_value = req==0?hv0:req==1?hv1:req==2?hv2:hv3;
+const device half* tree_key = req==0?pk0:req==1?pk1:req==2?pk2:pk3;
+const device half* tree_value = req==0?pv0:req==1?pv1:req==2?pv2:pv3;
+old_key += kv*p[3]; old_value += kv*p[5];
+tree_key += kv*p[7]; tree_value += kv*p[9];
+alignas(16) threadgroup bfloat staged[N*D], prob[M*N];
+threadgroup float scores[M*N], maxima[M], masses[M], scale[M];
+threadgroup atomic_uint rescale;
+if (tid < M) { maxima[tid] = -INFINITY; masses[tid] = 0.0f; }
+auto q = tensor(const_cast<device bfloat*>(query)+(req*2u+kv)*M*D,
+    dextents<int,2>{D,M}, array<int,2>{1,D});
+auto s = tensor(scores, dextents<int,2>{N,M}, array<int,2>{1,N});
+auto v = tensor<threadgroup bfloat,dextents<int,2>,tensor_inline>(
+    staged, dextents<int,2>{D,N}, array<int,2>{1,D});
+auto w = tensor(prob, dextents<int,2>{N,M}, array<int,2>{1,N});
+auto qt=q.slice<D,M>(0,0);
+auto vt=v.slice<D,N>(0,0);
+auto wt=w.slice<N,M>(0,0);
+constexpr auto qk_desc = matmul2d_descriptor(M,N,D,false,true,false,matmul2d_descriptor::mode::multiply);
+constexpr auto pv_desc = matmul2d_descriptor(M,D,N,false,false,true,matmul2d_descriptor::mode::multiply_accumulate);
+matmul2d<qk_desc,execution_simdgroups<8>> qk;
+matmul2d<pv_desc,execution_simdgroups<8>> pv;
+auto acc=pv.get_destination_cooperative_tensor<decltype(wt),decltype(vt),float>();
+const bool full=uint(acc.get_capacity())*256u==uint(M)*D;
+#pragma unroll
+for (ushort i=0; i<acc.get_capacity(); ++i)
+    if (full || acc.is_valid_element(i)) acc[i]=0;
+const auto load = [&](const device half* data, uint dim, uint valid) {
+    return valid && data
+        ? vec<bfloat,4>(float4(reinterpret_cast<const device half4*>(data)[dim/4u]))
+        : vec<bfloat,4>(bfloat(0.0f));
+};
+for (uint block=first;block<limit;block+=N) {
+    if (tid==0) atomic_store_explicit(&rescale,0u,memory_order_relaxed);
+    for (uint i=tid*4u;i<N*D;i+=256u*4u) {
+        const uint token=block+i/D, dim=i%D;
+        const device half* data = token < history ? old_key + token*p[4] :
+            token < limit ? tree_key + (token-history)*p[8] : nullptr;
+        reinterpret_cast<threadgroup vec<bfloat,4>*>(staged)[i/4u]=load(data,dim,token<limit);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto qs=qk.get_destination_cooperative_tensor<decltype(qt),decltype(vt),float>();
+    qk.run(qt,vt,qs);
+    qs.store(s.slice<N,M>(0,0));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=tid*4u;i<N*D;i+=256u*4u) {
+        const uint token=block+i/D, dim=i%D;
+        const device half* data = token < history ? old_value + token*p[6] :
+            token < limit ? tree_value + (token-history)*p[10] : nullptr;
+        reinterpret_cast<threadgroup vec<bfloat,4>*>(staged)[i/4u]=load(data,dim,token<limit);
+    }
+    if (tid < M*2u) {
+        const uint fused=tid/2u, row=fused/G, offset_half=(lane&1u)*8u;
+        const uint ancestors = row < rows ? p[11u+row] : 0u;
+        float score[8], high=-INFINITY;
+        for (uint j=0;j<8;++j) {
+            const uint token=block+offset_half+j;
+            const bool visible=row<rows && token<limit && (token<history || ((ancestors>>(token-history))&1u));
+            score[j]=visible?scores[fused*N+offset_half+j]*(1.0f/16.0f):-INFINITY;
+            high=max(high,score[j]);
+        }
+        const float top=max(maxima[fused],max(high,simd_shuffle_xor(high,1)));
+        const float carry=top==maxima[fused]?1.0f:fast::exp(maxima[fused]-top);
+        float mass=0.0f;
+        for (uint j=0;j<8;++j) {
+            const float exponential=isfinite(score[j])?fast::exp(score[j]-top):0.0f;
+            prob[fused*N+offset_half+j]=bfloat(exponential);
+            mass+=exponential;
+        }
+        const float sum=mass+simd_shuffle_xor(mass,1);
+        if (offset_half==0u) {
+            scale[fused]=carry;
+            masses[fused]=masses[fused]*carry+sum;
+            maxima[fused]=top;
+            if (carry!=1.0f) atomic_store_explicit(&rescale,1u,memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (block!=first && atomic_load_explicit(&rescale,memory_order_relaxed)) {
+#pragma unroll
+        for (ushort i=0;i<acc.get_capacity();++i)
+            if (full || acc.is_valid_element(i)) acc[i]*=scale[acc.get_multidimensional_index(i)[1]];
+    }
+    pv.run(wt,vt,acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+const uint slot=(req*2u+kv)*Splits+split;
+auto out=tensor(partials+slot*M*D,dextents<int,2>{D,M},array<int,2>{1,D});
+acc.store(out.slice<D,M>(0,0));
+if (tid<M) {
+    statistics[(slot*M+tid)*2u]=maxima[tid];
+    statistics[(slot*M+tid)*2u+1u]=masses[tid];
+}
+)METAL", header, false);
+    std::vector<array> inputs{prepared,layout};
+    for (const auto member : {&MlxQsaTreeAttentionLane::history_keys,&MlxQsaTreeAttentionLane::history_values,
+        &MlxQsaTreeAttentionLane::tree_keys,&MlxQsaTreeAttentionLane::tree_values}) {
+        for (int lane=0;lane<4;++lane) inputs.push_back(lanes[lane<width?lane:0].*member);
+    }
+    const auto temp = split(inputs, {{width, KvHeads, MaxSplits, Fused, HeadDim},
+        {width, KvHeads, MaxSplits, Fused, 2}}, {float32,float32}, {KvHeads*grid_splits*256,width,1},
+        {256,1,1}, {}, std::nullopt, false, {});
+    static const auto reduce = cached_metal_kernel("tylo_splash_qsa_tiled_reduce",
+        {"partials","statistics","layout"}, {"output"},R"METAL(
+constexpr uint P=19, M=96, Splits=32, D=256, G=12;
+const uint3 g=threadgroup_position_in_grid;
+const uint dim=thread_index_in_threadgroup, fused=g.x, batch=g.z, kv=g.y, row=fused/G;
+const device uint* p=layout+batch*P;
+if (row>=p[1]) return;
+const uint count=p[1]+p[2], chunk=qsa_split_chunk(count), used=(count+chunk-1u)/chunk;
+const uint slot=(batch*2u+kv)*Splits;
+threadgroup float weights[Splits], group_values[D/32];
+const bfloat value=qsa_combine_splits<G,8,D>(
+    partials,statistics,p[1],used,slot,fused,dim,weights,group_values);
+const uint head=kv*G+fused%G;
+output[((p[0]+row)*24u+head)*D+dim]=value;
+)METAL",header);
+    return reduce({temp[0], temp[1], layout}, {{1,total,QueryHeads,HeadDim}}, {bfloat16},
+        {Fused*HeadDim,KvHeads,width}, {256,1,1}, {}, std::nullopt, false, {})[0];
+}
+}
+
+array qwen4_qsa_batched_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    if (!mlx_metal_nax_disabled() && mlx_apple_chip_is("Apple M5 Max"))
+        return qwen4_qsa_tiled_tree_attention(query, lanes);
+    using namespace mlx::core;
+    constexpr int Heads = 24, KvHeads = 2, Dim = 256, Words = 19;
+    const int width = static_cast<int>(lanes.size()), total = query.shape(2);
+    if (width < 2 || width > 4 || query.shape() != Shape{1, Heads, total, Dim} || query.dtype() != bfloat16)
+        throw std::invalid_argument("invalid batched QSA verification query");
+    const auto valid_cache = [&](const array& value) {
+        return value.ndim() == 4 && value.shape(0) == 1 && value.shape(1) == KvHeads && value.shape(2) > 0 &&
+            value.shape(3) == Dim && value.dtype() == float16;
+    };
+    int first = 0, max_rows = 0, max_keys = 0;
+    std::vector<std::uint32_t> geometry;
+    std::vector<array> backing;
+    for (const auto& lane : lanes) {
+        const int rows = static_cast<int>(lane.parents.size()), history = lane.history_keys.shape(2);
+        if (!valid_cache(lane.history_keys) || !valid_cache(lane.history_values) ||
+            !valid_cache(lane.tree_keys) || !valid_cache(lane.tree_values) ||
+            lane.history_keys.shape() != lane.history_values.shape() || lane.tree_keys.shape() != lane.tree_values.shape() ||
+            lane.tree_keys.shape(2) != rows || rows < 3 || rows > 8 || history + rows > kQsaGroupedDecodeMaxKeys)
+            throw std::invalid_argument("invalid batched QSA verification cache");
+        geometry.insert(geometry.end(), {std::uint32_t(first), std::uint32_t(rows), std::uint32_t(history)});
+        geometry.insert(geometry.end(), 8, 0);
+        std::array<std::uint32_t, 8> mask{};
+        for (int row = 0; row < rows; ++row) {
+            const int parent=lane.parents[row];
+            if (parent < (row == 0 ? -1 : 0) || parent >= row)
+                throw std::invalid_argument("invalid QSA parent");
+            mask[row] = (1u << row) | (parent < 0 ? 0u : mask[parent]);
+        }
+        geometry.insert(geometry.end(),mask.begin(),mask.end());
+        backing.insert(backing.end(),{lane.history_keys, lane.history_values, lane.tree_keys, lane.tree_values});
+        first += rows;
+        max_rows = std::max(max_rows, rows);
+        max_keys = std::max(max_keys, history + rows);
+    }
+    if (first != total) throw std::invalid_argument("invalid QSA verification layout");
+    const auto layout = array(Shape{width, Words}, uint32,
+        std::make_shared<QsaTreeCacheLayout>(default_stream(Device::gpu), std::move(geometry)), std::move(backing));
+    static const auto pack = cached_metal_kernel("tylo_qsa_pack_for_mlx_attention",
+        {"query","layout","sizes","hk0","hk1","hk2","hk3","hv0","hv1","hv2","hv3",
+        "pk0","pk1","pk2","pk3","pv0","pv1","pv2","pv3"}, {"q","k","v","mask"}, R"METAL(
+constexpr uint D=256u, QH=24u, KH=2u, P=19u;
+const uint2 g=thread_position_in_grid.xy;
+const uint i=g.x, lane=g.y, Q=sizes[0], K=sizes[1];
+const device uint* p=layout+lane*P;
+const uint anchor=p[0], rows=p[1], history=p[2];
+if (i<QH*Q*D) {
+    const uint head=i/(Q*D), row=(i/D)%Q, dim=i%D;
+    const long from=long(head)*query_strides[1]+long(anchor+row)*query_strides[2]+long(dim)*query_strides[3];
+    q[lane*QH*Q*D+i]=row<rows?query[from]:bfloat(0);
+}
+if (i<KH*K*D) {
+    const uint head=i/(K*D), token=(i/D)%K, dim=i%D;
+    bfloat key=bfloat(0), value=bfloat(0);
+    if (token<history) {
+        const device half* hk=lane==0?hk0:lane==1?hk1:lane==2?hk2:hk3;
+        const device half* hv=lane==0?hv0:lane==1?hv1:lane==2?hv2:hv3;
+        key=bfloat(float(hk[head*p[3]+token*p[4]+dim]));
+        value=bfloat(float(hv[head*p[5]+token*p[6]+dim]));
+    } else if (token<history+rows) {
+        const device half* pk=lane==0?pk0:lane==1?pk1:lane==2?pk2:pk3;
+        const device half* pv=lane==0?pv0:lane==1?pv1:lane==2?pv2:pv3;
+        key=bfloat(float(pk[head*p[7]+(token-history)*p[8]+dim]));
+        value=bfloat(float(pv[head*p[9]+(token-history)*p[10]+dim]));
+    }
+    k[lane*KH*K*D+i]=key;
+    v[lane*KH*K*D+i]=value;
+}
+if (i<Q*K) {
+    const uint row=i/K, token=i%K;
+    mask[lane*Q*K+i]=token<history || (row<rows && token<history+rows && ((p[11u+row]>>(token-history))&1u));
+}
+)METAL", "", false);
+    std::vector<array> inputs{query, layout, array({std::uint32_t(max_rows), std::uint32_t(max_keys)})};
+    for (const auto member : {&MlxQsaTreeAttentionLane::history_keys, &MlxQsaTreeAttentionLane::history_values,
+            &MlxQsaTreeAttentionLane::tree_keys, &MlxQsaTreeAttentionLane::tree_values}) {
+        for (int lane = 0; lane < 4; ++lane)
+            inputs.push_back(lanes[lane < width ? lane : 0].*member);
+    }
+    const int columns = std::max(Heads * max_rows, KvHeads * max_keys) * Dim;
+    const auto packed = pack(inputs, {{width, Heads, max_rows, Dim}, {width, KvHeads, max_keys, Dim},
+        {width, KvHeads, max_keys, Dim}, {width, 1, max_rows, max_keys}},
+        {bfloat16, bfloat16, bfloat16, bool_}, {columns, width, 1}, {256, 1, 1}, {}, std::nullopt, false, {});
+    const auto attended = fast::scaled_dot_product_attention(packed[0], packed[1], packed[2], 1.f / 16.f, "", packed[3]);
+    std::vector<array> rows;
+    for (int lane = 0; lane < width; ++lane) {
+        const int count = static_cast<int>(lanes[lane].parents.size());
+        rows.push_back(transpose(slice(attended, {lane, 0, 0, 0}, {lane + 1, Heads, count, Dim}), {0, 2, 1, 3}));
+    }
+    return concatenate(rows, 1);
+}
+
+void qwen4_qsa_prepare_batched_tree() {
+    using namespace mlx::core;
+    if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
+        const auto history = zeros({1, 2, 320, 256}, float16);
+        const auto kv = zeros({1, 2, 8, 256}, float16);
+        const std::array parents{-1, 0, 1, 0, 3, 2, 2, 4};
+        const MlxQsaTreeAttentionLane lane{history, history, kv, kv, parents};
+        const std::array lanes{lane, lane, lane, lane};
+        preparation->add(qwen4_qsa_batched_tree_attention(zeros({1, 24, 32, 256}, bfloat16), lanes));
+    });
+}
+
+} // namespace mfq::metal

@@ -37,8 +37,13 @@ the backbone from loading.
 
 ## Model storage
 
-- A backend-neutral model-source contract exposes direct MFQ and native HF
-  Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
+- GGUF and TQ checkpoints are public model-file inputs; `.mfq` remains a
+  recognized suffix for the shared `MFQ1` container. File recognition does not
+  imply support for every tensor type or graph. Legacy NINT/NVQ/MFE/SQ operators
+  require an explicit [compatibility build](../build.md#native-format-profiles)
+  and must not be assumed present in the default runtime.
+- A backend-neutral model-source contract exposes direct TQ/MFQ-container and
+  native HF Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
   and lossless `FP8-128SQ/SQ8` views of block-scaled HF `F8_E4M3` weights.
   The native Metal path is production-validated for DeepSeek V4/V4.1; other
   architecture/backend combinations still require exact-artifact validation.
@@ -49,8 +54,9 @@ the backbone from loading.
 
 ## Shared runtime capabilities
 
-- Descriptor-driven NINTv2 and MFE execution keeps heterogeneous per-neuron,
-  per-projection, and per-expert precision inside unified logical containers.
+- Compatibility builds retain descriptor-driven NINTv2 and MFE execution for
+  heterogeneous per-neuron, per-projection, and per-expert precision. These
+  legacy operators are not included in the default build.
 - The server provides OpenAI-compatible chat and completion APIs, streaming
   responses, model-pool lifecycle management, and per-model capability
   reporting.
@@ -70,9 +76,11 @@ the backbone from loading.
 The default CUDA worker is a native C++/CUDA runtime with no Python, PyTorch,
 ATen, or LibTorch dependency during inference. It supports one-GPU execution
 and explicit tensor/expert-parallel device groups; multi-rank deployments still
-require physical validation. Packed NINTv2, VQ-family, dense,
-routed-MoE, attention, recurrent-state, and
-sampling kernels are selected through the shared model graph and backend plan.
+require physical validation. Supported GGUF, TQ, floating-point/FP8/MX,
+dense, routed-MoE, attention, recurrent-state, and sampling kernels are selected
+through the shared model graph and backend plan. Legacy NINTv2 and VQ-family
+operators require the explicit compatibility build described above; they are
+not part of the default worker.
 
 ### Apple silicon and Metal
 
@@ -82,6 +90,11 @@ temporarily dequantize for matrix multiplication without keeping a persistent
 FP16 weight copy. DeepSeek V4/V4.1 and Qwen Flash-Next runtimes also support
 bounded expert residency, while DeepSeek V4.1 can stream Engram storage from
 the internal SSD.
+
+The native Metal worker continuously batches eligible Flash-Next requests,
+including ordinary decode, native MTP, and DFlash2. See
+[Metal native serving](../serve.md#metal-native-serving) for the required
+weights, setup, and request parameters.
 
 ### AMD GPUs and ROCm (HIP)
 
@@ -97,5 +110,5 @@ stubbed.
 MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).
 
-Build requirements and backend selection: [`mfq build`](../cli/build.md).
-Serving and model-pool configuration: [`mfq serve`](../cli/serve.md).
+Build requirements and backend selection: [build the C++ runtime](../build.md).
+Serving and model-pool configuration: [`python -m serve`](../serve.md).

@@ -1,0 +1,281 @@
+#pragma once
+
+#include "mfq_container.h"
+#include "mlx_grouped_linear.h"
+#include "mlx_mx.h"
+#include "mlx_tq.h"
+#include "mlx_gguf.h"
+#include "mlx_affine.h"
+
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace mfq::metal {
+
+class MlxRmsNorm;
+
+// Opt-in memory-for-bandwidth mode. When enabled before model loading,
+// ordinary packed linear and embedding tensors are materialized once as FP16
+// and their packed runtime objects are released. MFE expert containers keep
+// their dedicated representation.
+void set_mlx_predequantize_fp16(bool enabled) noexcept;
+bool mlx_predequantize_fp16_enabled() noexcept;
+
+class MlxFp16WeightScope {
+public:
+    explicit MlxFp16WeightScope(bool enabled) noexcept;
+    ~MlxFp16WeightScope();
+    MlxFp16WeightScope(const MlxFp16WeightScope&) = delete;
+    MlxFp16WeightScope& operator=(const MlxFp16WeightScope&) = delete;
+private:
+    bool enabled_;
+};
+
+mlx::core::array load_dense_array(
+    const std::string& dtype,
+    std::span<const std::uint8_t> blob);
+
+class MlxChannelFp8Weight {
+public:
+    static MlxChannelFp8Weight from_blob(std::span<const std::uint8_t> blob);
+
+    int input_size() const noexcept { return values_.shape(1) * 4; }
+    int output_size() const noexcept { return values_.shape(0); }
+    struct Activation {
+        mlx::core::array values;
+        mlx::core::array scales;
+    };
+    bool dynamic_activations() const noexcept { return dynamic_activations_; }
+    static Activation quantize(const mlx::core::array& input);
+    mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul(const mlx::core::array& input, const Activation& activation) const;
+    std::optional<mlx::core::array> fused_swiglu(
+        const MlxChannelFp8Weight& up, const mlx::core::array& input) const;
+    mlx::core::array embedding(const mlx::core::array& rows, mlx::core::Dtype dtype) const;
+
+private:
+    mlx::core::array product(const mlx::core::array& source) const;
+    MlxChannelFp8Weight(mlx::core::array values, mlx::core::array unit_scales,
+        mlx::core::array channel_scales, bool dynamic_activations);
+
+    mlx::core::array values_;
+    mlx::core::array unit_scales_;
+    mlx::core::array channel_scales_;
+    bool dynamic_activations_;
+};
+
+class MlxLinear {
+public:
+    enum class GgufAccess { general, projection_only, row_lookup };
+
+    static MlxLinear load(
+        const MfqContainer& model,
+        const std::string& name,
+        GgufAccess gguf_access = GgufAccess::general);
+
+    explicit MlxLinear(MlxMxWeight weight);
+    explicit MlxLinear(MlxTqWeight weight);
+    explicit MlxLinear(MlxGgufWeight weight);
+    explicit MlxLinear(MlxAffineWeight weight);
+    explicit MlxLinear(MlxChannelFp8Weight weight);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    explicit MlxLinear(MlxNintWeight weight);
+    explicit MlxLinear(MlxNint8ZeroWeight weight);
+    explicit MlxLinear(MlxVqWeight weight);
+    explicit MlxLinear(MlxFp8SqWeight weight);
+    explicit MlxLinear(MlxMxfp4SqWeight weight);
+#endif
+    explicit MlxLinear(mlx::core::array weight);
+
+    mlx::core::array operator()(const mlx::core::array& input) const;
+
+    // Project one shared-expert activation and combine it with routed MoE
+    // rows. NINT uses a register-resident projection/reduce/gate epilogue;
+    // other formats retain the exact composed implementation.
+    mlx::core::array moe_shared(
+        const mlx::core::array& input,
+        const mlx::core::array& routed_pairs,
+        const mlx::core::array& route_weights,
+        const mlx::core::array& gate_logits) const;
+
+    // Returns a token id when the packed layout has a fused single-row
+    // LM-head/greedy implementation; otherwise returns std::nullopt.
+    std::optional<mlx::core::array> greedy_argmax(
+        const mlx::core::array& input) const;
+
+    // Diagonal grouped-projection layout:
+    // input [...,groups,K] -> [...,groups,OUT/groups].
+    mlx::core::array grouped_row_matmul(
+        const mlx::core::array& input,
+        int group_count) const;
+    void prepare_grouped_row_matmul(int group_count) const;
+
+    // Diagonal grouped projection whose input is still in adjacent-pair RoPE
+    // space: value [...,heads,head_dim] -> output [...,groups,OUT/groups].
+    // Packed formats use their fused inverse-RoPE kernel when its geometry is
+    // supported; every other format follows the same exact composed fallback.
+    mlx::core::array grouped_row_matmul_inverse_rope(
+        const mlx::core::array& value,
+        int group_count,
+        const mlx::core::array& cosine,
+        const mlx::core::array& sine,
+        int head_dimension,
+        int rotary_dimension) const;
+
+    int input_size() const noexcept {
+        return input_size_;
+    }
+    int output_size() const noexcept {
+        return output_size_;
+    }
+    bool packed() const noexcept {
+        return !std::holds_alternative<mlx::core::array>(weight_);
+    }
+    std::optional<MlxGroupedLinearWeightRef>
+    grouped_weight_ref() const noexcept;
+    const MlxMxWeight* mx_weight_ref() const noexcept;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const MlxNintWeight* nint_weight_ref() const noexcept;
+#endif
+    const MlxTqWeight* tq_weight_ref() const noexcept;
+    const MlxAffineWeight* affine_weight_ref() const noexcept;
+    const MlxGgufWeight* gguf_weight_ref() const noexcept;
+    const MlxChannelFp8Weight* channel_fp8_weight_ref() const noexcept;
+    void prepare_grouped_gguf();
+    const mlx::core::array* dense_weight_ref() const noexcept;
+
+    void materialize_fp16();
+
+private:
+    std::variant<
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        MlxNintWeight,
+        MlxNint8ZeroWeight,
+        MlxVqWeight,
+        MlxFp8SqWeight,
+        MlxMxfp4SqWeight,
+#endif
+        MlxMxWeight,
+        MlxTqWeight,
+        MlxGgufWeight,
+        MlxAffineWeight,
+        MlxChannelFp8Weight,
+        mlx::core::array> weight_;
+    int input_size_ = 0;
+    int output_size_ = 0;
+};
+
+// Register independent projections over one activation with the backend-wide
+// grouped coordinator. Model adapters only identify the participating
+// tensors; format eligibility and kernel selection remain runtime-owned.
+std::optional<MlxGroupedLinear> mlx_group_linears(
+    std::span<const MlxLinear* const> linears);
+
+// Runtime-owned coordinator for an arbitrary number of independent
+// projections over the same activation. Eligible contiguous projections are
+// partitioned into the largest genuinely fused groups supported by the
+// packed kernel; dense or unsupported members remain exact standalone
+// calls. Model adapters therefore describe topology without duplicating
+// format- or row-count dispatch policy.
+class MlxProjectionBatch {
+public:
+    explicit MlxProjectionBatch(
+        std::vector<const MlxLinear*> linears);
+
+    std::vector<mlx::core::array> operator()(
+        const mlx::core::array& input) const;
+    std::vector<mlx::core::array> forward_normalized(
+        const mlx::core::array& input, const MlxRmsNorm& norm) const;
+
+    // Execute a two-projection Gate/Up batch and apply SwiGLU. When the
+    // registered formats expose a fused small-M implementation, projection
+    // and activation stay in that kernel; otherwise the same coordinator
+    // performs the best grouped/standalone projection partition first.
+    mlx::core::array swiglu(
+        const mlx::core::array& input,
+        float limit = 0.0f) const;
+    bool supports_fused_swiglu(
+        const mlx::core::array& input) const noexcept;
+
+    std::size_t projection_count() const noexcept;
+    std::size_t grouped_projection_count() const noexcept;
+    bool projections_share_group(
+        std::size_t begin,
+        std::size_t count) const noexcept;
+
+private:
+    std::vector<mlx::core::array> project(
+        const mlx::core::array& input,
+        std::optional<mlx::core::Dtype> native_output_dtype) const;
+    struct Impl;
+    std::shared_ptr<const Impl> impl_;
+};
+
+class MlxEmbedding {
+public:
+    static MlxEmbedding load(
+        const MfqContainer& model,
+        const std::string& name,
+        std::optional<mlx::core::Dtype> activation_dtype = std::nullopt);
+
+    explicit MlxEmbedding(MlxMxWeight weight);
+    explicit MlxEmbedding(MlxTqWeight weight);
+    explicit MlxEmbedding(MlxGgufWeight weight);
+    explicit MlxEmbedding(MlxAffineWeight weight);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    explicit MlxEmbedding(MlxNintWeight weight);
+    explicit MlxEmbedding(MlxNint8ZeroWeight weight);
+    explicit MlxEmbedding(MlxVqWeight weight);
+    explicit MlxEmbedding(MlxFp8SqWeight weight);
+    explicit MlxEmbedding(MlxMxfp4SqWeight weight);
+#endif
+    explicit MlxEmbedding(mlx::core::array weight);
+
+    mlx::core::array operator()(
+        const mlx::core::array& token_ids,
+        mlx::core::Dtype dtype = mlx::core::float16) const;
+
+    // Apply the embedding table as an LM-head projection. This executes
+    // directly against this embedding's dense or packed storage, so tied
+    // embeddings do not require a second weight object or dequantized copy.
+    mlx::core::array project(
+        const mlx::core::array& input) const;
+
+    int vocabulary_size() const noexcept {
+        return vocabulary_size_;
+    }
+    int hidden_size() const noexcept {
+        return hidden_size_;
+    }
+    mlx::core::Dtype preferred_activation_dtype() const noexcept;
+    void set_activation_dtype(mlx::core::Dtype dtype);
+
+    void materialize_fp16();
+
+private:
+    std::variant<
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        MlxNintWeight,
+        MlxNint8ZeroWeight,
+        MlxVqWeight,
+        MlxFp8SqWeight,
+        MlxMxfp4SqWeight,
+#endif
+        MlxMxWeight,
+        MlxTqWeight,
+        MlxGgufWeight,
+        MlxAffineWeight,
+        mlx::core::array> weight_;
+    int vocabulary_size_ = 0;
+    int hidden_size_ = 0;
+    std::optional<mlx::core::Dtype> activation_dtype_;
+};
+
+} // namespace mfq::metal

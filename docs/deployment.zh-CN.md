@@ -1,41 +1,44 @@
 # 服务部署与性能设置
 
-以下以 **Windows / Linux、单张 NVIDIA GPU、MFQ 权重**为例，推荐配置针对
-Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`mfq serve`](cli/serve.md)。
+以下以 **Windows / Linux、单张 NVIDIA GPU、GGUF / TQ 权重**为例，配置说明针对
+Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`python -m serve`](serve.md)。
 
 ## 1. 构建当前版本
 
 准备 Git、uv、CMake 3.26+、CUDA Toolkit 和 C++ 编译器。Windows 使用安装了
 “使用 C++ 的桌面开发”的 Visual Studio 2022，并在 **x64 Native Tools** 终端执行；
-Linux 使用 GCC / Clang。详细要求见[构建说明](cli/build.md#backend-requirements)。
+Linux 使用 GCC / Clang。详细要求见[构建说明](build.md#backend-requirements)。
 
 ```shell
-git clone https://github.com/Tylogi/TyloInfer.git MFQ
-cd MFQ
-uv sync
-uv run mfq build --backend cuda --build-type Release -j 8
+git clone https://github.com/Tylogi/TyloInfer.git
+cd TyloInfer
+uv sync --project studio
+cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target mfq-runtime --parallel
 ```
 
-原生 CUDA 推理无需安装 PyTorch。**更新源码后重新执行构建命令**；已有的托管二进制
-会被 `serve` 直接使用，单独 `git pull` 不会更新它。编译是增量的。
+原生 CUDA 推理无需安装 PyTorch。**更新源码后重新执行构建命令**；`serve` 只使用
+已经构建好的二进制（通过 `--running-executable` 指定），单独 `git pull` 不会更新它。
+编译是增量的。
 
 ## 2. 启动 API 服务
 
 Linux：
 
 ```shell
-uv run mfq serve --backend cuda --model "/models/model-00001-of-00005.mfq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio python -m serve --backend cuda --running-executable build/mfq-runtime --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 Windows PowerShell：
 
 ```powershell
-uv run mfq serve --backend cuda --model "./Models/model-00001-of-00005.mfq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run --project studio python -m serve --backend cuda --running-executable build/mfq-runtime --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
-替换模型路径；分片模型指定第一片，并保留全部配套分片和共享表文件。
+替换为实际 GGUF / TQ 模型路径；`.mfq` 容器后缀仍可识别，但不代表所有旧量化格式默认可用。
+分片模型指定第一片，并保留全部配套分片和共享表文件；具体格式与后端限制见[支持矩阵](runtime/support.md)。
 `--no-web-ui` 适合 API 部署，不需要 Node.js。需要网页界面时去掉它，按提示安装
-Node.js/npm；推理后端相同。
+Node.js/pnpm；推理后端相同。
 
 客户端填写 OpenAI Base URL：`http://127.0.0.1:8090/v1`。
 使用 `GET /v1/models` 返回的 `id` 作为模型名，分片序号不属于模型名。
@@ -57,7 +60,7 @@ Linux 用 `export TYLOINFER_SERVER_API_KEY='replace-with-your-secret'`。
 | PP 分块 `--prefill-chunk-size` | 默认 `auto`；CUDA 按待处理输入和当前工作区预算选择，最大 `8192` | 通常省略。需要限制峰值时可设 `4096` 等较小上限；预算不足时仍会缩小 |
 | GPU 专家缓存 `--moe-gpu-cache-gb` | 在受支持路径上按显存和模型自动规划 | 通常省略。`0` 表示专家全部常驻，并非关闭专家缓存；不要直接填显卡总容量 |
 | 专家 RAM / SSD | RAM 能容纳完整专家集时预加载；不足时自动使用有界 RAM 缓存和 SSD 专家流式 | SSD 模式优先使用本机 NVMe。它能运行更大的模型，速度受磁盘读取影响 |
-| KV | CUDA 默认预分配，KV 量化和 SSD KV 默认关闭 | 保持默认作为起点；需要长上下文时再配置[KV 内存策略](runtime/cuda-kv-memory.md) |
+| KV | CUDA Flash-Next 的 QSA 默认使用固定 Affine INT8，允许冷 KV 写入 SSD；启用 RAM 预分配 | 按目标上下文预留 SSD 空间。精度和放置可在[KV 内存策略](runtime/cuda-kv-memory.md)中显式指定 |
 | 并发 | CUDA 每个模型默认 1 个请求 | 有并发需求再加 `--max-requests-per-runtime 2`；更多并发会增加 KV 和工作区需求 |
 | 前缀缓存 | 默认开启 | 多轮对话保留它；SSD 前缀缓存与 SSD KV 是不同功能 |
 
@@ -81,12 +84,12 @@ PowerShell 使用 `curl.exe`。加载返回 `202` 和操作 ID，通过
 
 ## 4. 快路径是否需要手工开启？
 
-**通过 `mfq serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
+**通过 `python -m serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
 服务会选择专家缓存、RAM 锁页、两阶段 FFN、传输复用、整层 prefill 和异步上传；
 CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环境变量。
 
 直接执行 `mfq-runtime` 不会经过 Python 服务的缓存和内存规划，部分原生默认值不同。
-部署应使用 `mfq serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
+部署应使用 `python -m serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
 时指定，避免误用另一份旧二进制。
 
 旧的实验环境变量会覆盖服务默认配置。速度异常时，检查启动环境中是否遗留
@@ -95,6 +98,11 @@ CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环�
 `TYLOINFER_PROFILE_*`。只移除自己设置过的覆盖值，不要批量清空全部 `TYLOINFER_*`。
 
 ## 5. 检查服务和速度
+
+首次上手请先完成[最小 API 请求闭环](serve.md#first-api-request)，按返回的精确模型 ID
+确认 HTTP 200 和非空 assistant 内容，再检查 MTP 和性能指标。
+以下命令默认本机无鉴权；启用鉴权时，为 `/v1` 和 `/api/v1` 请求添加 Bearer 凭据，
+PowerShell 使用 `curl.exe`，不要把实际密钥写进共享示例或日志。
 
 ```shell
 curl http://127.0.0.1:8090/health
@@ -122,7 +130,25 @@ curl -H "Content-Type: application/json" --data-binary "@request.json" http://12
 响应中的 `mfq_metrics` 提供 `prefill_tps`、`decode_tps`、`ttft_ms`、`mtp_used` 和
 `mtp_acceptance_rate`。流式请求加 `"stream_options":{"include_usage":true}`，在末尾获取指标。
 MTP 在有对应权重的模型上默认允许使用，会自适应决定是否采用；示例把深度上限明确设为 3。
-测试普通 decode 时设 `"enable_mtp":false`。
+测试普通 decode 时设 `"enable_mtp":false`。也可对 `/v1/chat/completions` 使用
+`X-TyloInfer-MTP: off` 请求头，但请求体中的 `enable_mtp` 优先；上面的示例已显式设为
+`true`，因此仅加 `off` 请求头不会关闭 MTP，需修改或移除该字段。
+
+结构化决策使用单独的 [`POST /v1/systemone`](api/http.md#82-structured-decisions)，
+不是聊天请求。它需要支持决策的模型和空闲运行时。运行时先检查是否为 `READY`：
+活动聊天会使实例进入 `BUSY`，此时返回 `409 model_not_ready`；只有实例仍为 `READY`，
+但已有活动请求、排队请求或控制租约时，才返回 `409 runtime_busy`。
+提高聊天并发容量不会解除此独占限制。
+CUDA 决策模型默认 `--jev-weights stream`，使用 RAM 权重和两个 GPU 分层流式缓冲区；
+`--jev-weights vram` 改为全显存驻留，显存需求更高。API 加载对应字段为 `jev_weights`，
+默认同为 `"stream"`，详见[权重放置说明](serve.md#jev-decision-model-weight-placement)。
+D3 文本和 JSON 决策也支持 Apple Silicon Metal，权重常驻统一内存。
+可以加载带训练读出头的 Qwen3.5 HF 权重，或带 D3 元数据的 GGUF 权重。
+d1 文本模型在 CUDA 和 Apple Silicon Metal 上使用同一接口，支持 `stream` 和
+`vram`。Metal 的 `stream` 每次只把一层权重放入 GPU 缓冲区。两种模式都使用统一内存。
+模型需配套 HF 配置、tokenizer、calibration 与同后端的原生可执行文件，
+详见 [服务部署指南](serve.md)。Score 由模型定义：D3 保留均值，
+d1 保留官方中位数；通用接口不强制某一种读出。
 
 上面的短请求用于确认服务可用。比较 PP 时使用 **4K / 8K 的真实输入**，保持模型、上下文、
 分块和 MTP 设置相同；记录前缀命中情况，分别看首轮和热轮。前缀复用减少了实际 PP 工作量，
@@ -146,4 +172,10 @@ decode 不包含首 token 出来前的等待。
 
 这份指南参考了 [Strata 的部署说明](https://github.com/Niko1221/Strata/blob/main/docs/INSTALL.md)
 和[分块、专家缓存说明](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md)。
-参数和默认值以 MFQ 自身为准；其他后端参见[支持矩阵](runtime/support.md)和[构建说明](cli/build.md)。
+参数和默认值以 TyloInfer 自身为准；其他后端参见[支持矩阵](runtime/support.md)和[构建说明](build.md)。
+
+## 7. 性能测量
+
+模型就绪后测第一次请求，不额外预热、不等待，也不命中前缀缓存。
+各引擎使用相同输入和采样设置，分别比较普通解码、原生 MTP 和 DFlash2。
+具体步骤与统计口径见[性能测量指南](benchmarking.md)。

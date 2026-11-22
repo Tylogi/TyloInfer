@@ -1,0 +1,22 @@
+#pragma once
+
+#include "mfq_tensor_backend.h"
+#include <cuda_runtime_api.h>
+
+#include <cstdint>
+#include <vector>
+
+mfq_tensor_backend::Tensor silu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
+mfq_tensor_backend::Tensor gelu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
+mfq_tensor_backend::Tensor situ_gate_up_cuda(const mfq_tensor_backend::Tensor& gate_up,
+    float beta, float linear_beta);
+mfq_tensor_backend::Tensor clipped_silu_mul_cuda(mfq_tensor_backend::Tensor gate,
+    mfq_tensor_backend::Tensor up,double limit);
+// relu(x)^2 for f32/f16/bf16 input; the output keeps the input dtype.
+mfq_tensor_backend::Tensor relu_squared_cuda(mfq_tensor_backend::Tensor input);
+
+namespace mfq::cuda {
+// Preserve the activation's dtype rounding before multiplying by its input.
+void materialize_gated_input(const void* input,const void* gate,bool half,
+    std::int64_t count,bool silu,void* output,cudaStream_t stream);
+}

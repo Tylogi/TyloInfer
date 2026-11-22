@@ -27,7 +27,7 @@ Example:
 
 ```json
 {
-  "schema": "tyloinfer.runtime.sampling",
+  "schema": "mfq.runtime.sampling",
   "version": 1,
   "chat": {
     "temperature": 0.7,

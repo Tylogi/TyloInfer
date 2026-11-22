@@ -1,0 +1,1 @@
+{"meta":{"title":"TyloInfer 集成","description":"默认连接 TyloInfer 本地模型服务，并报告推理核心协议兼容状态。不加载模型，不替换 DSH Agent 核心。"}}
