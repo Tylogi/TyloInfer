@@ -662,6 +662,12 @@ static void dequantize_row_ptq1_0(const void * src, float * dst, int64_t count) 
 #include "gyro_decode.h"
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name = "f8_e4m3",
+        .blck_size = 1,
+        .type_size = 1,
+        .is_quantized = false,
+    },
     [GGML_TYPE_TQ2_T] = { .type_name = "tq2_t", .blck_size = 128, .type_size = 34,
         .is_quantized = true, .to_float = dequantize_row_tq2_t },
     [GGML_TYPE_TQK6] = { .type_name = "tqk6", .blck_size = 128, .type_size = 26,

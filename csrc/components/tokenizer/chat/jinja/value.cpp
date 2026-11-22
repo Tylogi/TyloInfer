@@ -630,6 +630,35 @@ const func_builtins & value_string_t::get_builtins() const {
             jinja::string str = args.get_pos(0)->as_string().lowercase();
             return mk_val<value_string>(str);
         }},
+        {"format", [](const func_args & args) -> value {
+            args.ensure_vals<value_string>();
+            const auto source=args.get_pos(0)->as_string();
+            const auto format=source.str();
+            const bool input=std::any_of(source.parts.begin(),source.parts.end(),
+                [](const auto& part) {return part.is_input;});
+            jinja::string result;
+            size_t argument=1;
+            size_t start=0;
+            for (size_t i=0;i<format.size();++i) {
+                const auto ch=format[i];
+                if (ch!='{' && ch!='}') continue;
+                if (i>start) result.parts.push_back({input,format.substr(start,i-start)});
+                if (i+1<format.size() && format[i+1]==ch) {
+                    result.parts.push_back({input,std::string(1,ch)});
+                } else if (ch=='{' && i+1<format.size() && format[i+1]=='}') {
+                    auto replacement=args.get_pos(argument++);
+                    if (replacement->is_undefined()) throw raised_exception("format() has too few positional arguments");
+                    const auto value=replacement->as_string();
+                    result.parts.insert(result.parts.end(),value.parts.begin(),value.parts.end());
+                } else {
+                    throw raised_exception("format() expects {} fields or escaped braces");
+                }
+                start=i+2;
+                ++i;
+            }
+            if (start<format.size()) result.parts.push_back({input,format.substr(start)});
+            return mk_val<value_string>(result);
+        }},
         {"strip", [](const func_args & args) -> value {
             value val_input = args.get_pos(0);
             if (!is_val<value_string>(val_input)) {

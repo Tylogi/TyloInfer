@@ -34,6 +34,8 @@ void test_jinja_dictionary_arguments() {
     require(render("{% macro f(a,b) %}{{a}}:{{b}}{% endmacro %}{{f(**{'a':1,'b':2})}}")
         == "1:2", "Jinja macro keyword unpack mismatch");
     require(render("{{ namespace(**{'a':7}).a }}") == "7", "Jinja namespace keyword unpack mismatch");
+    require(render("{{ '<｜marker{}｜>{{{}}}'.format(':suffix', 7) }}") == "<｜marker:suffix｜>{7}",
+        "Jinja string format changed Unicode markers, arguments or escaped braces");
     for (const std::string source : {
         "{{ dict(**1) }}", "{{ dict(**{1:'a'}) }}", "{{ dict(a=1, **{'a':2}) }}",
         "{{ dict(**{'a':1}, a=2) }}", "{{ dict({}, {}) }}", "{{ dict([['a']]) }}"}) {

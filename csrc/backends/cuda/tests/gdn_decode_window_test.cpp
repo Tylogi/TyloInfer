@@ -290,6 +290,46 @@ int main(int argc,char** argv)try {
   auto shared_updates=shared.narrow(0,0,updates.numel()).reshape(updates.sizes());
   rejected(qkv,shared_updates,conv,state,output_conv,shared_state,1);
  }
+ {
+  constexpr int batch=3,tokens=2,nk=2,nv=4,channels=(2*nk+nv)*128;
+  for(bool transposed:{false,true}) {
+   auto qkv=data({batch,tokens,channels+17},301,.4f,tb::kFloat16).narrow(-1,0,channels);
+   auto gate=data({batch,tokens,nv*128+13},302,4,tb::kFloat16).narrow(-1,0,nv*128);
+   auto alpha=data({batch,tokens,2*nv},303,2,tb::kFloat16).slice(2,0,2*nv,2);
+   auto beta=data({batch,tokens,2*nv},304,2,tb::kFloat16).slice(2,1,2*nv,2);
+   auto conv=data({batch,3,channels},305,.3f),state=data({batch,nv,128,128},306,.17f);
+   auto weight=data({4,channels},307,.19f),bias=data({nv},308,1.3f);
+   auto decay=data({nv},309,.3f),norm=data({128},310,1.3f);
+   auto before_conv=conv.clone(),before_state=state.clone();
+   const auto journal=gdn_verify_window_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,decay,norm,
+    nk,nv,1e-6,1e-6,true,true,transposed,true,false,false,true);
+   exact(conv,before_conv,"batched verification changed convolution");
+   exact(state,before_state,"batched verification changed state");
+   const auto quantized=gdn_verify_window_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,decay,norm,
+    nk,nv,1e-6,1e-6,true,true,transposed,true,true,true,true);
+   auto packet=tb::empty_like(quantized[0]);
+   mfq::cuda::gguf::quantize_input_interleaved(journal[0].data_ptr(),true,batch*tokens,nv*128,
+    packet.data_ptr(),nullptr,stream);
+   exact(quantized[0],packet,"batched verification packed output");
+   auto keep=tb::tensor(std::vector<int64_t>{0,1,2}).to(tb::kCUDA);
+   if(!try_gdn_replay_updates_cuda(qkv,journal[3],conv,state,conv,state,tokens,transposed,keep))
+    throw std::runtime_error("batched GDN journal replay unavailable");
+   for(int slot=0;slot<batch;++slot) {
+    auto slice=[slot](const Tensor& x){return x.narrow(0,slot,1);};
+    auto expected_conv=slice(before_conv),expected_state=slice(before_state);
+    auto reference=gdn_verify_window_cuda(slice(qkv),slice(gate),slice(alpha),slice(beta),
+     expected_conv,expected_state,weight,bias,decay,norm,nk,nv,1e-6,1e-6,true,true,transposed,true);
+    exact(slice(journal[0]),reference[0],"batched verification output");
+    exact(journal[3].select(0,slot),reference[3],"batched verification journal");
+    if(slot && !try_gdn_replay_updates_cuda(slice(qkv),reference[3],expected_conv,expected_state,
+         expected_conv,expected_state,slot,transposed))
+     throw std::runtime_error("single-sequence GDN journal replay unavailable");
+    exact(slice(conv),expected_conv,"batched replay convolution");
+    exact(slice(state),expected_state,"batched replay state");
+    ++cases;
+   }
+  }
+ }
  mfq_cuda_synchronize();
  std::cout<<"gdn_register_window exact_cases="<<cases<<" changing_graph="<<replays<<" PASS\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

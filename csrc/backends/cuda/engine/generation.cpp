@@ -8,6 +8,8 @@
 #include "models/gemma4/ops.h"
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
+#include "models/hy4_flash/ops.h"
+#include "models/inkling2/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen35/linear_attention.h"
@@ -377,6 +379,28 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t advance() {
         if (!graph_active) {
+            if constexpr(std::is_same_v<Model,InklingCausalLm>) {
+                if (graph_config.enabled && generation_limit>=graph_config.minimum_generation_tokens &&
+                    (!prepared || !prepared->transformed())) {
+                    Tensor logits;
+                    bool initialized=false;
+                    if (inkling_graph_hidden(model,pending.reshape({1,1}),nullptr,0,
+                            full_ids.size(1)+generation_limit,logits,initialized)) {
+                        pending=mfq::cuda::sample_logits(sampler,logits.contiguous().view({1,-1}),counts,constraint);
+                        return pending.template item<int64_t>();
+                    }
+                }
+            }
+            if constexpr(std::is_same_v<Model,Hy4CausalLm>) {
+                if (graph_config.enabled && generation_limit>=graph_config.minimum_generation_tokens &&
+                    known_token_host.defined() && (!prepared || !prepared->transformed())) {
+                    if (auto logits=hy4_decode_graph_logits(model,pending.reshape({1,1}),known_token_host,
+                                                           full_ids.size(1)+generation_limit)) {
+                        pending=mfq::cuda::sample_logits(sampler,logits->contiguous().view({1,-1}),counts,constraint);
+                        return pending.template item<int64_t>();
+                    }
+                }
+            }
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
                 if(known_token_host.defined()) {
                     const bool greedy=sampler.greedy() && !has_penalties && !constraint;
@@ -1007,6 +1031,8 @@ TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::Qwen4CausalLm)
 TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::DeepseekV4CausalLm)
 TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::DeepseekV41CausalLm)
 TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::NemotronHCausalLm)
+TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::InklingCausalLm)
+TYLOINFER_INSTANTIATE_FLOW(mfq::cuda::Hy4CausalLm)
 
 #undef TYLOINFER_INSTANTIATE_FLOW
 } // namespace mfq::cuda::internal

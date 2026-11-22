@@ -105,9 +105,8 @@ template <class Ops> auto causal_forward(Ops &ops) {
     require_model(
         confirmed >= 0 &&
             (confirmed == 0 || (confirmed < T && B == 1 && model.cache_pos > 0 &&
-                                (!ops.pos_override.has_value() ||
+                                ((!ops.pos_override.has_value() && !ops.cache_positions_override.has_value()) ||
                                  model.adapter_allows_speculative_position_override()) &&
-                                !ops.cache_positions_override.has_value() &&
                                 !ops.attention_mask.has_value() && model.supports_speculation())),
         "unsupported speculative backbone geometry");
     if (confirmed > 0) {

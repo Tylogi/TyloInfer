@@ -3,6 +3,7 @@
 #include "mfq_tensor_backend.h"
 #include "tyloinfer/qsa_kv_store.h"
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include <utility>
@@ -56,14 +57,22 @@ public:
     void reset();
     void truncate(int64_t position);
     void append(const mfq_tensor_backend::Tensor& rows);
+    void append_host(const mfq_tensor_backend::Tensor& rows, mfq_tensor_backend::Device device);
     mfq_tensor_backend::Tensor gather(const std::vector<int64_t>& rows) const;
     // Shared staging is reused between completed decode graph segments. The
     // prior consumer must finish before the next call overwrites these buffers.
     void gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& workspace) const;
+    struct GatherSlice {
+        const KvOffloadSequence* sequence;
+        std::span<const int64_t> rows;
+        int64_t output_offset;
+    };
+    void gather_into(std::span<const GatherSlice> slices,const KvOffloadStore::GatherWorkspace& workspace) const;
     std::shared_ptr<KvOffloadStore::GatherWorkspace> gather_workspace(int64_t rows,int64_t heads=1,int64_t key_width=0) const {
         return store_->gather_workspace(rows,width_,dtype_,heads,key_width);
     }
     mfq_tensor_backend::Tensor range(int64_t start, int64_t count) const;
+    mfq_tensor_backend::Tensor range_host(int64_t start, int64_t count) const;
 private:
     std::shared_ptr<KvOffloadStore> store_;
     int64_t width_, block_rows_, position_ = 0;

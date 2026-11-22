@@ -257,6 +257,59 @@ int integer_pooling_cases() {
     }
     return cases;
 }
+int weighted_index_pool_cases() {
+    int cases=0;
+    for (int heads : {3, 16}) for (int queries : {1, 7}) {
+        Fixture f(queries, heads, 128, 65);
+        const std::int64_t query_positions[]{19, 6, 11, 12, 0, -1, 263};
+        std::copy_n(query_positions, queries, f.positions.begin());
+        f.upload();
+        std::vector<std::int16_t> records(std::size_t(f.blocks) * (f.width + 2));
+        std::vector<float> weights(std::size_t(queries) * heads);
+        for (int block=0; block<f.blocks; ++block) {
+            auto* row=records.data()+std::size_t(block)*(f.width+2);
+            std::copy_n(f.keys.data()+std::size_t(block)*f.width,f.width,row);
+            row[f.width]=static_cast<std::int16_t>(f.scales[block]);
+            row[f.width+1]=f.zero[block];
+        }
+        for (std::size_t i=0; i<weights.size(); ++i) weights[i] = float(int((13*i)%17)-9)/6;
+        Buffer keys(records.size()*sizeof(records[0])), head_weights(weights.size()*sizeof(weights[0]));
+        const auto scratch_bytes=tyloinfer::qsa::indexer_affine16_score_scratch(queries,heads,f.width);
+        Buffer scratch(scratch_bytes);
+        check(cudaMemcpy(keys.data,records.data(),records.size()*sizeof(records[0]),cudaMemcpyHostToDevice));
+        check(cudaMemcpy(head_weights.data,weights.data(),weights.size()*sizeof(weights[0]),cudaMemcpyHostToDevice));
+        for (const bool reserve_tail : {false, true}) for (const bool integer : {false, true}) {
+            check(tyloinfer::qsa::index_pool_affine16_scores(f.q.as<float>(),keys.as<std::int16_t>(),
+                head_weights.as<float>(),f.p.as<std::int64_t>(),f.out.as<float>(),queries,heads,f.width,f.blocks,
+                4,reserve_tail,nullptr,integer?scratch.data:nullptr,integer?scratch_bytes:0));
+            std::vector<float> actual(std::size_t(queries)*f.blocks);
+            check(cudaMemcpy(actual.data(),f.out.data,actual.size()*sizeof(actual[0]),cudaMemcpyDeviceToHost));
+            for (int query=0; query<queries; ++query) for (int block=0; block<f.blocks; ++block) {
+                const auto value=actual[std::size_t(query)*f.blocks+block];
+                if (block>=(f.positions[query]+!reserve_tail)/4) {
+                    if (value!=-INFINITY) throw std::runtime_error("IndexPool selected a nonhistorical group");
+                    continue;
+                }
+                const auto scale=__half2float(__ushort_as_half(f.scales[block]));
+                double score=0;
+                for (int head=0; head<heads; ++head) {
+                    double dot=0;
+                    const auto at=std::size_t(query)*heads+head;
+                    for (int channel=0; channel<f.width; ++channel) {
+                        const auto key=f.keys[std::size_t(block)*f.width+channel]-f.zero[block];
+                        dot+=double(f.query[at*f.width+channel])*float(key)*scale;
+                    }
+                    score+=std::max(dot,0.0)*weights[at];
+                }
+                score/=std::sqrt(double(f.width)*heads);
+                if(!std::isfinite(value) || std::abs(value-score)>3e-6+std::abs(score)*3e-5)
+                    throw std::runtime_error("IndexPool weighted score differs from FP64 reference");
+            }
+            ++cases;
+        }
+    }
+    return cases;
+}
 void pack_at_case(bool half_input,bool wide_positions) {
     constexpr int width=131,stride=143,capacity=12,rows=3,record=width+2;
     const std::vector<int32_t> positions{7,1,9};
@@ -310,6 +363,7 @@ int main()try {
     cases+=paired_layout_cases();
     cases+=integer_workspace_cases();
     cases+=integer_pooling_cases();
+    cases+=weighted_index_pool_cases();
     for(const bool half_input:{false,true})for(const bool wide_positions:{false,true})pack_at_case(half_input,wide_positions);
     graph_case();
     graph_case(true);

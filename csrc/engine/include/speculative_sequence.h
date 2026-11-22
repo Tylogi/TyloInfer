@@ -116,6 +116,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             ? 1
             : std::clamp<int>(sampling.mtp_max_draft_tokens, 1, mtp.blockwise_drafting()
                 ? policy::kMaximumBlockwiseDraftDepth : policy::kMaximumDraftDepth));
+    if constexpr (requires {mtp.prepare_request(occupied_context+limit,maximum_depth);})
+        mtp.prepare_request(occupied_context+limit,maximum_depth);
     policy::GenerationPolicy<policy::DsparkDepthController> depth_controller(
         maximum_depth, mtp.dspark_policy(), &mtp.policy_state,[&] {
             if constexpr(requires {ops.gradual_mtp_warmup();})return ops.gradual_mtp_warmup();
@@ -173,6 +175,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 return ops.stream_prompt_history(ops.size(input_ids, 1));
             return false;
         }();
+        const bool project_blockwise_prompt_chunks=mtp.blockwise_drafting() && [&] {
+            if constexpr (requires { mtp.project_blockwise_prompt_chunks(); })
+                return mtp.project_blockwise_prompt_chunks();
+            return false;
+        }();
         const int64_t predictor_chunk = [&] {
             if constexpr (requires { ops.predictor_prefill_chunk_size(prefill_chunk_size); })
                 return ops.predictor_prefill_chunk_size(prefill_chunk_size);
@@ -217,7 +224,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 return ops.prefill(chunk);
             }();
             hidden = std::move(step.hidden);
-            if (stream_prompt_history) {
+            if (project_blockwise_prompt_chunks) {
+                prime_blockwise(step.raw,offset+chunk.count,offset==0);
+                raw=ops.clone(ops.slice(step.raw,1,chunk.count-1,1));
+            } else if (stream_prompt_history) {
                 if (offset == static_cast<int64_t>(reused_tokens) && reused_tokens > 0)
                     prime_rows(restored_last_hidden, offset, 1);
                 if(stream_boundary_pair_pending) {
@@ -263,7 +273,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             if(offset==checkpoint) {
                 // Keep an exact checkpoint before the final prompt token so
                 // an identical retry can reuse the prefix and recompute logits.
-                if(stream_prompt_history) {
+                if(stream_prompt_history || project_blockwise_prompt_chunks) {
                     *session_last_hidden=raw;
                 } else {
                     auto context=raw_chunks.size()==1?std::move(raw_chunks.front()):ops.concatenate(raw_chunks,1);
@@ -296,7 +306,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             co_return;
         if (transformed_prompt)
             model.decode_position_delta = prepared->decode_position_delta;
-        if (!stream_prompt_history)
+        if (!stream_prompt_history && !project_blockwise_prompt_chunks)
             raw = raw_chunks.size() == 1 ? std::move(raw_chunks.front()) : ops.concatenate(raw_chunks, 1);
         raw_chunks.clear();
         auto committed_last_hidden = ops.slice(raw, 1, ops.size(raw, 1) - 1, 1);
@@ -315,7 +325,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             !token_constraint || initial_constraint, "MTP token constraint clone is incomplete");
         int32_t pending = ops.sample_constrained(logits, counts, initial_constraint);
 
-        if (mtp.blockwise_drafting()) {
+        if (mtp.blockwise_drafting() && !project_blockwise_prompt_chunks) {
             prime_blockwise(raw,ops.size(input_ids,1),!reused_tokens && !prompt_context_seeded);
         }
 

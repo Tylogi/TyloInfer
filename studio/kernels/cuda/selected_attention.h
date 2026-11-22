@@ -11,6 +11,8 @@ using mfq_tensor_backend::Tensor;
 void values(std::initializer_list<const Tensor*> tensors);
 Tensor promoted_matmul(const Tensor& left, const Tensor& right);
 Tensor dots(const Tensor& query, const Tensor& keys);
+std::pair<Tensor,Tensor> prepare_indices(const Tensor&,int64_t cache_length,int tile,
+    mfq::cuda::HotKvView hot={});
 Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
     int64_t offset, double scale, mfq::cuda::HotKvView hot = {});
 Tensor sparse(const Tensor& query, const Tensor& key, const Tensor& value,

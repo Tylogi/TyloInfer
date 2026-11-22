@@ -43,6 +43,7 @@ struct MoeWeightLoadOptions {
     bool ungated_experts = false;
     bool ungated_shared = false;
     std::size_t shared_gate_up_compatible_prefix = 2;
+    bool has_shared_expert = true;
 };
 
 FFN load_moe_weights(

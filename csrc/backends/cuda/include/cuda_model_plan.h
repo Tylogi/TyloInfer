@@ -21,6 +21,8 @@ enum class CudaBackbone {
     deepseek_v4,
     deepseek_v41,
     nemotron_h,
+    inkling2_loop,
+    hy_v4_flash,
     unsupported,
 };
 
@@ -92,6 +94,8 @@ inline constexpr CudaBackbone cuda_backbone(
     if (implementation == "nemotron_h") {
         return CudaBackbone::nemotron_h;
     }
+    if (implementation == "inkling2_loop") return CudaBackbone::inkling2_loop;
+    if (implementation == "hy_v4_flash") return CudaBackbone::hy_v4_flash;
     return CudaBackbone::unsupported;
 }
 

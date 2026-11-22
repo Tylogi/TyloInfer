@@ -90,7 +90,7 @@ static void kv_case(ScalarType dtype, int tokens, int width, int unaligned, int 
     std::vector<int64_t> positions((batched_positions ? batch : 1) * tokens);
     for (size_t i = 0; i < positions.size(); ++i) {
         const int t = i % tokens;
-        positions[i] = mode ? 3 + t : tokens - t + int(i / tokens);
+        positions[i] = mode ? 3 + t + int(i / tokens) : tokens - t + int(i / tokens);
         if (!mode && t == 0) positions[i] = -1;
         if (!mode && t == 1) positions[i] = capacity;
     }
@@ -136,6 +136,8 @@ int main() {
                     for (int mode : {1, 2})
                         for (int tokens : {3, 9})
                             kv_case(dtype, tokens, width, unaligned, mode, false);
+                    for (int tokens : {3, 9})
+                        kv_case(dtype, tokens, width, unaligned, 2, true);
                 }
         std::cout << "embedding and KV storage-offset checks passed\n";
     } catch (const std::exception& error) {

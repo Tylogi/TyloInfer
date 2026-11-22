@@ -4,10 +4,12 @@
 #include "tyloinfer/model_source.h"
 #include "tyloinfer/gguf_quant.h"
 #include "runtime/row_stage.h"
+#include <array>
 #include <optional>
 #include <functional>
 
 struct GgufInputRotation;
+struct GgufRoutedWeight;
 class GgufRowCorrection;
 // Activation-dependent neuron corrections retain the original input even
 // when the base integer projection consumes a shared Q8 packet.
@@ -44,6 +46,7 @@ struct GgufWeight {
     // Canonical projections retain their position-major packet preference.
     bool prefers_position_major_q8(std::int64_t tokens) const noexcept;
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor input,bool allow_mmq = true) const;
+    mfq_tensor_backend::Tensor try_forward_batched_logits(const mfq_tensor_backend::Tensor& input) const;
     mfq_tensor_backend::Tensor forward_base(mfq_tensor_backend::Tensor input,bool allow_mmq) const;
     bool can_forward_prefill_residual(std::int64_t tokens,const mfq_tensor_backend::Tensor& residual) const;
     mfq_tensor_backend::Tensor forward_base(mfq_tensor_backend::Tensor input,bool allow_mmq,
@@ -107,6 +110,8 @@ std::vector<std::pair<std::string, double>> gguf_expert_memory_metrics(const std
 bool prepare_gguf_graph_pool(const std::shared_ptr<GgufExpertCache>&);
 void finalize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>&, std::size_t reserve_bytes = 0);
 void seed_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>&, const mfq::ModelSource&);
+void prepare_gguf_expert_slots(const std::shared_ptr<GgufExpertCache>&,
+    const std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>>& layers);
 void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>&, std::size_t bytes);
 // A prepared decoder can price its remaining transient tensors separately
 // from graph/KV storage which is already allocated. No estimate preserves the
@@ -151,9 +156,13 @@ struct GgufRoutedWeight {
     mfq_tensor_backend::Tensor forward_base(mfq_tensor_backend::Tensor source,
         mfq_tensor_backend::Tensor ids) const;
 };
+bool place_gguf_experts_resident(CudaExecutionContext&,
+    const std::vector<std::shared_ptr<GgufRoutedWeight>>&,std::size_t kv_reserve_bytes);
+
 struct CudaIndependentBranchExecutor;
 struct GgufMoeBanks {
     std::shared_ptr<GgufRoutedWeight> gate, up, down;
+    std::shared_ptr<GgufRoutedWeight> gate_up;
     // Independent shared-expert work runs after streamed routes are published.
     // The serial path starts it after starting the transfer stream.
     // A prepared branch executor can overlap it with routed computation;
@@ -164,6 +173,9 @@ struct GgufMoeBanks {
         mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor weights, float limit = 0,
         const std::function<void()>& independent_work = {},
         CudaIndependentBranchExecutor* shared_executor = nullptr) const;
+    mfq_tensor_backend::Tensor forward_packed_situ(mfq_tensor_backend::Tensor source,
+        mfq_tensor_backend::Tensor ids,mfq_tensor_backend::Tensor weights,float beta,float linear_beta,
+        const std::function<void()>& independent_work) const;
 };
 
 GgufWeight load_gguf_weight(const mfq::ModelSource& source, const std::string& name,

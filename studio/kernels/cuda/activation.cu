@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
@@ -242,6 +243,44 @@ mfq_tensor_backend::Tensor gelu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_te
             mfq::cuda::Device{mfq::cuda::DeviceType::cuda, out.get_device()}),
         mfq_current_cuda_stream());
     return out;
+}
+
+template<class T> __global__ void situ_paired(const T* gate_up, T* output,
+    int64_t count, int64_t width, float beta, float linear_beta) {
+    const float inverse=1/beta;
+    const float inverse_linear=linear_beta>0?1/linear_beta:0;
+    for (auto i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x) {
+        const auto offset=i+i/width*width;
+        const float gate=activation_as_float(gate_up[offset]);
+        const float up=activation_as_float(gate_up[offset+width]);
+        const float gated=beta*tanhf(gate*inverse)/(1.0f+expf(-gate));
+        const float linear=linear_beta>0?linear_beta*tanhf(up*inverse_linear):up;
+        output[i]=activation_from_float<T>(gated*linear);
+    }
+}
+
+mfq_tensor_backend::Tensor situ_gate_up_cuda(const mfq_tensor_backend::Tensor& gate_up,
+    float beta, float linear_beta) {
+    namespace tb=mfq_tensor_backend;
+    const auto dtype=gate_up.scalar_type();
+    TYLOINFER_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() && gate_up.dim()>1 &&
+        gate_up.size(-1)>0 && gate_up.size(-1)%2==0 && (dtype==tb::kFloat32 || dtype==tb::kFloat16) &&
+        beta>0 && std::isfinite(beta) && linear_beta>=0 && std::isfinite(linear_beta),
+        "invalid SiTU Gate/Up geometry or scales");
+    auto shape=gate_up.sizes().vec();
+    const int64_t width=shape.back()/=2;
+    auto output=tb::empty(shape,gate_up.options());
+    const auto count=output.numel();
+    if (!count) return output;
+    constexpr int threads=256;
+    const int blocks=int(std::min<int64_t>((count-1)/threads+1,65535));
+    const auto stream=mfq_current_cuda_stream();
+    if (dtype==tb::kFloat32)
+        situ_paired<<<blocks,threads,0,stream>>>(gate_up.data_ptr<float>(),output.data_ptr<float>(),count,width,beta,linear_beta);
+    else situ_paired<<<blocks,threads,0,stream>>>(reinterpret_cast<const half*>(gate_up.data_ptr()),
+        reinterpret_cast<half*>(output.data_ptr()),count,width,beta,linear_beta);
+    TYLOINFER_CUDA_CHECK(cudaGetLastError());
+    return output;
 }
 // relu(x)^2: the ungated expert / projector activation. One line per element,
 // f32 accumulation, the result is rounded back to the input dtype.

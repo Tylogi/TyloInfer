@@ -130,14 +130,17 @@ struct CudaEngineState {
 
     void restore_graph_expert_space() {
         if(preparing_graph_depth)return;
+        const bool trace=runtime_options::layer_timings();
+        const auto start=trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         std::optional<std::size_t> transient;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
             if(!batching)transient=qwen4_decode_transient_reserve(language,planning_mtp?components.mtp.get():nullptr,graph_draft_depth);
         restore_routed_decode_workspace(*execution,
             execution->kv_memory?execution->kv_memory->growth_reserve():0,transient);
         if(execution->gguf_expert_cache || execution->tq_expert_cache) {
-            if(runtime_options::layer_timings()) {
-                std::cerr<<"runtime_routed_decode_ready";
+            if(trace) {
+                std::cerr<<"runtime_routed_decode_ready restore_ms="<<
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
                 for(const auto& [name,value]:routed_expert_memory_metrics(*execution))
                     if(name=="expert_logical_transfer_bytes" || name=="expert_host_fetch_ms" ||
                         name=="expert_batched_cpu_copy_ms" || name=="expert_batched_stage_wait_ms" ||
@@ -352,6 +355,8 @@ struct CudaEngineState {
                 auto owner=weak.lock();if(!owner)return std::size_t(0);
                 return reclaim_routed_expert_pinned(*owner,bytes);
             });
+        if constexpr (std::is_same_v<Model,InklingCausalLm>)
+            place_inkling_experts(language,config.continuous_batch.max_sequences);
         initial_expert_budget=routed_expert_cache_budget_bytes(*execution);
         if (execution->qsa_kv_store)
             execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) {
@@ -368,9 +373,21 @@ struct CudaEngineState {
             } else if constexpr (std::is_same_v<Model,Qwen35CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
-                    language, *execution, config.continuous_batch);
-            if constexpr (std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
-                batching->set_prefix_cache(cache);
+                    language, *execution, config.continuous_batch,
+                    language.config.sensenova_loop?dynamic_cast<const Qwen35Mtp*>(components.mtp.get()):nullptr);
+            else if constexpr (std::is_same_v<Model,InklingCausalLm>)
+                batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
+                    config.generation.prefill_chunk_size,config.continuous_batch.prefill_token_budget,
+                    language,*execution,config.continuous_batch,components.mtp.get());
+            else if constexpr (std::is_same_v<Model,Hy4CausalLm>) {
+                if (hy4::can_batch(language))
+                    batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
+                        config.generation.prefill_chunk_size,config.continuous_batch.prefill_token_budget,
+                        language,*execution,config.continuous_batch,components.mtp.get());
+            }
+            if constexpr (std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm> ||
+                          std::is_same_v<Model,InklingCausalLm> || std::is_same_v<Model,Hy4CausalLm>)
+                if (batching) batching->set_prefix_cache(cache);
         }
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if(has_routed_expert_cache(*execution))
@@ -497,7 +514,7 @@ struct CudaEngineState {
                 trace_load("expert_profile");
                 seed_gguf_expert_cache(execution->gguf_expert_cache,*language.source);
             }
-        }
+        } else if constexpr(std::is_same_v<Model,Hy4CausalLm>) prepare_hy4_expert_cache(language);
         trace_load("ready");
     }
     bool can_batch(const EngineRequest& request) const {
@@ -509,6 +526,27 @@ struct CudaEngineState {
                 FlashNextBatchOperations::supports_mtp(input.sampling,{}) &&
                 (!input.chat || !request.token_ids.empty() || (input.chat_input && input.chat_input->preformatted_prompt &&
                     input.chat_input->template_inputs.json_schema.empty()));
+        }
+        if constexpr (std::is_same_v<Model,InklingCausalLm> || std::is_same_v<Model,Hy4CausalLm>) {
+            const auto& input=request.input;
+            if (!batching || input.media || !input.cache_plan.session_id.empty()) return false;
+            if (!input.sampling.enable_mtp || !components.mtp) return true;
+            const auto& sampling=input.sampling;
+            return config.continuous_batch.cuda_graph && mfq_cuda_graph_capture_supported() &&
+                (!input.chat_input || input.chat_input->template_inputs.json_schema.empty()) &&
+                sampling.presence_penalty==0 && sampling.frequency_penalty==0 && sampling.repetition_penalty==1 &&
+                (sampling.temperature==0 || (sampling.top_k>0 && sampling.top_k<=64));
+        }
+        if constexpr (std::is_same_v<Model,Qwen35CausalLm>) {
+            const auto& input=request.input;
+            const auto& sampling=input.sampling;
+            if (language.config.sensenova_loop && sampling.enable_mtp && components.mtp)
+                return batching && !input.media && input.cache_plan.session_id.empty() &&
+                    !(cache.persistent_prefix_enabled() && input.prefix_cache_enabled) &&
+                    qwen_continuous_batch_cuda_graph_enabled(language,config.continuous_batch) &&
+                    (!input.chat_input || input.chat_input->template_inputs.json_schema.empty()) &&
+                    sampling.presence_penalty==0 && sampling.frequency_penalty==0 && sampling.repetition_penalty==1 &&
+                    (sampling.temperature==0 || (sampling.top_k>0 && sampling.top_k<=64));
         }
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
@@ -555,6 +593,10 @@ struct CudaEngineState {
         graph.invalidate();
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
             qwen4_release_decode_graphs(language,components.mtp.get());
+        if constexpr(std::is_same_v<Model,Hy4CausalLm>)
+            clear_hy4_decode_graph(language);
+        if constexpr(std::is_same_v<Model,InklingCausalLm>)
+            clear_inkling_graphs(language);
         if(batching)batching->release_idle_buffers();
         if(components.mtp)components.mtp->reset(1);
         language.reset(1);
@@ -633,6 +675,7 @@ struct CudaEngineState {
     Generation generate(const RequestId& id, ExecutionRequest& request) {
         if (request.batched) {
             graph.invalidate();
+            if constexpr (std::is_same_v<Model,InklingCausalLm>) clear_inkling_graphs(language);
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
                 // Exclusive MTP generation has ended before a batch starts.
                 // Its graph consumers must retire before idle batch buffers.
@@ -909,7 +952,8 @@ struct CudaEngineState {
                 {"resident_memory_budget_bytes",double(resident_budget)}, {"resident_weight_budget_bytes",double(weight_budget)},
                 {"resident_memory_used_bytes",double(std::max(allocated,reserved))},
                 {"resident_reclaimable_weight_bytes",double(expert_bytes>minimum?expert_bytes-minimum:0)}});
-            metrics.emplace_back("qsa_kv_offload_supported",std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0);
+            metrics.emplace_back("qsa_kv_offload_supported",
+                std::is_same_v<Model,Qwen4CausalLm> || std::is_same_v<Model,Hy4CausalLm> ? 1.0 : 0.0);
             if (execution->qsa_kv_store) {
                 auto kv = execution->qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());
@@ -956,7 +1000,9 @@ using State = std::variant<
     std::unique_ptr<CudaEngineState<Qwen4CausalLm>>,
     std::unique_ptr<CudaEngineState<DeepseekV4CausalLm>>,
     std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>,
-    std::unique_ptr<CudaEngineState<NemotronHCausalLm>>>;
+    std::unique_ptr<CudaEngineState<NemotronHCausalLm>>,
+    std::unique_ptr<CudaEngineState<InklingCausalLm>>,
+    std::unique_ptr<CudaEngineState<Hy4CausalLm>>>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
@@ -995,8 +1041,8 @@ struct CudaBackend {
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
-                if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
-                    if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+                if constexpr (!std::is_same_v<Model, Qwen4CausalLm> && !std::is_same_v<Model, Hy4CausalLm>)
+                    if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires sparse attention");
                 if(std::getenv("TYLOINFER_TRACE_ENGINE_LOAD"))std::cerr<<"cuda_engine_load phase=model_loaded\n";
                 return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config,weight_memory);
             });

@@ -29,7 +29,7 @@ Ffn load_dense_ffn(Loader& ops, const ModelConfig& config, const std::string& pr
 template <class Ffn, class Loader>
 Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
                     bool router_bias_required = false, bool ungated_experts = false,
-                    bool ungated_shared = false) {
+                    bool ungated_shared = false, bool has_shared_expert = true) {
     const auto gate_up = prefix + "experts.gate_up.weight", gate = prefix + "experts.gate.weight",
                up = prefix + "experts.up.weight", down = prefix + "experts.down.weight";
     const bool has_up = ops.has(up), has_down = ops.has(down);
@@ -90,6 +90,7 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
         result.moe_router_projection=ops.router_projection;
     if (router_bias_required || ops.has(prefix + "router.bias"))
         result.moe_router_bias = ops.router_parameter(prefix + "router.bias");
+    if (!has_shared_expert) return result;
     result.shared = std::make_unique<Ffn>();
     result.shared->down = ops.linear(prefix + "shared_expert.down.weight");
     const auto shared_gate = prefix + "shared_expert.gate.weight";

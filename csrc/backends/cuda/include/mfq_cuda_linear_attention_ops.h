@@ -15,7 +15,8 @@ bool try_gdn_replay_state_cuda(
     const mfq_tensor_backend::Tensor& initial_convolution,
     const mfq_tensor_backend::Tensor& initial_recurrent,
     mfq_tensor_backend::Tensor& convolution, mfq_tensor_backend::Tensor& recurrent,
-    int64_t retained_tokens, bool transposed, bool tiled_heads);
+    int64_t retained_tokens, bool transposed, bool tiled_heads,
+    const mfq_tensor_backend::Tensor& retained_by_sequence = {});
 
 std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
     mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log,

@@ -1,6 +1,7 @@
 #include "runtime/routed_host_cache.h"
 #include "runtime/routed_event_retirement.h"
 #include "runtime/routed_resident_views.h"
+#include "mfq_cuda_activation_ops.h"
 #include "storage/routed_host_image.h"
 #include "gguf_weight.h"
 #include "gguf_row_correction.h"
@@ -234,7 +235,7 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
     bool host_evacuation_blocked_=false;
     using BlockHostEvacuation=mfq::cuda::RoutedHostEvacuationBlock;
     std::uint64_t sources_ = 0;
-    std::size_t payload_bytes_ = 0, predictor_resident_bytes_ = 0;
+    std::size_t payload_bytes_ = 0, predictor_resident_bytes_ = 0, resident_model_bytes_ = 0;
     std::uint64_t calls_ = 0, gpu_hits_ = 0, host_hits_ = 0, source_bytes_ = 0,
         source_reads_ = 0, transfer_bytes_ = 0, host_evictions_ = 0, device_evictions_ = 0,
         writeback_bytes_ = 0, pin_failures_ = 0, pin_capacity_misses_ = 0,
@@ -1690,6 +1691,33 @@ public:
             count+=std::min(touch.uses,UINT64_MAX-count);decode_seed_pending_.insert(device);
         }
     }
+    void prepare_slots(const std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>>& layers) {
+        if (!strata_slots_requested() || layers.empty()) return;
+        const int device=mfq_current_cuda_device();
+        {
+            std::lock_guard lock(mutex_);
+            if (slot_tiers_.count(device) || device_used_[device] || !device_limit_.count(device) || !device_limit_.at(device)) return;
+            if (std::any_of(layers.begin(),layers.end(),[&](const auto& layer) {
+                return std::any_of(layer.begin(),layer.end(),[&](const auto& bank) {
+                    return !bank || bank->cache.get()!=this || bank->resident_packed.defined() || bank->experts!=layer[0]->experts;
+                });
+            })) return;
+            for (const auto& layer:layers) {
+                auto& demand=prefill_demand_[device][layer[0]->source_id];
+                demand.counts.resize(size_t(layer[0]->experts));
+                for (size_t role=0;role<layer.size();++role) demand.banks[role]=layer[role];
+            }
+            prefill_rebalance_pending_.insert(device);
+        }
+        try {rebalance_prefill();}
+        catch (const MfqResourceExhausted&) {
+            std::lock_guard lock(mutex_);
+            if (slot_tiers_.count(device)) release_slot_tier(device);
+            prefill_demand_.erase(device);
+            prefill_rebalance_pending_.erase(device);
+            return;
+        }
+    }
     void seed_profile(const mfq::ModelSource& source) {
         if(!strata_slots_requested() || (source.architecture()!="qwen4_exp" && source.architecture()!="qwen4exp"))return;
         const auto metadata=source.metadata().find("gguf_metadata");
@@ -2209,6 +2237,18 @@ public:
         auto metadata=std::make_shared<GgufRoutedWeight>(bank);metadata->cache.reset();
         std::lock_guard lock(mutex_);reclaim_banks_.emplace(bank.source_id,std::move(metadata));
     }
+    void place_resident(const std::vector<std::shared_ptr<GgufRoutedWeight>>& banks,std::size_t bytes) {
+        std::lock_guard lock(mutex_);
+        payload_bytes_-=bytes;
+        resident_model_bytes_+=bytes;
+        for (const auto& bank:banks) {
+            for (int64_t expert=0;expert<bank->experts;++expert) erase_host((bank->source_id<<32)|uint64_t(expert));
+            source_readers_.erase(bank->source_id);
+            group_sources_.erase(bank->source_id);
+            snapshot_sources_.erase(bank->source_id);
+            reclaim_banks_.erase(bank->source_id);
+        }
+    }
     std::size_t source_bytes() {
         std::lock_guard lock(mutex_);return payload_bytes_;
     }
@@ -2597,6 +2637,7 @@ public:
             {"gguf_gpu_resident_view_updates",double(resident_view_updates_)},
             {"gguf_gpu_resident_view_prepare_ms",resident_view_prepare_ms_},
             {"gguf_predictor_resident_expert_bytes",double(predictor_resident_bytes_)},
+            {"gguf_resident_model_expert_bytes",double(resident_model_bytes_)},
             {"gguf_prefill_inplace_mmq_bytes",double(prefill_inplace_mmq_bytes_)},
             {"gguf_host_device_ready_waits",double(host_device_ready_waits_)},
             {"gguf_prefill_device_ready_skips",double(prefill_device_ready_skips_)},
@@ -3524,6 +3565,10 @@ void finalize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache, s
 void seed_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache,const mfq::ModelSource& source) {
     if(cache)cache->seed_profile(source);
 }
+void prepare_gguf_expert_slots(const std::shared_ptr<GgufExpertCache>& cache,
+        const std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>>& layers) {
+    if (cache) cache->prepare_slots(layers);
+}
 void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>& cache, std::size_t bytes) {
     if (cache) cache->reserve_workspace(bytes);
 }
@@ -3550,6 +3595,74 @@ bool set_gguf_reuse_learning(const std::shared_ptr<GgufExpertCache>& cache,bool 
     return cache?cache->set_reuse_learning(enabled):false;
 }
 
+namespace {
+struct ResidentExpertImage {tb::Tensor packed,addresses;};
+
+ResidentExpertImage upload_expert_bank(const GgufRoutedWeight& bank,tb::Tensor& staging) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
+    const mfq::cuda::ResidentAllocationScope permanent;
+    const auto device=mfq_current_cuda_device();
+    const auto bytes=bank.expert_bytes*uint64_t(bank.experts);
+    if (bytes>INT64_MAX) throw std::overflow_error("GGUF resident expert bank exceeds tensor size limits");
+    auto packed=tb::empty({int64_t(bytes)},tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
+    auto addresses=tb::empty({bank.experts},tb::TensorOptions().device(tb::kCPU).dtype(tb::kInt64));
+    const auto stream=mfq_current_cuda_stream();
+    for (uint64_t offset=0;offset<bytes;) {
+        const auto count=std::min<uint64_t>(bytes-offset,staging.nbytes());
+        bank.reader(offset,reinterpret_cast<std::byte*>(staging.data_ptr()),count);
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(packed.data_ptr<uint8_t>()+offset,staging.data_ptr(),
+            count,cudaMemcpyHostToDevice,stream));
+        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+        offset+=count;
+    }
+    for (int64_t expert=0;expert<bank.experts;++expert)
+        addresses.data_ptr<int64_t>()[expert]=reinterpret_cast<intptr_t>(packed.data_ptr<uint8_t>()+expert*bank.expert_bytes);
+    return {packed,addresses.to(packed.device())};
+}
+} // namespace
+
+bool place_gguf_experts_resident(CudaExecutionContext& execution,
+        const std::vector<std::shared_ptr<GgufRoutedWeight>>& banks,std::size_t kv_reserve_bytes) {
+    if (banks.empty() || !execution.gguf_expert_cache || execution.layer_placement.enabled() ||
+        execution.tensor_parallel.enabled() || execution.expert_parallel.enabled() ||
+        execution.config.moe_device_cache_bytes.has_value() || execution.config.moe_host_cache_bytes)
+        return false;
+    std::size_t bytes=0,table_bytes=0;
+    for (const auto& bank:banks) {
+        if (!bank || bank->cache!=execution.gguf_expert_cache || bank->resident_packed.defined() || bank->correction)
+            return false;
+        const auto payload=bank->expert_bytes*uint64_t(bank->experts);
+        if (payload>SIZE_MAX-bytes) return false;
+        bytes+=std::size_t(payload);
+        table_bytes+=std::size_t(bank->experts)*sizeof(int64_t);
+    }
+    const MfqCudaGuard guard(execution.layer_placement.primary_device());
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    context->reclaim_idle_memory();
+    const auto available=context->available_memory();
+    const auto workspace=mfq::cuda::runtime_options::workspace_reserve_bytes();
+    if (available<workspace || available-workspace<kv_reserve_bytes ||
+        available-workspace-kv_reserve_bytes<table_bytes ||
+        available-workspace-kv_reserve_bytes-table_bytes<bytes) return false;
+    std::vector<ResidentExpertImage> loaded;
+    loaded.reserve(banks.size());
+    try {
+        auto staging=tb::empty({4LL<<20},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8));
+        for (const auto& bank:banks) loaded.push_back(upload_expert_bank(*bank,staging));
+    } catch (const MfqResourceExhausted&) {
+        loaded.clear();
+        context->reclaim_idle_memory();
+        return false;
+    }
+    execution.gguf_expert_cache->place_resident(banks,bytes);
+    for (size_t i=0;i<banks.size();++i) {
+        banks[i]->resident_packed=std::move(loaded[i].packed);
+        banks[i]->resident_addresses=std::move(loaded[i].addresses);
+    }
+    std::fprintf(stderr,"native_gguf_resident_experts banks=%zu bytes=%zu\n",banks.size(),bytes);
+    return true;
+}
+
 GgufRoutedWeight::GgufRoutedWeight(CudaExecutionContext& execution,
     const mfq::ModelSource& source, const std::string& name) {
     const auto* record = source.find_tensor(name);
@@ -3572,38 +3685,16 @@ GgufRoutedWeight::GgufRoutedWeight(CudaExecutionContext& execution,
     reader = source.tensor_reader(name);
     batch_reader = source.tensor_batch_reader(name);
     const bool resident=name.starts_with("predictor.");
-    if(resident) {
-        if(record->nbytes>INT64_MAX)throw std::overflow_error("GGUF resident expert bank exceeds tensor size limits");
-        const mfq::cuda::WeightAllocationScope weight_memory;
-        const mfq::cuda::ResidentAllocationScope permanent;
-        const int device=mfq_current_cuda_device();
-        resident_packed=tb::empty({std::int64_t(record->nbytes)},
-            tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
-        // Preserve the original compressed encoding. Bounded staging avoids
-        // keeping a second host copy of a fully resident predictor bank.
-        constexpr std::size_t chunk_bytes=4ULL<<20;
-        auto host=tb::empty({std::int64_t(std::min<std::uint64_t>(record->nbytes,chunk_bytes))},
-            tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8));
-        for(std::uint64_t offset=0;offset<record->nbytes;) {
-            const auto bytes=std::min<std::uint64_t>(record->nbytes-offset,host.nbytes());
-            reader(offset,reinterpret_cast<std::byte*>(host.data_ptr()),bytes);
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(resident_packed.data_ptr<std::uint8_t>()+offset,
-                host.data_ptr(),bytes,cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-            offset+=bytes;
-        }
+    if (resident) {
+        auto staging=tb::empty({4LL<<20},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8));
+        auto image=upload_expert_bank(*this,staging);
+        resident_packed=std::move(image.packed);
+        resident_addresses=std::move(image.addresses);
         std::fprintf(stderr,"native_gguf_predictor_resident actual_match=1 bank=%s bytes=%llu device=%d\n",
-            name.c_str(),static_cast<unsigned long long>(record->nbytes),device);
+            name.c_str(),static_cast<unsigned long long>(record->nbytes),mfq_current_cuda_device());
     }
     if (!execution.gguf_expert_cache) execution.gguf_expert_cache = std::make_shared<GgufExpertCache>(execution,source);
     cache = execution.gguf_expert_cache;
-    if(resident) {
-        const mfq::cuda::ResidentAllocationScope permanent;
-        auto addresses=tb::empty({experts},tb::TensorOptions().device(tb::kCPU).dtype(tb::kInt64));
-        for(std::int64_t expert=0;expert<experts;++expert)
-            addresses.data_ptr<std::int64_t>()[expert]=reinterpret_cast<std::intptr_t>(resident_packed.data_ptr<std::uint8_t>()+expert*expert_bytes);
-        resident_addresses=addresses.to(resident_packed.device());
-    }
     // Lab path: cold file-backed page faults can cost more than pageable D2H.
     // Keep the measured transfer path until mapped residency is accounted for.
     const auto* mapped_recovery=std::getenv("TYLOINFER_GGUF_MAPPED_RECOVERY");
@@ -3704,9 +3795,9 @@ struct GgufExpertStage {
         host_ids = std::make_unique<mfq::cuda::HostBuffer>(tokens * routes * sizeof(std::int64_t));
     }
     ~GgufExpertStage() { try { MfqCudaGuard guard(stream.device()); (void)cudaStreamSynchronize(stream.stream()); } catch (...) {} }
-    void load() {
+    void load() {load(static_cast<const std::int64_t*>(host_ids->data()));}
+    void load(const std::int64_t* values) {
         MfqCudaStreamGuard guard(stream);
-        const auto* values = static_cast<const std::int64_t*>(host_ids->data());
         std::vector<std::int64_t> unique;
         std::unordered_set<std::int64_t> visited;
         for (std::int64_t i = 0; i < tokens * routes; ++i)
@@ -3727,6 +3818,24 @@ struct GgufExpertStage {
             bank.experts, bank.out, bank.input, ids.data_ptr<std::int64_t>(), tokens, routes,
             quantized.data_ptr(), routed, output.data_ptr<float>(), stream.stream());
     }
+};
+
+struct GgufPackedMoeStage {
+    std::shared_ptr<GgufGraphLease> gate_lease=std::make_shared<GgufGraphLease>();
+    std::shared_ptr<GgufGraphLease> down_lease=std::make_shared<GgufGraphLease>();
+    GgufExpertStage gate_up,down;
+
+    GgufPackedMoeStage(const GgufMoeBanks& banks,const tb::Tensor& source,int64_t routes)
+        : gate_up(*banks.gate_up,source,source.size(0),routes,gate_lease),
+          down(*banks.down,tb::empty({source.size(0),routes,banks.down->input},source.options()),
+               source.size(0),routes,down_lease) {}
+
+    void load() {
+        const auto* routes=static_cast<const int64_t*>(gate_up.host_ids->data());
+        gate_up.load(routes);
+        down.load(routes);
+    }
+    void clear() {gate_lease->clear();down_lease->clear();}
 };
 
 // A route selects a complete expert, rather than three independent projections.
@@ -4834,6 +4943,97 @@ static tb::Tensor resident_moe(const GgufMoeBanks& banks,tb::Tensor source,
     return result;
 }
 
+
+static tb::Tensor resident_packed_situ(const GgufMoeBanks& banks,tb::Tensor source,tb::Tensor ids,
+        tb::Tensor weights,float beta,float linear_beta) {
+    using namespace mfq::cuda::gguf;
+    const auto& gate=*banks.gate_up;
+    const auto& down=*banks.down;
+    const auto tokens=ids.size(0),routes=ids.size(1),rows=tokens*routes;
+    const auto stream=mfq_current_cuda_stream();
+    const auto stream_id=reinterpret_cast<std::uintptr_t>(stream);
+    for (const auto* bank:{&gate,&down}) {
+        if (bank->resident_packed.device()!=source.device())
+            throw std::invalid_argument("GGUF resident packed MoE device mismatch");
+        bank->resident_packed.record_stream(stream_id);
+        bank->resident_addresses.record_stream(stream_id);
+    }
+    ids=ids.to(tb::kInt64).contiguous();
+    const auto options=source.options().dtype(tb::kFloat32);
+    auto packet=tb::empty({int64_t(tokens*q8_row_bytes(gate.input))},options.dtype(tb::kUInt8));
+    auto projected=tb::empty({tokens,routes,gate.out},options);
+    tb::Tensor plan;
+    RouteGroup* groups=nullptr;
+    if (tokens>1) {
+        plan=tb::empty({int64_t((rows+1)*sizeof(RouteGroup))},options.dtype(tb::kUInt8));
+        groups=static_cast<RouteGroup*>(plan.data_ptr());
+        prepare_route_groups(ids.data_ptr<int64_t>(),rows,int(tokens),groups,stream);
+    }
+    const auto addresses=[](const GgufRoutedWeight& bank) {
+        return reinterpret_cast<const uint64_t*>(bank.resident_addresses.data_ptr());
+    };
+    prepare_bank_input(gate.rotation,source,packet,nullptr,stream);
+    grouped_routed_matvec_q8(gate.type,addresses(gate),gate.row_bytes,gate.experts,
+        gate.out,gate.input,ids.data_ptr<int64_t>(),groups,tokens,routes,packet.data_ptr(),false,
+        projected.data_ptr<float>(),stream);
+    auto hidden=situ_gate_up_cuda(projected.to(source.scalar_type()),beta,linear_beta);
+    auto encoded=tb::empty({int64_t(rows*q8_row_bytes(down.input))},options.dtype(tb::kUInt8));
+    prepare_bank_input(down.rotation,hidden.reshape({rows,down.input}),encoded,nullptr,stream);
+    auto result=tb::empty({tokens,routes,down.out},options);
+    grouped_routed_matvec_q8(down.type,addresses(down),down.row_bytes,down.experts,
+        down.out,down.input,ids.data_ptr<int64_t>(),groups,tokens,routes,encoded.data_ptr(),
+        true,result.data_ptr<float>(),stream);
+    return moe_weighted_reduce_cuda(result.to(source.scalar_type()),weights.to(tb::kFloat32).contiguous());
+}
+
+tb::Tensor GgufMoeBanks::forward_packed_situ(tb::Tensor source,tb::Tensor ids,tb::Tensor weights,
+        float beta,float linear_beta,const std::function<void()>& independent_work) const {
+    if (!gate_up || !down || gate_up->experts!=down->experts || gate_up->out!=2*down->input ||
+        source.dim()!=2 || !source.is_cuda() || source.size(1)!=gate_up->input || ids.dim()!=2 ||
+        ids.size(0)!=source.size(0) || ids.device()!=source.device() || weights.device()!=source.device() ||
+        weights.sizes()!=ids.sizes())
+        throw std::invalid_argument("invalid GGUF packed MoE geometry");
+    const MfqCudaGuard guard(source.get_device());
+    if (source.size(0)>32 || gate_up->correction || down->correction) {
+        if (independent_work) independent_work();
+        auto hidden=situ_gate_up_cuda(gate_up->forward(source,ids),beta,linear_beta);
+        return moe_weighted_reduce_cuda(down->forward(hidden,ids),weights.to(tb::kFloat32).contiguous());
+    }
+    if (gate_up->resident_packed.defined() && down->resident_packed.defined()) {
+        if (independent_work) independent_work();
+        return resident_packed_situ(*this,std::move(source),std::move(ids),std::move(weights),beta,linear_beta);
+    }
+    gate_up->cache->wait_direct_admission();
+    auto* window=mfq::cuda::DecodeWindow::recording();
+    const auto create=[&]{return std::make_shared<GgufPackedMoeStage>(*this,source,ids.size(1));};
+    auto stage=window?window->workspace<GgufPackedMoeStage>(this,create):create();
+    auto& gate=stage->gate_up;
+    auto& down_stage=stage->down;
+    if (gate.tokens!=ids.size(0) || gate.routes!=ids.size(1))
+        throw std::invalid_argument("GGUF packed MoE graph geometry changed");
+    gate.input.copy_(gate_up->rotation?gate_up->rotation->apply(source):source);
+    gate.ids.copy_(ids);
+    down_stage.ids.copy_(gate.ids);
+    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(gate.host_ids->data(),gate.ids.data_ptr(),gate.ids.nbytes(),
+        cudaMemcpyDeviceToHost,gate.stream.stream()));
+    cudaStreamCaptureStatus capture;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(gate.stream.stream(),&capture));
+    if (capture==cudaStreamCaptureStatusNone) {
+        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(gate.stream.stream()));
+        stage->load();
+    }
+    if (window) {
+        window->enroll({stage.get(),[]{},[]{},[stage]{stage->clear();},[]{},
+            [stage]{stage->clear();},[stage]{stage->clear();}});
+        window->host_barrier([stage]{stage->load();});
+    }
+    if (independent_work) independent_work();
+    gate.compute();
+    auto hidden=situ_gate_up_cuda(gate.output.to(source.scalar_type()),beta,linear_beta);
+    down_stage.input.copy_(down->rotation?down->rotation->apply(hidden):hidden);
+    down_stage.compute();
+    return moe_weighted_reduce_cuda(down_stage.output.to(hidden.scalar_type()),weights.to(tb::kFloat32).contiguous());
+}
 
 tb::Tensor GgufMoeBanks::forward(tb::Tensor source, tb::Tensor ids, tb::Tensor weights, float limit,
         const std::function<void()>& independent_work,CudaIndependentBranchExecutor* shared_executor) const {

@@ -14,6 +14,8 @@
 #include "models/gemma4/ops.h"
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
+#include "models/hy4_flash/ops.h"
+#include "models/inkling2/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/nemotron_h/ops.h"
@@ -43,6 +45,31 @@
 
 namespace mfq::cuda::internal {
 
+namespace {
+constexpr std::array<uint8_t, 8> hybrid_magic{'M', 'F', 'Q', 'C', 'U', 'D', '4', 0};
+
+struct HybridPageHeader {
+    uint32_t start, count, layers, flags;
+};
+
+HybridPageHeader read_hybrid_header(CudaPagedReader& reader) {
+    std::array<uint8_t, 8> magic{};
+    reader.raw(magic.data(), magic.size(), "magic");
+    if (magic != hybrid_magic || reader.scalar<uint32_t>("version") != 1)
+        throw CudaSessionStateError("unsupported CUDA hybrid prefix payload");
+    const HybridPageHeader result{reader.scalar<uint32_t>("start"), reader.scalar<uint32_t>("count"),
+        reader.scalar<uint32_t>("layers"), reader.scalar<uint32_t>("flags")};
+    if (!result.count || !result.layers || result.layers > 4096 ||
+        (result.flags!=0 && result.flags!=1 && result.flags!=3 && result.flags!=7))
+        throw CudaSessionStateError("invalid CUDA hybrid prefix geometry");
+    return result;
+}
+}
+
+CudaPagedPayload encode_cuda_hybrid_paged_block(const TextSessionState&, size_t, size_t);
+TextSessionState decode_cuda_hybrid_paged_session(const std::vector<CudaPagedPayload>&,
+    const std::vector<int64_t>&, size_t);
+
 bool cuda_has_separate_memory() {
     return device_has_separate_memory(mfq_current_cuda_device());
 }
@@ -52,7 +79,10 @@ static std::string cuda_prefix_cache_compatibility_key(
     std::ostringstream key;
     key << "mfq-cuda-prefix-v1\n"
         << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" :
-            source.architecture()=="deepseek_v41" ? "cuda-deepseek-v41-session-v1" : "cuda-full-attention-kv-v1") << '\n'
+            source.architecture()=="deepseek_v41" ? "cuda-deepseek-v41-session-v1" :
+            (source.architecture()=="sensenova_loop" || source.architecture()=="inkling2_loop" ||
+                source.architecture()=="hy_v4_flash") ?
+                "cuda-hybrid-session-v1" : "cuda-full-attention-kv-v1") << '\n'
         << "context=" << max_position_embeddings << '\n'
         << "architecture=" << source.architecture() << '\n';
     const auto quantization=mfq::cuda::cuda_kv_quantization_tag();
@@ -125,11 +155,14 @@ struct CudaSessionOps {
             return decode_cuda_qwen4_paged_session(payloads,tokens,block_size);
         if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='3')
             return decode_cuda_deepseek_v41_paged_session(payloads,tokens,block_size);
+        if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='4')
+            return decode_cuda_hybrid_paged_session(payloads,tokens,block_size);
         return decode_cuda_paged_session(payloads, tokens, block_size);
     }
     static auto encode(const Snapshot &state, size_t block_size, size_t index) {
         if(state.kind()==TextSessionStateKind::Qwen4)return encode_cuda_qwen4_paged_block(state,block_size,index);
         if(state.kind()==TextSessionStateKind::DeepseekV41)return encode_cuda_deepseek_v41_paged_block(state,block_size,index);
+        if(state.kind()==TextSessionStateKind::HybridAttention)return encode_cuda_hybrid_paged_block(state,block_size,index);
         return encode_cuda_paged_block(state, block_size, index);
     }
     static Snapshot decode_paged(mfq::cache::PagedPrefixCache& cache,mfq::cache::PrefixMatch& match,
@@ -158,11 +191,20 @@ struct CudaSessionOps {
     static void refresh_bytes(Snapshot& state) {refresh_cuda_qwen4_session_bytes(state);}
     static void prepare_restore(const Snapshot& state,bool disk) {prepare_cuda_qwen4_session_restore(state,disk);}
     static bool paged_mtp(const Snapshot& state) {
-        return state.kind()==TextSessionStateKind::Qwen4 || state.kind()==TextSessionStateKind::DeepseekV41;
+        return state.kind()==TextSessionStateKind::Qwen4 || state.kind()==TextSessionStateKind::DeepseekV41 ||
+            state.kind()==TextSessionStateKind::HybridAttention;
     }
     static bool partial_blocks(const Snapshot& state) { return paged_mtp(state); }
     static bool paged_media(const Snapshot& state) { return state.kind()==TextSessionStateKind::DeepseekV41; }
     static bool checkpoint_needs_update(const CudaPagedPayload& payload,const Snapshot& state) {
+        if (state.kind()==TextSessionStateKind::HybridAttention) {
+            if (!payload) return true;
+            CudaPagedReader reader(*payload);
+            const auto flags=read_hybrid_header(reader).flags;
+            if (state.mtp && !state.mtp->blocks.empty() && state.mtp->cache_pos==state.cache_pos && !(flags&4))
+                return true;
+            return !(flags&1) || (state.mtp && !(flags&2));
+        }
         return cuda_paged_checkpoint_needs_update(payload,state);
     }
     static size_t decodable_blocks(const std::vector<CudaPagedPayload>& payloads) { return cuda_paged_decodable_blocks(payloads); }
@@ -292,6 +334,8 @@ TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen4CausalLm)
 TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV4CausalLm)
 TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV41CausalLm)
 TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::NemotronHCausalLm)
+TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::InklingCausalLm)
+TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::Hy4CausalLm)
 
 #undef TYLOINFER_INSTANTIATE_SESSION_CACHE
 
@@ -325,7 +369,13 @@ void CudaPagedWriter::raw(const void *data, size_t size) {
 }
 
 void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source) {
-    if (!source.defined() || !source.is_cuda() || source.dim() <= 0 || source.dim() > 8) {
+    if (!source.defined() || !source.is_cuda()) throw CudaSessionStateError("invalid CUDA paged cache tensor");
+    tensor(source,source.get_device());
+}
+
+void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source,int device) {
+    if (!source.defined() || device<0 || source.dim()<=0 || source.dim()>8 ||
+        (source.is_cuda() && source.get_device()!=device)) {
         throw std::runtime_error("invalid CUDA paged cache tensor");
     }
     const auto dtype = source.scalar_type();
@@ -337,7 +387,7 @@ void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source) {
         if (dimension <= 0) throw std::runtime_error("invalid CUDA paged cache tensor shape");
     const auto cpu = source.contiguous().to(mfq_tensor_backend::kCPU);
     scalar<int32_t>(type->code);
-    scalar<int32_t>(source.get_device());
+    scalar<int32_t>(device);
     scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
     scalar<uint32_t>(0);
     for (const auto dimension : cpu.sizes())
@@ -527,13 +577,295 @@ CudaPagedPayload encode_cuda_qwen4_paged_block(const TextSessionState& state,siz
     return std::move(writer).finish();
 }
 
+namespace mfq::cuda::internal {
+namespace {
+namespace tb = mfq_tensor_backend;
+
+void write_hybrid_kv(CudaPagedWriter& writer, const FullBlockSessionState& kv,
+                     int64_t start, int64_t count) {
+    if (!session_kv_geometry_matches(kv.k, kv.v) || kv.k.size(0)!=1 ||
+        start+count>kv.k.size(2) || kv.capacity<kv.k.size(2))
+        throw CudaSessionStateError("invalid CUDA hybrid prefix KV geometry");
+    writer.tensor(kv.k.narrow(2,start,count));
+    writer.tensor(kv.v.narrow(2,start,count));
+}
+
+std::pair<FullBlockSessionState, int> read_hybrid_kv(CudaPagedReader& reader,
+                                                    int64_t capacity, int64_t count, bool ring) {
+    auto [key,device]=reader.tensor();
+    auto [value,value_device]=reader.tensor();
+    if (device!=value_device || count<=0 || capacity<count ||
+        !session_kv_geometry_matches(key,value) || key.size(0)!=1 || key.size(2)!=count)
+        throw CudaSessionStateError("invalid CUDA hybrid prefix KV page");
+    return {{std::move(key),std::move(value),capacity,ring},device};
+}
+
+void upload_hybrid_kv(FullBlockSessionState& kv, int device, size_t& bytes) {
+    const tb::Device target(tb::kCUDA,device);
+    kv.k=kv.k.to(target);
+    kv.v=kv.v.to(target);
+    bytes+=session_tensor_bytes(kv.k)+session_tensor_bytes(kv.v);
+}
+
+void write_latent_page(CudaPagedWriter& writer,const HybridBlockSessionState& layer,
+                       int64_t start,int64_t count,bool exact) {
+    const auto& kv=layer.full_attention;
+    const auto group=layer.group_size;
+    if (!kv.k.defined() || kv.k.dim()!=4 || kv.k.size(0)!=1 || kv.k.size(1)!=1 ||
+        kv.capacity<kv.k.size(2) || (!kv.ring && kv.k.size(2)<start+count) ||
+        (kv.ring && kv.capacity!=kv.k.size(2)) || group<0 || group>64)
+        throw CudaSessionStateError("invalid latent KV checkpoint geometry");
+    writer.scalar<int64_t>(kv.capacity);
+    writer.scalar<uint32_t>(kv.ring);
+    writer.scalar<int64_t>(group);
+    if (!kv.ring) writer.tensor(kv.k.narrow(2,start,count),layer.latent_device);
+    else if (exact) writer.tensor(kv.k);
+    if (!group) return;
+    const auto first=start/group,last=(start+count)/group;
+    if (first<last) writer.tensor(layer.index_pool.narrow(1,first,last-first),layer.latent_device);
+    if (exact) {writer.tensor(layer.pending_values);writer.tensor(layer.pending_logits);}
+}
+
+tb::Tensor join_hybrid_pages(const std::vector<tb::Tensor>& pages, int64_t tokens) {
+    if (pages.size()==1) return pages.front();
+    const auto heads=pages.front().size(1);
+    const auto width=pages.front().size(3);
+    const auto row_bytes=size_t(width)*pages.front().element_size();
+    auto joined=tb::empty({1,heads,tokens,width},pages.front().options());
+    auto* destination=static_cast<uint8_t*>(joined.data_ptr());
+    size_t offset=0;
+    for (const auto& page:pages) {
+        const auto count=size_t(page.size(2));
+        const auto* source=static_cast<const uint8_t*>(page.data_ptr());
+        for (size_t head=0;head<size_t(heads);++head)
+            std::memcpy(destination+(head*tokens+offset)*row_bytes,
+                source+head*count*row_bytes,count*row_bytes);
+        offset+=count;
+    }
+    return joined;
+}
+}
+
+CudaPagedPayload encode_cuda_hybrid_paged_block(const TextSessionState& state, size_t block_size, size_t index) {
+    using Kind=HybridBlockSessionStateKind;
+    const auto* layers=std::get_if<std::vector<HybridBlockSessionState>>(&state.payload);
+    if (!layers || layers->empty() || layers->size()>4096 || !block_size || state.cache_pos<=0 ||
+        state.cache_pos>UINT32_MAX || state.tokens.size()!=size_t(state.cache_pos) ||
+        index>(state.tokens.size()-1)/block_size || state.decode_position_delta)
+        throw CudaSessionStateError("invalid CUDA hybrid prefix boundary");
+    const auto start=index*block_size,count=std::min(block_size,state.tokens.size()-start);
+    const bool exact=start+count==state.tokens.size();
+    const bool full_predictor=state.mtp && !state.mtp->blocks.empty() && state.mtp->cache_pos==state.cache_pos;
+    const size_t flags=exact?1+(state.mtp?2:0)+(full_predictor?4:0):0;
+    CudaPagedWriter writer;
+    writer.raw(hybrid_magic.data(),hybrid_magic.size());
+    writer.scalar<uint32_t>(1);
+    for (const auto field:{start,count,layers->size(),flags})
+        writer.scalar<uint32_t>(uint32_t(field));
+    for (const auto& layer:*layers) {
+        writer.scalar<uint32_t>(static_cast<uint32_t>(layer.kind));
+        if (layer.kind==Kind::LatentAttention) write_latent_page(writer,layer,start,count,exact);
+        if (layer.kind==Kind::FullAttention || layer.kind==Kind::AttentionConvolution) {
+            const auto& kv=layer.full_attention;
+            writer.scalar<int64_t>(kv.capacity);
+            writer.scalar<uint32_t>(kv.ring);
+            if (!kv.ring) write_hybrid_kv(writer,kv,start,count);
+            else if (exact) write_hybrid_kv(writer,kv,0,kv.capacity);
+        }
+        if (layer.kind==Kind::AttentionConvolution && exact) writer.tensor(layer.convolution_state);
+        if (layer.kind==Kind::Recurrent && exact) {
+            writer.tensor(layer.convolution_state);
+            writer.tensor(layer.recurrent_state);
+        }
+    }
+    if (exact && state.mtp) {
+        const auto& mtp=*state.mtp;
+        if (mtp.cache_pos<=0 || mtp.cache_pos!=state.cache_pos-int64_t(!mtp.blocks.empty() && !full_predictor) ||
+            mtp.blocks.size()>4096)
+            throw CudaSessionStateError("invalid CUDA hybrid predictor checkpoint");
+        writer.scalar<uint32_t>(uint32_t(mtp.blocks.size()));
+        writer.tensor(mtp.last_target_hidden);
+        for (const auto& kv:mtp.blocks) {
+            writer.scalar<int64_t>(kv.capacity);
+            writer.scalar<uint32_t>(kv.ring);
+            write_hybrid_kv(writer,kv,0,kv.ring?kv.capacity:mtp.cache_pos);
+        }
+    }
+    return std::move(writer).finish();
+}
+
+TextSessionState decode_cuda_hybrid_paged_session(const std::vector<CudaPagedPayload>& payloads,
+    const std::vector<int64_t>& tokens, size_t block_size) {
+    using Kind=HybridBlockSessionStateKind;
+    if (!block_size || tokens.empty() || payloads.size()!=(tokens.size()-1)/block_size+1)
+        throw CudaSessionStateError("invalid CUDA hybrid prefix chain length");
+    struct KvFragments {
+        std::vector<tb::Tensor> keys, values, index;
+        int device=-1;
+        bool ring=false;
+    };
+    TextSessionState state;
+    state.tokens=tokens;
+    state.cache_pos=int64_t(tokens.size());
+    auto& layers=state.payload.emplace<std::vector<HybridBlockSessionState>>();
+    std::vector<KvFragments> fragments;
+    for (size_t page=0;page<payloads.size();++page) {
+        CudaPagedReader reader(*payloads[page]);
+        const auto header=read_hybrid_header(reader);
+        const bool final=page+1==payloads.size();
+        if (header.start!=page*block_size || header.count!=std::min(block_size,tokens.size()-header.start) ||
+            (page && header.layers!=layers.size()) || (final && !(header.flags&1)))
+            throw CudaSessionStateError("invalid CUDA hybrid prefix chain boundary");
+        if (!page) { layers.resize(header.layers);fragments.resize(header.layers); }
+        for (size_t i=0;i<layers.size();++i) {
+            auto& layer=layers[i];
+            auto& parts=fragments[i];
+            const auto kind=reader.scalar<uint32_t>("layer kind");
+            if (kind>uint32_t(Kind::LatentAttention) || (page && layer.kind!=static_cast<Kind>(kind)))
+                throw CudaSessionStateError("inconsistent CUDA hybrid prefix layer kind");
+            layer.kind=static_cast<Kind>(kind);
+            if (layer.kind==Kind::LatentAttention) {
+                const auto capacity=reader.scalar<int64_t>("latent capacity");
+                const auto ring=reader.scalar<uint32_t>("latent ring");
+                const auto group=reader.scalar<int64_t>("index group size");
+                const bool exact=(header.flags&1)!=0;
+                if (ring>1 || capacity<=0 || (!ring && capacity<int64_t(header.start)+header.count) ||
+                    group<0 || group>64 || (page && (parts.ring!=bool(ring) || layer.group_size!=group)))
+                    throw CudaSessionStateError("inconsistent latent cache topology");
+                parts.ring=ring;
+                layer.group_size=group;
+                if (!ring || exact) {
+                    auto [rows,device]=reader.tensor();
+                    if (rows.dim()!=4 || rows.size(0)!=1 || rows.size(1)!=1 || rows.size(2)!=(ring?capacity:header.count) ||
+                        (rows.scalar_type()!=tb::kFloat16 && rows.scalar_type()!=tb::kInt32) ||
+                        (parts.device>=0 && device!=parts.device) ||
+                        (!parts.keys.empty() && (parts.keys.front().size(3)!=rows.size(3) ||
+                            parts.keys.front().scalar_type()!=rows.scalar_type())))
+                        throw CudaSessionStateError("invalid latent prefix page");
+                    parts.device=device;
+                    if (!ring) parts.keys.push_back(std::move(rows));
+                    if (final) {
+                        auto key=ring?std::move(rows):join_hybrid_pages(parts.keys,state.cache_pos);
+                        if (ring) key=key.to(tb::Device(tb::kCUDA,device));
+                        layer.latent_device=device;
+                        state.bytes+=session_tensor_bytes(key);
+                        layer.full_attention={std::move(key),{},capacity,bool(ring)};
+                        parts.keys.clear();
+                    }
+                }
+                if (!group) continue;
+                const auto end=int64_t(header.start)+header.count;
+                const auto count=end/group-header.start/group;
+                if (count) {
+                    auto [index,device]=reader.tensor();
+                    if (index.dim()!=3 || index.size(0)!=1 || index.size(1)!=count ||
+                        index.scalar_type()!=tb::kInt16 || device!=parts.device ||
+                        (!parts.index.empty() && parts.index.front().size(3)!=index.size(2)))
+                        throw CudaSessionStateError("invalid latent index prefix page");
+                    parts.index.push_back(index.unsqueeze(1));
+                }
+                if (exact) {
+                    auto [values,device]=reader.tensor();
+                    auto [logits,logits_device]=reader.tensor();
+                    if (values.dim()!=3 || values.size(0)!=1 || values.size(1)!=group ||
+                        logits.sizes()!=values.sizes() || values.scalar_type()!=tb::kFloat32 ||
+                        logits.scalar_type()!=tb::kFloat32 || device!=parts.device || device!=logits_device)
+                        throw CudaSessionStateError("invalid latent pending group");
+                    if (final) {
+                        const tb::Device target(tb::kCUDA,device);
+                        layer.pending_values=values.to(target);
+                        layer.pending_logits=logits.to(target);
+                        state.bytes+=session_tensor_bytes(values)+session_tensor_bytes(logits);
+                        if (!parts.index.empty()) {
+                            layer.index_pool=join_hybrid_pages(parts.index,end/group).squeeze(1);
+                            state.bytes+=session_tensor_bytes(layer.index_pool);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (layer.kind==Kind::FullAttention || layer.kind==Kind::AttentionConvolution) {
+                const auto capacity=reader.scalar<int64_t>("KV capacity");
+                const auto ring=reader.scalar<uint32_t>("KV ring");
+                if (ring>1 || capacity<0 || (!ring && capacity<int64_t(header.start)+header.count) ||
+                    (page && parts.ring!=bool(ring)))
+                    throw CudaSessionStateError("inconsistent CUDA hybrid prefix KV mode");
+                parts.ring=ring;
+                if (ring && !(header.flags&1)) continue;
+                auto [kv,device]=read_hybrid_kv(reader,capacity,ring?capacity:header.count,ring);
+                if (layer.kind==Kind::AttentionConvolution && (header.flags&1)) {
+                    auto [conv,conv_device]=reader.tensor();
+                    if (device!=conv_device) throw CudaSessionStateError("inconsistent CUDA convolution device");
+                    if (final) {
+                        layer.convolution_state=conv.to(tb::Device(tb::kCUDA,device));
+                        state.bytes+=session_tensor_bytes(conv);
+                    }
+                }
+                if (ring) {
+                    if (final) { upload_hybrid_kv(kv,device,state.bytes);layer.full_attention=std::move(kv); }
+                    continue;
+                }
+                if ((parts.device>=0 && parts.device!=device) || (!parts.keys.empty() &&
+                    (parts.keys.front().scalar_type()!=kv.k.scalar_type() || parts.keys.front().size(1)!=kv.k.size(1) ||
+                    parts.keys.front().size(3)!=kv.k.size(3) || parts.values.front().size(3)!=kv.v.size(3))))
+                    throw CudaSessionStateError("inconsistent CUDA hybrid prefix KV topology");
+                parts.device=device;
+                parts.keys.push_back(std::move(kv.k));
+                parts.values.push_back(std::move(kv.v));
+                if (final) {
+                    layer.full_attention={join_hybrid_pages(parts.keys,state.cache_pos),
+                        join_hybrid_pages(parts.values,state.cache_pos),capacity,false};
+                    upload_hybrid_kv(layer.full_attention,device,state.bytes);
+                    parts={};
+                }
+            } else if (layer.kind==Kind::Recurrent && (header.flags&1)) {
+                auto [conv,device]=reader.tensor();
+                auto [recurrent,recurrent_device]=reader.tensor();
+                if (device!=recurrent_device)
+                    throw CudaSessionStateError("inconsistent CUDA hybrid recurrence device");
+                if (final) {
+                    const tb::Device target(tb::kCUDA,device);
+                    layer.convolution_state=conv.to(target);
+                    layer.recurrent_state=recurrent.to(target);
+                    state.bytes+=session_tensor_bytes(conv)+session_tensor_bytes(recurrent);
+                }
+            }
+        }
+        if (header.flags&2) {
+            const auto count=reader.scalar<uint32_t>("predictor blocks");
+            const bool full_predictor=(header.flags&4)!=0;
+            const auto anchor_lag=int64_t(count!=0 && !full_predictor);
+            if (count>4096 || (full_predictor && !count) || header.start+header.count<=anchor_lag)
+                throw CudaSessionStateError("invalid CUDA hybrid prefix predictor geometry");
+            MtpSessionState mtp;
+            mtp.cache_pos=int64_t(header.start)+header.count-anchor_lag;
+            auto [hidden,device]=reader.tensor();
+            if (final) {
+                mtp.last_target_hidden=hidden.to(tb::Device(tb::kCUDA,device));
+                mtp.bytes=session_tensor_bytes(hidden);
+            }
+            for (uint32_t i=0;i<count;++i) {
+                const auto capacity=reader.scalar<int64_t>("predictor KV capacity");
+                const auto ring=reader.scalar<uint32_t>("predictor KV ring");
+                if (ring>1) throw CudaSessionStateError("invalid CUDA hybrid prefix predictor KV mode");
+                auto [kv,kv_device]=read_hybrid_kv(reader,capacity,ring?capacity:mtp.cache_pos,ring);
+                if (final) { upload_hybrid_kv(kv,kv_device,mtp.bytes);mtp.blocks.push_back(std::move(kv)); }
+            }
+            if (final) { state.bytes+=mtp.bytes;state.mtp=std::move(mtp); }
+        }
+        reader.expect_end();
+    }
+    return state;
+}
+}
+
 size_t cuda_paged_payload_tokens(const CudaPagedPayload& payload) {
     if(!payload)throw CudaSessionStateError("null CUDA prefix block");
     CudaPagedReader reader(*payload);std::array<uint8_t,8> magic{};reader.raw(magic.data(),magic.size(),"magic");
     constexpr std::array<uint8_t,8> full_magic{'M','F','Q','C','U','D','1',0};
     constexpr std::array<uint8_t,8> deepseek_magic{'M','F','Q','C','U','D','3',0};
     const auto version=reader.scalar<uint32_t>("version");
-    if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic) ||
+    if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic && magic!=mfq::cuda::internal::hybrid_magic) ||
         (version!=1 && !(magic==qwen4_magic && version==2)))
         throw CudaSessionStateError("invalid CUDA prefix block header");
     (void)reader.scalar<uint32_t>("start");return reader.scalar<uint32_t>("count");
@@ -545,6 +877,11 @@ size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>& payloads
         if((*payload)[6]=='1')return count;
         if((*payload)[6]=='3') {
             if(cuda_deepseek_v41_paged_exact(payload))return count;
+            continue;
+        }
+        if((*payload)[6]=='4') {
+            CudaPagedReader reader(*payload);
+            if (mfq::cuda::internal::read_hybrid_header(reader).flags&1) return count;
             continue;
         }
         CudaPagedReader reader(*payload);if(read_qwen4_header(reader).exact)return count;

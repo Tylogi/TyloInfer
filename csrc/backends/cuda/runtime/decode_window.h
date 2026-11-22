@@ -52,8 +52,23 @@ public:
     // Update the next segment at a completed host barrier, before its launch.
     // Zero disables a kernel while preserving the captured dependency edges.
     void set_kernel_rows(std::size_t segment,cudaGraphNode_t node,unsigned rows);
+    // Shared weights may be used more than once in one causal forward. Their
+    // graph buffers belong to the invocation site, while weights remain shared.
+    class OperatorSiteScope {
+    public:
+        OperatorSiteScope(DecodeWindow* window,const void* site)
+            : window_(window),previous_(window?window->operator_site_:nullptr) {
+            if (window_) window_->operator_site_=site;
+        }
+        OperatorSiteScope(const OperatorSiteScope&)=delete;
+        OperatorSiteScope& operator=(const OperatorSiteScope&)=delete;
+        ~OperatorSiteScope() {if (window_) window_->operator_site_=previous_;}
+    private:
+        DecodeWindow* window_;
+        const void* previous_;
+    };
     template<class T,class Factory> std::shared_ptr<T> workspace(const void* identity,Factory create) {
-        auto& owner=workspaces_[identity];if(!owner)owner=create();return std::static_pointer_cast<T>(owner);
+        auto& owner=workspaces_[{operator_site_,identity}];if(!owner)owner=create();return std::static_pointer_cast<T>(owner);
     }
     void run();
     // Enqueue pure-device graphs without a host wait. Host tasks, I/O
@@ -105,7 +120,8 @@ private:
     std::map<int,std::string> profile_kinds_;
     void observe_layers();
     std::vector<Task> tasks_;
-    std::map<const void*,std::shared_ptr<void>> workspaces_;
+    const void* operator_site_=nullptr;
+    std::map<std::pair<const void*,const void*>,std::shared_ptr<void>> workspaces_;
     struct Barrier {std::size_t task_end;std::function<void()> serve;};
     std::vector<Barrier> barriers_;
     bool recording_segments_=false;

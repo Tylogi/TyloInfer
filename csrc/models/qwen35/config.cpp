@@ -3,6 +3,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,20 @@ Config Config::from_json(
 
     Config config;
     static_cast<ModelConfig&>(config) = ModelConfig::from_json(payload);
+    if (graph.architecture == "sensenova_loop") {
+        const auto& loop = text.at("loop");
+        const auto& mhc = loop.at("mhc");
+        const auto start = mhc.at("start").get<int64_t>(), end = mhc.at("end").get<int64_t>();
+        const auto iterations = mhc.at("iterations").get<int>();
+        const auto scale = mhc.at("pre_scale").get<float>();
+        const LoopLayerPlan layers(config.num_hidden_layers, loop.at("start"), loop.at("end"), loop.at("count"),
+                                  LoopLayerNumbering::execution);
+        if (loop.at("block_numbering") != "execution" || mhc.at("streams") != 2 || start < 0 || end <= start ||
+            end > layers.weight_layers() || iterations <= 0 || iterations > 20 || !std::isfinite(scale) || scale <= 0)
+            throw std::runtime_error("invalid SenseNova loop or mHC configuration");
+        config.sensenova_loop.emplace(SenseNovaLoopConfig{layers, start, end, iterations, scale,
+            mhc.at("fixed_identity").get<bool>()});
+    }
     config.num_experts = text.value(
         "num_experts",
         text.value("n_routed_experts", std::int64_t{0}));

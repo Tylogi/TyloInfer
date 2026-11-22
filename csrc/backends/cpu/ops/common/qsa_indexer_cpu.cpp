@@ -11,6 +11,7 @@
 namespace mfq::cpu {
 #if defined(TYLOINFER_GGUF_CPU_AVX2)
 float qsa_affine16_score_avx2(const float*, const float*, int, const std::int16_t*, int, int, float);
+float index_pool_affine16_score_avx2(const float*,const float*,const float*,int,const std::int16_t*,int,int,float);
 void qsa_affine16_score_pair_avx2(const float*, const float*, const std::int16_t*, int, int, float, int, float, float*);
 #endif
 namespace {
@@ -47,6 +48,16 @@ float score_scalar(const float* query, const float* sums, int heads, const std::
         float dot = 0;
         for (int k = 0; k < width; ++k) dot += float(code[k]) * query[h * width + k];
         score += std::max((dot - float(zero) * sums[h]) * scale, 0.f);
+    }
+    return score;
+}
+float score_weighted(const float* query,const float* sums,const float* weights,int heads,
+    const std::int16_t* codes,int width,int zero,float scale) {
+    float score=0;
+    for (int head=0;head<heads;++head) {
+        float dot=0;
+        for (int col=0;col<width;++col) dot+=float(codes[col])*query[head*width+col];
+        score+=weights[head]*std::max((dot-float(zero)*sums[head])*scale,0.f);
     }
     return score;
 }
@@ -135,6 +146,65 @@ void qsa_indexer_topk(const float* queries, const std::int64_t* positions, int q
         std::sort(merged.begin(), merged.end(), better);
         auto* out = selected + std::size_t(q) * slots * 2;
         for (std::size_t i = 0; i < merged.size(); ++i) { out[2 * i] = merged[i].id; out[2 * i + 1] = 15; }
+    }
+}
+
+void index_pool_affine16_topk(const float* queries,const float* head_weights,const std::int64_t* positions,
+    int query_count,int heads,int width,const std::int16_t* records,int pools,int pool_size,
+    bool reserve_tail,int count,int threads,std::int32_t* selected) {
+    std::fill_n(selected,std::size_t(query_count)*count,-1);
+    std::vector<float> sums(std::size_t(query_count)*heads);
+    std::vector<int> visible(query_count);
+    int longest=0;
+    for (int query=0;query<query_count;++query) {
+        visible[query]=int(std::clamp<std::int64_t>((positions[query]+!reserve_tail)/pool_size,0,pools));
+        longest=std::max(longest,visible[query]);
+        for (int head=0;head<heads;++head) {
+            const auto row=std::size_t(query)*heads+head;
+            const auto* values=queries+row*width;
+            sums[row]=std::accumulate(values,values+width,0.f);
+        }
+    }
+    if (!longest || !count) return;
+    const int workers=std::max(1,std::min(threads,(longest+1023)/1024));
+    std::vector<std::vector<Candidate>> local(std::size_t(workers)*query_count);
+    auto score=score_weighted;
+#if defined(TYLOINFER_GGUF_CPU_AVX2)
+    if (width%8==0 && gguf::available()) score=index_pool_affine16_score_avx2;
+#endif
+    mfq::host_parallel_for(0,workers,1,workers,[&](std::int64_t begin,std::int64_t end) {
+        std::vector<Candidate> cutoffs(query_count);
+        for (auto worker=begin;worker<end;++worker) {
+            std::fill(cutoffs.begin(),cutoffs.end(),
+                Candidate{-std::numeric_limits<float>::infinity(),std::numeric_limits<int>::max()});
+            for (int q=0;q<query_count;++q) local[worker*query_count+q].reserve(std::size_t(count)*2);
+            for (int id=int(longest*worker/workers);id<int(longest*(worker+1)/workers);++id) {
+                const auto* record=records+std::size_t(id)*(width+2);
+                const auto scale=scale_value(std::uint16_t(record[width]));
+                for (int q=0;q<query_count;++q) {
+                    if (id>=visible[q]) continue;
+                    const auto row=std::size_t(q)*heads;
+                    const Candidate candidate{score(queries+row*width,sums.data()+row,head_weights+row,
+                        heads,record,width,record[width+1],scale),id};
+                    if (!better(candidate,cutoffs[q])) continue;
+                    auto& list=local[worker*query_count+q];
+                    list.push_back(candidate);
+                    if (list.size()==std::size_t(count)*2) cutoffs[q]=select(list,count);
+                }
+            }
+            for (int q=0;q<query_count;++q) select(local[worker*query_count+q],count);
+        }
+    });
+    std::vector<Candidate> merged;
+    for (int q=0;q<query_count;++q) {
+        merged.clear();
+        for (int worker=0;worker<workers;++worker) {
+            const auto& list=local[worker*query_count+q];
+            merged.insert(merged.end(),list.begin(),list.end());
+        }
+        select(merged,count);
+        std::sort(merged.begin(),merged.end(),better);
+        for (std::size_t i=0;i<merged.size();++i) selected[std::size_t(q)*count+i]=merged[i].id;
     }
 }
 

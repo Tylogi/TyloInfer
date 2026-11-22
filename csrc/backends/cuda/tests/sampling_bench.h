@@ -121,6 +121,25 @@ static void benchmark_sampling_keys(bool timings=true) {
             }
         }
     }
+    {
+        auto logits=tb::empty({4,4096},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+        for (int i=0;i<logits.numel();++i) logits.data_ptr<float>()[i]=float((i*37)%317-158)/53;
+        logits=logits.to(tb::kCUDA);
+        const auto random=tb::tensor({0.031f,0.217f,0.561f,0.921f},logits.options());
+        for (int k:{100,256,1024}) {
+#ifdef _WIN32
+            _putenv_s("TYLOINFER_SAMPLE_RADIX_TOPK","0");
+#else
+            setenv("TYLOINFER_SAMPLE_RADIX_TOPK","0",1);
+#endif
+            auto expected=sample_top_k_top_p_cuda(logits,random,0.7,k,0.95).cpu().contiguous();
+            sampling_key_variant(16);
+            auto actual=sample_top_k_top_p_cuda(logits,random,0.7,k,0.95).cpu().contiguous();
+            check(std::memcmp(actual.data_ptr(),expected.data_ptr(),expected.nbytes())==0,
+                "parallel large top-k changed batched nucleus sampling");
+            ++checks;
+        }
+    }
     if(timings)for(int vocab:{256,4096,32768,151936,248320})
     for(int top_k:{20,64})if(top_k==20 || vocab>=151936)
     for(int variant:{0,16,17,18,0}) {

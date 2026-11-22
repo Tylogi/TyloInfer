@@ -43,14 +43,16 @@ class EngramHashState {
         std::vector<std::int32_t> token_map;
     };
   public:
+    enum class HashPolicy {signed_modulo, unsigned_modulo};
     EngramHashState(int vocabulary, int max_ngram_size, int heads, std::int64_t pad_id,
                     std::vector<std::int64_t> layer_ids, std::vector<std::int64_t> table_rows,
                     std::vector<std::int64_t> primes, std::vector<std::int64_t> offsets,
-                    std::vector<std::int64_t> multipliers, std::vector<std::int32_t> token_map)
+                    std::vector<std::int64_t> multipliers, std::vector<std::int32_t> token_map,
+                    HashPolicy policy=HashPolicy::signed_modulo)
         : vocabulary_(vocabulary), max_ngram_size_(max_ngram_size), heads_(heads), pad_id_(pad_id),
           parameters_(std::make_shared<const Parameters>(Parameters{
               std::move(layer_ids),std::move(table_rows),std::move(primes),std::move(offsets),
-              std::move(multipliers),std::move(token_map)})) {}
+              std::move(multipliers),std::move(token_map)})), policy_(policy) {}
 
     void reset(int batch) {
         if (batch <= 0) {
@@ -184,7 +186,7 @@ class EngramHashState {
                 bool blocked = false;
                 for (int shift = 0; shift < max_ngram_size_; ++shift) {
                     const auto source = row[prefix + token - shift];
-                    blocked = blocked || source == kDeadToken;
+                    blocked = source == kDeadToken || (blocked && policy_==HashPolicy::signed_modulo);
                     ngram_tokens[static_cast<std::size_t>(shift)] = blocked ? pad_id_ : source;
                 }
                 for (int layer = 0; layer < layers; ++layer) {
@@ -202,7 +204,8 @@ class EngramHashState {
                             const int column = (shift - 1) * heads_ + head;
                             const auto bucket = static_cast<std::size_t>(layer * columns + column);
                             const auto prime = parameters_->primes[bucket];
-                            auto remainder = signed_hash % prime;
+                            auto remainder = policy_==HashPolicy::unsigned_modulo
+                                ? static_cast<int64_t>(rolling % static_cast<uint64_t>(prime)) : signed_hash % prime;
                             if (remainder < 0)
                                 remainder += prime;
                             const auto hash = remainder + parameters_->offsets[bucket];
@@ -214,7 +217,8 @@ class EngramHashState {
                                 ((static_cast<std::size_t>(layer) * batch + bi) * tokens + token) *
                                     columns +
                                 column;
-                            result.values[output] = hash;
+                            result.values[output] = policy_==HashPolicy::unsigned_modulo &&
+                                compressed[std::size_t(bi)*tokens+token]==kDeadToken?kDeadToken:hash;
                         }
                     }
                 }
@@ -235,6 +239,7 @@ class EngramHashState {
     int heads_ = 0;
     std::int64_t pad_id_ = 0;
     std::shared_ptr<const Parameters> parameters_;
+    HashPolicy policy_;
     int batch_ = 0;
     std::int64_t position_ = 0;
     std::vector<std::int64_t> context_;
