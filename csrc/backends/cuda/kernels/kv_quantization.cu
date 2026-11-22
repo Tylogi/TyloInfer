@@ -70,12 +70,18 @@ Tables tables(int width, int bits, bool value, const tb::Device& device) {
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_get_current_cuda_stream()));
     cached.emplace(key,result);return result;
 }
-__global__ void encode_kernel(const float* input,uint32_t* out,const float* centers,const float* signs,
-        int d,int w,int bits,int packed) {
+template<class Input>
+__global__ void encode_kernel(const Input* input,uint32_t* out,const float* centers,const float* signs,
+        int d,int w,int bits,int packed,int input_stride,int output_stride) {
     const int lane=threadIdx.x,row=blockIdx.x;
     __shared__ float work[1024],norms[1024];
     __shared__ uint32_t codes[1024];
-    const float x=lane<d?input[int64_t(row)*d+lane]:0.f;
+    float x=0.f;
+    if (lane<d) {
+        const auto value=input[int64_t(row)*input_stride+lane];
+        if constexpr (std::is_same_v<Input,__half>) x=__half2float(value);
+        else x=value;
+    }
     work[lane]=x*signs[lane];norms[lane]=x*x;__syncthreads();
     for(int stride=w/2;stride;stride/=2){if(lane<stride)norms[lane]+=norms[lane+stride];__syncthreads();}
     const float norm=sqrtf(norms[0]);
@@ -87,7 +93,7 @@ __global__ void encode_kernel(const float* input,uint32_t* out,const float* cent
     int lo=0,hi=(1<<bits)-1;
     while(lo<hi){int mid=(lo+hi)/2;if(rotated>(centers[mid]+centers[mid+1])*0.5f)lo=mid+1;else hi=mid;}
     codes[lane]=lo;__syncthreads();
-    auto* dest=out+int64_t(row)*packed;
+    auto* dest=out+int64_t(row)*output_stride;
     if(lane==0)dest[0]=__float_as_uint(norm);
     for(int word=lane;word<packed-1;word+=w) {
         uint32_t result=0;
@@ -253,8 +259,33 @@ tb::Tensor cuda_kv_encode(const tb::Tensor& source,int bits,bool value) {
     auto output=tb::empty(shape,source.options().dtype(tb::kInt32));const auto rows=input.numel()/d;
     TYLOINFER_RUNTIME_CHECK(rows<=std::numeric_limits<int>::max(),"TurboQuant encode grid overflow");
     auto table=tables(w,bits,value,source.device());
-    if(rows)encode_kernel<<<unsigned(rows),w,0,mfq_get_current_cuda_stream()>>>(input.data_ptr<float>(),reinterpret_cast<uint32_t*>(output.data_ptr()),table.centers.data_ptr<float>(),table.signs.data_ptr<float>(),d,w,bits,p);
+    if(rows)encode_kernel<<<unsigned(rows),w,0,mfq_get_current_cuda_stream()>>>(input.data_ptr<float>(),reinterpret_cast<uint32_t*>(output.data_ptr()),table.centers.data_ptr<float>(),table.signs.data_ptr<float>(),d,w,bits,p,d,p);
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
+tb::Tensor cuda_kv_encode_mla(const tb::Tensor& source,int latent,int rotary,int bits) {
+    const auto latent_words=cuda_kv_packed_width(latent,bits);
+    const auto rotary_words=cuda_kv_packed_width(rotary,bits);
+    const auto width=latent+rotary,packed=latent_words+rotary_words;
+    TYLOINFER_RUNTIME_CHECK(source.is_cuda() && source.dim()==3 && source.scalar_type()==tb::kFloat16 &&
+        source.is_contiguous() && source.size(2)==width,"invalid MLA cache input");
+    const auto count=source.numel()/width;
+    TYLOINFER_RUNTIME_CHECK(count<=std::numeric_limits<int>::max(),"MLA KV encode grid overflow");
+    MfqCudaGuard guard(source.get_device());
+    auto output=tb::empty({source.size(0),source.size(1),packed},source.options().dtype(tb::kInt32));
+    if (!count) return output;
+    const auto* input=reinterpret_cast<const __half*>(source.data_ptr());
+    auto* destination=reinterpret_cast<uint32_t*>(output.data_ptr());
+    const auto encode=[&](int dim,int words,int input_offset,int output_offset) {
+        const auto rotation=rotation_width(dim);
+        const auto table=tables(rotation,bits,false,source.device());
+        encode_kernel<<<unsigned(count),rotation,0,mfq_get_current_cuda_stream()>>>(input+input_offset,
+            destination+output_offset,table.centers.data_ptr<float>(),table.signs.data_ptr<float>(),
+            dim,rotation,bits,words,width,packed);
+        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+    encode(latent,latent_words,0,0);
+    encode(rotary,rotary_words,latent,latent_words);
+    return output;
 }
 tb::Tensor cuda_kv_decode(const tb::Tensor& source,int d,int bits,bool value,tb::ScalarType dtype) {
     const int w=rotation_width(d),p=cuda_kv_packed_width(d,bits);

@@ -3,13 +3,19 @@
 
 void kv_quantization_case() {
     using namespace mfq::cuda;
-    for (int bits:{2,4,8}) {
+    for (int bits:{2,3,4,6,8}) {
         constexpr int latent=512,rotary=64,batch=3,capacity=9;
-        const auto x=cuda_kv_encode(data({batch,capacity,latent},27,.5f),bits,false);
-        const auto y=cuda_kv_encode(data({batch,capacity,rotary},33,.5f),bits,false);
+        const auto raw_latent=data({batch,capacity,latent},27,.5f).to(tb::kFloat16);
+        const auto raw_rotary=data({batch,capacity,rotary},33,.5f).to(tb::kFloat16);
+        const auto x=cuda_kv_encode(raw_latent,bits,false);
+        const auto y=cuda_kv_encode(raw_rotary,bits,false);
+        const auto combined=cuda_kv_encode_mla(tb::cat({raw_latent,raw_rotary},-1),latent,rotary,bits);
+        const auto separate=tb::cat({x,y},-1).to(tb::kCPU),packed=combined.to(tb::kCPU);
+        if (std::memcmp(separate.data_ptr(),packed.data_ptr(),packed.nbytes())!=0)
+            throw std::runtime_error("Compact MLA quantization changed the packed bytes");
         auto expected=tb::cat({cuda_kv_decode(x,latent,bits,false),cuda_kv_decode(y,rotary,bits,false)},-1).to(tb::kCPU);
         auto lengths=tb::tensor(std::vector<int32_t>{2,0,capacity}).to(tb::kCUDA);
-        auto decoded=cuda_kv_decode_mla(tb::cat({x,y},-1),latent,rotary,bits,lengths).to(tb::kCPU);
+        auto decoded=cuda_kv_decode_mla(combined,latent,rotary,bits,lengths).to(tb::kCPU);
         for (int row:{0,2}) {
             const auto count=row==0?2:capacity;
             const auto a=expected.select(0,row).narrow(0,0,count);

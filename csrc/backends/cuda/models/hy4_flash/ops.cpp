@@ -67,8 +67,7 @@ struct Shared {
 
     Tensor encode_kv(const Tensor& rows) const {
         if (!cold_bits) return rows;
-        return tb::cat({cuda_kv_encode(rows.narrow(-1,0,config.kv_rank),cold_bits,false),
-            cuda_kv_encode(rows.narrow(-1,config.kv_rank,config.metadata.rotary_dim),cold_bits,false)},-1);
+        return cuda_kv_encode_mla(rows,int(config.kv_rank),int(config.metadata.rotary_dim),cold_bits);
     }
 
     Tensor decode_kv(const Tensor& rows,const Tensor& lengths={}) const {
@@ -402,32 +401,41 @@ struct Hy4Block final : Block {
         auto learned=index_score.forward(execution,hidden).to(tb::kFloat32).contiguous();
         const auto selected=std::min(cap,config.index_budget/g-int64_t(config.keep_tail));
         if (state->host_indexer) return select_groups_on_host(query,learned,positions,selected);
+        const auto device_positions=positions.dim()==1 && b>1
+            ?positions.unsqueeze(0).expand({b,t}).contiguous():positions;
+        return select_groups_on_device(query,learned,device_positions,selected);
+    }
+
+    Tensor select_groups_on_device(const Tensor& query,const Tensor& weights,
+        const Tensor& positions,int64_t selected) const {
+        const auto& config=state->config;
+        const auto b=query.size(0),t=query.size(1),w=config.index_width,g=config.group_size,cap=records.size(1);
         const auto workspace_row=std::size_t(cap)*sizeof(float)+
             tyloinfer::qsa::indexer_affine16_score_scratch(1,int(config.index_heads),int(w));
         // Leave the remainder of the workspace for TopK and live projections.
         const auto scratch_limit=runtime_options::workspace_reserve_bytes()/2;
-        const auto tile=std::clamp<int64_t>(int64_t(scratch_limit/workspace_row),1,t);
-        auto scores=tb::empty({1,tile,cap},hidden.options().dtype(tb::kFloat32));
-        const auto bytes=tyloinfer::qsa::indexer_affine16_score_scratch(int(tile),int(config.index_heads),int(w));
-        auto workspace=tb::empty({int64_t(bytes)},hidden.options().dtype(tb::kUInt8));
-        const auto choose=[&](int64_t batch,int64_t offset,int64_t count) {
-            const auto row=positions.dim()==1?positions:positions.select(0,batch);
-            const auto at=row.narrow(0,offset,count).contiguous();
-            auto block_scores=scores.narrow(1,0,count);
+        const auto tile=std::clamp<int64_t>(int64_t(scratch_limit/workspace_row/std::size_t(b)),1,t);
+        auto scores=tb::empty({1,b*tile,cap},query.options().dtype(tb::kFloat32));
+        const auto bytes=tyloinfer::qsa::indexer_affine16_score_scratch(int(b*tile),int(config.index_heads),int(w));
+        auto workspace=tb::empty({int64_t(bytes)},query.options().dtype(tb::kUInt8));
+        const auto choose=[&](int64_t offset,int64_t count) {
+            const auto at=positions.reshape({b,t}).narrow(1,offset,count).contiguous();
+            const auto queries=query.narrow(1,offset,count).contiguous();
+            const auto learned=weights.narrow(1,offset,count).contiguous();
+            auto block_scores=scores.narrow(1,0,b*count);
             TYLOINFER_CUDA_CHECK(static_cast<cudaError_t>(tyloinfer::qsa::index_pool_affine16_scores(
-                query.select(0,batch).narrow(0,offset,count).data_ptr<float>(),records.select(0,batch).data_ptr<int16_t>(),
-                learned.select(0,batch).narrow(0,offset,count).data_ptr<float>(),at.data_ptr<int64_t>(),
+                queries.data_ptr<float>(),records.data_ptr<int16_t>(),learned.data_ptr<float>(),at.data_ptr<int64_t>(),
                 block_scores.data_ptr<float>(),int(count),int(config.index_heads),int(w),int(cap),int(g),
-                config.keep_tail,mfq_current_cuda_stream(),workspace.data_ptr(),bytes)));
-            return mfq_qwen4_exp::live_topk_blocks(block_scores,at,g,selected).to(tb::kInt32);
+                config.keep_tail,mfq_current_cuda_stream(),workspace.data_ptr(),bytes,int(b))));
+            return mfq_qwen4_exp::live_topk_blocks(block_scores,at.reshape({b*count}),g,selected)
+                .to(tb::kInt32).reshape({b,count,selected});
         };
-        if (b==1 && tile==t) return choose(0,0,t);
+        if (tile==t) return choose(0,t);
         auto groups=tb::empty({b,t,selected},positions.options().dtype(tb::kInt32));
-        for (int64_t i=0;i<b;++i)
-            for (int64_t offset=0;offset<t;offset+=tile) {
-                const auto count=std::min(tile,t-offset);
-                groups.narrow(0,i,1).narrow(1,offset,count).copy_(choose(i,offset,count));
-            }
+        for (int64_t offset=0;offset<t;offset+=tile) {
+            const auto count=std::min(tile,t-offset);
+            groups.narrow(1,offset,count).copy_(choose(offset,count));
+        }
         return groups;
     }
 
@@ -734,13 +742,15 @@ void commit_batch_selections(Hy4CausalLm& model,std::span<const uint8_t> active)
 
 void set_batch_verification(Hy4CausalLm& model,bool value) {model.shared->batch_verification=value;}
 
-BatchVerification take_batch_verification(Hy4CausalLm& model) {
+BatchVerification take_batch_verification(Hy4CausalLm& model,bool rollback) {
     BatchVerification result;
     result.reserve(model.blocks.size());
     for (const auto& owned:model.blocks) {
         auto& block=static_cast<Hy4Block&>(*owned);
-        result.push_back(std::move(block.verification.value()));
-        block.verification.reset();
+        if (rollback) {
+            result.push_back(std::move(block.verification.value()));
+            block.verification.reset();
+        } else result.emplace_back().selections=block.last_selection;
     }
     return result;
 }
@@ -766,7 +776,7 @@ void retain_batch_prefix(Hy4CausalLm& model,const BatchVerification& journals,co
                 }
             }
         }
-        if (block.indexed) index_pool_retain_prefix(journal.values,journal.logits,journal.positions,lengths,
+        if (block.indexed && journal.values.defined()) index_pool_retain_prefix(journal.values,journal.logits,journal.positions,lengths,
             journal.pending_values,journal.pending_logits,block.pending_values,block.pending_logits);
     }
 }
@@ -843,8 +853,21 @@ void Hy4Model::configure_kv_tiers() {
     if (option.gpu_budget && option.placement!="ram" && desired>available)
         throw std::invalid_argument("kv_vram_insufficient: explicit KV VRAM budget exceeds available capacity after workspace");
     const auto quantization=cuda_kv_quantization();
-    if (!std::getenv("TYLOINFER_QSA_KV_BUDGET_BYTES") &&
-        option.placement!="ram" && kv_bytes<=std::min(desired,available) &&
+    if (execution->qsa_kv_store) {
+        auto tiers=execution->qsa_kv_store->config();
+        if (tiers.gpu_budget_bytes>available)
+            throw std::invalid_argument("kv_vram_insufficient: explicit KV VRAM budget exceeds available capacity after workspace");
+        shared->cold_bits=quantization.key_bits();
+        const auto row_bytes=size_t(shared->storage_width())*(shared->cold_bits?sizeof(int32_t):sizeof(uint16_t));
+        if (row_bytes>tiers.buffer_bytes/2/size_t(config.group_size))
+            throw std::invalid_argument("kv_memory_insufficient: Hy4 streamed KV budget cannot stage one IndexPool group");
+        tiers.preallocate=true;
+        tiers.ram_budget_bytes=std::min({tiers.ram_budget_bytes,ram,layers*context*row_bytes});
+        shared->offload=std::make_shared<KvOffloadStore>(std::move(tiers));
+        execution->qsa_kv_store=shared->offload;
+        return;
+    }
+    if (option.placement!="ram" && kv_bytes<=std::min(desired,available) &&
         (!quantization.enabled() || option.placement=="vram")) return;
     if (option.placement=="vram")
         throw std::invalid_argument("kv_vram_insufficient: configured Hy4 KV does not fit in VRAM");

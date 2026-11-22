@@ -91,6 +91,15 @@ template<bool Records,int Fragments,bool Weighted=false> __global__ void indexer
 
     const int qbase=blockIdx.y*Fragments*per_fragment;
     const int rows=queries*heads,stride=width+(Records?2:0);
+    const auto plane_stride=std::int64_t(rows)*gridDim.z*padded;
+    if constexpr (Weighted) {
+        const auto batch=std::int64_t(blockIdx.z);
+        digits+=batch*rows*padded;
+        info+=batch*rows;
+        keys+=batch*blocks*stride;
+        output+=batch*queries*blocks;
+        head_weights+=batch*rows;
+    }
     int visible=0;
     for(int local=0;local<Fragments*per_fragment && qbase+local<queries;++local)
         visible=max(visible,info[(qbase+local)*heads].visible);
@@ -132,7 +141,7 @@ template<bool Records,int Fragments,bool Weighted=false> __global__ void indexer
                 for(int plane=0;plane<3;++plane) {
                     unsigned b[2]={};
                     if(active) {
-                        const auto* source=digits+(std::int64_t(plane)*rows+qr)*padded+dbase+sub*4;
+                        const auto* source=digits+plane*plane_stride+std::int64_t(qr)*padded+dbase+sub*4;
                         b[0]=*reinterpret_cast<const unsigned*>(source);
                         b[1]=*reinterpret_cast<const unsigned*>(source+16);
                     }
@@ -221,10 +230,10 @@ int launch_affine_scores_integer(const float* query,const std::int16_t* keys,
         const std::uint16_t* scales,const std::int16_t* zero,const std::int64_t* positions,
         float* output,int queries,int heads,int width,int blocks,int records,int pooling,
         void* workspace,std::size_t workspace_bytes,cudaStream_t stream,
-        const float* head_weights=nullptr,bool reserve_tail=false) {
+        const float* head_weights=nullptr,bool reserve_tail=false,int batches=1) {
     if(!query || !keys || !output || queries<=0 || heads<=0 || width<=0 || blocks<=0 || pooling<=0 ||
        (!records && (!scales || !zero)))return int(cudaErrorInvalidValue);
-    const auto needed=indexer_affine16_score_scratch(queries,heads,width);
+    const auto needed=indexer_affine16_score_scratch(queries*batches,heads,width);
     if(!needed || !workspace || workspace_bytes<needed || (reinterpret_cast<std::uintptr_t>(workspace)&15))
         return int(cudaErrorNotSupported);
     struct Configuration {int device=-1,max_grid_y=0;bool supported=false;};
@@ -253,13 +262,13 @@ int launch_affine_scores_integer(const float* query,const std::int16_t* keys,
     const int fragments=queries>2*per_fragment?4:queries>per_fragment?2:1;
     const auto grid_y=(std::int64_t(queries)+fragments*per_fragment-1)/(fragments*per_fragment);
     if(grid_y>config.max_grid_y)return int(cudaErrorNotSupported);
-    const int padded=(width+31)/32*32,rows=queries*heads;
+    const int padded=(width+31)/32*32,rows=queries*batches*heads;
     const std::size_t payload=(std::size_t(3)*rows*padded+15)/16*16;
     auto* digits=static_cast<signed char*>(workspace);
     auto* info=reinterpret_cast<IndexerIntegerQuery*>(digits+payload);
     indexer_integer_prepare<<<rows,256,0,stream>>>(query,digits,info,rows,width,padded,positions,
         heads,blocks,records?pooling:4,reserve_tail);
-    const dim3 grid(unsigned((std::int64_t(blocks)+63)/64),unsigned(grid_y));
+    const dim3 grid(unsigned((std::int64_t(blocks)+63)/64),unsigned(grid_y),unsigned(batches));
 #define RUN(R,F,W) indexer_integer_scores<R,F,W><<<grid,128,0,stream>>>(digits,info,keys,scales,zero,output,queries,heads,width,padded,blocks,per_fragment,head_weights)
     if(head_weights){if(fragments==4){RUN(true,4,true);}else if(fragments==2){RUN(true,2,true);}else{RUN(true,1,true);}}
     else if(records){if(fragments==4){RUN(true,4,false);}else if(fragments==2){RUN(true,2,false);}else{RUN(true,1,false);}}

@@ -191,10 +191,11 @@ int indexer_affine16_record_scores(const float* query,const std::int16_t* record
 
 // IndexPool uses learned, signed weights after ReLU. A reserved tail masks
 // the entire current group from TopK so the attention path can append it once.
+// Each batch lane has its own records, positions, and queries.
 int index_pool_affine16_scores(const float* query, const std::int16_t* records,
     const float* head_weights, const std::int64_t* positions, float* output,
     int queries, int heads, int width, int blocks, int pool, bool reserve_tail,
-    cudaStream_t stream, void* workspace, std::size_t workspace_bytes);
+    cudaStream_t stream, void* workspace, std::size_t workspace_bytes, int batches=1);
 
 // Online TQ8: full 16-bit serialized states, sparse candidate transitions.
 // candidates: [bins, 256 destination symbols, 8 predecessor symbols].

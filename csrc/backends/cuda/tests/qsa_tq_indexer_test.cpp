@@ -307,6 +307,40 @@ int weighted_index_pool_cases() {
             }
             ++cases;
         }
+        auto batched_queries=f.query;
+        auto batched_records=records;
+        auto batched_weights=weights;
+        auto batched_positions=f.positions;
+        batched_queries.insert(batched_queries.end(),f.query.rbegin(),f.query.rend());
+        batched_records.insert(batched_records.end(),records.begin()+f.width+2,records.end());
+        batched_records.insert(batched_records.end(),records.begin(),records.begin()+f.width+2);
+        batched_weights.insert(batched_weights.end(),weights.rbegin(),weights.rend());
+        batched_positions.insert(batched_positions.end(),f.positions.rbegin(),f.positions.rend());
+        Buffer batch_q(batched_queries.size()*sizeof(float)),batch_k(batched_records.size()*sizeof(int16_t)),
+            batch_w(batched_weights.size()*sizeof(float)),batch_p(batched_positions.size()*sizeof(int64_t));
+        const auto outputs=std::size_t(queries)*f.blocks;
+        Buffer batch_out(2*outputs*sizeof(float)),single_out(2*outputs*sizeof(float));
+        const auto batch_scratch_bytes=tyloinfer::qsa::indexer_affine16_score_scratch(2*queries,heads,f.width);
+        Buffer batch_scratch(batch_scratch_bytes);
+        check(cudaMemcpy(batch_q.data,batched_queries.data(),batched_queries.size()*sizeof(float),cudaMemcpyHostToDevice));
+        check(cudaMemcpy(batch_k.data,batched_records.data(),batched_records.size()*sizeof(int16_t),cudaMemcpyHostToDevice));
+        check(cudaMemcpy(batch_w.data,batched_weights.data(),batched_weights.size()*sizeof(float),cudaMemcpyHostToDevice));
+        check(cudaMemcpy(batch_p.data,batched_positions.data(),batched_positions.size()*sizeof(int64_t),cudaMemcpyHostToDevice));
+        for (const bool integer : {false,true}) {
+            check(tyloinfer::qsa::index_pool_affine16_scores(batch_q.as<float>(),batch_k.as<int16_t>(),
+                batch_w.as<float>(),batch_p.as<int64_t>(),batch_out.as<float>(),queries,heads,f.width,f.blocks,4,true,
+                nullptr,integer?batch_scratch.data:nullptr,integer?batch_scratch_bytes:0,2));
+            for (int lane=0;lane<2;++lane) check(tyloinfer::qsa::index_pool_affine16_scores(
+                batch_q.as<float>()+lane*f.query.size(),batch_k.as<int16_t>()+lane*records.size(),
+                batch_w.as<float>()+lane*weights.size(),batch_p.as<int64_t>()+lane*queries,
+                single_out.as<float>()+lane*outputs,queries,heads,f.width,f.blocks,4,true,
+                nullptr,integer?scratch.data:nullptr,integer?scratch_bytes:0));
+            std::vector<float> combined(2*outputs),separate(2*outputs);
+            check(cudaMemcpy(combined.data(),batch_out.data,2*outputs*sizeof(float),cudaMemcpyDeviceToHost));
+            check(cudaMemcpy(separate.data(),single_out.data,2*outputs*sizeof(float),cudaMemcpyDeviceToHost));
+            if (combined!=separate) throw std::runtime_error("Batched IndexPool changed a lane's scores");
+            ++cases;
+        }
     }
     return cases;
 }

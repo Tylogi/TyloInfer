@@ -95,6 +95,7 @@ public:
     bool project_blockwise_prompt_chunks() const noexcept override {return true;}
     bool dspark_policy() const noexcept override {return true;}
     bool retains_partial_target_prefix() const noexcept override {return true;}
+    int preferred_context_update_batch_size() const noexcept override {return config.block;}
     bool take_graph_initialization() noexcept override {return std::exchange(graph_initialized_,false);}
     uint64_t graph_replay_count() const noexcept override {return replays_;}
     int maximum_draft_depth() const noexcept override {return config.block-1;}

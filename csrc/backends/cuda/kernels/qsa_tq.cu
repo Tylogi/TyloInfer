@@ -396,6 +396,14 @@ void affine_scores(const float* query,const int16_t* keys,const uint16_t* scales
     constexpr int Rows=QT==1?4:2;
     const int lane=threadIdx.x&31,base=(blockIdx.x*(affine_score_threads/32)+threadIdx.x/32)*Rows,first=blockIdx.y*QT;
     if(base>=blocks)return;
+    if constexpr (Weighted) {
+        const auto batch=int64_t(blockIdx.z);
+        query+=batch*queries*heads*width;
+        keys+=batch*blocks*(width+2);
+        positions+=batch*queries;
+        output+=batch*queries*blocks;
+        head_weights+=batch*queries*heads;
+    }
     // Unpacked index rows each represent four tokens.
     const int pooling=Records?pool:4;
     bool active[QT][Rows];bool any=false;
@@ -1368,15 +1376,17 @@ int indexer_affine16_record_scores(const float* query,const int16_t* records,con
 }
 int index_pool_affine16_scores(const float* query,const int16_t* records,const float* head_weights,
     const int64_t* positions,float* output,int queries,int heads,int width,int blocks,int pool,bool reserve_tail,
-    cudaStream_t stream,void* workspace,std::size_t workspace_bytes) {
+    cudaStream_t stream,void* workspace,std::size_t workspace_bytes,int batches) {
     if(!query || !records || !head_weights || !positions || !output || queries<=0 || heads<=0 ||
-        width<=0 || width>INT_MAX-2 || blocks<=0 || pool<=0)
+        width<=0 || width>INT_MAX-2 || blocks<=0 || pool<=0 || batches<=0 ||
+        batches>std::numeric_limits<uint16_t>::max() || queries>INT_MAX/batches)
         return int(cudaErrorInvalidValue);
     const auto status=launch_affine_scores_integer(query,records,nullptr,nullptr,positions,output,
-        queries,heads,width,blocks,1,pool,workspace,workspace_bytes,stream,head_weights,reserve_tail);
+        queries,heads,width,blocks,1,pool,workspace,workspace_bytes,stream,head_weights,reserve_tail,batches);
     if (status!=int(cudaErrorNotSupported)) return status;
     constexpr int queries_per_block = 4;
-    const dim3 grid(unsigned((int64_t(blocks)+15)/16),unsigned((int64_t(queries)+queries_per_block-1)/queries_per_block));
+    const dim3 grid(unsigned((int64_t(blocks)+15)/16),
+        unsigned((int64_t(queries)+queries_per_block-1)/queries_per_block),unsigned(batches));
     affine_scores<queries_per_block,true,false,true><<<grid,affine_score_threads,0,stream>>>(
         query,records,nullptr,nullptr,positions,output,queries,heads,width,blocks,pool,head_weights,reserve_tail);
     return int(cudaGetLastError());

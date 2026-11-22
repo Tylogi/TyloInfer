@@ -280,6 +280,15 @@ mfq::engine::Generation publish_cuda_batch_mtp(
 }
 
 template<class Model,class Adapter>
+void StatefulCudaBatchOperations<Model,Adapter>::flush_draft_context(Request& request) {
+    auto& pending=request.deferred_draft_context;
+    if (pending.empty()) return;
+    auto& predictor=*request.predictor;
+    predictor.append_target_context(pending.size()==1?pending.front():tb::cat(pending,1),predictor.cache_position());
+    pending.clear();
+}
+
+template<class Model,class Adapter>
 typename StatefulCudaBatchOperations<Model,Adapter>::Decoded
 StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     const auto device=execution_.layer_placement.primary_device();
@@ -287,7 +296,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     const auto host=options.device(tb::kCPU).pinned_memory(true);
     const auto batch=int64_t(slots_.size());
     const auto cycle_start=CudaBatchSpeculation::Clock::now();
-    const auto budget=speculation_.depth(state);
+    const auto budget=speculation_.depth(state,routed_expert_streamed_bytes(execution_)>0);
     const auto parked_before=speculation_.parked_rounds();
     int64_t width=1,remaining=planned_length_;
     int64_t position=0;
@@ -299,7 +308,10 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     }
     width=std::min(width,remaining);
     if (width<1) throw std::logic_error("CUDA batch verification exceeds the model context");
-    auto& graph=speculative_graphs_[width];
+    const bool need_rollback=width>1 || std::any_of(slots_.begin(),slots_.end(),[](const auto* request) {
+        return !request || !request->eligible;
+    });
+    auto& graph=speculative_graphs_[{width,need_rollback}];
     if (!graph) {
         graph=std::make_unique<SpeculativeGraph>();
         ResidentAllocationScope persistent;
@@ -333,7 +345,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         data[lane*width]=request->pending_token;
         if (!request->eligible || !request->predictor) continue;
         auto& predictor=*request->predictor;
-        if (predictor.cache_position()!=request->cache_length)
+        if (predictor.cache_position()+int64_t(request->deferred_draft_context.size())!=request->cache_length)
             throw std::logic_error("CUDA batch predictor position changed");
         ++mtp_rows;
         if (!request->sampler->greedy()) top_k=std::max<int64_t>(top_k,request->sampling.top_k);
@@ -342,6 +354,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         proposal.request=request.get();
         proposal.depth=std::min<int64_t>({cap,width-1,request->generation_limit-request->produced-1});
         if (proposal.depth<=0) continue;
+        flush_draft_context(*request);
         proposal.previous=tb::full({1,1},request->pending_token,options);
         draft_lanes.push_back({&predictor,proposal.previous,lane,int(proposal.depth)});
     }
@@ -386,7 +399,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     if constexpr (std::is_same_v<Model,Hy4CausalLm>) {
         std::vector<uint8_t> active(batch);
         for (const auto& request:state.active) active[request->slot]=request->eligible;
-        hy4::batch_engram_rows(model_,host_ids,host_positions,active,graph->engram_rows,width,true);
+        hy4::batch_engram_rows(model_,host_ids,host_positions,active,graph->engram_rows,width,need_rollback);
     }
     graph->metadata.copy_(graph->metadata_host);
     const auto ids=graph->metadata.narrow(0,0,batch*width).reshape({batch,width});
@@ -410,15 +423,15 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         bool recorded=false,complete=false;
         struct VerifyScope {
             Model& model;
-            VerifyScope(Model& m,const hy4::EngramRows& rows):model(m) {
-                Adapter::set_verification(model,true);
+            VerifyScope(Model& m,const hy4::EngramRows& rows,bool rollback):model(m) {
+                Adapter::set_verification(model,rollback);
                 if constexpr (std::is_same_v<Model,Hy4CausalLm>) hy4::set_staged_engram(model,&rows);
             }
             ~VerifyScope() {
                 if constexpr (std::is_same_v<Model,Hy4CausalLm>) hy4::set_staged_engram(model,nullptr);
                 Adapter::set_verification(model,false);
             }
-        } verify(model_,graph->engram_rows);
+        } verify(model_,graph->engram_rows,need_rollback);
         graph->window->capture([&] {
             complete=false;
             cudaStreamCaptureStatus status;
@@ -428,8 +441,12 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
             graph->logits=model_.logits_from_hidden(hidden);
             complete=true;
         },[&] {
-            if (complete) {
-                auto journals=Adapter::take_verification(model_);
+            if (complete && (need_rollback || std::is_same_v<Model,Hy4CausalLm>)) {
+                auto journals=[&] {
+                    if constexpr (std::is_same_v<Model,Hy4CausalLm>)
+                        return hy4::take_batch_verification(model_,need_rollback);
+                    else return Adapter::take_verification(model_);
+                }();
                 if (recorded) graph->journals=std::move(journals);
             }
             Adapter::restore(model_,before,all);
@@ -439,8 +456,8 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     }
     RoutedSpeculativeRoutes routes;
     std::optional<RoutedCacheLearningScope> ignore_padding;
-    if (full_verification) routes.begin(execution_,int(batch*width));
-    else ignore_padding.emplace(execution_,false);
+    if (full_verification && need_rollback) routes.begin(execution_,int(batch*width));
+    if (!full_verification) ignore_padding.emplace(execution_,false);
     graph->window->run();
     ++graph_replays_;
     const auto candidates=rank_cuda_batch_logits(graph->logits,top_k);
@@ -477,7 +494,13 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         request->verified_tokens.assign(proposed.tokens.begin(),proposed.tokens.begin()+accepted);
         request->verified_tokens.push_back(result.next_token);
         auto raw=graph->raw.narrow(0,lane,1).narrow(1,0,kept[lane]).contiguous();
-        request->predictor->append_target_context(raw,request->cache_length);
+        auto& predictor=*request->predictor;
+        const auto preferred=predictor.preferred_context_update_batch_size();
+        if (proposed.tokens.empty() && preferred>1) {
+            // The verifier overwrites its output on the next graph replay.
+            request->deferred_draft_context.push_back(raw.clone());
+            if (request->deferred_draft_context.size()>=std::size_t(preferred)) flush_draft_context(*request);
+        } else predictor.append_target_context(raw,request->cache_length);
         request->cache_length+=int64_t(accepted);
         auto& stats=request->mtp_stats;
         stats.target_ms+=target_ms;
@@ -489,12 +512,13 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         for (size_t i=0;i<proposed.tokens.size();++i) ++stats.position_drafted[i];
         observed.push_back(int(accepted));
     }
-    auto lengths_kept=tb::tensor(kept,options);
     if constexpr (std::is_same_v<Model,Hy4CausalLm>) {
-        hy4::retain_batch_prefix(model_,graph->journals,lengths_kept,host_positions,kept,width);
-        hy4::commit_batch_engram(model_,host_ids,host_positions,kept,width);
-    } else inkling::retain_batch_prefix(model_,graph->journals,lengths_kept);
-    if (full_verification) routes.resolve(int(std::accumulate(kept.begin(),kept.end(),int64_t(0))),false);
+        hy4::retain_batch_prefix(model_,graph->journals,need_rollback?tb::tensor(kept,options):Tensor{},
+            host_positions,kept,width);
+        if (need_rollback) hy4::commit_batch_engram(model_,host_ids,host_positions,kept,width);
+    } else if (need_rollback) inkling::retain_batch_prefix(model_,graph->journals,tb::tensor(kept,options));
+    if (full_verification && need_rollback)
+        routes.resolve(int(std::accumulate(kept.begin(),kept.end(),int64_t(0))),false);
     speculation_.observe(int(width-1),observed,cycle_start,graph_ready,!state.prefilling.empty());
     const auto parked_after=speculation_.parked_rounds();
     const auto cycle_ms=std::chrono::duration<double,std::milli>(CudaBatchSpeculation::Clock::now()-cycle_start).count();

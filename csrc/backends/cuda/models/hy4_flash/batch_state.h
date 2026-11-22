@@ -47,7 +47,7 @@ struct Verification {
 };
 using BatchVerification=std::vector<Verification>;
 void set_batch_verification(Hy4CausalLm&,bool);
-BatchVerification take_batch_verification(Hy4CausalLm&);
+BatchVerification take_batch_verification(Hy4CausalLm&,bool rollback=true);
 void retain_batch_prefix(Hy4CausalLm&,const BatchVerification&,const mfq_tensor_backend::Tensor& lengths,
                         std::span<const int64_t> positions,std::span<const int64_t> kept,int64_t width);
 void set_staged_engram(Hy4CausalLm&,const EngramRows*);

@@ -43,7 +43,7 @@ public:
     using Clock=mfq::engine::mtp::v1::BatchDepthPolicy::Clock;
 
     template<class Request>
-    int depth(const mfq::engine::BatchState<Request>& state) {
+    int depth(const mfq::engine::BatchState<Request>& state,bool costly_probes=false) {
         if (!fixed_depth_) fixed_depth_=cuda_fixed_mtp_draft_depth();
         std::vector<std::string> predicting;
         std::size_t ordinary=0;
@@ -58,8 +58,8 @@ public:
             } else ++ordinary;
         }
         if (*fixed_depth_ || predicting.empty()) return std::min(*fixed_depth_,maximum);
-        const auto key=std::tuple{predicting.size(),ordinary,maximum,std::bit_ceil(uint64_t(context))};
-        auto& policy=policies_.try_emplace(key,std::move(predicting),maximum,ordinary).first->second;
+        const auto key=std::tuple{predicting.size(),ordinary,maximum,std::bit_ceil(uint64_t(context)),costly_probes};
+        auto& policy=policies_.try_emplace(key,std::move(predicting),maximum,ordinary,true,costly_probes).first->second;
         if (policy_!=&policy) interrupt();
         policy_=&policy;
         return policy_->depth();
@@ -75,7 +75,7 @@ public:
 
 private:
     std::optional<int> fixed_depth_;
-    std::map<std::tuple<std::size_t,std::size_t,int,uint64_t>,mfq::engine::mtp::v1::BatchDepthPolicy> policies_;
+    std::map<std::tuple<std::size_t,std::size_t,int,uint64_t,bool>,mfq::engine::mtp::v1::BatchDepthPolicy> policies_;
     mfq::engine::mtp::v1::BatchDepthPolicy* policy_=nullptr;
 };
 
@@ -269,6 +269,7 @@ template<class Cache> struct StatefulCudaBatchRequest : mfq::engine::BatchReques
           prefix_limit(input.cache_plan.stable_prefix_tokens) {}
     std::optional<Sampler> sampler;
     mfq_tensor_backend::Tensor ids,counts;
+    std::vector<mfq_tensor_backend::Tensor> deferred_draft_context;
     Cache cache;
     double prefill_ms=0;
     int64_t slot=-1;
@@ -334,6 +335,7 @@ public:
     static constexpr bool isolate_prefill_failures=true;
 private:
     Decoded verify_speculative(State&);
+    void flush_draft_context(Request&);
     void clear_slots();
     Model& model_;
     CudaExecutionContext& execution_;
@@ -351,7 +353,7 @@ private:
     std::shared_ptr<GraphPoolLease> graph_pool_;
     std::unique_ptr<DecodeWindow> graph_;
     struct SpeculativeGraph;
-    std::map<int64_t,std::unique_ptr<SpeculativeGraph>> speculative_graphs_;
+    std::map<std::pair<int64_t,bool>,std::unique_ptr<SpeculativeGraph>> speculative_graphs_;
     int64_t speculative_batches_=0,speculative_maximum_batch_=0;
     CudaBatchSpeculation speculation_;
 };
