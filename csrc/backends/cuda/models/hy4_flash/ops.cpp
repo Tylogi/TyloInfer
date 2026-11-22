@@ -54,6 +54,7 @@ struct Shared {
     RopeCache rope,sliding_rope;
     std::optional<EngramState> engram;
     std::shared_ptr<KvOffloadStore> offload;
+    std::shared_ptr<void> prepared_expert_workspace;
     std::unique_ptr<DecodeGraphs> graphs;
     const EngramRows* staged_engram=nullptr;
     bool batch_verification=false,host_indexer=false;
@@ -991,17 +992,21 @@ void enable_hy4_draft_history(Hy4CausalLm& model,const std::vector<int64_t>& lay
 const RopeCache& hy4_full_rope(const Hy4CausalLm& model) {return model.shared->rope;}
 
 void clear_hy4_decode_graph(Hy4CausalLm& model) {
-    if (model.shared) model.shared->graphs.reset();
+    if (model.shared) {
+        model.shared->graphs.reset();
+        model.shared->prepared_expert_workspace.reset();
+    }
 }
 
-void prepare_hy4_expert_cache(Hy4CausalLm& model) {
+void prepare_hy4_expert_cache(Hy4CausalLm& model,int verification_rows) {
     std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>> layers;
     for (const auto& owned:model.blocks) {
         const auto& layer=static_cast<const Hy4Block&>(*owned);
         if (const auto& weights=layer.ffn.moe_gguf)
             layers.push_back({weights->gate,weights->up,weights->down});
     }
-    prepare_gguf_expert_slots(model.execution->gguf_expert_cache,layers);
+    model.shared->prepared_expert_workspace=prepare_gguf_expert_slots(
+        model.execution->gguf_expert_cache,layers,verification_rows,model.config.expert_top_k);
 }
 
 std::optional<Tensor> hy4_graph_hidden(Hy4CausalLm& model,const Tensor& ids,const Tensor& host_ids,
@@ -1269,9 +1274,25 @@ void CudaSessionCodec<Hy4Model>::restore(Model& model,const TextSessionState& st
                 model.shared->offload,width,config.group_size,dtype);
             sequence->append_host(saved.k.reshape({count,width}).to(tb::kCPU),device);
             target.sequences.push_back(std::move(sequence));
+        } else if (target.sliding) {
+            const auto rows=saved.k.squeeze(1).to(device);
+            const auto decode_capacity=std::min(model.max_position_embeddings(),
+                config.window+int64_t(mfq::engine::mtp::kMaximumBlockwiseDraftDepth));
+            // A checkpoint saves only the live window. Keep the decode ring's
+            // speculative capacity and addresses when restoring that window.
+            target.kv=target.allocate_growing(target.kv,rows,std::max(count,decode_capacity),
+                width,dtype,true,0);
+            const auto capacity=target.kv.size(1);
+            const auto first=std::max(int64_t(0),state.cache_pos-std::min(count,config.window));
+            for (auto token=first;token<state.cache_pos;) {
+                const auto from=token%count,to=token%capacity;
+                const auto extent=std::min({state.cache_pos-token,count-from,capacity-to});
+                target.kv.narrow(1,to,extent).copy_(rows.narrow(1,from,extent));
+                token+=extent;
+            }
         } else {
             const auto previous=target.kv.defined()?target.kv.size(1):0;
-            const auto capacity=target.sliding?saved.capacity:std::max(saved.capacity,previous);
+            const auto capacity=std::max(saved.capacity,previous);
             restore_session_prefix_tensor(target.kv,saved.k.squeeze(1).to(device),1,capacity);
         }
         target.last_selection={};

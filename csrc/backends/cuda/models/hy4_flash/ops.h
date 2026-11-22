@@ -44,7 +44,7 @@ std::optional<mfq_tensor_backend::Tensor> hy4_graph_hidden(Hy4CausalLm&,
     const mfq_tensor_backend::Tensor& ids,const mfq_tensor_backend::Tensor& host_ids,
     int64_t confirmed,int64_t horizon,mfq_tensor_backend::Tensor& logits,bool& initialized);
 void clear_hy4_decode_graph(Hy4CausalLm&);
-void prepare_hy4_expert_cache(Hy4CausalLm&);
+void prepare_hy4_expert_cache(Hy4CausalLm&,int verification_rows);
 
 template<> struct CudaSessionCodec<Hy4Model> {
     using Model=Hy4CausalLm;

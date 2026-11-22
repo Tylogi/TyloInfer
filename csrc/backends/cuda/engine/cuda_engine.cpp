@@ -514,7 +514,8 @@ struct CudaEngineState {
                 trace_load("expert_profile");
                 seed_gguf_expert_cache(execution->gguf_expert_cache,*language.source);
             }
-        } else if constexpr(std::is_same_v<Model,Hy4CausalLm>) prepare_hy4_expert_cache(language);
+        } else if constexpr(std::is_same_v<Model,Hy4CausalLm>)
+            prepare_hy4_expert_cache(language,components.mtp?1+components.mtp->maximum_draft_depth():0);
         trace_load("ready");
     }
     bool can_batch(const EngineRequest& request) const {

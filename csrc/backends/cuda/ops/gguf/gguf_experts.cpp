@@ -154,6 +154,17 @@ struct GgufDirectArena {
     GgufDirectWorkspaceImages images;
 };
 
+struct GgufDirectHostPacket {
+    mfq::cuda::HostBuffer storage;
+    void* mapped = nullptr;
+
+    explicit GgufDirectHostPacket(std::size_t bytes):storage(bytes,true) {
+        TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&mapped,storage.data(),0));
+        mfq::cuda::charge_tensor_host_bytes(bytes);
+    }
+    ~GgufDirectHostPacket() { mfq::cuda::tensor_host_bytes.fetch_sub(storage.size()); }
+};
+
 // Cache the original GGUF blocks. Formats share capacity and eviction policy;
 // only the projection kernel interprets their encoding.
 using GgufHostImage=mfq::cuda::RoutedHostImage<GgufHostSnapshot>;
@@ -200,9 +211,8 @@ class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
     std::size_t decode_growth_reserve_=0;
     std::optional<std::size_t> decode_transient_reserve_;
     std::array<UploadStage, 2> upload_stages_;
-    static constexpr std::size_t direct_capacity = 256ULL << 20;
-    std::unique_ptr<mfq::cuda::HostBuffer> direct_host_;
-    void* direct_mapped_ = nullptr;
+    static constexpr std::size_t initial_direct_capacity = 256ULL << 20;
+    std::shared_ptr<GgufDirectHostPacket> direct_host_;
     bool serving_graph_ = false;
     bool reuse_learning_ = true;
     std::size_t upload_cursor_ = 0;
@@ -1532,13 +1542,8 @@ public:
         const auto* direct=std::getenv("TYLOINFER_GGUF_DIRECT_EXPERTS");
         if (can_map && (!direct || direct[0]!='0')) {
             try {
-                direct_host_=std::make_unique<mfq::cuda::HostBuffer>(direct_capacity,true);
-                TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&direct_mapped_,direct_host_->data(),0));
-                mfq::cuda::charge_tensor_host_bytes(direct_capacity);
-            } catch (const std::exception& error) {
-                if(!std::string(error.what()).starts_with("CUDA pinned allocation failed:"))throw;
-                direct_host_.reset();direct_mapped_=nullptr;
-            }
+                direct_host_=std::make_shared<GgufDirectHostPacket>(initial_direct_capacity);
+            } catch (const MfqResourceExhausted&) {}
         }
         host_limit_ = execution.config.moe_host_cache_bytes;
         TYLOINFER_CUDA_CHECK(mfq::cuda::moe_mapped_copy_launch_geometry(&upload_blocks_,&upload_threads_));
@@ -1590,9 +1595,33 @@ public:
         transfers_.clear();device_.clear();
         for(auto& stage:upload_stages_)stage.device={};
         graph_pools_.clear();
-        if (direct_host_) mfq::cuda::tensor_host_bytes.fetch_sub(direct_capacity);
     }
-    bool direct_supported(std::size_t bytes) const {return direct_mapped_ && bytes<=direct_capacity;}
+    bool reserve_direct_host(std::size_t bytes,bool initializing=false) {
+        std::shared_ptr<GgufDirectHostPacket> previous;
+        {
+            std::lock_guard lock(mutex_);
+            if(!direct_host_)return false;
+            if(bytes<=direct_host_->storage.size())return true;
+            // Startup can replace its unused packet without pinning both
+            // allocations at once. Live graphs retain any packet they use.
+            if(initializing && direct_host_.use_count()==1)previous=std::move(direct_host_);
+        }
+        const auto previous_bytes=previous?previous->storage.size():0;
+        previous.reset();
+        // Pinned allocation can call back into the expert cache to reclaim RAM.
+        const auto allocate=[&](std::size_t capacity) {
+            auto packet=std::make_shared<GgufDirectHostPacket>(capacity);
+            std::lock_guard lock(mutex_);
+            if(!direct_host_ || capacity>direct_host_->storage.size())direct_host_=std::move(packet);
+        };
+        try {
+            allocate(bytes);
+            return true;
+        } catch (const MfqResourceExhausted&) {
+            if(previous_bytes)try {allocate(previous_bytes);} catch(const MfqResourceExhausted&) {}
+            return false;
+        }
+    }
     bool set_reuse_learning(bool enabled) {
         std::lock_guard lock(mutex_);return std::exchange(reuse_learning_,enabled);
     }
@@ -3209,7 +3238,7 @@ public:
     }
     void acquire_direct(
         const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
-        const std::vector<std::int64_t>& experts,int device,cudaStream_t consumer,void* workspace,
+        const std::vector<std::int64_t>& experts,int device,cudaStream_t consumer,void* workspace,std::size_t workspace_bytes,
         const std::array<std::int64_t*,3>& pointers,
         const std::array<const std::int64_t*,3>& resident,
         std::vector<GgufWeight>& keep,std::vector<std::shared_ptr<void>>& host_keep,
@@ -3280,12 +3309,13 @@ public:
                 const void* source=nullptr;
                 if(image->pinned())source=image->mapped_data(device);
                 else {
-                    if(image->bytes>direct_capacity-pageable_bytes)throw std::logic_error("GGUF direct host packet overflow");
-                    mfq::copy_host_range({static_cast<std::uint8_t*>(direct_host_->data())+pageable_bytes,image->data(),image->bytes});
-                    source=static_cast<const std::uint8_t*>(direct_mapped_)+pageable_bytes;
+                    if(image->bytes>direct_host_->storage.size()-pageable_bytes)throw std::logic_error("GGUF direct host packet overflow");
+                    if(!pageable_bytes)host_keep.push_back(direct_host_);
+                    mfq::copy_host_range({static_cast<std::uint8_t*>(direct_host_->storage.data())+pageable_bytes,image->data(),image->bytes});
+                    source=static_cast<const std::uint8_t*>(direct_host_->mapped)+pageable_bytes;
                     pageable_bytes=(pageable_bytes+image->bytes+15)&~std::size_t(15);
                 }
-                if(image->bytes>direct_capacity-copy_bytes)throw std::logic_error("GGUF direct GPU packet overflow");
+                if(image->bytes>workspace_bytes-copy_bytes)throw std::logic_error("GGUF direct GPU packet overflow");
                 auto* destination=workspace_images?workspace_images->destination(selected,role):
                     static_cast<std::uint8_t*>(workspace)+copy_bytes;
                 copies[copy_count++]={reinterpret_cast<std::uint64_t>(destination),
@@ -3565,9 +3595,42 @@ void finalize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache, s
 void seed_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache,const mfq::ModelSource& source) {
     if(cache)cache->seed_profile(source);
 }
-void prepare_gguf_expert_slots(const std::shared_ptr<GgufExpertCache>& cache,
-        const std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>>& layers) {
-    if (cache) cache->prepare_slots(layers);
+static std::size_t direct_packet_bytes(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
+        int64_t unique) {
+    if(unique<=0 || !banks[0] || !banks[1] || !banks[2] ||
+       banks[0]->cache!=banks[1]->cache || banks[0]->cache!=banks[2]->cache)return 0;
+    std::size_t bytes=0;
+    for(const auto& bank:banks) {
+        if(bank->expert_bytes>SIZE_MAX-15)return 0;
+        const auto aligned=(bank->expert_bytes+15)&~std::size_t(15);
+        if(aligned>SIZE_MAX-bytes)return 0;
+        bytes+=aligned;
+    }
+    return bytes<=std::size_t(INT64_MAX)/std::size_t(unique)?bytes*std::size_t(unique):0;
+}
+
+std::shared_ptr<void> prepare_gguf_expert_slots(const std::shared_ptr<GgufExpertCache>& cache,
+        const std::vector<std::array<std::shared_ptr<GgufRoutedWeight>,3>>& layers,
+        int64_t verification_rows,int64_t routes) {
+    if(!cache)return {};
+    std::shared_ptr<void> arena;
+    if(verification_rows>1 && routes>0 && routes<=INT64_MAX/verification_rows) {
+        std::size_t capacity=0;
+        for(const auto& banks:layers)
+            if(banks[0] && banks[0]->cache==cache)
+                capacity=std::max(capacity,direct_packet_bytes(banks,
+                    std::min(verification_rows*routes,banks[0]->experts)));
+        const bool host_ready=capacity && cache->reserve_direct_host(capacity,true);
+        if(host_ready) {
+            try {arena=cache->direct_arena(mfq_current_cuda_device(),mfq_current_cuda_stream(),capacity);}
+            catch(const MfqResourceExhausted&) {}
+        }
+        if(std::getenv("TYLOINFER_TRACE_ENGINE_LOAD"))
+            std::fprintf(stderr,"native_gguf_verify_workspace rows=%lld bytes=%zu host=%d device=%d\n",
+                static_cast<long long>(verification_rows),capacity,int(host_ready),int(bool(arena)));
+    }
+    cache->prepare_slots(layers);
+    return arena;
 }
 void reserve_gguf_expert_workspace(const std::shared_ptr<GgufExpertCache>& cache, std::size_t bytes) {
     if (cache) cache->reserve_workspace(bytes);
@@ -3914,17 +3977,11 @@ struct GgufMoeStage {
         int can_map = 0;
         TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, source.get_device()));
         const auto unique=std::min(tokens*routes,banks.gate->experts);
-        std::size_t expert_bytes=0;
-        bool fits=true;
-        for(const auto& bank:this->banks) {
-            if(bank->expert_bytes>SIZE_MAX-15 || ((bank->expert_bytes+15)&~std::uint64_t(15))>SIZE_MAX-expert_bytes){fits=false;break;}
-            expert_bytes+=(bank->expert_bytes+15)&~std::uint64_t(15);
-        }
-        direct=fits && unique>0 && can_map && banks.gate->cache==banks.up->cache && banks.up->cache==banks.down->cache &&
-            expert_bytes<=SIZE_MAX/std::size_t(unique) && banks.gate->cache->direct_supported(expert_bytes*unique);
+        const auto bytes=direct_packet_bytes(this->banks,unique);
+        direct=can_map && bytes && banks.gate->cache->reserve_direct_host(bytes);
         if(direct) {
             try {
-            const auto capacity=std::int64_t(expert_bytes*unique);
+                const auto capacity=std::int64_t(bytes);
             if(!this->lease->direct_workspace.defined() || this->lease->direct_workspace.numel()<capacity) {
                 this->lease->direct_arena=this->banks[0]->cache->direct_arena(source.get_device(),stream.stream(),std::size_t(capacity));
                 this->lease->direct_workspace=this->lease->direct_arena->storage;
@@ -4202,6 +4259,7 @@ struct GgufMoeStage {
             if(!reusable)images.invalidate();
             if(reusable)reusable->prepare(banks,selected,lease->direct_workspace.data_ptr(),lease->direct_workspace.nbytes());
             try {banks[0]->cache->acquire_direct(banks,selected,stream.device(),stream.stream(),lease->direct_workspace.data_ptr(),
+                lease->direct_workspace.nbytes(),
                 {host_table(0),host_table(1),host_table(2)},
                 {resident_overlap?resident_host_table(0):nullptr,resident_overlap?resident_host_table(1):nullptr,
                     resident_overlap?resident_host_table(2):nullptr},lease->weights,lease->host_owners,
