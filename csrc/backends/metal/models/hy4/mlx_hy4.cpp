@@ -394,7 +394,7 @@ namespace {
 constexpr int selected_query_tile = 16;
 
 struct VerifiedLayerRows {
-    std::optional<array> old_window, new_window, index_pairs, selections;
+    std::optional<array> new_window, index_pairs, selections;
 };
 
 array trailing_rope(const array& values, const RotaryPhases& phases, int rotary) {
@@ -505,9 +505,10 @@ array sliding_attention_rows(const array& window, const array& next, int positio
 }
 
 array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const array& query,
-    const array& next, const array& sinks, int position, float scale) {
+    const array& next, const array& sinks, int position, float scale, VerifiedLayerRows* verified = nullptr) {
     const int count = next.shape(1);
-    if (count == 1)
+    if (verified) verified->new_window = next;
+    if (count == 1 && !verified)
         return as_dense_attention(query, append_sliding_decode(cache, g, next, position),
             sinks, position, 0, 0, scale, g.kv_rank);
     if (!cache.window) cache.window = zeros({1, g.window, next.shape(-1)}, next.dtype());
@@ -525,7 +526,7 @@ array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const ar
             position + start, first_key, g.window, scale, g.kv_rank));
     }
     auto attention = output.size() == 1 ? output.front() : concatenate(output, 1);
-    cache.window = mlx_circular_cache_append(*cache.window, next, position, attention);
+    if (!verified) cache.window = mlx_circular_cache_append(*cache.window, next, position, attention);
     return attention;
 }
 
@@ -1023,14 +1024,10 @@ std::pair<array, MlxHyperConnectionState> prepare_layer(const Layer& layer, cons
         deferred && *deferred ? &**deferred : nullptr);
     const auto& in = mix.branch;
     const auto rows = project_mla(layer, g, in, phases);
-    if (verified && layer.sliding) {
-        verified->old_window = cache.window;
-        verified->new_window = rows.latent;
-        if (cache.window) cache.window = *cache.window + zeros_like(*cache.window);
-    }
     const float scale = 1.0f / std::sqrt(float(g.q_dim));
     const auto attention = [&] {
-        if (layer.sliding) return sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale);
+        if (layer.sliding)
+            return sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale, verified);
         std::optional<IndexScores> scoring;
         if (offset + in.shape(1) > g.index_budget)
             scoring = project_index_scores(*layer.index, g, in, rows.query_low, phases);
@@ -1663,12 +1660,8 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
                     auto& cache = request.layers[index];
                     auto next = axis_slice(rows.latent, 1, sequence.begin, sequence.end);
                     if (!cache.window) cache.window = zeros({1, g.window, next.shape(-1)}, next.dtype());
-                    if (inputs[row].verification) {
-                        auto& saved = inputs[row].verification->layers[index];
-                        saved.old_window = cache.window;
-                        saved.new_window = next;
-                        cache.window = *cache.window + zeros_like(*cache.window);
-                    }
+                    if (inputs[row].verification)
+                        inputs[row].verification->layers[index].new_window = next;
                     const int history = std::min(request.position, g.window - 1);
                     auto visible = sliding_attention_rows(*cache.window, next, request.position, history);
                     windows.push_back({std::move(visible), verify_sliding_masks[row]});
@@ -1676,6 +1669,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
                 }
                 auto result = batch_dense_mla_windows(rows.query, windows, layer.sinks, scale, g.kv_rank);
                 for (int row = 0; row < batch; ++row) {
+                    if (inputs[row].verification) continue;
                     auto& request = *requests[row];
                     auto& cache = request.layers[index];
                     cache.window = mlx_circular_cache_append(*cache.window, updates[row], request.position,
@@ -1722,12 +1716,8 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
                 const auto query = axis_slice(rows.query, 2, sequence.begin, sequence.end);
                 const auto latent = axis_slice(rows.latent, 1, sequence.begin, sequence.end);
                 if (layer.sliding) {
-                    if (verified) {
-                        verified->old_window = cache.window;
-                        verified->new_window = latent;
-                        if (cache.window) cache.window = *cache.window + zeros_like(*cache.window);
-                    }
-                    attended.push_back(sliding_attention(cache, g, query, latent, layer.sinks, request.position, scale));
+                    attended.push_back(sliding_attention(cache, g, query, latent, layer.sinks,
+                        request.position, scale, verified));
                 } else {
                     std::optional<IndexScores> lane_scores;
                     if (scoring && request.position + latent.shape(1) > g.index_budget)
@@ -1827,33 +1817,36 @@ void MlxHy4Model::resolve_verification(Cache& cache, const Verification& trace, 
     const auto& w = *weights_;
     const auto& g = w.g;
     const int keep = accepted + 1, position = trace.position + keep;
-    if (accepted != proposed) {
-        for (int i = 0; i < g.layers; ++i) {
-            auto& layer = cache.layers[i];
-            const auto& saved = trace.layers[i];
-            if (g.sliding[i]) {
-                const auto new_rows = axis_slice(*saved.new_window, 1, 0, keep);
-                layer.window = mlx_circular_cache_append(*saved.old_window, new_rows, trace.position);
-                continue;
-            }
-            if (layer.offloaded_latent) {
-                layer.offloaded_latent->trim(position);
-                layer.offloaded_groups->trim(position / g.group_size);
-            } else {
-                layer.latent->trim(proposed - accepted);
-                layer.groups->trim(layer.groups->position() - position / g.group_size);
-            }
-            const int owed = position % g.group_size;
-            if (owed) {
-                const int end = trace.position % g.group_size + keep;
-                layer.index_tail = axis_slice(*saved.index_pairs, 1, end - owed, end);
-            } else {
-                layer.index_tail.reset();
-            }
-            layer.last_indices = saved.selections
-                ? axis_slice(*saved.selections, 1, accepted, keep)
-                : reshape(arange(0, position, 1, int32), {1, 1, position});
+    const bool rejected = accepted != proposed;
+    for (int i = 0; i < g.layers; ++i) {
+        auto& layer = cache.layers[i];
+        const auto& saved = trace.layers[i];
+        if (g.sliding[i]) {
+            // Commit after target verification has finished reading the original window.
+            const auto rows = axis_slice(*saved.new_window, 1, 0, keep);
+            layer.window = mlx_circular_cache_append(*layer.window, rows, trace.position, logits);
+            continue;
         }
+        if (!rejected) continue;
+        if (layer.offloaded_latent) {
+            layer.offloaded_latent->trim(position);
+            layer.offloaded_groups->trim(position / g.group_size);
+        } else {
+            layer.latent->trim(proposed - accepted);
+            layer.groups->trim(layer.groups->position() - position / g.group_size);
+        }
+        const int owed = position % g.group_size;
+        if (owed) {
+            const int end = trace.position % g.group_size + keep;
+            layer.index_tail = axis_slice(*saved.index_pairs, 1, end - owed, end);
+        } else {
+            layer.index_tail.reset();
+        }
+        layer.last_indices = saved.selections
+            ? axis_slice(*saved.selections, 1, accepted, keep)
+            : reshape(arange(0, position, 1, int32), {1, 1, position});
+    }
+    if (rejected) {
         if (w.engram) {
             const auto end = trace.engram_tokens.end() - (proposed - accepted);
             const int length = std::min(position, w.engram->grams - 1);
