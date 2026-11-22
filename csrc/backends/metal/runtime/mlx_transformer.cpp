@@ -4,6 +4,7 @@
 #include "mlx_dsa.h"
 
 #include "mlx_detached_copy.h"
+#include "mlx_eval_timing.h"
 
 #include <algorithm>
 #include <bit>
@@ -930,7 +931,7 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
     auto visible = physical_view();
     auto key = detached ? detached_copy(visible.first) : visible.first;
     auto value = detached ? detached_copy(visible.second) : visible.second;
-    mlx::core::eval(key, value);
+    detail::eval_with_timing({key, value});
     return MlxKvCacheSnapshot{
         batch_,
         heads_,

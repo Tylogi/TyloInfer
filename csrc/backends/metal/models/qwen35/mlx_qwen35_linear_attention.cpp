@@ -502,7 +502,7 @@ MlxQwen35LinearAttentionBlock::snapshot_cache(bool detached) const {
     }
     auto convolution = detached ? detached_copy(*convolution_state_) : *convolution_state_;
     auto recurrent = detached ? detached_copy(*recurrent_state_) : *recurrent_state_;
-    if (detached) mlx::core::eval(convolution, recurrent);
+    if (detached) detail::eval_with_timing({convolution, recurrent});
     return {
         std::move(convolution),
         std::move(recurrent),
