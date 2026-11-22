@@ -82,6 +82,13 @@ void Qwen35BatchStateAdapter::pause_prefill(QwenBatchRequestState &request) {
         paged_kv_->detach();
 }
 
+void Qwen35BatchStateAdapter::adopt_prefix(QwenBatchRequestState& request,int64_t offset,int64_t tokens) {
+    TYLOINFER_RUNTIME_CHECK(request.slot_<0 && !request.prefill_ && model_.cache_pos==offset &&
+        offset>0 && offset<tokens,"invalid continuous batching prefix restore");
+    if (paged_kv_) paged_kv_->import_prefix(request.pages_,offset,tokens);
+    pause_prefill(request);
+}
+
 void Qwen35BatchStateAdapter::activate(QwenBatchRequestState &request) {
     TYLOINFER_RUNTIME_CHECK(request.slot_ < 0, "continuous batching request already has a slot");
     const auto free = std::find(slots_.begin(), slots_.end(), nullptr);

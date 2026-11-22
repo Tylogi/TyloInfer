@@ -8,15 +8,26 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <mlx/mlx.h>
+#include "tyloinfer/token_constraint.h"
 
+namespace mfq::engine::mtp { struct ChainVerification; }
 namespace mfq::metal {
 
 class MlxQwen4CausalLm;
 class MlxQwen35CausalLm;
+class MlxSampler;
 struct MlxSamplingParams;
+
+std::int32_t mlx_dflash2_constrained_token(
+    MlxSampler& sampler, const mlx::core::array& logits, std::int32_t token,
+    const MfqTokenConstraintPtr& constraint);
+mfq::engine::mtp::ChainVerification mlx_dflash2_verify_constraint(
+    MlxSampler& sampler, const mlx::core::array& logits, std::span<const std::int32_t> drafts,
+    std::span<const std::int32_t> targets, const MfqTokenConstraintPtr& constraint);
 
 struct MlxDFlash2Config {
     int hidden = 0, vocabulary = 0, layers = 0, intermediate = 0;
@@ -34,7 +45,6 @@ struct MlxDFlash2Context {
     };
     int position = 0;
     const void* owner = nullptr;
-    std::optional<mlx::core::array> window;
     std::vector<Layer> layers;
     std::size_t bytes() const noexcept;
 };
@@ -71,10 +81,12 @@ public:
     static MlxDFlash2 load(const std::filesystem::path& directory);
     const MlxDFlash2Config& config() const noexcept;
     std::size_t weight_bytes() const noexcept;
+    const std::string& prefix_cache_key() const noexcept;
     void track_weights() const;
     void prepare(const std::function<mlx::core::array(const mlx::core::array&)>& output_head,
         bool tree_batch = false) const;
     void reset(MlxDFlash2Context& context) const;
+    void restore_context(MlxDFlash2Context& context, const MlxDFlash2Context& snapshot) const;
     void append_context(MlxDFlash2Context& context, const mlx::core::array& target_hidden,
         int start_position) const;
     struct ContextCommit {
@@ -103,7 +115,8 @@ public:
         const std::function<bool(std::int64_t)>& callback = {},
         const std::function<void(std::size_t, double)>& prefill_callback = {},
         int prefill_chunk_size = 4096, std::optional<int> stop_token = std::nullopt,
-        MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7) const;
+        MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7,
+        const MfqTokenConstraintPtr& constraint = {}) const;
     std::int32_t generate_greedy(MlxQwen4CausalLm& target,
         const std::vector<std::int64_t>& prompt, std::int32_t max_tokens,
         const std::function<bool(std::int64_t)>& callback = {},
@@ -115,7 +128,8 @@ public:
         const std::function<bool(std::int64_t)>& callback = {},
         const std::function<void(std::size_t, double)>& prefill_callback = {},
         int prefill_chunk_size = 4096, std::optional<int> stop_token = std::nullopt,
-        MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7) const;
+        MlxDFlash2GenerationStats* stats = nullptr, int maximum_drafts = 7,
+        const MfqTokenConstraintPtr& constraint = {}) const;
 
 private:
     struct TreeProposals;

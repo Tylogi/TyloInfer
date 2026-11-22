@@ -3,6 +3,7 @@
 // Native Qwen4-Exp model graph and generation lifecycle.
 
 #include "mfq_container.h"
+#include "../dflash2/mlx_dflash2.h"
 #include "mlx_mtp.h"
 #include "mlx_prefix_cache.h"
 #include "mlx_transformer.h"
@@ -101,6 +102,7 @@ struct MlxQwen4TextSessionState {
     std::vector<MlxQwen4LayerCacheSnapshot> layers;
     std::vector<MlxQwen4LayerCacheSnapshot> mtp_layers;
     std::optional<mlx::core::array> last_hidden;
+    std::optional<MlxDFlash2Context> dflash;
     int cache_position = 0;
     int cache_batch = 0;
     std::size_t bytes = 0;
@@ -159,6 +161,10 @@ public:
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
         const std::vector<std::vector<std::int64_t>>& tokens,
         std::optional<mlx::core::array>* packed_logits = nullptr);
+    std::vector<std::pair<mlx::core::array, mlx::core::array>> forward_request_windows(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::vector<std::int64_t>>& tokens,
+        std::optional<mlx::core::array>* packed_logits, bool native_mtp);
     bool can_verify_request_tree(const MlxQwen4RequestCache& cache) const;
     mlx::core::array forward_request_trees(
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
@@ -244,6 +250,10 @@ public:
     std::vector<std::pair<std::string, double>> mtp_session_metrics() const;
 
 private:
+    mlx::core::array forward_request_trees_with_hidden(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
+        int tuned_dflash_width, std::optional<mlx::core::array>* packed_hidden);
     std::int32_t generate_prepared_impl(
         const MlxPreparedPrompt& prompt,
         const MlxSamplingParams& sampling,

@@ -55,6 +55,7 @@ struct LinearAttentionBlock final : ::Block {
   FFN ffn;
   mfq::cuda::RecurrentMixerState mixer;
   bool transposed_gdn_state = true;
+  bool batch_verification = false;
   int64_t speculative_ffn_batches = 0;
   int64_t speculative_projection_batches = 0;
   LinearRecurrentInputs speculative_inputs;
@@ -365,7 +366,7 @@ struct LinearAttentionBlock final : ::Block {
   forward_attention_cuda(CudaExecutionContext &execution,
                          mfq_tensor_backend::Tensor x,
                          LinearRecurrentInputs *captured = nullptr,
-                         GgufProjectionInput* normalized_ffn_input=nullptr) {
+                         GgufProjectionInput* normalized_ffn_input=nullptr, bool attention_only=false) {
     auto &profiler = execution.profiler;
     transposed_gdn_state = execution.config.gdn_transposed_state;
     int64_t B = x.size(0), T = x.size(1), H = x.size(2);
@@ -390,7 +391,7 @@ struct LinearAttentionBlock final : ::Block {
     GgufProjectionInput normalized_projection_input;
     std::unique_ptr<PrefillInputScope> normalized_prefill_input;
     PrefillProduct scaled_output;
-    const bool scaled_residual=T>=512 && x.scalar_type()==mfq_tensor_backend::kFloat16 &&
+    const bool scaled_residual=!attention_only && T>=512 && x.scalar_type()==mfq_tensor_backend::kFloat16 &&
         execution.kl_mmq.mode==KlMmqMode::Default && !execution.config.diagnostic_fp32_residual &&
         ffn_norm.scalar_type()==mfq_tensor_backend::kFloat32 && ffn_norm.is_contiguous() && ffn_norm.numel()==H;
 
@@ -582,25 +583,29 @@ struct LinearAttentionBlock final : ::Block {
               dt_bias.scalar_type()==mfq_tensor_backend::kFloat32 && dt_bias.is_contiguous() &&
               a_log.scalar_type()==mfq_tensor_backend::kFloat32 && a_log.is_contiguous() &&
               linear_norm.scalar_type()==mfq_tensor_backend::kFloat32 && linear_norm.is_contiguous();
-          if(fused_core_inputs && captured && B==1 && T>=2 && T<=8 && taps==4 && dk==128) {
+          if(fused_core_inputs && captured && (B==1 || batch_verification) && T>=2 && T<=8 && taps==4 && dk==128) {
             const auto& p=projected;
             auto weight=conv_weight;
             if(weight.dim()==2 && weight.size(0)==conv_dim && weight.size(1)==taps)
               weight=weight.reshape({conv_dim,1,taps});
             const bool quantized=out_proj.is_gguf() && !out_proj.gguf.prefers_original_input();
-            const bool position_major=quantized && out_proj.gguf.prefers_position_major_q8(T);
+            const auto projection_rows=B*T;
+            const bool position_major=quantized && out_proj.gguf.prefers_position_major_q8(projection_rows);
             auto result=profiler.measure("linear.verify_core",[&] {
               return gdn_verify_window_cuda(p.qkv,p.output_gate,p.alpha.reshape({B,T,nv}),p.beta.reshape({B,T,nv}),
                 mixer.convolution,mixer.recurrent,weight,dt_bias,a_log,linear_norm,nk,nv,
                 qwen_config.rms_norm_eps,qwen_config.rms_norm_eps,true,false,transposed_gdn_state,
-                tiled_v_heads,quantized,position_major);
+                tiled_v_heads,quantized,position_major,batch_verification);
             });
             captured->qkv=p.qkv;captured->value=result[3];
             captured->batch=B;captured->tokens=T;captured->split=false;captured->fused=true;
-            mixer.convolution.copy_(result[1]);mixer.speculative_recurrent=result[2];
+            if(!batch_verification) {
+              mixer.convolution.copy_(result[1]);
+              mixer.speculative_recurrent=result[2];
+            }
             return profiler.measure("linear.out_proj_prepared",[&] {
               if(!quantized)return out_proj.forward(execution,result[0].reshape({B,T,vsz}));
-              return out_proj.gguf.forward_q8(result[0],T,mfq_tensor_backend::kFloat32,position_major).reshape({B,T,H});
+              return out_proj.gguf.forward_q8(result[0],projection_rows,mfq_tensor_backend::kFloat32,position_major).reshape({B,T,H});
             });
           }
           if(fused_core_inputs && T==1 && !captured) {
@@ -905,6 +910,7 @@ struct LinearAttentionBlock final : ::Block {
         },
         [&](mfq_tensor_backend::Tensor residual,
             mfq_tensor_backend::Tensor oo) {
+          if (attention_only) return std::array<mfq_tensor_backend::Tensor, 2>{oo.reshape({B,T,H}), {}};
           auto attn_pair =
               profiler.measure("linear.attn_residual_ffn_norm", [&]() {
                 auto rr = residual.reshape({-1, H});

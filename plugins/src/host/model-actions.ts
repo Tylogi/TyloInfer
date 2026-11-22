@@ -99,11 +99,13 @@ export function resolveModelAction(endpoint: string, payload: any): BridgeCall |
   }
   if (endpoint === 'instances/configure') {
     if (!fields(payload, ['instance_id', 'request', 'confirmed'], ['instance_id', 'request', 'confirmed']) || !uuid(payload.instance_id) || payload.confirmed !== true
-      || !fields(payload.request, ['pinned', 'idle_ttl_seconds']) || Object.keys(payload.request).length === 0
+      || !fields(payload.request, ['pinned', 'idle_ttl_seconds', 'dflash2_enabled']) || Object.keys(payload.request).length === 0
       || !optional(payload.request, 'pinned', value => typeof value === 'boolean')
+      || !optional(payload.request, 'dflash2_enabled', value => typeof value === 'boolean')
       || !optional(payload.request, 'idle_ttl_seconds', nullable(value => integer(value)))) return null;
     return write('/api/v1/runtime/instances/' + payload.instance_id, payload.request,
       value => object(value) && sameId(value.id, payload.instance_id) && typeof value.pinned === 'boolean'
+        && (!Object.hasOwn(payload.request, 'dflash2_enabled') || value.dflash2_enabled === payload.request.dflash2_enabled)
         && nullable(value => integer(value))(value.idle_ttl_seconds), 'PATCH');
   }
   if (endpoint === 'context/configure') {

@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 import { ModelLoadContextView } from '../../../studio/web/src/features/models/ModelLoadContextView.tsx';
 import { ModelLoadPolicy } from '../../../studio/web/src/features/models/ModelLoadPolicy.tsx';
+import { DFlash2Controls } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
 import { Icon, SettingRow } from '../../../studio/web/src/app/display.tsx';
 import { Dialog } from './shared-primitives.tsx';
 import { PageTabs } from './page-navigation.tsx';
 
 import { nativeLoadRequest } from './model-load-options.ts';
 import { companionsAvailable, validCompanionPaths } from './companion-options.ts';
-export function ModelLoadDialog({ model, mode, options, onOptions, runtime, api, disabled, t, tr, onClose, onLoad, triggerRef, companionIds = [], artifacts = [] }) {
+export function ModelLoadDialog({ model, mode, options, onOptions, runtime, api, disabled, t, tr, onClose, onLoad, triggerRef, companionIds = [], artifacts = [], draftDownloadAvailable, onDownloadDraft }) {
   const [tab, setTab] = useState('context');
   const [ready, setReady] = useState(false);
   const patch = value => onOptions({ ...options, ...value });
@@ -23,6 +24,9 @@ export function ModelLoadDialog({ model, mode, options, onOptions, runtime, api,
       {companionIds.length > 0 && <SettingRow title={tr('已选 Engram 配套资产', 'Selected Engram companion')} detail={tr('加载时由核心核实文件与兼容性。', 'The core verifies files and compatibility on load.')} trailing={<strong>{(pathCompanions ? companionIds : companionIds.map(id => artifacts.find(item => item.id === id)?.name || tr('资产已不可用', 'Artifact unavailable'))).join(' · ')}</strong>} />}
       {mode !== 'configure' && !validCompanions && <p role="alert">{tr('请选择已登记的配套资产，或填写服务端完整路径。', 'Select a registered companion or enter its full server path.')}</p>}
       <fieldset disabled={disabled}>
+        <DFlash2Controls model={model} artifacts={artifacts} backend={runtime?.backend} disabled={disabled}
+          loadReady={ready && validCompanions} downloadAvailable={draftDownloadAvailable} tr={tr} onDownload={onDownloadDraft}
+          onLoad={draftId => onLoad({ ...nativeLoadRequest(model, options), dflash2_artifact_id: draftId }, companionIds)} />
         <section role="tabpanel" aria-label={tab === 'context' ? tr('上下文与 KV', 'Context and KV') : tr('驻留与设备', 'Residency and device')}>
           {tab === 'context' ? <ModelLoadContextView value={options.context} onChange={context => patch({ context })} disabled={disabled}
             model={model} device={options.devices[0]} readPlan={api.loadPlan} onReadyChange={setReady} /> : <ModelLoadPolicy catalog={catalog} />}

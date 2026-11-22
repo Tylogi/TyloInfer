@@ -41,7 +41,7 @@ void configure_dflash2(MlxEngineComponents& components,
     };
     components.speculative_generate = [runtime, draft](const auto& prompt, const auto& sampling,
         MlxGenerationJob& job, const auto& constraint, int chunk_size) {
-        if (!mlx_dflash2_sampling_supported(sampling, constraint)) return false;
+        if (!mlx_dflash2_sampling_supported(sampling)) return false;
         if (!runtime || !runtime->has_value()) throw std::logic_error("DFlash2 target is unavailable");
         auto& target = runtime->value();
         target.reset_generation_state();
@@ -52,7 +52,7 @@ void configure_dflash2(MlxEngineComponents& components,
         draft->generate(target, prompt, parameters, sampling.max_tokens,
             [&](auto token) { MlxResidentBudgetScope::reserve(0); return job.token(token); },
             [&](auto tokens, auto ms) { MlxResidentBudgetScope::reserve(0); job.prefill({tokens, ms, 0, ms}); },
-            chunk_size, std::nullopt, &stats, sampling.mtp_max_draft_tokens);
+            chunk_size, std::nullopt, &stats, sampling.mtp_max_draft_tokens, constraint);
         job.mtp = {};
         job.mtp.available = true;
         job.mtp.used = stats.cycles > 0;

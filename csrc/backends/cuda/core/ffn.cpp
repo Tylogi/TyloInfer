@@ -454,8 +454,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             }
             return mfq_tensor_backend::cat(outputs, 0).reshape(xh.sizes());
         }
-        if (!shared || moe_top_k <= 0 || (!moe_router.defined() && !moe_router_projection) ||
-            (!moe_shared_ungated && !moe_shared_gate.defined())) {
+        if (moe_top_k <= 0 || (!moe_router.defined() && !moe_router_projection) ||
+            (shared && !moe_shared_ungated && !moe_shared_gate.defined())) {
             throw std::runtime_error("incomplete MoE FFN state");
         }
         auto xf = xh.reshape({-1, xh.size(-1)}).contiguous();
@@ -468,7 +468,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         const bool expert_parallel = expert_parallel_moe_compatible();
         const bool use_pipeline=bool(moe_pipeline_forward) &&
             execution.kl_mmq.mode==KlMmqMode::Default && !execution.force_moe_materialized_swiglu;
-        const bool deferred_shared=native_routed && !use_pipeline && !moe_ungated_experts &&
+        const bool deferred_shared=shared && native_routed && !use_pipeline && !moe_ungated_experts &&
             activation==ActivationKind::silu_gated && xf.size(0)<=32;
         Tensor deferred_shared_output;
         const auto run_shared=[&] {
@@ -597,8 +597,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         }
                     }
                 }
-                auto shared_output=deferred_shared?Tensor{}:run_shared();
-                if (!moe_split_gate_up && !moe_shared_ungated) {
+                auto shared_output=deferred_shared || !shared?Tensor{}:run_shared();
+                if (shared && !moe_split_gate_up && !moe_shared_ungated) {
                     shared_gate_logits = profiler.measure("moe.shared_gate", [&]() {
                         return mfq_tensor_backend::matmul(xf32, moe_shared_gate.transpose(0, 1))
                             .contiguous();
@@ -662,6 +662,22 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     return {finish_latent(std::move(reduced)),true};
                 }
                 if (moe_gguf) {
+                    if (moe_gguf->gate_up) {
+                        if (situ_beta>0) {
+                            auto reduced=profiler.measure("moe.gguf.packed",[&] {
+                                return moe_gguf->forward_packed_situ(routed_input,selected.at(0),selected.at(1),
+                                    situ_beta,situ_linear_beta,shared_work);
+                            });
+                            return {finish_latent(std::move(reduced)),true};
+                        }
+                        if (shared_work) shared_work();
+                        auto projected=moe_gguf->gate_up->forward(routed_input,selected.at(0));
+                        const auto width=projected.size(-1)/2;
+                        auto hidden=dense_expert_activation(activation,projected.narrow(-1,0,width),
+                                projected.narrow(-1,width,width),swiglu_limit);
+                        auto pairs=moe_gguf->down->forward(hidden,selected.at(0));
+                        return {finish_latent(moe_weighted_reduce_cuda(pairs,selected.at(1))),true};
+                    }
                     TYLOINFER_RUNTIME_CHECK(moe_gguf->up && moe_gguf->down &&
                         (moe_ungated_experts || moe_gguf->gate), "incomplete GGUF routed expert banks");
                     if (!moe_ungated_experts && activation == ActivationKind::silu_gated) {
@@ -933,6 +949,9 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
 #endif
             },
             [&](ExpertOutput experts, Tensor shared_half, const auto &selected) {
+                if (!shared)
+                    return experts.reduced ? std::move(experts.values) :
+                        moe_weighted_reduce_cuda(experts.values,selected.at(1));
                 if(deferred_shared) {
                     shared_half=std::move(deferred_shared_output);
                     if(shared_half.defined())mfq_cuda_record_stream(shared_half,mfq_get_current_cuda_stream(xf.get_device()));

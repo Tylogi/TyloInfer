@@ -15,7 +15,7 @@ function ModelLibrary({ state, runtime, tr, openLoad, openUnload, openSettings, 
   const catalog = {
     runtime, artifacts, instances: state.inventory.instances, busy: disabled || deletionBusy, modelFilter: query, setModelFilter: setQuery,
     prepareModelDeletion,
-    filteredArtifacts: artifacts.filter(item => (item.name || item.id).toLowerCase().includes(query.toLowerCase())),
+    filteredArtifacts: artifacts.filter(item => [item.name || item.id, item.dflash2_target].some(name => name?.toLowerCase().includes(query.trim().toLowerCase()))),
     connectionRevision: refreshKey, loadDeviceIds: undefined,
     loadContextForModel: name => loadContextForModel(name) || { jev_weights: 'stream' },
     loadArtifact: (name, companionIds) => { const model = artifacts.find(item => item.name === name); if (model) openLoad(model, companionIds); },
@@ -59,7 +59,9 @@ export function ModelsContent({ values, state, actions, t, api, mutation, refres
     if (result) setDeletion({ plan: null, loading: false, error: null });
   }
   return <>{values.status?.error && <CoreError error={values.status.error} />}<ModelRegistration api={api} mutation={mutation} refreshKey={refreshKey} open={directoryOpen} onOpenChange={onDirectoryChange} triggerRef={directoryTrigger} startPath={folderPath} onRegistered={rememberFolder} />
-    {catalogState.inventory && <ModelManagement state={catalogState} actions={actions} t={t} tr={tr} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} runtime={runtime} renderCatalog={controls => <ModelLibrary {...controls} folderPath={folderPath} refreshKey={refreshKey} state={catalogState} runtime={runtime} tr={tr} prepareModelDeletion={prepareModelDeletion} deletionBusy={deletion.loading} chooseDirectory={chooseDirectory} openFiles={id => { fileTrigger.current = document.activeElement; setFilesModel(id); }} />} />}
+    {catalogState.inventory && <ModelManagement state={catalogState} actions={actions} t={t} tr={tr} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} runtime={runtime}
+      draftDownloadAvailable={values.job_kinds?.value?.data?.some(job => job.kind === 'download.huggingface') === true}
+      renderCatalog={controls => <ModelLibrary {...controls} folderPath={folderPath} refreshKey={refreshKey} state={catalogState} runtime={runtime} tr={tr} prepareModelDeletion={prepareModelDeletion} deletionBusy={deletion.loading} chooseDirectory={chooseDirectory} openFiles={id => { fileTrigger.current = document.activeElement; setFilesModel(id); }} />} />}
     {deletion.loading && <p role="status">{tr('正在读取删除范围…', 'Reading deletion scope…')}</p>}{deletion.error && <CoreError error={deletion.error} />}
     <ModelDeleteDialog catalog={{ modelDeletion: deletion.plan, busy: mutation.busy || mutation.unknown, deletionTriggerRef: deleteTrigger, cancelModelDeletion: () => setDeletion({ plan: null, loading: false, error: null }), confirmModelDeletion }} />
     {filesModel && <ModelRegistration key={filesModel} api={api} mutation={mutation} refreshKey={refreshKey} open modelId={filesModel} onOpenChange={open => { if (!open) setFilesModel(null); }} triggerRef={fileTrigger} />}

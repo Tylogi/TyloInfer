@@ -1,10 +1,12 @@
 import { build } from 'vite';
 import postcss from 'postcss';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import manifest from './package.json' with { type: 'json' };
 
 const root = fileURLToPath(new URL('.', import.meta.url));
+const dsbot = process.argv.includes('--dsbot');
+const output = new URL(dsbot ? './dist/dsbot/' : './', import.meta.url);
 const clientEntry = fileURLToPath(new URL('./src/client/client.tsx', import.meta.url));
 const studioSource = new URL('../studio/web/src/', import.meta.url);
 const versionSource = await readFile(new URL('../studio/_version.py', import.meta.url), 'utf8');
@@ -48,12 +50,29 @@ const result = await build({ configFile: false, root, logLevel: 'error', plugins
     const path = id.replaceAll('\\', '/');
     if (path.startsWith(studioRoot) && /\.tsx$/.test(path) && !/import\s+React\b/.test(code)) return `import React from 'react';\n${code}`;
   },
-}], define: { __TYLOINFER_PRODUCT_VERSION__: JSON.stringify(productVersion), __TYLOINFER_PLUGIN_NAME__: JSON.stringify(manifest.name) }, oxc: { jsx: { runtime: 'classic' } },
+}], define: { __TYLOINFER_PRODUCT_VERSION__: JSON.stringify(productVersion), __TYLOINFER_PLUGIN_NAME__: JSON.stringify(manifest.name), __TYLOINFER_DSBOT__: JSON.stringify(dsbot) }, oxc: { jsx: { runtime: 'classic' } },
   build: { write: false, minify: false, lib: { entry: clientEntry, name: 'TyloInferClient', formats: ['iife'] },
     rollupOptions: { external: ['react'], output: { globals: { react: 'React' } } } } });
 const outputs = Array.isArray(result) ? result : [result];
 const chunks = outputs.flatMap((item) => item.output).filter((item) => item.type === 'chunk');
 if (chunks.length !== 1) throw new Error('Expected one self-contained Client factory');
-await mkdir(new URL('./lib/', import.meta.url), { recursive: true });
-await writeFile(new URL(manifest.exports['./client'], import.meta.url), `window.__ModuleLoader__.load({ id: ${JSON.stringify(manifest.name)}, factory(require) {\nconst React = require('react');\n${chunks[0].code}\nreturn TyloInferClient;\n} });\n`);
+await mkdir(new URL('lib/', output), { recursive: true });
+const portal = dsbot ? "const createDSBotPortal = require('react-dom').createPortal;\n" : '';
+await writeFile(new URL(manifest.exports['./client'], output), `window.__ModuleLoader__.load({ id: ${JSON.stringify(manifest.name)}, factory(require) {\nconst React = require('react');\n${portal}${chunks[0].code}\nreturn TyloInferClient;\n} });\n`);
+
+if (dsbot) {
+  // The Host half is already compiled to lib/host/ by `npm run build`; the DSBot bundle carries it.
+  await cp(new URL('./lib/host/', import.meta.url), new URL('lib/host/', output), { recursive: true });
+  const { name, version, type, engines, exports, dsh } = manifest;
+  const packageManifest = {
+    name, version, type, engines, dsh,
+    description: 'TyloInfer inference controls for DSBot',
+    license: manifest.license,
+    exports: { ...exports, './bridge': './lib/host/index.js' },
+    peerDependencies: { react: manifest.devDependencies.react, 'react-dom': manifest.devDependencies.react },
+    files: ['lib', 'cordis.patch.yml'],
+  };
+  await copyFile(new URL('dsbot.patch.yml', import.meta.url), new URL('cordis.patch.yml', output));
+  await writeFile(new URL('package.json', output), JSON.stringify(packageManifest, null, 2) + '\n');
+}
 console.log('CLIENT_BUILD_OK external_react=true factory_count=1');

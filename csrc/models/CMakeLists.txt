@@ -7,6 +7,9 @@ add_library(mfq-models STATIC
     qwen4_exp/config.cpp
     gemma4/config.cpp
     glm_dsa/config.cpp
+    hy4_flash/dfly2_config.cpp
+    hy4_flash/config.cpp
+    inkling2/config.cpp
     minicpmo45/config.cpp
     nemotron_h/config.cpp
     nemotron_h/vision.cpp

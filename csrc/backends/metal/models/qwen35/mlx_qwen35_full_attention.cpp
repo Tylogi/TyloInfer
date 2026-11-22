@@ -355,7 +355,7 @@ void MlxQwen35FullAttentionBlock::reset_cache(
         cache_->reset();
         return;
     }
-    cache_ = std::make_unique<MlxKvCache>(
+    cache_.emplace(
         batch,
         checked_int(
             config_.num_key_value_heads,
@@ -474,6 +474,19 @@ array MlxQwen35FullAttentionBlock::forward_decision(const array& input, int stat
 }
 
 array MlxQwen35FullAttentionBlock::forward_impl(
+    const array& input,
+    const array* positions,
+    int position_offset,
+    bool use_cache,
+    int state_tokens) {
+    auto residual = input + forward_attention(input, positions, position_offset, use_cache, state_tokens);
+    detail::profile_eval("qwen35.full_attention.output", residual);
+    residual = residual + forward_feed_forward(residual);
+    detail::profile_eval("qwen35.ffn", residual);
+    return residual;
+}
+
+array MlxQwen35FullAttentionBlock::forward_attention(
     const array& input,
     const array* positions,
     int position_offset,
@@ -664,11 +677,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
         attended = attended * mlx::core::sigmoid(gate);
     }
 
-    auto residual = input + output_(attended);
-    detail::profile_eval("qwen35.full_attention.output", residual);
-    residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-    detail::profile_eval("qwen35.ffn", residual);
-    return residual;
+    return output_(attended);
 }
 
 } // namespace mfq::metal

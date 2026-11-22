@@ -34,7 +34,7 @@ export function ServiceContent({ values, inventory, api, mutation, tr, openSetti
       <PolicyPanel title={tr('API 参数', 'API parameters')} entry={values.listener}>{value => <>
         <SettingRow title={tr('模型 ID', 'Model ID')} detail={tr('用于对话补全请求。', 'Used for chat completions.')} trailing={<div className="server-row-actions server-model-control"><ModelAliasMappingView key={refreshKey} models={runtimeModelNames([], inventory?.instances || [])} selectedModel={selectedModel} services={aliasServices} connectionScope={confirmation.connectionScope} notify={() => {}} writeBlocked={disabled} /></div>} />
         {values.model_aliases?.error && <CoreError error={values.model_aliases.error} />}
-        <SettingRow title={tr('服务连接', 'Service connection')} trailing={<button type="button" onClick={openSettings}>{tr('Agent 提供商设置', 'Agent provider settings')}</button>} />
+        {openSettings && <SettingRow title={tr('服务连接', 'Service connection')} trailing={<button type="button" onClick={openSettings}>{tr('Agent 提供商设置', 'Agent provider settings')}</button>} />}
         <ListenerControls listener={value} api={api} mutation={mutation} disabled={disabled} tr={tr} />
         <AuthenticationControls entry={authentication} api={api} mutation={mutation} disabled={disabled} tr={tr} />
       </>}</PolicyPanel>

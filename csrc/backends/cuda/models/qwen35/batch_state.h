@@ -88,6 +88,7 @@ class Qwen35BatchStateAdapter {
 
     void suspend_decode();
     void prepare_prefill(QwenBatchRequestState &request, std::int64_t offset, std::int64_t tokens);
+    void adopt_prefix(QwenBatchRequestState &request, std::int64_t offset, std::int64_t tokens);
     void pause_prefill(QwenBatchRequestState &request);
     void activate(QwenBatchRequestState &request);
     void resume_decode(std::int64_t cache_position);

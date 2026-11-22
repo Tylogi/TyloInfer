@@ -42,6 +42,8 @@ export interface ModelLoadPlanQuery {
   preallocate: boolean;
   device?: string;
   streamed_jev: boolean;
+  ssd_kv?: boolean;
+  ram_preallocated?: boolean;
 }
 
 export interface DownloadDirectoryStatus {
@@ -142,7 +144,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize: number | 'auto' = 'auto',
-    policy: { jev_weights?: 'stream' | 'vram'; pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[] } = {},
+    policy: { jev_weights?: 'stream' | 'vram'; pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[]; dflash2_artifact_id?: string; replace_instance_id?: string } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -160,6 +162,8 @@ export const modelsApi = {
         } } : {}),
         ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
         ...(policy.gguf_companions?.length ? { gguf_companions: policy.gguf_companions } : {}),
+        dflash2_artifact_id: policy.dflash2_artifact_id,
+        replace_instance_id: policy.replace_instance_id,
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });

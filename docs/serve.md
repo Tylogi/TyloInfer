@@ -288,16 +288,16 @@ uv run --project studio python -m serve \
   buffers before growing the tile. Ordinary and MTP prefill share this policy.
   Explicit integers from `1` to `8192` set a smaller limit and are always passed
   to the worker. On Metal and HIP, `auto` preserves their native default policy.
-- `--max-requests-per-runtime N` enables continuous batching on supported
-  native paths; capacity limits and scheduling behavior are documented in
-  [Flash-Next continuous batching](runtime/cuda-continuous-batching.md).
+- `--max-requests-per-runtime N` configures request capacity per worker. It
+  defaults to 8 on CUDA and Metal and 1 on HIP. Batching eligibility depends on
+  the backend, model, and request. See [CUDA Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
+  and [Metal native serving](#metal-native-serving).
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 Persistent Session KV caching is configured with `--prefix-cache-dir`,
 `--prefix-cache-disk-size`, `--prefix-cache-hot-size`, and
-`--prefix-cache-block-tokens`; `--no-prefix-cache` disables it entirely. The
-cache survives restarts in the configured directory and its entries can be
-inspected and purged through the [runtime API](api/http.md).
+`--prefix-cache-block-tokens`. The cache survives restarts in the configured
+directory. You can inspect and purge entries through the [runtime API](api/http.md).
 
 Resident-model admission is capped by `--max-runtime-memory`, and
 `--moe-gpu-cache-gb` bounds the resident routed-expert cache (`0` keeps
@@ -310,9 +310,19 @@ unpinned models; instances may override it through the runtime API.
 
 ## Speculative decoding (MTP / DFlash2)
 
-Native MTP needs predictor weights compatible with the target graph; enabling
-MTP is not enough when those weights are absent. DFlash2 needs a matching draft
-checkpoint. The current CLI exposes these explicit companion controls for CUDA:
+Native MTP requires predictor weights compatible with the target graph.
+DFlash2 requires a matching draft checkpoint.
+
+For Flash-Next on Metal or CUDA, open the target model's settings under
+**Models** in Studio or **Inference engine → Models** in Agent or DS Bot.
+**Download DFlash2 draft** queues the matching Hugging Face checkpoint in the
+configured download directory. **Load DFlash2 draft** binds a registered draft
+to the target. If the target is already running, wait for its requests to finish
+and confirm the reload, which clears active KV state. After loading, **Enable
+DFlash2** controls the instance without reloading its weights. The service MTP
+switch also applies to DFlash2.
+
+The managed `python -m serve` CLI also exposes explicit companion controls.
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
@@ -325,13 +335,13 @@ uv run --project studio python -m serve --backend cuda --model /models/target.gg
 ```
 
 Replace the paths with compatible artifacts. The draft switches are mutually
-exclusive and require CUDA. The native companion must be an existing file;
-the DFlash2 path must be an existing directory.
+exclusive. The CUDA native MTP companion must be an existing file. DFlash2
+supports Metal and CUDA and takes an existing checkpoint directory.
 
 | Option | Effect | Default |
 | --- | --- | --- |
 | `--mtp-native-draft PATH` | Native MTP GGUF companion for a CUDA GGUF target. | No explicit override |
-| `--dflash2-draft PATH` | DFlash2 checkpoint directory for the supported CUDA path. | No explicit override |
+| `--dflash2-draft PATH` | DFlash2 checkpoint directory for compatible CUDA or Metal targets. | No explicit override |
 | `--spec-min-p P` / `--mtp-min-probability P` | CUDA greedy draft probability threshold, in `[0,1]`; `0` disables the threshold. | No CLI override |
 | `--draft-conf P` / `--dflash2-draft-confidence P` | CUDA greedy DFlash2 cumulative confidence, in `[0,1]`; nonzero overrides `--spec-min-p`. | No CLI override |
 | `--mtp-cost-aware` / `--no-mtp-cost-aware` | Select CUDA greedy native MTP depth using measured cost and calibrated probabilities. | No CLI override |
@@ -348,12 +358,80 @@ baseline; `"enable_mtp": true` permits speculation and
 an explicit body value takes precedence. Other header values are ignored.
 Without either override, the chat parser defaults to `true`. This is a
 request-local chat control, not a `/v1/systemone` option. Availability still depends on
-model weights, runtime support, and scheduling (see
-[continuous batching limits](runtime/cuda-continuous-batching.md)). Inspect
+model weights, runtime support, and scheduling. Inspect
 reported `mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate` when present;
 do not assume the requested path actually ran. The metrics name is a retained
 wire-format identifier, not the public CLI name. See the
 [performance guide](benchmarking.md) for measurement steps.
+
+### Metal native serving
+
+The native Metal HTTP server supports continuous batching on Flash-Next,
+including ordinary decode, native MTP with a compatible single-layer
+predictor without predictor LoRA, and DFlash2 with a matching draft checkpoint.
+`--continuous-batching N` sets the maximum concurrent requests for this worker.
+Values of `0` and `1` run serially.
+
+To serve Flash-Next with DFlash2 directly, use the binary from the
+[Metal build](build.md#quick-start) and pass the draft directory to the worker.
+
+```shell
+TYLOINFER_METAL_DFLASH2_TREES=1 build/metal/mfq-decode-metal \
+  --transport http --model /models/target.gguf \
+  --dflash2-draft /models/matching-dflash2 --continuous-batching 8 \
+  --host 127.0.0.1 --port 8080 --ctx-size 32768
+```
+
+`TYLOINFER_METAL_DFLASH2_TREES=1` enables tree verification for eligible
+greedy requests. The DFlash2 batched path requires text requests with
+`enable_mtp` enabled, an output budget above one token, zero presence and
+frequency penalties, and a repetition penalty of one. Grammar, JSON schema,
+and tool constraints can affect path selection.
+
+Send test requests to the worker's `/runtime/generate` route. Check
+`metrics.mtp_used` in the response. Agent, DS Bot, and other OpenAI-compatible
+clients connect to the managed API. See [native HTTP transport](runtime/transport.md#private-http).
+
+```shell
+curl -fsS http://127.0.0.1:8080/runtime/generate \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "input": {"messages": [{"role": "user", "content": "Explain continuous batching."}]},
+    "sampling": {"enable_mtp": true, "temperature": 0, "max_new_tokens": 128},
+    "stream": false
+  }'
+```
+
+### SenseNova Loop-9B and Inkling 2 Mini on Metal
+
+Load the text GGUF with `--model`. Prefix cache saves the attention and
+recurrent state for each pass through the repeated layers. SenseNova Loop-9B
+can use the NextN predictor embedded in its GGUF. Use the per-request
+`enable_mtp` setting to control it.
+
+### Hy4 Flash on Metal
+
+Keep the two numbered GGUF shards in the same directory and pass the first shard
+to the native worker. The worker reads Engram rows from the CPU-mapped second
+shard. Set `TYLOINFER_QSA_KV_BUDGET_BYTES` to enable the shared RAM/SSD store for
+IndexPool and latent KV.
+
+The TurboQuant KV setting compresses the indexed MLA cache and stores pooled
+IndexPool keys in FP16 in GPU memory and in the RAM/SSD store. Index scores and
+incomplete pooling groups use FP32. Set `TYLOINFER_KV_TURBOQUANT_BITS` when
+launching the native worker directly.
+
+To enable DFly2, keep the official BF16 draft shard and its `config.json` in the
+same directory. The per-request `enable_mtp` and `mtp_max_draft_tokens` settings
+control draft use and depth.
+
+```shell
+mfq-decode-metal --server --model /models/Hy4-flash-IQ2_AH-00001-of-00002.gguf \
+  --dfly2-draft /models/hy4-bf16/model-00148-of-00148.safetensors
+```
+
+Studio's `python -m serve --backend metal` accepts the same `--dfly2-draft`
+option for Hy4 Flash workers.
 
 ## Jev decision-model weight placement
 
@@ -414,7 +492,6 @@ For API loading, omit `jev_weights` to use d1 residency automatically, or select
 | `--prefix-cache-disk-size SIZE` | Maximum persistent Session KV cache size, such as `100G`. | None |
 | `--prefix-cache-hot-size SIZE` | Maximum hot prefix-cache size, such as `2G`; its memory tier depends on the backend. | None |
 | `--prefix-cache-block-tokens N` | Tokens per content-addressed Session KV block. | Runtime default |
-| `--no-prefix-cache` | Disable persistent Session KV caching. | Off |
 | `--runtime-idle-timeout SECONDS` | Default unload delay for an idle unpinned model. | Runtime default |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
 | `--backend {auto,cuda,hip,metal}` | Select or detect the native backend. | `auto` |

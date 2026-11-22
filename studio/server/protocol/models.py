@@ -628,6 +628,9 @@ class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
     gguf_companions: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list, max_length=16)
+    dflash2_artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    dflash2_enabled: bool = True
+    replace_instance_id: UUID | None = None
     device_ids: list[str] = Field(default_factory=list)
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
     pin: bool = False
@@ -884,6 +887,8 @@ class RuntimeInstanceResource(ProtocolModel):
     pinned: bool = False
     mtp_supported: bool = False
     mtp_available: bool = False
+    dflash2_draft: str | None = None
+    dflash2_enabled: bool = False
     qsa_kv_offload_supported: bool = False
     kv_quantization_supported: bool = False
     kv_memory_supported: bool = False
@@ -897,6 +902,7 @@ class RuntimeInstanceResource(ProtocolModel):
 class UpdateRuntimeInstanceRequest(ProtocolModel):
     pinned: bool | None = None
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
+    dflash2_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_update(self) -> UpdateRuntimeInstanceRequest:
@@ -904,6 +910,8 @@ class UpdateRuntimeInstanceRequest(ProtocolModel):
             raise ValueError("at least one runtime policy field is required")
         if "pinned" in self.model_fields_set and self.pinned is None:
             raise ValueError("pinned must be boolean")
+        if "dflash2_enabled" in self.model_fields_set and self.dflash2_enabled is None:
+            raise ValueError("dflash2_enabled must be boolean")
         return self
 
 
@@ -954,7 +962,8 @@ class ModelArtifactResource(ProtocolModel):
     name: str = Field(min_length=1, max_length=255)
     architecture: str = Field(min_length=1, max_length=128)
     format: Literal["tq", "hf", "gguf"] = "tq"
-    asset_kind: Literal['model', 'ple', 'engram'] = 'model'
+    asset_kind: Literal['model', 'ple', 'engram', 'dflash2'] = 'model'
+    dflash2_target: str | None = Field(default=None, max_length=128)
     owned_file_bytes: int | None = Field(default=None, ge=0)
     gguf_companion_required: bool = False
     structured_decisions: bool = False

@@ -5,10 +5,12 @@ adapter with a TyloInfer route and a protocol-status plugin. It targets the
 verified DSH `0.2.2-rc.2` composition; it is not a Core fork or a completed
 redistributable release.
 
-The default provider uses the local inference API and starts with an empty
-model list. Configure/discover actual models through the official Models
-settings; installing the bundle does not load weights or run inference. Other
-official provider routes and their credential services remain available.
+The default provider starts with an empty model list and connects to the local
+inference API. The Host periodically registers loaded model IDs or their
+serving aliases, preserving settings for matching IDs. Select a registered
+model and configure its context and output budgets in DSH. See the
+[model registration and output budget guide](../../docs/agent-host.md#模型登记和输出预算).
+Other official provider routes and their credential services remain available.
 
 The same package ships the browser Client from [`../client/`](../client/).
 DSH's Client module system loads it rather than mounting another application root.
@@ -34,7 +36,7 @@ activation. It returns no credentials, profile paths, or session contents.
 The optional `connectionFile` Config field writes a private authenticated URL
 for local validation; never publish that file or log its contents.
 
-Agent model/tool execution migration, automatic model-capability discovery,
-independent-upgrade and final packaging checks, full compatibility tests, and
-release artwork are not completed by this bundle. The legacy SDK prototype remains separate until
-those migrations are validated.
+Web chat against a loaded TyloInfer model was verified with the pinned DSH
+release in both the standalone Agent and DS Bot 0.3.8. The
+[launch guide](../../docs/agent-host.md) covers both installations. The legacy
+SDK prototype stays in the compatibility-test directory.

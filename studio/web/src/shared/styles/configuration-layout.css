@@ -31,7 +31,7 @@
 .model-settings-dialog > header { flex: 0 0 auto; margin: 0; border-bottom: 1px solid var(--line-soft); padding: 20px 24px; }
 .model-settings-dialog > header > div { min-width: 0; }
 .model-settings-dialog > header h2 { overflow: hidden; font-size: 16px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
-.model-settings-dialog > .configuration-tabs { margin: 0; padding: 0 24px; }
+.model-settings-dialog > .configuration-tabs { flex-wrap: wrap; row-gap: 0; margin: 0; padding: 0 24px; }
 .model-settings-dialog :is(input[type="number"], select, small) { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; }
 .model-settings-body { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 24px 24px; }
 .model-settings-body .model-context-models { margin: 0; border: 0; padding: 0; }
@@ -45,8 +45,13 @@
 .model-settings-body .model-context-footer { flex-wrap: wrap; gap: 14px; }
 .model-settings-dialog .model-context-yarn input, .model-settings-dialog .qsa-kv-toggle input { width: 14px; height: 14px; min-height: 14px; padding: 0; }
 .model-settings-dialog label.qsa-kv-toggle { display: flex; margin: 0; }
-.model-settings-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 20px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
+.model-settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 20px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
 .model-settings-actions > span { color: var(--muted); font-size: 12px; }
+.model-settings-body .dflash2-panel { margin-bottom: 20px; }
+.dflash2-panel .setting-row small { overflow-wrap: anywhere; }
+.dflash2-panel .model-settings-actions { gap: 8px; margin-top: 0; padding: 12px 0; }
+.dflash2-panel .model-settings-actions > button { max-width: 100%; min-height: 34px; white-space: normal; }
+.dflash2-panel .dflash2-confirmation > span { flex: 1 0 100%; line-height: 1.5; }
 @media (max-width: 1200px) { .checkpoint-family-panel .model-list:not(:has(details[open])) { grid-template-rows: var(--checkpoint-group-rows); } .model-library-panel .model-row { grid-template-columns: 8px minmax(0, 1fr) 258px; } .model-library-panel .local-checkpoint-resources { grid-column: 2 / -1; grid-row: 2; } .model-library-panel .model-row-controls { grid-column: 3; grid-row: 1; } }
 @media (max-width: 560px) {
   .model-library-summary { gap: 8px; font-size: 11px; }

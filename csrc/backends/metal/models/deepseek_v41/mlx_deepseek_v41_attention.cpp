@@ -1102,33 +1102,14 @@ array MlxDeepseekV41Attention::forward(
     }
 
     array local_for_attention = state.local_kv;
-    std::optional<array> pending_local_values;
-    std::optional<array> pending_local_rows;
     if (tokens == 1) {
-        auto rows = mlx::core::full(
-            Shape{batch, 1}, pos0 % window, mlx::core::int32);
-        state.local_kv = mlx_cache_write_inplace(
-            state.local_kv, local_kv, rows);
+        state.local_kv = mlx_circular_cache_append(state.local_kv, local_kv, pos0);
         local_for_attention = state.local_kv;
+    } else if (ced_replay) {
+        local_for_attention = local_kv;
     } else {
-        if (ced_replay) {
-            local_for_attention = local_kv;
-        } else {
-            auto history_values = mlx_circular_cache_history(
-                state.local_kv, pos0);
-            local_for_attention = mlx::core::concatenate(
-                {history_values, local_kv}, 1);
-        }
-        const int recent = std::min(tokens, window);
-        pending_local_values = slice_axis(
-            local_kv, 1, tokens - recent, tokens);
-        auto recent_positions = positions(
-            pos0 + tokens - recent, pos0 + tokens);
-        auto recent_slots = mlx::core::remainder(
-            recent_positions, array(window, mlx::core::int32));
-        pending_local_rows = mlx::core::broadcast_to(
-            mlx::core::reshape(recent_slots, Shape{1, recent}),
-            Shape{batch, recent});
+        local_for_attention = mlx::core::concatenate(
+            {mlx_circular_cache_history(state.local_kv, pos0), local_kv}, 1);
     }
 
     const bool fused_output_rope = packed && batch == 1 && tokens >= 2 && tokens <= 6 &&
@@ -1146,17 +1127,9 @@ array MlxDeepseekV41Attention::forward(
         pos0,
         ratio_,
         window);
-    if (pending_local_values) {
-        // Multi-token attention reads the previous circular-cache contents.
-        // Preserve that dependency before the in-place write can reuse a
-        // wrapped slot; this is also required by MTP target verification.
-        auto ordered_local = mlx::core::depends(
-            std::vector<array>{state.local_kv},
-            std::vector<array>{attended});
-        state.local_kv = mlx_cache_write_inplace(
-            ordered_local.front(),
-            *pending_local_values,
-            *pending_local_rows);
+    if (tokens > 1) {
+        // Multi-token attention must read the old ring before overwriting wrapped rows.
+        state.local_kv = mlx_circular_cache_append(state.local_kv, local_kv, pos0, attended);
     }
     const int groups = checked_int(config_.o_groups, "output groups");
     auto low_rank = fused_output_rope ? components_.output_a.grouped_row_matmul(
@@ -1177,7 +1150,7 @@ array MlxDeepseekV41Attention::forward(
         });
     state.position = pos0 + tokens;
     auto output = components_.output_b(low_rank);
-    if (pending_local_values)
+    if (tokens > 1)
         output = mlx::core::depends(std::vector<array>{output},
             std::vector<array>{state.local_kv}).front();
     return output;

@@ -1,4 +1,5 @@
 #include "tyloinfer/gguf_model_source.h"
+#include "tyloinfer/loop_layer_plan.h"
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 
@@ -606,6 +607,77 @@ void qwen4_source(const std::filesystem::path& directory) {
         require(delta == .25f, "canonical MTP norm no longer uses the backbone convention");
         gguf_free(canonical); ggml_free(canonical_tensors);
     }
+    {
+        auto* nextn_tensors=ggml_init({3<<20,nullptr,false});
+        auto* nextn=gguf_init_empty();
+        auto* backbone=gguf_init_from_file(main_path.string().c_str(),{true,nullptr});
+        require(backbone,"NextN backbone header read failed");
+        gguf_set_kv(nextn,backbone);
+        gguf_free(backbone);
+        gguf_set_val_u32(nextn,"qwen4exp.block_count",5);
+        gguf_set_val_u32(nextn,"qwen4exp.nextn_predict_layers",1);
+        const auto add=[&](const char* name,ggml_type type,std::vector<int64_t> shape) {
+            std::reverse(shape.begin(),shape.end());
+            auto* tensor=ggml_new_tensor(nextn_tensors,type,int(shape.size()),shape.data());
+            ggml_set_name(tensor,name);
+            std::memset(tensor->data,0,ggml_nbytes(tensor));
+            if(type==GGML_TYPE_F32)
+                std::fill_n(static_cast<float*>(tensor->data),ggml_nelements(tensor),1.25f);
+            gguf_add_tensor(nextn,tensor);
+            return tensor;
+        };
+        add("token_embd.weight",GGML_TYPE_Q8_0,{3,256});
+        add("output.weight",GGML_TYPE_Q8_0,{3,256});
+        add("blk.4.nextn.enorm.weight",GGML_TYPE_F32,{256});
+        add("blk.4.nextn.hnorm.weight",GGML_TYPE_F32,{512});
+        add("blk.4.nextn.hc_head_norm.weight",GGML_TYPE_F32,{512});
+        add("blk.4.nextn.hc_head_down.weight",GGML_TYPE_Q8_0,{64,512});
+        add("blk.4.nextn.hc_head_up.weight",GGML_TYPE_Q8_0,{512,64});
+        auto* fusion=add("blk.4.nextn.eh_proj.weight",GGML_TYPE_Q8_0,{256,512});
+        auto* packed=static_cast<std::byte*>(fusion->data);
+        for(std::size_t i=0;i<ggml_nbytes(fusion);++i)packed[i]=std::byte(i%251);
+        add("blk.4.attn_q.weight",GGML_TYPE_Q8_0,{512,256});
+        add("blk.4.ffn_gate_inp.weight",GGML_TYPE_F32,{4,256});
+        add("blk.4.ffn_gate_exps.weight",GGML_TYPE_Q8_0,{4,128,256});
+        add("blk.4.ffn_up_exps.weight",GGML_TYPE_Q8_0,{4,128,256});
+        add("blk.4.ffn_down_exps.weight",GGML_TYPE_Q8_0,{4,256,128});
+        add("blk.4.indexer.q_proj.weight",GGML_TYPE_BF16,{128,256});
+        add("blk.4.indexer.k_proj.weight",GGML_TYPE_BF16,{128,256});
+        const auto nextn_path=directory/"nextn-predictor.gguf";
+        require(gguf_write_to_file(nextn,nextn_path.string().c_str(),false),"NextN predictor write failed");
+        const mfq::GgufModelSource composed(main_path,{table_path,nextn_path});
+        const auto config=nlohmann::json::parse(composed.model_config_json());
+        require(config["num_hidden_layers"]==4 && config["mtp_num_hidden_layers"]==1,
+            "NextN companion changed backbone depth or lost its predictor");
+        require(composed.read("model.token_embedding.weight")==source.read("model.token_embedding.weight"),
+            "NextN companion replaced backbone embeddings");
+        require(!composed.find_tensor("model.block.4.attention.query.weight") &&
+            composed.find_tensor("predictor.block.0.attention.indexer.query_key.weight"),
+            "NextN predictor aliases or indexer composition differ");
+        require(composed.canonical_tensor_name("blk.4.nextn.eh_proj.weight")=="predictor.fusion.weight" &&
+            composed.find_tensor("predictor.fusion.weight"),"NextN fusion source alias was lost");
+        const auto norm=composed.read("predictor.mhc.pre.norm.weight");
+        float delta=0;std::memcpy(&delta,norm.data()+12,4);
+        require(delta==.25f,"NextN head norm did not use the backbone convention");
+        const auto row=ggml_row_size(GGML_TYPE_Q8_0,256);
+        for(int part=0;part<2;++part) {
+            const auto name=part?"predictor.fusion.hidden.weight":"predictor.fusion.embedding.weight";
+            const auto* info=composed.find_tensor(name);
+            require(info && info->dtype=="GGUF_Q8_0" && *info->shape==std::vector<int64_t>{256,256},
+                "NextN fusion split changed shape or precision");
+            const auto bytes=composed.read(name);
+            for(int r=0;r<256;++r)
+                require(std::memcmp(bytes.data()+r*row,packed+(2*r+part)*row,row)==0,
+                    "NextN fusion split changed packed quantization blocks");
+        }
+        gguf_set_val_u32(nextn,"qwen4exp.expert_count",8);
+        require(gguf_write_to_file(nextn,nextn_path.string().c_str(),false),"invalid NextN predictor write failed");
+        bool rejected=false;
+        try { mfq::GgufModelSource invalid(main_path,{table_path,nextn_path}); }
+        catch(const std::runtime_error&) { rejected=true; }
+        require(rejected,"incompatible NextN expert geometry was accepted");
+        gguf_free(nextn);ggml_free(nextn_tensors);
+    }
     add_predictor("mtp.unsupported.weight", GGML_TYPE_F32, {1});
     require(gguf_write_to_file(predictor, predictor_path.string().c_str(), false), "GGUF invalid predictor write failed");
     bool unsupported_predictor = false;
@@ -857,6 +929,188 @@ void fixture_composition(const std::filesystem::path& directory,const std::files
     write(spec);require(bool(mfq::open_model_source(fixture)),"fixture failure retained a recursive-open guard");
 }
 }
+void loop_sources(const std::filesystem::path& directory) {
+    for (const bool expanded : {false, true}) {
+        const std::string arch = expanded ? "sensenova_loop" : "inkling2_loop";
+        const auto path = directory / (arch + ".gguf");
+        const auto key = [&](const char* suffix) { return arch + "." + suffix; };
+        const auto raw = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+        const auto tensors = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+            ggml_init({4096, nullptr, false}), ggml_free);
+        auto* header = raw.get();
+        gguf_set_val_str(header, "general.architecture", arch.c_str());
+        gguf_set_val_u32(header, key("block_count").c_str(), expanded ? 9 : 4);
+        gguf_set_val_u32(header, key("loop.start").c_str(), 1);
+        gguf_set_val_u32(header, key("loop.end").c_str(), 3);
+        gguf_set_val_u32(header, key("loop.count").c_str(), 3);
+        const std::array<bool, 9> recurrent{false, true, false, true, false, true, false, true, false};
+        const std::array<bool, 4> sliding{true, true, false, true};
+        auto* embedded = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 2, 2);
+        std::memset(embedded->data, 0, ggml_nbytes(embedded));
+        ggml_set_name(embedded, "token_embd.weight");
+        gguf_add_tensor(header, embedded);
+        if (expanded) {
+            gguf_set_val_u32(header, key("embedding_length").c_str(), 32);
+            gguf_set_val_u32(header, key("attention.head_count").c_str(), 2);
+            gguf_set_val_u32(header, key("attention.head_count_kv").c_str(), 1);
+            gguf_set_val_u32(header, key("mhc.start").c_str(), 1);
+            gguf_set_val_u32(header, key("mhc.end").c_str(), 3);
+            gguf_set_val_u32(header, key("mhc.streams").c_str(), 2);
+            gguf_set_val_u32(header, key("mhc.iterations").c_str(), 4);
+            gguf_set_val_u32(header, key("ssm.state_size").c_str(), 2);
+            gguf_set_val_u32(header, key("ssm.group_count").c_str(), 1);
+            gguf_set_val_u32(header, key("ssm.time_step_rank").c_str(), 2);
+            gguf_set_val_u32(header, key("nextn_predict_layers").c_str(), 1);
+            gguf_set_arr_data(header, key("attention.recurrent_layers").c_str(), GGUF_TYPE_BOOL,
+                              recurrent.data(), recurrent.size());
+            auto* predictor = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 2, 2);
+            std::memset(predictor->data, 0, ggml_nbytes(predictor));
+            ggml_set_name(predictor, "blk.8.attn_q.weight");
+            gguf_add_tensor(header, predictor);
+            const auto add_packed = [&](const char* name, int64_t first, int64_t second) {
+                auto* packed = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_Q4_0, 32, first + second);
+                const auto row = ggml_row_size(GGML_TYPE_Q4_0, 32);
+                std::memset(packed->data, 0x10, first * row);
+                std::memset(static_cast<char*>(packed->data) + first * row, 0x20, second * row);
+                ggml_set_name(packed, name);
+                gguf_add_tensor(header, packed);
+            };
+            add_packed("blk.1.attn_qkv_gate.weight", 8, 4);
+            add_packed("blk.1.ssm_beta_alpha.weight", 2, 2);
+        } else {
+            gguf_set_val_u32(header, key("attention.sliding_window").c_str(), 128);
+            gguf_set_val_u32(header, key("loop.gate_rank").c_str(), 2);
+            gguf_set_val_u32(header, key("attn_res.block_size").c_str(), 1);
+            gguf_set_val_u32(header, key("attention.key_length").c_str(), 2);
+            gguf_set_val_u32(header, key("attention.relative_length").c_str(), 2);
+            gguf_set_val_u32(header, key("attention.relative_extent").c_str(), 128);
+            gguf_set_val_u32(header, key("attention.log_scale_floor").c_str(), 128);
+            gguf_set_val_u32(header, key("shortconv.l_cache").c_str(), 4);
+            gguf_set_val_u32(header, key("expert_count").c_str(), 2);
+            gguf_set_arr_data(header, key("attention.sliding_window_pattern").c_str(), GGUF_TYPE_BOOL,
+                              sliding.data(), sliding.size());
+        }
+        require(gguf_write_to_file(header, path.string().c_str(), false), "loop GGUF fixture write failed");
+        const mfq::GgufModelSource model(path);
+        const auto config = nlohmann::json::parse(model.model_config_json());
+        require(config.at("num_hidden_layers") == 8 && config.at("num_weight_layers") == 4,
+                "loop logical and weight layer counts differ");
+        const auto& loop = config.at("loop");
+        const auto layout = expanded ? mfq::LoopLayerNumbering::execution : mfq::LoopLayerNumbering::physical;
+        const mfq::LoopLayerPlan plan(expanded ? 8 : 4, loop.at("start"), loop.at("end"),
+                                      loop.at("count"), layout);
+        require(plan.source_layer(1) == 1 && plan.source_layer(3) == 1 && plan.source_layer(5) == 1 &&
+                plan.source_layer(7) == (expanded ? 7 : 3), "loop source block numbering differs");
+        if (expanded) {
+            require(config.at("recurrent_layer_pattern").size() == 8 &&
+                    model.find_tensor("predictor.block.0.attention.query.weight") &&
+                    !model.find_tensor("model.block.8.attention.query.weight"),
+                    "loop GGUF NextN metadata was included in the backbone");
+            require(config.at("layer_types")[1] == "linear_attention" &&
+                    config.at("layer_types")[3] == "linear_attention" &&
+                    config.at("loop").at("mhc").at("iterations") == 4 &&
+                    model.legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout,
+                    "SenseNova GGUF repeated GDN or mHC configuration differs");
+            const std::string root = "model.block.1.linear_attention.";
+            const auto check_views = [&](const char* first, int64_t first_rows,
+                                         const char* second, int64_t second_rows) {
+                const auto a = model.tensor_file_range(root + first);
+                const auto b = model.tensor_file_range(root + second);
+                const auto row = ggml_row_size(GGML_TYPE_Q4_0, 32);
+                require(a && b && a->offset + a->nbytes == b->offset &&
+                        a->nbytes == first_rows * row && b->nbytes == second_rows * row,
+                        "SenseNova GGUF GDN projections lost adjacent file views");
+                require(model.read(root + first) == std::vector<std::byte>(a->nbytes, std::byte{0x10}) &&
+                        model.read(root + second) == std::vector<std::byte>(b->nbytes, std::byte{0x20}),
+                        "SenseNova GGUF packed GDN projection rows were reordered");
+            };
+            check_views("qkv.weight", 8, "gate.weight", 4);
+            check_views("beta.weight", 2, "alpha.weight", 2);
+            auto bad = recurrent;
+            bad[3] = false;
+            gguf_set_arr_data(header, key("attention.recurrent_layers").c_str(), GGUF_TYPE_BOOL,
+                              bad.data(), bad.size());
+            require(gguf_write_to_file(header, path.string().c_str(), false), "invalid loop GGUF fixture write failed");
+            bool rejected = false;
+            try { mfq::GgufModelSource invalid(path); } catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "loop admitted different attention types across visits to shared weights");
+        } else {
+            require(config.at("rotary_dim") == 0 && config.at("short_convolution_width") == 4 &&
+                    config.at("relative_attention").at("extent") == 128 &&
+                    config.at("layer_types")[2] == "full_attention" && config.at("layer_types")[4] == "full_attention" &&
+                    config.at("layer_types")[6] == "full_attention", "Inkling GGUF logical attention topology differs");
+        }
+    }
+}
+
+void hy4_engram_source(const std::filesystem::path& directory) {
+    auto main = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+    auto table = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+    auto tensors = std::unique_ptr<ggml_context, decltype(&ggml_free)>(ggml_init({4096, nullptr, false}), ggml_free);
+    gguf_set_val_str(main.get(), "general.architecture", "hy_v4_flash");
+    gguf_set_val_u32(main.get(), "hy_v4_flash.embedding_length_per_layer_input", 4);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.block_count", 3);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.nextn_predict_layers", 1);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.attention.sliding_window", 32);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.attention.indexer.top_k", 16);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.attention.indexer.kpool", 4);
+    gguf_set_val_bool(main.get(), "hy_v4_flash.attention.indexer.kpool_select_tail", true);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.attention.indexer.head_count", 2);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.attention.indexer.key_length", 8);
+    gguf_set_val_u32(main.get(), "hy_v4_flash.rope.dimension_count", 4);
+    const std::array<bool, 3> sliding{false, true, false};
+    const std::array<bool, 2> sparse{true, false};
+    gguf_set_arr_data(main.get(), "hy_v4_flash.attention.sliding_window_pattern", GGUF_TYPE_BOOL,
+                      sliding.data(), sliding.size());
+    gguf_set_arr_data(main.get(), "hy_v4_flash.attention.indexer.types", GGUF_TYPE_BOOL,
+                      sparse.data(), sparse.size());
+    gguf_set_val_u16(main.get(), "split.no", 0);
+    gguf_set_val_u16(main.get(), "split.count", 2);
+    gguf_set_val_u16(table.get(), "split.no", 1);
+    gguf_set_val_u16(table.get(), "split.count", 2);
+    auto* weight = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 2, 2);
+    ggml_set_name(weight, "token_embd.weight");
+    std::memset(weight->data, 0, ggml_nbytes(weight));
+    gguf_add_tensor(main.get(), weight);
+    for (const auto* role : {"blk.0.ffn_norm.weight", "blk.0.post_attention_norm.weight", "blk.0.post_ffw_norm.weight",
+                             "blk.0.ffn_routed_down.weight", "blk.0.indexer_compressor_ape.weight",
+                             "blk.2.attn_kv_a_mqa.weight", "blk.2.nextn.eh_proj.weight"}) {
+        auto* tensor = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 2, 2);
+        ggml_set_name(tensor, role);
+        std::memset(tensor->data, 0, ggml_nbytes(tensor));
+        gguf_add_tensor(main.get(), tensor);
+    }
+    auto* rows = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F8_E4M3, 4, 3);
+    ggml_set_name(rows, "per_layer_token_embd.weight");
+    const std::array<uint8_t, 12> bytes{0x00, 0x38, 0x40, 0xb8, 0x3c, 0x00, 0x02, 0x18, 0x01, 0x76, 0x00, 0x7e};
+    std::memcpy(rows->data, bytes.data(), bytes.size());
+    gguf_add_tensor(table.get(), rows);
+    const auto primary = directory / "hy4-00001-of-00002.gguf";
+    const auto secondary = directory / "hy4-00002-of-00002.gguf";
+    require(gguf_write_to_file(main.get(), primary.string().c_str(), false) &&
+            gguf_write_to_file(table.get(), secondary.string().c_str(), false), "Hy4 GGUF fixture write failed");
+    const mfq::GgufModelSource model(primary);
+    const auto config = nlohmann::json::parse(model.model_config_json());
+    require(config.at("num_hidden_layers") == 2 && config.at("mtp_num_hidden_layers") == 1 &&
+            config.at("layer_types") == nlohmann::json::array({"index_pool_attention", "sliding_attention"}) &&
+            config.at("index_pool").at("group_size") == 4 &&
+            config.at("index_pool").at("select_tail") == true, "Hy4 GGUF IndexPool geometry differs");
+    for (const auto* role : {"model.block.0.mlp.norm.weight", "model.block.0.attention.output_norm.weight",
+                             "model.block.0.mlp.output_norm.weight", "model.block.0.mlp.latent.down.weight",
+                             "model.block.0.attention.indexer.pool.position_bias",
+                             "predictor.block.0.attention.key_value_a.weight", "predictor.fusion.weight"})
+        require(model.find_tensor(role) != nullptr, "Hy4 GGUF parameter was assigned to the wrong operation");
+    const std::string name = "model.associative_memory.embedding.weight";
+    const auto* meta = model.find_tensor(name);
+    require(meta && meta->dtype == "F8_E4M3" && meta->nbytes == bytes.size() && meta->shape ==
+            std::vector<int64_t>({3, 4}), "Hy4 Engram FP8 row geometry differs");
+    const auto range = model.tensor_file_range(name);
+    require(range && range->path == secondary, "Hy4 Engram was not retained as an SSD-backed range");
+    const auto row = model.read(name, 4, 4);
+    require(row.size() == 4 && std::memcmp(row.data(), bytes.data() + 4, 4) == 0,
+            "Hy4 Engram row read changed the FP8 payload");
+}
+
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("tinfer-gguf-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -971,6 +1225,8 @@ int main() {
         qwen35_nextn_companion_source(directory);
         compact_formats(directory);
         deepseek_source(directory);
+        loop_sources(directory);
+        hy4_engram_source(directory);
         std::filesystem::remove_all(directory);
         return 0;
     } catch (const std::exception& error) {

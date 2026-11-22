@@ -83,6 +83,12 @@ mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
 mfq_tensor_backend::Tensor attention_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, bool causal);
 mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                  double scale, int64_t window);
+// Relative bias is already projected to one row per [batch, query head, token].
+// The age beyond the bias table has zero bias and the sink is a zero-value key.
+mfq_tensor_backend::Tensor attention_cache_relative_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, mfq_tensor_backend::Tensor relative_bias,
+    mfq_tensor_backend::Tensor sinks, double scale, int64_t window, int64_t planned_length);
 mfq_tensor_backend::Tensor attention_cache_swa_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t window);
@@ -135,6 +141,14 @@ mfq_tensor_backend::Tensor glm_dsa_indexer_scores_decode_cuda(
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor meta, double scale);
+mfq_tensor_backend::Tensor attention_mla_latent_selected_cuda(
+    const mfq_tensor_backend::Tensor& q, const mfq_tensor_backend::Tensor& kv,
+    const mfq_tensor_backend::Tensor& indices, const mfq_tensor_backend::Tensor& sinks, double scale);
+// Expand completed index groups and the causal tail into token addresses. An
+// empty group tensor selects the last window tokens of each query.
+mfq_tensor_backend::Tensor mla_group_token_indices_cuda(const mfq_tensor_backend::Tensor& groups,
+    const mfq_tensor_backend::Tensor& positions, int64_t batch, int64_t tokens,
+    int64_t group_size, int64_t window, int64_t ring_capacity, bool keep_tail);
 mfq_tensor_backend::Tensor mfq_attention_mma256_swa_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelSettingsDialogView } from '../../../studio/web/src/features/models/ModelSettingsDialogView.tsx';
+import { DFlash2Controls } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
 import { ModelContextSettingsView } from '../../../studio/web/src/features/runtime/ModelContextSettingsView.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { terminalStates } from './model-api.ts';
@@ -25,7 +26,7 @@ function useProfiles(names, api, inventory) {
   return state.key === key ? state : { cacheProfiles: {}, cacheErrors: {} };
 }
 
-export function LoadedModelSettings({ model, inventory, runtime, api, mutation, refresh, refreshKey, tr, onClose, triggerRef, disabled }) {
+export function LoadedModelSettings({ model, inventory, runtime, api, mutation, refresh, refreshKey, tr, onClose, triggerRef, disabled, draftDownloadAvailable, onDownloadDraft, onLoadDraft }) {
   const [confirmation, setConfirmation] = useState(null);
   const [notice, setNotice] = useState('');
   const pending = useRef(null);
@@ -73,11 +74,20 @@ export function LoadedModelSettings({ model, inventory, runtime, api, mutation, 
     }),
   };
   const blocked = disabled || mutation.busy || mutation.unknown || Boolean(mutation.operation && !terminalStates.has(mutation.operation.status));
+  const instance = inventory.instances.find(item => item.model === model.name && item.state !== 'failed');
   const catalog = { artifacts: inventory.models, instances: inventory.instances, settingsModel: model.name, connectionRevision: 0, runtime,
     modelSettingsTriggerRef: triggerRef, setSettingsModel: value => { if (!value) onClose(); }, busy: blocked };
   return <>
     <ModelSettingsDialogView catalog={catalog} refreshRuntime={async () => refresh()} connectionScope={connectionScope}
       configureInstance={(instanceId, policy) => requestConfirmation('residency', { instance_id: instanceId, policy })} disabled={Boolean(blocked)}
+      dflash2={<DFlash2Controls model={model} artifacts={inventory.models} instance={instance} backend={runtime?.backend}
+        disabled={Boolean(blocked)} loadReady={Boolean(instance)} downloadAvailable={draftDownloadAvailable} serviceEnabled={runtime?.mtp_service_enabled}
+        onDownload={onDownloadDraft} onLoad={draftId => onLoadDraft(draftId, instance.id)} tr={tr}
+        onToggle={instance ? async enabled => {
+          const result = await mutation.run(signal => api.configureInstance(instance.id, { dflash2_enabled: enabled }, signal));
+          if (result) await refresh();
+          return result;
+        } : undefined} />}
       externalError={<>{mutation.ownNotice && mutation.error && <CoreError error={mutation.error} />}{mutation.unknown && <p role="alert">{tr('结果未知，不会自动重发。关闭此窗口后刷新并核实实例状态，再决定下一步。', 'Outcome unknown. The request will not be replayed. Close this dialog, refresh and verify the instance before another operation.')}</p>}</>}
       renderLoadContext={() => null} renderContext={name => <><ModelContextSettingsView scope="model" modelName={name} runtimeState={runtimeState} jobs={jobs} services={services} writeBlocked={Boolean(blocked)} />{notice && <p role="status">{notice}</p>}</>} />
     <ConfirmationDialog open={Boolean(confirmation)} tr={tr}

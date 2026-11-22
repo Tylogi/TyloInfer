@@ -88,6 +88,59 @@ void qsa_kv_offload_case() {
         throw std::runtime_error("zero RAM budget must spill directly to SSD");
     equal(direct.range(0,64),source.narrow(0,0,64),"KV direct SSD restore",0,0);
 
+    {
+        KvOffloadConfig disk_only=config;
+        disk_only.preallocate=true;
+        disk_only.gpu_budget_bytes=disk_only.buffer_bytes;
+        const auto tail_store=std::make_shared<KvOffloadStore>(disk_only);
+        KvOffloadSequence tail(tail_store,32,64);
+        tail.append(source.narrow(0,0,63));
+        tail_store->flush();
+        if (metric(tail_store,"qsa_kv_ssd_written_bytes"))
+            throw std::runtime_error("Unfinished KV was written to SSD");
+        const std::vector<int64_t> selected{62,3,17};
+        auto workspace=tail.gather_workspace(selected.size());
+        const auto expected=source.index_select(0,tb::tensor(selected).to(tb::kCUDA));
+        tail.gather_into(selected,*workspace);
+        equal(expected,workspace->rows,"SSD-only gather uses the unfinished KV",0,0);
+        tail.append(source.narrow(0,63,1));
+        tail_store->flush();
+        if (!metric(tail_store,"qsa_kv_ssd_written_bytes"))
+            throw std::runtime_error("Completed KV did not reach SSD");
+        tail.truncate(17);
+        tail.append(source.narrow(0,17,16));
+        equal(tail.range(0,33),source.narrow(0,0,33),"SSD-only truncate to unfinished KV",0,0);
+    }
+
+    for (const bool allow_ssd:{false,true}) {
+        KvOffloadConfig growing;
+        growing.preallocate=true;
+        growing.ssd_enabled=allow_ssd;
+        growing.buffer_bytes=growing.gpu_budget_bytes=8u<<10;
+        growing.ram_budget_bytes=4u<<10;
+        growing.ram_growth_limit=16u<<10;
+        auto shared=std::make_shared<KvOffloadStore>(growing);
+        KvOffloadSequence first(shared,32,64),second(shared,32,64);
+        first.append(source.narrow(0,0,192));
+        second.append(source.narrow(0,192,64));
+        equal(first.range(0,192),source.narrow(0,0,192),"RAM KV across arenas",0,0);
+        equal(second.range(0,64),source.narrow(0,192,64),"RAM KV second sequence",0,0);
+        if (metric(shared,"qsa_kv_ram_bytes")!=growing.ram_growth_limit ||
+            metric(shared,"qsa_kv_ssd_bytes")!=0)
+            throw std::runtime_error("Concurrent KV did not use the available RAM before SSD");
+        first.reset();
+        if (metric(shared,"qsa_kv_ram_bytes")!=8192)
+            throw std::runtime_error("Unused working RAM KV arena was retained");
+        second.append(source.narrow(0,256,64));
+        equal(second.range(0,128),source.narrow(0,192,128),"RAM KV reclaimed arena space",0,0);
+        if (allow_ssd) {
+            second.append(source.narrow(0,320,192));shared->flush();
+            if (!metric(shared,"qsa_kv_ssd_bytes") || metric(shared,"qsa_kv_ram_bytes")>growing.ram_growth_limit)
+                throw std::runtime_error("KV did not spill after reaching the shared RAM limit");
+            equal(second.range(0,320),source.narrow(0,192,320),"SSD overflow after RAM growth",0,0);
+        }
+    }
+
     for(const auto dtype:{tb::kInt16,tb::kInt32}) {
         KvOffloadConfig typed_config;typed_config.buffer_bytes=16u<<10;
         typed_config.gpu_budget_bytes=24u<<10;typed_config.ram_budget_bytes=8u<<10;

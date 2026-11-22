@@ -1,4 +1,5 @@
 #include "qwen4_ops.h"
+#include "mlx_platform.h"
 #include "mlx_nint_metadata.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_cached_kernel.h"
@@ -2349,25 +2350,6 @@ void require_rank(const array& value, int rank, const char* name) {
     }
 }
 
-array qsa_head_scores(const array& query, const array& pooled_keys) {
-    require_rank(query, 4, "Qwen4 index query");
-    require_rank(pooled_keys, 3, "Qwen4 pooled key");
-    if (query.shape(0) != pooled_keys.shape(0) ||
-        query.shape(3) != pooled_keys.shape(2)) {
-        throw std::invalid_argument("Qwen4 QSA score dimensions disagree");
-    }
-    if (query.shape(1) >= 1 && query.shape(1) <= 8 && query.shape(2) <= 8 &&
-        query.shape(3) >= 4 && query.shape(3) <= 1024 && query.shape(3) % 4 == 0 &&
-        pooled_keys.dtype() == mlx::core::float32)
-        return mlx_sparse_indexer_dot_scores(query, pooled_keys);
-    auto keys = mlx::core::transpose(
-        mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1});
-    return mlx::core::reshape(
-        mlx::core::matmul(
-            mlx::core::reshape(mlx::core::astype(query, mlx::core::float32),
-                Shape{query.shape(0), query.shape(1) * query.shape(2), query.shape(3)}), keys),
-        Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
-}
 
 } // namespace
 
@@ -2820,7 +2802,7 @@ array qwen4_qsa_output_gate(const array& attended, const array& gate,
 array qwen4_qsa_block_scores(
     const array& query,
     const array& pooled_keys) {
-    auto scores = qsa_head_scores(query, pooled_keys);
+    auto scores = mlx_sparse_indexer_head_scores(query, pooled_keys);
     scores = mlx::core::maximum(scores, array(0.0f));
     return mlx::core::sum(scores, -2) /
         std::sqrt(static_cast<float>(query.shape(3)));
@@ -2832,7 +2814,7 @@ array qwen4_qsa_select_blocks(
     int query_offset,
     int block_size) {
     return mlx_sparse_indexer_topk512(
-        qsa_head_scores(query, pooled_keys), query_offset, block_size);
+        mlx_sparse_indexer_head_scores(query, pooled_keys), query_offset, block_size);
 }
 
 array qwen4_dense_gqa_decode_batch(const array& query, const std::vector<array>& keys,
@@ -2958,7 +2940,251 @@ private:
 };
 }
 
+namespace {
+array qwen4_qsa_tiled_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    using namespace mlx::core;
+    constexpr int QueryHeads = 24, HeadDim = 256, KvHeads = 2, Rows = 8;
+    constexpr int Fused = Rows * QueryHeads / KvHeads, MaxSplits = 32;
+    constexpr int Params = 19;
+    const int width = int(lanes.size()), total = query.shape(2);
+    if (width < 2 || width > 4 || query.shape() != Shape{1, QueryHeads, total, HeadDim} ||
+        query.dtype() != bfloat16)
+        throw std::invalid_argument("invalid tiled QSA tree query");
+    const auto supported = [&](const array& kv) {
+        return kv.ndim() == 4 && kv.shape(0) == 1 && kv.shape(1) == KvHeads &&
+            kv.shape(2) > 0 && kv.shape(3) == HeadDim && kv.dtype() == float16;
+    };
+    std::vector<std::uint32_t> params;
+    std::vector<array> cache_inputs;
+    int begin = 0, grid_splits = 1;
+    for (const auto& l : lanes) {
+        const int rows = int(l.parents.size()), history = l.history_keys.shape(2);
+        if (!supported(l.history_keys) || !supported(l.history_values) ||
+            !supported(l.tree_keys) || !supported(l.tree_values) || rows < 3 || rows > Rows ||
+            l.history_keys.shape() != l.history_values.shape() || l.tree_keys.shape() != l.tree_values.shape() ||
+            l.tree_keys.shape(2) != rows || history + rows > kQsaGroupedDecodeMaxKeys)
+            throw std::invalid_argument("invalid tiled QSA tree cache");
+        params.insert(params.end(), {std::uint32_t(begin),std::uint32_t(rows),std::uint32_t(history)});
+        params.insert(params.end(), 8, 0);
+        cache_inputs.insert(cache_inputs.end(), {l.history_keys,l.history_values,l.tree_keys,l.tree_values});
+        std::array<std::uint32_t, Rows> mask{};
+        for (int r = 0; r < rows; ++r) {
+            const int parent = l.parents[r];
+            if (parent < (r == 0 ? -1 : 0) || parent >= r) throw std::invalid_argument("invalid tiled QSA tree parent");
+            mask[r] = (1u << r) | (parent < 0 ? 0u : mask[parent]);
+        }
+        params.insert(params.end(), mask.begin(), mask.end());
+        begin += rows;
+        grid_splits = std::max(grid_splits, std::min(MaxSplits, (history + rows + 31) / 32));
+    }
+    if (begin != total) throw std::invalid_argument("invalid tiled QSA tree layout");
+    const auto layout = array(Shape{width, Params}, uint32,
+        std::make_shared<QsaTreeCacheLayout>(default_stream(Device::gpu),std::move(params)),std::move(cache_inputs));
+    static const auto pack = cached_metal_kernel("tylo_splash_qsa_pack", {"query","layout"}, {"packed"}, R"METAL(
+constexpr uint D = 256, G = 12, M = 96, P = 19;
+const uint3 g = threadgroup_position_in_grid;
+const uint f = thread_index_in_threadgroup + g.x * 256u;
+const uint row = f / (G*D), head = (f / D) % G, dim = f % D;
+const uint first = layout[g.z * P], rows = layout[g.z * P + 1];
+const long src = long(g.y*G+head)*query_strides[1] + long(first+row)*query_strides[2] + long(dim)*query_strides[3];
+packed[((g.z*2u+g.y)*M*D)+f] = row < rows ? query[src] : bfloat(0);
+)METAL", "", false);
+    auto prepared = pack({query,layout},
+        {{width, KvHeads, Fused, HeadDim}}, {bfloat16}, {Fused*HeadDim,KvHeads,width},{256,1,1},
+        {}, std::nullopt, false, {})[0];
+    // The ordered split reduction is adapted from Splash 1.7.0 (Apache-2.0). See NOTICE.
+    static const std::string header = R"METAL(
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+inline uint qsa_split_chunk(uint kv) {
+    const uint units = (kv + 31u) / 32u;
+    const uint parts = min(units, 32u);
+    return ((units + parts - 1u) / parts) * 32u;
+}
+// Partials are [slot][fused row][dimension]; statistics are
+// [slot][fused row]{max, sum}. The callers lay a sequence's slots out from its
+// first_slot as [tile][KV head][part][split], a sparse tile being one part.
+// Combines the first `written` splits of one fused row in split order, a
+// threadgroup of HeadDim threads, one per output dimension. The statistics
+// are shared by all output dimensions: their weights are computed once per
+// row, the splits' maxima by the threads at their split's index (written
+// never exceeds HeadDim), then each lane streams one dimension of the
+// partials; the row's value comes back to each thread, its dimension's, and a
+// row past the tile's active rows is zero. A threadgroup owns one fused row,
+// so it returns uniformly.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
+inline bfloat qsa_combine_splits(
+    device const float *partials, device const float *statistics, uint active_rows, uint written,
+    ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = HeadDim;
+  if (fused_row / QueryHeadsPerKVHead >= active_rows)
+    return bfloat(0.0f);
+  const uint lane = thread_index % 32, sg = thread_index / 32;
+  const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
+  const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
+  const float group_maximum = simd_max(maximum);
+  if (lane == 0) group_values[sg] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
+  if (thread_index < written)
+    weights[thread_index] = fast::exp(maximum - row_maximum);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  // Keep both accumulations in the original split order. A parallel sum of
+  // the denominator changes speculative acceptance on real model prompts.
+  for (uint split = 0; split < written; ++split) {
+    const float weight = weights[split];
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    numerator += weight *
+        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+    denominator += weight * statistics[stat + 1];
+  }
+  return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
+
+
+)METAL";
+    static const auto split = cached_metal_kernel("tylo_splash_qsa_tiled_split",
+        {"query","layout","hk0","hk1","hk2","hk3","hv0","hv1","hv2","hv3",
+         "pk0","pk1","pk2","pk3","pv0","pv1","pv2","pv3"}, {"partials","statistics"}, R"METAL(
+constexpr ushort M = 96, D = 256, N = 16;
+constexpr uint P = 19, G = 12, Splits = 32;
+const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+const uint2 group = threadgroup_position_in_grid.xy;
+const uint req = group.y, kv = group.x % 2u, split = group.x / 2u;
+const device uint* p = layout + req * P;
+const uint rows = p[1], history = p[2], count = rows + history;
+const uint chunk = qsa_split_chunk(count);
+const uint first = chunk * split, limit = min(count, first + chunk);
+if (first >= count) return;
+const device half* old_key = req==0?hk0:req==1?hk1:req==2?hk2:hk3;
+const device half* old_value = req==0?hv0:req==1?hv1:req==2?hv2:hv3;
+const device half* tree_key = req==0?pk0:req==1?pk1:req==2?pk2:pk3;
+const device half* tree_value = req==0?pv0:req==1?pv1:req==2?pv2:pv3;
+old_key += kv*p[3]; old_value += kv*p[5];
+tree_key += kv*p[7]; tree_value += kv*p[9];
+alignas(16) threadgroup bfloat staged[N*D], prob[M*N];
+threadgroup float scores[M*N], maxima[M], masses[M], scale[M];
+threadgroup atomic_uint rescale;
+if (tid < M) { maxima[tid] = -INFINITY; masses[tid] = 0.0f; }
+auto q = tensor(const_cast<device bfloat*>(query)+(req*2u+kv)*M*D,
+    dextents<int,2>{D,M}, array<int,2>{1,D});
+auto s = tensor(scores, dextents<int,2>{N,M}, array<int,2>{1,N});
+auto v = tensor<threadgroup bfloat,dextents<int,2>,tensor_inline>(
+    staged, dextents<int,2>{D,N}, array<int,2>{1,D});
+auto w = tensor(prob, dextents<int,2>{N,M}, array<int,2>{1,N});
+auto qt=q.slice<D,M>(0,0);
+auto vt=v.slice<D,N>(0,0);
+auto wt=w.slice<N,M>(0,0);
+constexpr auto qk_desc = matmul2d_descriptor(M,N,D,false,true,false,matmul2d_descriptor::mode::multiply);
+constexpr auto pv_desc = matmul2d_descriptor(M,D,N,false,false,true,matmul2d_descriptor::mode::multiply_accumulate);
+matmul2d<qk_desc,execution_simdgroups<8>> qk;
+matmul2d<pv_desc,execution_simdgroups<8>> pv;
+auto acc=pv.get_destination_cooperative_tensor<decltype(wt),decltype(vt),float>();
+const bool full=uint(acc.get_capacity())*256u==uint(M)*D;
+#pragma unroll
+for (ushort i=0; i<acc.get_capacity(); ++i)
+    if (full || acc.is_valid_element(i)) acc[i]=0;
+const auto load = [&](const device half* data, uint dim, uint valid) {
+    return valid && data
+        ? vec<bfloat,4>(float4(reinterpret_cast<const device half4*>(data)[dim/4u]))
+        : vec<bfloat,4>(bfloat(0.0f));
+};
+for (uint block=first;block<limit;block+=N) {
+    if (tid==0) atomic_store_explicit(&rescale,0u,memory_order_relaxed);
+    for (uint i=tid*4u;i<N*D;i+=256u*4u) {
+        const uint token=block+i/D, dim=i%D;
+        const device half* data = token < history ? old_key + token*p[4] :
+            token < limit ? tree_key + (token-history)*p[8] : nullptr;
+        reinterpret_cast<threadgroup vec<bfloat,4>*>(staged)[i/4u]=load(data,dim,token<limit);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto qs=qk.get_destination_cooperative_tensor<decltype(qt),decltype(vt),float>();
+    qk.run(qt,vt,qs);
+    qs.store(s.slice<N,M>(0,0));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=tid*4u;i<N*D;i+=256u*4u) {
+        const uint token=block+i/D, dim=i%D;
+        const device half* data = token < history ? old_value + token*p[6] :
+            token < limit ? tree_value + (token-history)*p[10] : nullptr;
+        reinterpret_cast<threadgroup vec<bfloat,4>*>(staged)[i/4u]=load(data,dim,token<limit);
+    }
+    if (tid < M*2u) {
+        const uint fused=tid/2u, row=fused/G, offset_half=(lane&1u)*8u;
+        const uint ancestors = row < rows ? p[11u+row] : 0u;
+        float score[8], high=-INFINITY;
+        for (uint j=0;j<8;++j) {
+            const uint token=block+offset_half+j;
+            const bool visible=row<rows && token<limit && (token<history || ((ancestors>>(token-history))&1u));
+            score[j]=visible?scores[fused*N+offset_half+j]*(1.0f/16.0f):-INFINITY;
+            high=max(high,score[j]);
+        }
+        const float top=max(maxima[fused],max(high,simd_shuffle_xor(high,1)));
+        const float carry=top==maxima[fused]?1.0f:fast::exp(maxima[fused]-top);
+        float mass=0.0f;
+        for (uint j=0;j<8;++j) {
+            const float exponential=isfinite(score[j])?fast::exp(score[j]-top):0.0f;
+            prob[fused*N+offset_half+j]=bfloat(exponential);
+            mass+=exponential;
+        }
+        const float sum=mass+simd_shuffle_xor(mass,1);
+        if (offset_half==0u) {
+            scale[fused]=carry;
+            masses[fused]=masses[fused]*carry+sum;
+            maxima[fused]=top;
+            if (carry!=1.0f) atomic_store_explicit(&rescale,1u,memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (block!=first && atomic_load_explicit(&rescale,memory_order_relaxed)) {
+#pragma unroll
+        for (ushort i=0;i<acc.get_capacity();++i)
+            if (full || acc.is_valid_element(i)) acc[i]*=scale[acc.get_multidimensional_index(i)[1]];
+    }
+    pv.run(wt,vt,acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+const uint slot=(req*2u+kv)*Splits+split;
+auto out=tensor(partials+slot*M*D,dextents<int,2>{D,M},array<int,2>{1,D});
+acc.store(out.slice<D,M>(0,0));
+if (tid<M) {
+    statistics[(slot*M+tid)*2u]=maxima[tid];
+    statistics[(slot*M+tid)*2u+1u]=masses[tid];
+}
+)METAL", header, false);
+    std::vector<array> inputs{prepared,layout};
+    for (const auto member : {&MlxQsaTreeAttentionLane::history_keys,&MlxQsaTreeAttentionLane::history_values,
+        &MlxQsaTreeAttentionLane::tree_keys,&MlxQsaTreeAttentionLane::tree_values}) {
+        for (int lane=0;lane<4;++lane) inputs.push_back(lanes[lane<width?lane:0].*member);
+    }
+    const auto temp = split(inputs, {{width, KvHeads, MaxSplits, Fused, HeadDim},
+        {width, KvHeads, MaxSplits, Fused, 2}}, {float32,float32}, {KvHeads*grid_splits*256,width,1},
+        {256,1,1}, {}, std::nullopt, false, {});
+    static const auto reduce = cached_metal_kernel("tylo_splash_qsa_tiled_reduce",
+        {"partials","statistics","layout"}, {"output"},R"METAL(
+constexpr uint P=19, M=96, Splits=32, D=256, G=12;
+const uint3 g=threadgroup_position_in_grid;
+const uint dim=thread_index_in_threadgroup, fused=g.x, batch=g.z, kv=g.y, row=fused/G;
+const device uint* p=layout+batch*P;
+if (row>=p[1]) return;
+const uint count=p[1]+p[2], chunk=qsa_split_chunk(count), used=(count+chunk-1u)/chunk;
+const uint slot=(batch*2u+kv)*Splits;
+threadgroup float weights[Splits], group_values[D/32];
+const bfloat value=qsa_combine_splits<G,8,D>(
+    partials,statistics,p[1],used,slot,fused,dim,weights,group_values);
+const uint head=kv*G+fused%G;
+output[((p[0]+row)*24u+head)*D+dim]=value;
+)METAL",header);
+    return reduce({temp[0], temp[1], layout}, {{1,total,QueryHeads,HeadDim}}, {bfloat16},
+        {Fused*HeadDim,KvHeads,width}, {256,1,1}, {}, std::nullopt, false, {})[0];
+}
+}
+
 array qwen4_qsa_batched_tree_attention(const array& query, std::span<const MlxQsaTreeAttentionLane> lanes) {
+    if (!mlx_metal_nax_disabled() && mlx_apple_chip_is("Apple M5 Max"))
+        return qwen4_qsa_tiled_tree_attention(query, lanes);
     using namespace mlx::core;
     constexpr int Heads = 24, KvHeads = 2, Dim = 256, Words = 19;
     const int width = static_cast<int>(lanes.size()), total = query.shape(2);

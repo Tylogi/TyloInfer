@@ -5,6 +5,7 @@
 #include "mfq_model_graph.h"
 #include "models/common/model_config.h"
 #include "models/common/moe.h"
+#include "tyloinfer/loop_layer_plan.h"
 
 #include <cstdint>
 #include <optional>
@@ -14,6 +15,14 @@
 #include <vector>
 
 namespace mfq::models::qwen35 {
+
+struct SenseNovaLoopConfig {
+    LoopLayerPlan layers;
+    int64_t mhc_start, mhc_end;
+    int mhc_iterations;
+    float mhc_pre_scale;
+    bool mhc_fixed_identity;
+};
 
 struct Config : ModelConfig {
     MfqLegacyTensorLayout legacy_tensor_layout;
@@ -37,6 +46,7 @@ struct Config : ModelConfig {
     std::optional<GridVisionConfig> grid_vision;
     std::optional<std::int64_t> image_token_id;
     std::optional<std::int64_t> video_token_id;
+    std::optional<SenseNovaLoopConfig> sensenova_loop;
 
     enum class AttentionKind { full, linear };
     static AttentionKind attention_kind(std::string_view type) {

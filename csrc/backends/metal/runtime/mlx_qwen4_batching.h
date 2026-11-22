@@ -76,13 +76,16 @@ private:
 
 class MlxDFlashTreeBudget {
 public:
-    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false) const {
+    void choose(std::span<MlxDFlash2Tree> trees, bool calibrated = false, bool price_wide_rows = false,
+        std::span<const double> weights = {}) const {
         const int lanes = static_cast<int>(trees.size());
         if (lanes == 0 || lanes > static_cast<int>(costs_.size())) return;
         const auto& cost = costs_[lanes - 1];
-        if (!calibrated && (cost.samples < 4 || cost.samples % 16 == 15)) return;
+        const bool probe = !calibrated && (cost.samples < 4 || cost.samples % 16 == 15);
+        if (probe && !price_wide_rows) return;
         const auto step_cost = [&](int rows) {
-            return calibrated ? row_bucket_price(lanes, rows) : price(cost, lanes, rows);
+            if (calibrated) return row_bucket_price(lanes, rows);
+            return price(cost, lanes, rows) * wide_row_factor(price_wide_rows, rows);
         };
         // Splash StepCosts pools the next row of every lane by path reach,
         // then chooses the prefix with the most expected tokens per cost.
@@ -90,17 +93,25 @@ public:
         kept.fill(1);
         best = kept;
         double tokens = lanes;
+        if (!weights.empty()) {
+            tokens = 0.;
+            for (double weight : weights) tokens += weight;
+        }
         double rate = tokens / step_cost(lanes);
         for (int rows = lanes + 1;; ++rows) {
             int next = -1;
+            double best_value = 0.;
             for (int lane = 0; lane < lanes; ++lane) {
                 if (kept[lane] >= trees[lane].reach.size()) continue;
-                const auto value = trees[lane].reach[kept[lane]];
-                if (next < 0 || value > trees[next].reach[kept[next]] ||
-                    (value == trees[next].reach[kept[next]] && kept[lane] < kept[next])) next = lane;
+                const double value = trees[lane].reach[kept[lane]] * (weights.empty() ? 1. : weights[lane]);
+                if (next < 0 || value > best_value || (value == best_value && kept[lane] < kept[next])) {
+                    next = lane;
+                    best_value = value;
+                }
             }
             if (next < 0) break;
-            tokens += trees[next].reach[kept[next]++];
+            ++kept[next];
+            tokens += best_value;
             const double candidate = tokens / step_cost(rows);
             if (candidate > rate) { rate = candidate; best = kept; }
         }
@@ -111,10 +122,11 @@ public:
         }
     }
 
-    void observe(int lanes, int rows, double ms) {
+    void observe(int lanes, int rows, double ms, bool price_wide_rows = false) {
         if (lanes < 1 || lanes > static_cast<int>(costs_.size()) || ms <= 0.0) return;
         auto& c = costs_[lanes - 1];
-        const double wall = c.samples ? std::min(ms, 2.0 * price(c, lanes, rows)) : ms;
+        const double normalized_ms = ms / wide_row_factor(price_wide_rows, rows);
+        const double wall = c.samples ? std::min(normalized_ms, 2.0 * price(c, lanes, rows)) : normalized_ms;
         constexpr double decay = .95;
         ++c.samples;
         c.weight = c.weight * decay + 1.0;
@@ -129,6 +141,12 @@ private:
         int samples = 0;
         double weight = 0.0, rows = 0.0, rows_squared = 0.0, wall = 0.0, rows_wall = 0.0;
     };
+
+    static double wide_row_factor(bool enabled, int rows) {
+        // Flash-Next's native GGUF projections switch plans above 32 rows.
+        // The factor includes the draft time in the measured decode step.
+        return enabled && rows > 32 ? 1.30 : 1.0;
+    }
 
     static double row_bucket_price(int lanes, int rows) {
         // Splash's measured step costs on resident Flash-Next
@@ -250,12 +268,13 @@ public:
         : runtime_(runtime), hooks_(std::move(hooks)) {}
 
     std::int64_t prepare(const std::shared_ptr<Request>& request) {
-        if (hooks_.dflash2 && mlx_dflash2_sampling_supported(request->sampling, request->token_constraint))
+        if (hooks_.dflash2 && mlx_dflash2_sampling_supported(request->sampling))
             hooks_.dflash2->reset(request->dflash_context.emplace());
-        request->mtp = request->dflash_context || (request->sampling.enable_mtp && runtime_.supports_mtp());
+        request->mtp = request->dflash_context || (request->sampling.enable_mtp &&
+            request->sampling.max_tokens > 1 && runtime_.supports_batch_mtp());
         runtime_.clear_cache();
         request->cache = runtime_.make_request_cache();
-        const auto restored = hooks_.restore && !request->dflash_context ? hooks_.restore(*request) : 0;
+        const auto restored = hooks_.restore ? hooks_.restore(*request) : 0;
         if (restored) runtime_.adopt_request_cache(*request->cache);
         if (request->sampler.params().has_penalties()) {
             request->counts = sample_token_counts_add(mlx::core::zeros(
@@ -735,9 +754,15 @@ private:
         auto& context = *request->dflash_context;
         auto& stats = request->mtp_stats;
         stats.available = true;
+        const auto emit = [&](const std::vector<std::int64_t>& tokens) {
+            auto delta = output.append(tokens);
+            if (request->token_constraint)
+                for (const auto token : delta.token_ids) request->token_constraint->accept(token);
+            return delta;
+        };
         auto pending = static_cast<std::int32_t>(sample_logits(*request, *request->initial_logits));
         request->initial_logits.reset();
-        auto delta = output.append({pending});
+        auto delta = emit({pending});
         request->produced += delta.token_ids.size();
         stats.standard_tokens = request->produced;
         if (mlx_dflash_tree_enabled() && request->sampler.params().greedy() && !request->counts && !request->token_constraint) {
@@ -795,15 +820,19 @@ private:
                     node = child;
                 }
                 matched = static_cast<int>(tokens.size());
-            } else if (depth) {
-                const auto decision = mfq::engine::mtp::verify_greedy(
-                    {drafts, static_cast<std::size_t>(depth)}, {target, static_cast<std::size_t>(depth + 1)});
+            } else if (depth || request->token_constraint) {
+                const std::span<const std::int32_t> proposed(drafts, depth);
+                const std::span<const std::int32_t> predicted(target, depth + 1);
+                const auto decision = request->token_constraint
+                    ? mlx_dflash2_verify_constraint(request->sampler, verified.logits, proposed,
+                        predicted, request->token_constraint)
+                    : mfq::engine::mtp::verify_greedy(proposed, predicted);
                 matched = static_cast<int>(decision.accepted_drafts);
                 pending = decision.next_token;
-                tokens.assign(drafts, drafts + matched);
+                if (matched) tokens.assign(drafts, drafts + matched);
             }
             tokens.push_back(pending);
-            delta = output.append(tokens);
+            delta = emit(tokens);
             const int retained = std::min(matched, static_cast<int>(delta.token_ids.size()));
             auto features = std::move(verified.hidden);
             if (tree) {
@@ -933,9 +962,30 @@ private:
             mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", !two_way);
         const bool calibrated = three_way && flash_next_on_m5_max;
         const bool four_way_buckets = four_way && width >= 3 && flash_next_on_m5_max;
+        const bool price_wide_rows = width >= 5 && flash_next_on_m5_max && !runtime_.ssd_expert_payload_bytes();
         // Use full trees once a calibrated three-request group drains.
-        if (adaptive && (!calibrated || width == 3))
-            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets);
+        if (adaptive && (!calibrated || width == 3)) {
+            std::array<double, 8> weights;
+            std::span<const double> active_weights;
+            // A wide cohort loses throughput as lanes finish far apart. Nudge
+            // the row budget toward requests with more tokens left to generate.
+            const int limit = cohort.active.front()->generation_limit;
+            if (price_wide_rows && width <= weights.size() && limit > 0 &&
+                std::ranges::all_of(cohort.active, [limit](const auto& request) {
+                    return request->dflash_max_verify_width == 8 && request->generation_limit == limit;
+                })) {
+                double total_remaining = 0.;
+                for (const auto& request : cohort.active) total_remaining += limit - request->produced;
+                const double average = total_remaining / width;
+                if (average > 0.) {
+                    for (std::size_t lane = 0; lane < width; ++lane)
+                        weights[lane] = std::clamp((limit - cohort.active[lane]->produced) / average, .75, 1.25);
+                    const auto [low, high] = std::minmax_element(weights.begin(), weights.begin() + width);
+                    if (*high > *low) active_weights = std::span(weights).first(width);
+                }
+            }
+            dflash_tree_budget_.choose(trees, calibrated || four_way_buckets, price_wide_rows, active_weights);
+        }
         for (std::size_t lane = 0; lane < trees.size(); ++lane)
             plans[draft_lanes[lane]] = {std::move(trees[lane].tokens), std::move(trees[lane].parents)};
         const auto verification = std::chrono::steady_clock::now();
@@ -997,7 +1047,7 @@ private:
         const auto finished = std::chrono::steady_clock::now();
         dflash_tree_verify_ms_ += std::chrono::duration<double, std::milli>(finished - verification).count();
         if (adaptive && !calibrated) dflash_tree_budget_.observe(static_cast<int>(caches.size()), start,
-            std::chrono::duration<double, std::milli>(finished - started).count());
+            std::chrono::duration<double, std::milli>(finished - started).count(), price_wide_rows);
         ++decode_batches_;
         decode_rows_ += caches.size();
         maximum_batch_ = std::max(maximum_batch_, caches.size());
@@ -1083,7 +1133,7 @@ private:
             std::optional<mlx::core::array> packed_logits, joint_tokens;
             DFlashCapture capture(runtime_, capture_dflash ? hooks_.dflash2.get() : nullptr);
             auto target = runtime_.forward_request_windows(caches, windows,
-                joint_greedy ? &packed_logits : nullptr);
+                joint_greedy ? &packed_logits : nullptr, joint_greedy && !capture_dflash);
             auto features = capture.take();
             if (packed_logits) joint_tokens = sample_greedy(mlx::core::reshape(*packed_logits,
                 {packed_logits->shape(1), packed_logits->shape(2)}));
@@ -1198,7 +1248,13 @@ private:
                 (!hooks_.block_size || position % hooks_.block_size))) return;
         try {
             std::vector<std::int64_t> tokens(request.history.begin(), request.history.begin() + position);
-            hooks_.store(request, runtime_.capture_request_cache(*request.cache, tokens));
+            if (request.dflash_context && request.dflash_context->position != static_cast<int>(position)) return;
+            auto state = runtime_.capture_request_cache(*request.cache, tokens);
+            if (request.dflash_context) {
+                state.dflash = request.dflash_context;
+                state.bytes += state.dflash->bytes();
+            }
+            hooks_.store(request, std::move(state));
             request.checkpoint = position;
         } catch (const std::exception& error) {
             std::cerr << "server_session_cache backend=metal action=skip error=" << error.what() << '\n';

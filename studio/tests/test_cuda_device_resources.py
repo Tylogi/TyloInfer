@@ -40,3 +40,38 @@ def test_capacity_tracks_selected_physical_gpus_and_runtime_environment(tmp_path
     assert pool._cuda_discrete_device_capacity(request.model_copy(update={"device_ids": ["3", "1"]})) == 48 * GiB
     assert pool._cuda_discrete_device_capacity(request.model_copy(update={"device_ids": ["2"]})) is None
     asyncio.run(pool.aclose())
+
+
+@pytest.mark.parametrize("visible", [
+    "GPU-22222222-2222-2222-2222-222222222222",
+    "GPU-22222222",
+])
+def test_uuid_visibility_uses_physical_gpu_capacity_and_telemetry_id(tmp_path, monkeypatch, visible):
+    GiB = 1 << 30
+    hardware = HardwareIdentity("CPU", 8, gpu_memory=(
+        GpuMemory("A", 24 * GiB, device_id="1",
+            device_uuid="GPU-11111111-1111-1111-1111-111111111111"),
+        GpuMemory("B", 48 * GiB, device_id="3",
+            device_uuid="GPU-22222222-2222-2222-2222-222222222222")))
+    monkeypatch.setattr("server.runtime.runtime_pool.hardware_identity", lambda: hardware)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False,
+        runtime_environment={"CUDA_VISIBLE_DEVICES": visible + ",GPU-11111111"})
+    request = ModelLoadRequest(model="test")
+    assert pool._cuda_device_ids(request) == ["3"]
+    assert pool._cuda_discrete_device_capacity(request) == 48 * GiB
+    assert pool.runtime_environment["CUDA_VISIBLE_DEVICES"] == visible + ",GPU-11111111"
+    assert pool._cuda_device_ids(request.model_copy(update={"device_ids": ["1"]})) == ["1"]
+    asyncio.run(pool.aclose())
+
+
+def test_ambiguous_uuid_does_not_attribute_memory_to_another_gpu(tmp_path, monkeypatch):
+    hardware = HardwareIdentity("CPU", 8, gpu_memory=(
+        GpuMemory("A", 24 << 30, device_id="1", device_uuid="GPU-11111111-aaaa"),
+        GpuMemory("B", 48 << 30, device_id="3", device_uuid="GPU-11111111-bbbb")))
+    monkeypatch.setattr("server.runtime.runtime_pool.hardware_identity", lambda: hardware)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False,
+        runtime_environment={"CUDA_VISIBLE_DEVICES": "GPU-11111111"})
+    request = ModelLoadRequest(model="test")
+    assert pool._cuda_device_ids(request) == ["GPU-11111111"]
+    assert pool._cuda_discrete_device_capacity(request) is None
+    asyncio.run(pool.aclose())

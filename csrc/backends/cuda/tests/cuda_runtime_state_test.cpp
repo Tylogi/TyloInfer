@@ -1196,6 +1196,24 @@ static void check_speculative_recurrent_input_reuse() {
             retained,transposed,tiled),"in-place retained GDN commit rejected a safe column alias");
         check(exact(alias_state,fused.mixer.recurrent) && exact(alias_conv,fused.mixer.convolution),
             "in-place retained GDN commit differs from independent-output replay");
+        if (batch==2 && retained==1) {
+            const auto prefix=tb::tensor(std::vector<int64_t>{0,tokens-1},convolution.options().dtype(tb::kInt64));
+            auto outputs=tb::empty_like(convolution),states=tb::empty_like(recurrent);
+            check(try_gdn_replay_state_cuda(inputs.normalized_k,inputs.convolved_v,inputs.gate,inputs.beta,
+                inputs.qkv,convolution,recurrent,outputs,states,tokens,transposed,tiled,prefix),
+                "GDN replay rejected different retained lengths in one batch");
+            auto expected_conv=tb::empty_like(convolution.narrow(0,1,1));
+            auto expected_state=tb::empty_like(recurrent.narrow(0,1,1));
+            check(try_gdn_replay_state_cuda(inputs.normalized_k.narrow(0,1,1),inputs.convolved_v.narrow(0,1,1),
+                inputs.gate.narrow(0,1,1),inputs.beta.narrow(0,1,1),inputs.qkv.narrow(0,1,1),
+                convolution.narrow(0,1,1),recurrent.narrow(0,1,1),expected_conv,expected_state,tokens-1,
+                transposed,tiled),
+                "GDN single-lane replay rejected the reference prefix");
+            check(exact(outputs.narrow(0,0,1),convolution.narrow(0,0,1)) &&
+                exact(states.narrow(0,0,1),recurrent.narrow(0,0,1)) &&
+                exact(outputs.narrow(0,1,1),expected_conv) && exact(states.narrow(0,1,1),expected_state),
+                "GDN batch retention changed the paused lane or the accepted prefix");
+        }
         ++cases;
     }
     std::cout<<"Retained Q/K/V and fused GDN rollback: "<<cases
@@ -1915,6 +1933,7 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-bench") {
         const auto context=default_context();benchmark_kv_speculative_lru();return 0;
     }
+    if(argc==2 && std::string(argv[1])=="--gdn-prefix-check") {check_speculative_recurrent_input_reuse();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
     if(argc==2 && std::string(argv[1])=="--conditional-compact-sampling-check") {check_conditional_compact_sampling();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-fallback-check") {check_sampling_fallback();return 0;}

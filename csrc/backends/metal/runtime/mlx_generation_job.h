@@ -30,6 +30,8 @@ public:
     bool done() const;
     void join();
     mfq::engine::mtp::GenerationStats mtp;
+    std::size_t cached_tokens = 0;
+    double prefix_restore_ms = 0.0;
 
 private:
     bool push(Event event);

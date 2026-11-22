@@ -50,10 +50,35 @@ function EngineLauncher({ wide, settingsOpen, openSettings, t, showInference, ho
       <Icon name="server-rack" size={18} />{wide && <span>{t('engine')}</span>}
       {wide && <span className="tylo-studio-triangle" data-open={open} aria-hidden="true" />}
     </button>
-    <button type="button" className="tylo-studio-settings" aria-haspopup="dialog" aria-expanded={settingsOpen}
-      aria-label={t('settings')} onClick={() => openSettings()}><Icon name="settings" size={18} />{wide && <span>{t('settings')}</span>}</button>
+    {openSettings && <button type="button" className="tylo-studio-settings" aria-haspopup="dialog" aria-expanded={settingsOpen}
+      aria-label={t('settings')} onClick={() => openSettings()}><Icon name="settings" size={18} />{wide && <span>{t('settings')}</span>}</button>}
     {wide && <div className="tylo-studio-version"><span>{productName} {productVersion}</span>{' '}<span>based on DSH {hostVersion || t('unknownVersion')}</span></div>}
   </div>;
+}
+
+function DSBotEngineLauncher(props) {
+  const [placement, setPlacement] = useState(null);
+  useEffect(() => {
+    const mount = document.createElement('div');
+    mount.className = 'tylo-studio-dsbot-footer';
+    const place = () => {
+      const footer = document.querySelector('.bt-leftcol:not([data-leaving]) .bt-leftcol-foot');
+      if (!footer) {
+        mount.remove();
+        setPlacement(null);
+        return;
+      }
+      if (mount.nextElementSibling !== footer) footer.before(mount);
+      const wide = !footer.classList.contains('bt-leftcol-foot-rail');
+      setPlacement(current => current?.wide === wide ? current : { mount, wide });
+    };
+    const observer = new MutationObserver(place);
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-leaving', 'data-left'] });
+    place();
+    return () => { observer.disconnect(); mount.remove(); };
+  }, []);
+  if (placement) return createDSBotPortal(<EngineLauncher {...props} wide={placement.wide} />, placement.mount);
+  return <div className="tylo-studio-dsbot-classic"><EngineLauncher {...props} /></div>;
 }
 
 function InferencePanel({ t, useSelection, useModelState, watchModels, modelActions, pageApi, showInference, openProductSettings, backToChat, theme, subscribeTheme, pageCheckpoint }) {
@@ -132,21 +157,15 @@ function ThemeControls({ t, theme, subscribeTheme, setTheme, panelInfo }) {
   </div>;
 }
 
-export const inject = ['slots', 'layout', 'locale', 'theme', 'connection', 'modules'];
-export function apply(ctx) {
-  ctx.effect(() => ctx.locale.register(namespace, messages));
+function applyProductShell(ctx) {
   ctx.effect(() => applyProductIcon(document));
   ctx.slots.inject('sidebar.brand.mark', () => ctx.slots.register({ name: 'sidebar.brand.mark', priority: -100 }, BrandMark));
   ctx.slots.inject('sidebar.brand.name', () => ctx.slots.register({ name: 'sidebar.brand.name', priority: -100 }, BrandName));
   ctx.slots.inject('conversation.hero.brand.mark', () => ctx.slots.register({ name: 'conversation.hero.brand.mark', priority: -100 }, HomeMark));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'tyloinfer-title', order: 110 }, ProductTitle));
   ctx.effect(() => {
-    const style = document.createElement('style');
-    style.dataset.tyloinferStudio = '';
-    style.textContent = [stylesheet, settingsStyles, pagesStyles, productStyles, sharedStudioStyles, restoredStyles].join('\n');
-    document.head.append(style);
     document.body.classList.add('tylo-studio-product');
-    return () => { style.remove(); document.body.classList.remove('tylo-studio-product'); };
+    return () => document.body.classList.remove('tylo-studio-product');
   });
   ctx.effect(() => ctx.theme.overrideTokens(__TYLOINFER_PLUGIN_NAME__, {
     '--dsw-alias-brand-primary': { light: '#9f6232', dark: '#d6aa73' },
@@ -156,6 +175,21 @@ export function apply(ctx) {
     '--dsw-alias-bg-base': { light: '#ffffff', dark: '#222327' },
     '--dsw-specific-sidebar-fill': { light: '#eef0f3', dark: '#1c1d21' },
   }));
+}
+
+export const inject = ['slots', 'layout', 'locale', 'theme', 'connection', 'modules'];
+export function apply(ctx) {
+  ctx.effect(() => ctx.locale.register(namespace, messages));
+  if (!__TYLOINFER_DSBOT__) applyProductShell(ctx);
+  ctx.effect(() => {
+    const style = document.createElement('style');
+    style.dataset.tyloinferStudio = '';
+    style.textContent = (__TYLOINFER_DSBOT__
+      ? [stylesheet, pagesStyles, sharedStudioStyles, restoredStyles]
+      : [stylesheet, settingsStyles, pagesStyles, productStyles, sharedStudioStyles, restoredStyles]).join('\n');
+    document.head.append(style);
+    return () => style.remove();
+  });
   const listeners = new Set();
   let view = 'overview';
   const selection = { getSnapshot: () => view, subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); } };
@@ -163,15 +197,21 @@ export function apply(ctx) {
   const modelManager = createModelManager(ctx.connection, { checkpoint: createOperationCheckpoint(() => window.sessionStorage, 'tyloinfer.model-operation.v1') });
   const pageApi = createPageApi(ctx.connection);
   const pageCheckpoint = createOperationCheckpoint(() => window.sessionStorage, 'tyloinfer.page-operation.v1');
-  const openProductSettings = () => document.querySelector('.tylo-studio-settings')?.click();
+  const openProductSettings = __TYLOINFER_DSBOT__ ? undefined : () => document.querySelector('.tylo-studio-settings')?.click();
   const modelActions = { refresh: modelManager.refresh, load: modelManager.load, unload: modelManager.unload, cancel: modelManager.cancel, poll: modelManager.poll, track: modelManager.track, acknowledge: modelManager.acknowledge };
   ctx.effect(() => modelManager.dispose);
   const subscribeTheme = (listener) => ctx.on('theme/change', listener);
-  ctx.slots.inject('settings.launcher', () => ctx.slots.register({ name: 'settings.launcher', priority: -100, locale: namespace,
-    inject: () => ({ hooks: { navSelection: selection }, showInference, hostVersion: ctx.modules.manifest.release?.version }) }, EngineLauncher));
+  const launcher = __TYLOINFER_DSBOT__
+    ? { name: 'sidebar.footer.action', id: mainKey, order: 10 }
+    : { name: 'settings.launcher', priority: -100 };
+  ctx.slots.inject(launcher.name, () => ctx.slots.register({ ...launcher, locale: namespace,
+    inject: () => ({ hooks: { navSelection: selection }, showInference, hostVersion: ctx.modules.manifest.release?.version }) },
+  __TYLOINFER_DSBOT__ ? DSBotEngineLauncher : EngineLauncher));
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: mainKey, locale: namespace,
     inject: () => ({ hooks: { selection, modelState: modelManager }, watchModels: modelManager.watch, modelActions, pageApi, pageCheckpoint, showInference, openProductSettings, theme: ctx.theme, subscribeTheme, backToChat: () => ctx.layout.selectPanel(null) }) }, InferencePanel));
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'tyloinfer-theme', order: 100, locale: namespace,
-    inject: () => ({ theme: ctx.theme, subscribeTheme, panelInfo: ctx.layout.panelInfo, setTheme: (value) => ctx.theme.setTheme(value) }) }, ThemeControls));
+  if (!__TYLOINFER_DSBOT__) {
+    ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'tyloinfer-theme', order: 100, locale: namespace,
+      inject: () => ({ theme: ctx.theme, subscribeTheme, panelInfo: ctx.layout.panelInfo, setTheme: (value) => ctx.theme.setTheme(value) }) }, ThemeControls));
+  }
   ctx.effect(() => () => { listeners.clear(); });
 }

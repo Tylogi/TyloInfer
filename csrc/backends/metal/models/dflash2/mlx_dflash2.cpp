@@ -1,5 +1,8 @@
 #include "mlx_dflash2.h"
 #include "hf_safetensors_store.h"
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+#include "mfq_paged_prefix_cache.h"
+#endif
 #include "mlx_cached_kernel.h"
 #include "mlx_tensor.h"
 #include "mlx_weight_residency.h"
@@ -14,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <queue>
 #include <stdexcept>
@@ -34,26 +38,29 @@ array rotated(const array& value, int dimension, float theta, int offset) {
 
 array draft_ring_attention(const array& query, const array& key, const array& value,
     const std::vector<array>& past_keys, const std::vector<array>& past_values, const array& positions) {
-    constexpr int blocks = 128;
-    // Keep the round-robin split and reduction order of MLX's padded
-    // two-pass vector SDPA. Skip masked entries and read the ring and
-    // proposal rows directly in the same four-token order. See NOTICE.
+    const int lanes = query.shape(0);
+    const int blocks = lanes > 4 ? 32 : 128;
+    // Read the ring and proposal rows directly in four-token order. The
+    // wider path uses fewer splits for short contexts. See NOTICE.
     static const auto options = [] {
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Safe;
         return compile_options;
     }();
-    static const auto split = cached_metal_kernel("tinfer_draft_vector_ring_split",
-        {"query", "key", "value", "key0", "key1", "key2", "key3",
-         "value0", "value1", "value2", "value3", "positions"}, {"parts", "sums", "maxima"}, R"METAL(
+    static const auto splits = [&] {
+        const auto make = [&](int slots) {
+            std::vector<std::string> names{"query", "key", "value"};
+            for (const auto* prefix : {"key", "value"})
+                for (int slot = 0; slot < slots; ++slot) names.push_back(prefix + std::to_string(slot));
+            names.push_back("positions");
+            std::string source = R"METAL(
       const uint3 group = threadgroup_position_in_grid;
       const uint3 local = thread_position_in_threadgroup;
       constexpr uint D = 128, KV = 8, Q = 32, Rows = 8, Window = 2048;
       const uint h = group.x, b = group.y, block = group.z, lane = thread_index_in_simdgroup;
       const uint row = local.z, qhead = h * 4 + local.y;
       const ulong q_offset = (ulong(b * Q + qhead) * Rows + row) * D + lane * 4;
-      device const bfloat* old_k = b == 0 ? key0 : (b == 1 ? key1 : (b == 2 ? key2 : key3));
-      device const bfloat* old_v = b == 0 ? value0 : (b == 1 ? value1 : (b == 2 ? value2 : value3));
+      RING_POINTERS
       old_k += ulong(h) * Window * D + lane * 4;
       old_v += ulong(h) * Window * D + lane * 4;
       const ulong new_base = ulong(b * KV + h) * Rows * D + lane * 4;
@@ -102,7 +109,22 @@ array draft_ring_attention(const array& query, const array& key, const array& va
       const ulong result = (ulong(b * Q + qhead) * Rows + row) * Blocks + block;
       if (lane == 0) { sums[result] = denominator; maxima[result] = maximum; }
       for (uint j = 0; j < 4; ++j) parts[result * D + lane * 4 + j] = bfloat(o[j]);
-)METAL", "", true, false, options);
+)METAL";
+            std::string pointers;
+            for (const auto* prefix : {"key", "value"}) {
+                pointers += prefix[0] == 'k' ? "device const bfloat* old_k = " : "device const bfloat* old_v = ";
+                for (int slot = 0; slot + 1 < slots; ++slot) {
+                    const auto index = std::to_string(slot);
+                    pointers += "b == " + index + " ? " + prefix + index + " : ";
+                }
+                pointers += prefix + std::to_string(slots - 1) + ";\n";
+            }
+            source.replace(source.find("RING_POINTERS"), std::string_view("RING_POINTERS").size(), pointers);
+            return cached_metal_kernel(slots == 4 ? "tinfer_draft_vector_ring_split" : "tinfer_draft_vector_ring_split_wide",
+                names, {"parts", "sums", "maxima"}, source, "", true, false, options);
+        };
+        return std::array{make(4), make(8)};
+    }();
     static const auto reduce = cached_metal_kernel("tinfer_draft_vector_ring_reduce",
         {"partials", "sums", "maxs"}, {"out"}, R"METAL(
       constexpr uint D = 128, Rows = 8, Q = 32, BN = 32;
@@ -135,17 +157,18 @@ array draft_ring_attention(const array& query, const array& key, const array& va
           for (uint j = 0; j < 4; ++j) out[base + j] = bfloat(o[j]);
       }
 )METAL", "", true, false, options);
-    const int lanes = query.shape(0);
+    const bool wide = lanes > 4;
+    const int slots = wide ? 8 : 4;
     std::vector<array> inputs{query, key, value};
-    inputs.reserve(12);
+    inputs.reserve(4 + 2 * slots);
     for (const auto* ring : {&past_keys, &past_values})
-        for (int lane = 0; lane < 4; ++lane)
+        for (int lane = 0; lane < slots; ++lane)
             inputs.push_back((*ring)[lane < lanes ? lane : 0]);
     inputs.push_back(positions);
     const Shape partial_shape{lanes, 32, 8, blocks, 128};
     const Shape statistics_shape{lanes, 32, 8, blocks};
     const std::vector<std::pair<std::string, fast::TemplateArg>> parameters{{"Blocks", blocks}};
-    const auto partials = split(inputs, {partial_shape, statistics_shape, statistics_shape},
+    const auto partials = splits[wide](inputs, {partial_shape, statistics_shape, statistics_shape},
         {bfloat16, float32, float32}, {8 * 32, lanes * 4, blocks * 8}, {32, 4, 8},
         parameters, std::nullopt, false, {});
     return reduce(partials, {{lanes, 8, 4096}}, {bfloat16}, {lanes * 32 * 1024, 8, 1},
@@ -281,13 +304,23 @@ struct Loader {
     HfSafetensorStore store;
     std::size_t bytes = 0;
     std::vector<array> allocations;
-    explicit Loader(const std::filesystem::path& directory) : store(directory, false) {}
+    std::string fingerprint;
+    explicit Loader(const std::filesystem::path& directory) : store(directory, false) {
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        std::ifstream config(directory / "config.json", std::ios::binary);
+        const std::string bytes{std::istreambuf_iterator<char>{config}, std::istreambuf_iterator<char>{}};
+        fingerprint = mfq::cache::block_hash_hex(mfq::cache::sha256(bytes));
+#endif
+    }
     array dense(const std::string& name, const Shape& shape, bool retain = true) {
         const auto& record = store.tensor(name);
         if (record.dtype != "BF16" || std::vector<std::int64_t>(shape.begin(), shape.end()) != record.shape)
             throw std::invalid_argument("DFlash2 tensor shape or precision differs: " + name);
         auto value = array(allocator::malloc(record.nbytes), shape, bfloat16);
         store.read_tensor(record, {reinterpret_cast<std::byte*>(value.data<std::uint8_t>()), std::size_t(record.nbytes)});
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        fingerprint += mfq::cache::block_hash_hex(mfq::cache::sha256(value.data<std::uint8_t>(), record.nbytes));
+#endif
         if (retain) { bytes += value.nbytes(); MlxWeightResidency::track(value); allocations.push_back(value); }
         return value;
     }
@@ -370,6 +403,7 @@ struct MlxDFlash2::Impl {
     std::optional<array> mask_embedding;
     std::vector<array> allocations;
     std::size_t bytes = 0;
+    std::string prefix_key;
     Impl(Loader& loader, MlxDFlash2Config c)
         : config(std::move(c)),
           context_projection(loader.linear("fc", config.hidden, config.hidden * int(config.target_layers.size()))),
@@ -382,12 +416,14 @@ struct MlxDFlash2::Impl {
         if (loader.store.tensors().contains("mask_embedding")) mask_embedding = loader.dense("mask_embedding", {config.hidden});
         bytes = loader.bytes;
         allocations = std::move(loader.allocations);
+#ifdef TYLOINFER_METAL_PAGED_PREFIX_CACHE
+        prefix_key = "dflash2-ring-v1:" + mfq::cache::block_hash_hex(mfq::cache::sha256(loader.fingerprint));
+#endif
     }
     void validate_context(const MlxDFlash2Context& context) const {
         if (context.owner != this || context.position < 0 ||
             context.position > std::numeric_limits<int>::max() - config.block_size ||
-            context.layers.size() != std::size_t(config.layers) || !context.window ||
-            context.window->shape() != Shape{1, config.window, config.hidden} || context.window->dtype() != bfloat16)
+            context.layers.size() != std::size_t(config.layers))
             throw std::invalid_argument("DFlash2 context state differs from checkpoint");
         for (const auto& layer : context.layers) for (const auto* value : {&layer.keys, &layer.values})
             if (!*value || (*value)->shape() != Shape{1, config.kv_heads, config.window, config.head_dimension} ||
@@ -403,11 +439,12 @@ MlxDFlash2 MlxDFlash2::load(const std::filesystem::path& directory) {
 }
 const MlxDFlash2Config& MlxDFlash2::config() const noexcept { return impl_->config; }
 std::size_t MlxDFlash2::weight_bytes() const noexcept { return impl_->bytes; }
+const std::string& MlxDFlash2::prefix_cache_key() const noexcept { return impl_->prefix_key; }
 void MlxDFlash2::track_weights() const {
     for (const auto& value : impl_->allocations) MlxWeightResidency::track(value);
 }
 std::size_t MlxDFlash2Context::bytes() const noexcept {
-    std::size_t result = window ? window->nbytes() : 0;
+    std::size_t result = 0;
     for (const auto& layer : layers) {
         if (layer.keys) result += layer.keys->nbytes();
         if (layer.values) result += layer.values->nbytes();
@@ -419,11 +456,17 @@ void MlxDFlash2::reset(MlxDFlash2Context& context) const {
     const auto& c = config();
     MlxDFlash2Context next;
     next.owner = impl_.get();
-    next.window = zeros({1, c.window, c.hidden}, bfloat16);
     for (int index = 0; index < c.layers; ++index) next.layers.push_back({
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16),
         zeros({1, c.kv_heads, c.window, c.head_dimension}, bfloat16)});
     context = std::move(next);
+}
+
+void MlxDFlash2::restore_context(MlxDFlash2Context& context, const MlxDFlash2Context& snapshot) const {
+    auto restored = snapshot;
+    restored.owner = impl_.get();
+    impl_->validate_context(restored);
+    context = std::move(restored);
 }
 
 void MlxDFlash2::append_context(MlxDFlash2Context& context, const array& target_hidden, int start_position) const {
@@ -436,7 +479,7 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
     const auto& c = config();
     struct Lane {
         int begin, retained, position, end_position;
-        array slots, index;
+        array index;
         std::vector<MlxDFlash2Context::Layer> layers;
     };
     std::vector<Lane> lanes;
@@ -454,7 +497,7 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
         features.push_back(astype(slice(hidden, {0, offset, 0}, {1, count, hidden.shape(2)}), bfloat16));
         auto slots = remainder(arange(start + offset, start + count, int32), array(c.window, int32));
         auto index = broadcast_to(reshape(slots, {1, 1, retained, 1}), {1, c.kv_heads, retained, c.head_dimension});
-        lanes.push_back({begin, retained, start + offset, start + count, std::move(slots), std::move(index), {}});
+        lanes.push_back({begin, retained, start + offset, start + count, std::move(index), {}});
         if (begin > std::numeric_limits<int>::max() - retained)
             throw std::invalid_argument("DFlash2 context batch is too large");
         begin += retained;
@@ -482,18 +525,10 @@ void MlxDFlash2::append_context_batch(std::span<const ContextCommit> commits) co
             lane.layers.push_back({std::move(keys), std::move(values)});
         }
     }
-    std::vector<array> windows;
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-        const auto& lane = lanes[i];
-        auto index = broadcast_to(reshape(lane.slots, {1, lane.retained, 1}), {1, lane.retained, c.hidden});
-        windows.push_back(put_along_axis(*commits[i].context->window, index, part(hidden, lane), 1));
-        outputs.push_back(windows.back());
-    }
     if (!MlxKernelPreparation::collecting()) async_eval(outputs);
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         auto& context = *commits[i].context;
         context.layers = std::move(lanes[i].layers);
-        context.window = std::move(windows[i]);
         context.position = lanes[i].end_position;
     }
 }
@@ -531,11 +566,11 @@ MlxDFlash2::ProposalLattice MlxDFlash2::proposal_lattice(std::span<const MlxDFla
     std::vector<int> positions;
     std::vector<int> row_offsets{0};
     int maximum_depth = 0;
-    const bool direct_ring = batch >= 2 && batch <= 4 && c.block_size == 8 && c.window == 2048 &&
+    const bool direct_ring = batch >= 2 && batch <= 8 && c.block_size == 8 && c.window == 2048 &&
         c.query_heads == 32 && c.kv_heads == 8 && c.head_dimension == 128 &&
         mlx_apple_chip_is("Apple M5 Max") && !std::getenv("MLX_SDPA_BLOCKS") &&
         std::all_of(contexts.begin(), contexts.end(), [&](const auto* context) {
-            return context && context->position < c.window;
+            return context && (batch <= 4 ? context->position < c.window : context->position <= 512);
         });
     for (int lane = 0; lane < batch; ++lane) {
         if (!contexts[lane] || anchors[lane] < 0 || anchors[lane] >= c.vocabulary)
@@ -803,6 +838,15 @@ void MlxDFlash2::prepare(const std::function<array(const array&)>& output_head, 
         auto proposal = propose(context, 0, zeros({1, c.block_size, c.hidden}, bfloat16), output_head);
         preparation->add(proposal.tokens); preparation->add(proposal.confidence);
         if (tree_batch) {
+            if (c.block_size == 8 && c.window == 2048 &&
+                c.query_heads == 32 && c.kv_heads == 8 && c.head_dimension == 128 &&
+                mlx_apple_chip_is("Apple M5 Max") && !std::getenv("MLX_SDPA_BLOCKS")) {
+                const auto ring = zeros({1, 8, 2048, 128}, bfloat16);
+                const std::vector<array> past(8, ring);
+                const auto kv = zeros({8, 8, 8, 128}, bfloat16);
+                preparation->add(draft_ring_attention(zeros({8, 32, 8, 128}, bfloat16), kv, kv,
+                    past, past, zeros({8}, int32)));
+            }
             MlxDFlash2Context second;
             reset(second);
             const auto features = zeros({1, c.block_size, c.hidden * int(c.target_layers.size())}, bfloat16);
@@ -831,6 +875,40 @@ std::int32_t MlxDFlash2::generate_greedy(MlxQwen4CausalLm& target,
     int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) const {
     return generate(target, prompt, MlxSamplingParams{}, max_tokens, callback, prefill_callback,
         prefill_chunk_size, stop_token, stats, maximum_drafts);
+}
+
+std::int32_t mlx_dflash2_constrained_token(MlxSampler& sampler, const mlx::core::array& logits,
+    std::int32_t token, const MfqTokenConstraintPtr& constraint) {
+    if (!constraint || constraint->allows(token)) return token;
+    auto adjusted = mlx::core::contiguous(mlx::core::astype(logits, mlx::core::float32));
+    adjusted.eval();
+    std::vector<float> masked(adjusted.data<float>(), adjusted.data<float>() + adjusted.size());
+    constraint->apply(masked.data(), masked.size());
+    const mlx::core::array row(masked.begin(), {1, static_cast<int>(masked.size())}, mlx::core::float32);
+    const auto selected = sampler.sample(row).item<std::int32_t>();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= masked.size() || !constraint->allows(selected))
+        throw std::runtime_error("DFlash2 constrained target sampler returned an invalid token");
+    return selected;
+}
+
+mfq::engine::mtp::ChainVerification mlx_dflash2_verify_constraint(MlxSampler& sampler,
+    const mlx::core::array& logits, std::span<const std::int32_t> drafts,
+    std::span<const std::int32_t> targets, const MfqTokenConstraintPtr& constraint) {
+    auto cursor = constraint->clone();
+    if (!cursor) throw std::runtime_error("DFlash2 token constraint clone is incomplete");
+    const int vocab = logits.shape(-1);
+    const auto rows = mlx::core::reshape(logits, {static_cast<int>(targets.size()), vocab});
+    for (std::size_t i = 0; i < drafts.size(); ++i) {
+        const int row = static_cast<int>(i);
+        const auto token = mlx_dflash2_constrained_token(sampler,
+            mlx::core::slice(rows, {row, 0}, {row + 1, vocab}), targets[i], cursor);
+        if (token != drafts[i]) return {i, token, false};
+        cursor->accept(token);
+    }
+    const int last = static_cast<int>(drafts.size());
+    const auto bonus = mlx_dflash2_constrained_token(sampler,
+        mlx::core::slice(rows, {last, 0}, {last + 1, vocab}), targets.back(), cursor);
+    return {drafts.size(), bonus, true};
 }
 
 namespace {
@@ -890,7 +968,8 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) {
     const auto& c = draft.config();
     if (prompt.empty() || prompt.size() > std::size_t(target.context_capacity()) || max_tokens < 0 ||
         prefill_chunk_size < 1 || maximum_drafts < 1 || maximum_drafts >= c.block_size ||
@@ -903,6 +982,10 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
     if (sampling.has_penalties()) throw std::invalid_argument("DFlash2 does not support sampling penalties");
     MlxSampler sampler(sampling);
     const auto select = [&](const array& logits) { return reshape(astype(sampler.sample(logits), int32), {-1}); };
+    const auto select_one = [&](const array& logits) {
+        return mlx_dflash2_constrained_token(sampler, logits,
+            select(logits).template item<std::int32_t>(), constraint);
+    };
     if (stats) *stats = {};
     if (!max_tokens) return 0;
     target.set_hidden_capture_layers(c.target_layers);
@@ -929,11 +1012,12 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         start += count;
     }
     const int limit = std::min(max_tokens, target.context_capacity() - int(prompt.size()) + 1);
-    int pending = select(*logits).template item<std::int32_t>();
+    int pending = select_one(*logits);
     int generated = 0;
     bool running = true;
     const auto emit = [&](int token) {
         if (stop_token && token == *stop_token) { running = false; return false; }
+        if (constraint) constraint->accept(token);
         ++generated;
         running = !callback || callback(token);
         return running;
@@ -945,7 +1029,7 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         if (remaining == 1) {
             const auto started = Clock::now();
             auto value = target.decode(pending);
-            const auto token = select(value).template item<std::int32_t>();
+            const auto token = select_one(value);
             if (stats) stats->target_ms += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
             emit(token);
             if (stats) ++stats->standard_tokens;
@@ -994,9 +1078,11 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         if (stats) stats->target_ms += std::chrono::duration<double, std::milli>(Clock::now() - verify_started).count();
         auto features = target.take_hidden_capture();
         if (!features) throw std::runtime_error("DFlash2 target omitted verification features");
-        const auto decision = mfq::engine::mtp::verify_greedy(
-            std::span<const std::int32_t>(proposal.tokens.template data<std::int32_t>(), depth),
-            std::span<const std::int32_t>(predictions.template data<std::int32_t>(), depth + 1));
+        const std::span<const std::int32_t> drafts(proposal.tokens.template data<std::int32_t>(), depth);
+        const std::span<const std::int32_t> targets(predictions.template data<std::int32_t>(), depth + 1);
+        const auto decision = constraint
+            ? mlx_dflash2_verify_constraint(sampler, verified, drafts, targets, constraint)
+            : mfq::engine::mtp::verify_greedy(drafts, targets);
         const int matched = int(decision.accepted_drafts);
         if (stats) {
             ++stats->cycles; stats->proposed += c.block_size - 1;
@@ -1034,20 +1120,22 @@ std::int32_t MlxDFlash2::generate(MlxQwen4CausalLm& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) const {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) const {
     Qwen4DFlashTarget adapter(target);
     return generate_target(*this, adapter, prompt, sampling, max_tokens, callback, prefill_callback,
-        prefill_chunk_size, stop_token, stats, maximum_drafts);
+        prefill_chunk_size, stop_token, stats, maximum_drafts, constraint);
 }
 
 std::int32_t MlxDFlash2::generate(MlxQwen35CausalLm& target,
     const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling, std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts) const {
+    int prefill_chunk_size, std::optional<int> stop_token, MlxDFlash2GenerationStats* stats, int maximum_drafts,
+    const MfqTokenConstraintPtr& constraint) const {
     Qwen35DFlashTarget adapter(target);
     return generate_target(*this, adapter, prompt, sampling, max_tokens, callback, prefill_callback,
-        prefill_chunk_size, stop_token, stats, maximum_drafts);
+        prefill_chunk_size, stop_token, stats, maximum_drafts, constraint);
 }
 
 }

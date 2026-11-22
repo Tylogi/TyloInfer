@@ -343,6 +343,35 @@ array mlx_kv_decode(const array& input, int dimension, int bits, bool value, mlx
         {{"D", dimension}, {"W", width}, {"B", bits}, {"P", packed}, {"O", dtype}}, std::nullopt, false, {}).at(0);
 }
 
+int MlxMlaKvFormat::width() const {
+    if (!quantization.enabled()) return latent_dimension + rotary_dimension;
+    return mlx_kv_packed_width(latent_dimension, quantization.value_bits()) +
+        mlx_kv_packed_width(rotary_dimension, quantization.key_bits());
+}
+
+mlx::core::Dtype MlxMlaKvFormat::dtype() const noexcept {
+    return quantization.enabled() ? mlx::core::uint32 : mlx::core::float16;
+}
+
+array MlxMlaKvFormat::pack(const array& rows) const {
+    if (!quantization.enabled()) return rows;
+    if (!rows.ndim() || rows.shape(-1) != latent_dimension + rotary_dimension)
+        throw std::invalid_argument("MLA cache row width differs from its latent and rotary widths");
+    const auto split = mlx::core::split(rows, Shape{latent_dimension}, -1);
+    return mlx::core::concatenate({mlx_kv_encode(split[0], quantization.value_bits(), true),
+        mlx_kv_encode(split[1], quantization.key_bits(), false)}, -1);
+}
+
+array MlxMlaKvFormat::unpack(const array& rows) const {
+    if (!quantization.enabled()) return rows;
+    if (!rows.ndim() || rows.shape(-1) != width())
+        throw std::invalid_argument("packed MLA cache row width is invalid");
+    const auto split = mlx::core::split(rows,
+        Shape{mlx_kv_packed_width(latent_dimension, quantization.value_bits())}, -1);
+    return mlx::core::concatenate({mlx_kv_decode(split[0], latent_dimension, quantization.value_bits(), true),
+        mlx_kv_decode(split[1], rotary_dimension, quantization.key_bits(), false)}, -1);
+}
+
 array mlx_kv_sparse_attention(const array& query, const array& key, const array& value,
     const std::optional<array>& blocks, MlxKvQuantization quantization,
     int position, int query_offset, int ratio, int budget, const std::optional<array>& key_mask) {

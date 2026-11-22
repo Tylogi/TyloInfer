@@ -276,6 +276,8 @@ export interface RuntimeInstance {
   pinned?: boolean;
   mtp_supported?: boolean;
   mtp_available?: boolean;
+  dflash2_draft?: string | null;
+  dflash2_enabled?: boolean;
   qsa_kv_offload_supported?: boolean;
   kv_quantization_supported?: boolean;
   kv_memory_supported?: boolean;

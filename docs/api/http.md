@@ -686,6 +686,20 @@ Token counting is not supported, so `count_tokens` always answers `501`.
 Errors use the error envelope of the selected protocol, not the common
 `error` envelope.
 
+For `POST /v1/chat/completions`, `max_completion_tokens` takes precedence
+over `max_tokens`. When both fields are omitted, an instance's
+`sampling_defaults` can supply the limit. The parser's built-in default is
+`128000`. The native runtime limits generation to the smaller of the
+requested output budget and the context space remaining after tokenization.
+Generation can stop earlier. The runtime rejects a prompt that exceeds the
+context limit. A prompt that exactly fills the context has a zero-token
+output budget. For limits sent by Agent or DS Bot, see the
+[provider settings guide](../agent-host.md#模型登记和输出预算).
+
+When native generation exhausts its output budget before a stop, the chat
+response reports `finish_reason: "length"` and omits tool calls. This applies
+to both streaming and non-streaming responses.
+
 ### 8.1 Request-local MTP control
 
 For `POST /v1/chat/completions`, the optional `X-TyloInfer-MTP` header accepts
@@ -696,6 +710,14 @@ neither sets the value, the chat parser defaults `enable_mtp` to `true`.
 This applies to streaming and non-streaming chat requests, not to
 `/v1/systemone`. It permits speculation rather than guaranteeing it runs;
 compatible weights, backend support and scheduling are still required.
+
+Managed Flash-Next loads on Metal and CUDA can select a registered DFlash2
+checkpoint using `dflash2_artifact_id` on `POST /api/v1/models/load`. To bind
+it to a running model, also provide `replace_instance_id` for the idle target.
+The job reloads the model with its current settings and attempts to restore
+the previous configuration if the new worker fails to start. The instance reports the loaded
+draft in `dflash2_draft`. A PATCH to `/api/v1/runtime/instances/{id}` can set
+`dflash2_enabled` for subsequent requests without reloading the model.
 
 ### 8.2 Structured decisions
 

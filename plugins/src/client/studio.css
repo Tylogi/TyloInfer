@@ -1,4 +1,10 @@
 .tylo-studio-launcher { display: flex; flex-direction: column; width: 100%; min-height: 0; padding: 8px; border-top: 1px solid var(--dsw-alias-border-l1, #dddddf); color: var(--dsw-alias-label-primary, #202122); font: inherit; }
+.tylo-studio-dsbot-footer { flex: none; width: 100%; min-width: 0; }
+[data-slot='sidebar'] :has(> [data-slot='sidebar.footer.action'] > .tylo-studio-dsbot-classic) { flex-direction: column; }
+.tylo-studio-dsbot-classic { min-width: 0; width: 100%; }
+.tylo-studio-dsbot-classic .tylo-studio-launcher { box-sizing: border-box; }
+[data-slot='sidebar.footer.action']:has(> .tylo-studio-dsbot-classic) > .bt-return { align-self: flex-start; margin-inline: 8px; }
+[data-slot='sidebar.footer.action']:has(> .tylo-studio-dsbot-classic > .tylo-studio-rail) > .bt-return { align-self: center; margin-inline: 0; }
 .tylo-studio-launcher .ui-icon { display: block; flex: 0 0 auto; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .tylo-studio-launcher nav { display: grid; gap: 2px; max-height: 42dvh; min-height: 0; overflow: auto; }
 .tylo-studio-launcher nav[hidden] { display: none; }

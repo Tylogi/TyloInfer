@@ -18,4 +18,4 @@ TyloInfer Studio remains a pure inference desktop application and WebUI. It must
 
 The supported integration contract is split into [model bridge](agent-model-bridge.md), [inference page reads](agent-inference-pages.md), [maintenance](agent-maintenance-bridge.md), and [model/download actions](agent-model-actions.md). Each document distinguishes implementation, deployment, isolated API checks and actual user-operation evidence. A successful bridge test is not an end-to-end real-model Agent acceptance result.
 
-This migration is pending the corresponding isolated validation and the next coordinated core deployment window. Do not restart an existing core or Host just to apply documentation changes. DS Bot-specific collaboration and native desktop distribution remain separate incomplete work.
+Web chat against a loaded TyloInfer model was verified in the standalone Agent and in DS Bot `0.3.8`, both on DSH `0.2.2-rc.2`. Installation and provider settings are documented in the [Host and DS Bot guide](../agent-host.md).

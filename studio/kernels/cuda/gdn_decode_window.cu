@@ -21,6 +21,7 @@ namespace tb=mfq_tensor_backend;
 // Time steps reuse those registers; only rollback prefixes and the final
 // state are written. Convolution history remains read-only until completion.
 struct GdnWindowSnapshots {float* conv[8]{};float* state[8]{};int confirmed=1;float* updates=nullptr;block_q8_1* quantized=nullptr;bool position_major=false;float* final_state=nullptr;};
+struct GdnWindowBatchStrides {int64_t qkv,gate,alpha,beta;};
 
 enum class GdnWindowMode {Snapshots,ReadOnly,Commit,RecordUpdates};
 
@@ -31,10 +32,14 @@ template<class Gate>
 __global__ void gdn_prepare_window_inputs(const void* qkv,const Gate* alpha,const Gate* beta,
  const float* conv,const float* weights,const float* bias,const float* a_log,float* prepared,
  int nk,int nv,int layout,float eps,int64_t qs,int64_t as,int64_t ah,int64_t bs,int64_t bh,
- bool qkv_float,bool tiled_heads) {
+ bool qkv_float,bool tiled_heads,GdnWindowBatchStrides batch_strides) {
  constexpr int D=128;
- const int head=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
+ const int head=blockIdx.x,t=blockIdx.y,tid=threadIdx.x,batch=blockIdx.z;
  const int kh=tiled_heads?head%nk:head/(nv/nk),channels=(2*nk+nv)*D;
+ qkv=static_cast<const char*>(qkv)+batch*batch_strides.qkv*(qkv_float?sizeof(float):sizeof(__half));
+ alpha+=batch*batch_strides.alpha;
+ beta+=batch*batch_strides.beta;
+ conv+=size_t(batch)*3*channels;
  const int qc=kh*D+tid,kc=nk*D+qc,vc=2*nk*D+head*D+tid;
  float q=0,k=0,v=0;
  #pragma unroll
@@ -61,7 +66,7 @@ __global__ void gdn_prepare_window_inputs(const void* qkv,const Gate* alpha,cons
   if(!tid){inverse_q=1.f/fmaxf(sqrtf(qr),eps);inverse_k=1.f/fmaxf(sqrtf(kr),eps);}
  }
  __syncthreads();
- auto* out=prepared+(size_t(t)*nv+head)*386;
+ auto* out=prepared+((size_t(batch)*gridDim.y+t)*nv+head)*386;
  out[tid]=q*inverse_q;out[128+tid]=k*inverse_k;out[256+tid]=v;
  if(!tid) {
   const float a=float(alpha[int64_t(t)*as+int64_t(head)*ah])+bias[head];
@@ -276,12 +281,27 @@ __global__ __launch_bounds__(Mode==GdnWindowMode::RecordUpdates?128:256,(Mode==G
  const float* __restrict__ bias,const float* __restrict__ a_log,const float* __restrict__ norm,
  Output* __restrict__ output,float* __restrict__ next_conv,
  int nk,int nv,int tokens,int layout,bool transposed,bool silu,float conv_eps,double norm_eps,
- int64_t qs,int64_t gs,int64_t as,int64_t ah,int64_t bs,int64_t bh,GdnWindowSnapshots snapshots,bool qkv_float,bool tiled_heads,const float* prepared) {
+ int64_t qs,int64_t gs,int64_t as,int64_t ah,int64_t bs,int64_t bh,GdnWindowSnapshots snapshots,bool qkv_float,bool tiled_heads,
+ const float* prepared,GdnWindowBatchStrides batch_strides) {
  // Prepared verification uses eight four-warp column tiles. Snapshots
  // retain four eight-warp tiles; both expose independent state columns.
  // Output normalization waits for all tiles; each column retains its exact
  // recurrence and checkpoint arithmetic.
  constexpr int Columns=(Mode==GdnWindowMode::RecordUpdates || Mode==GdnWindowMode::Snapshots)?4:16;
+ if constexpr(Mode==GdnWindowMode::RecordUpdates) {
+  const auto batch=size_t(blockIdx.y), channels=size_t(2*nk+nv)*128;
+  qkv=static_cast<const char*>(qkv)+batch*batch_strides.qkv*(qkv_float?sizeof(float):sizeof(__half));
+  output_gate+=batch*batch_strides.gate;
+  alpha+=batch*batch_strides.alpha;
+  beta+=batch*batch_strides.beta;
+  conv+=batch*3*channels;
+  state+=batch*nv*128*128;
+  output+=batch*tokens*nv*128;
+  prepared+=batch*tokens*nv*386;
+  snapshots.updates+=batch*tokens*nv*257;
+  if(next_conv)next_conv+=batch*3*channels;
+  if(snapshots.final_state)snapshots.final_state+=batch*nv*128*128;
+ }
  gdn_decode_window_body<Gate,Output,Mode,Columns,Mode==GdnWindowMode::RecordUpdates>(qkv,output_gate,alpha,beta,conv,state,weights,bias,a_log,norm,
   output,next_conv,nk,nv,tokens,layout,transposed,silu,conv_eps,norm_eps,qs,gs,as,ah,bs,bh,snapshots,qkv_float,tiled_heads,std::is_same_v<Gate,float>,prepared);
 }
@@ -303,9 +323,9 @@ __global__ void gdn_replay_copy_convolutions(const GdnReplayLayer* layers) {
 
 template<class Gate,bool Half,bool Quantized>
 __global__ void gdn_finish_recorded_readout(const float* attended,const Gate* gate,const float* norm,
-        void* output,int nv,int64_t gate_stride,bool silu,double norm_eps,bool position_major) {
+        void* output,int nv,int64_t gate_stride,int64_t batch_gate_stride,bool silu,double norm_eps,bool position_major) {
  constexpr int D=128;const int head=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
- const auto at=(size_t(t)*nv+head)*D+tid;
+ const auto at=((size_t(blockIdx.z)*gridDim.y+t)*nv+head)*D+tid;
  __shared__ float square[D],inverse;
  square[tid]=__fadd_rn(0.f,__fmul_rn(attended[at],attended[at]));
  __syncthreads();
@@ -319,13 +339,13 @@ __global__ void gdn_finish_recorded_readout(const float* attended,const Gate* ga
   if(!tid)inverse=__fdiv_rn(1.f,__fsqrt_rn(float(double(__fdiv_rn(sum,float(D)))+norm_eps)));
  }
  __syncthreads();
- const float z=float(gate[int64_t(t)*gate_stride+head*D+tid]);
+ const float z=float(gate[int64_t(blockIdx.z)*batch_gate_stride+int64_t(t)*gate_stride+head*D+tid]);
  const float sigmoid=__fdiv_rn(1.f,__fadd_rn(1.f,expf(-z)));
  const float activated=silu?__fmul_rn(z,sigmoid):sigmoid;
  float value=__fmul_rn(__fmul_rn(__fmul_rn(attended[at],inverse),norm[tid]),activated);
  if constexpr(Half)value=__half2float(__float2half_rn(value));
  if constexpr(Quantized) {
-  if(position_major)mfq::cuda::gguf::store_q8_position_major(value,int64_t(at),int64_t(nv)*D,int(gridDim.y),output);
+  if(position_major)mfq::cuda::gguf::store_q8_position_major(value,int64_t(at),int64_t(nv)*D,int(gridDim.y*gridDim.z),output);
   else mfq::cuda::gguf::store_q8(value,int64_t(at),static_cast<block_q8_1*>(output));
  }
  else if constexpr(Half)static_cast<__half*>(output)[at]=__float2half_rn(value);
@@ -408,14 +428,17 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
  const tb::Tensor& alpha,const tb::Tensor& beta,const tb::Tensor& conv,const tb::Tensor& state,
  const tb::Tensor& weights,const tb::Tensor& bias,const tb::Tensor& a_log,const tb::Tensor& norm,
  int nk,int nv,int confirmed,double conv_eps,double norm_eps,bool silu,bool half,bool transposed,
- const std::vector<tb::Tensor>& checkpoint_conv,const std::vector<tb::Tensor>& checkpoint_state,bool tiled_heads,GdnWindowMode mode,bool quantize_output=false,bool position_major=false,bool out_of_place=false) {
+ const std::vector<tb::Tensor>& checkpoint_conv,const std::vector<tb::Tensor>& checkpoint_state,bool tiled_heads,GdnWindowMode mode,
+ bool quantize_output=false,bool position_major=false,bool out_of_place=false,bool batch_journal=false) {
  TYLOINFER_RUNTIME_CHECK(!out_of_place || mode==GdnWindowMode::ReadOnly || mode==GdnWindowMode::RecordUpdates,"GDN separate final state requires read-only verification");
  TYLOINFER_RUNTIME_CHECK(!quantize_output || mode!=GdnWindowMode::Commit,"GDN output preparation requires a readout");
- TYLOINFER_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(0)==1 && qkv.size(1)>=1 && qkv.size(1)<=8 &&
+ TYLOINFER_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(0)>=1 && qkv.size(0)<=65535 && qkv.size(1)>=1 && qkv.size(1)<=8 &&
+  (qkv.size(0)==1 || batch_journal) && (!batch_journal || mode==GdnWindowMode::RecordUpdates) &&
   nk>0 && nv>0 && nv<=65535 && nv%nk==0 && int64_t(2)*nk+nv<=std::numeric_limits<int>::max()/128,
   "GDN window heads/sequence invalid");
  const int tokens=int(qkv.size(1)),channels=(2*nk+nv)*128;
- TYLOINFER_RUNTIME_CHECK(!position_major || (quantize_output && tokens>=2 && tokens<=8),"GDN position-major output requires 2..8 Q8 rows");
+ const int batch=int(qkv.size(0)),rows=batch*tokens;
+ TYLOINFER_RUNTIME_CHECK(!position_major || (quantize_output && rows>=2 && rows<=8),"GDN position-major output requires 2..8 Q8 rows");
  TYLOINFER_RUNTIME_CHECK(confirmed>=1 && confirmed<=tokens &&
   checkpoint_conv.size()==size_t(tokens-confirmed) && checkpoint_state.size()==checkpoint_conv.size(),"GDN window geometry invalid");
  const auto device=qkv.device();
@@ -424,7 +447,7 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
   qkv.stride(2)==1 && qkv.stride(1)>=channels && std::isfinite(conv_eps) && conv_eps>0 && std::isfinite(norm_eps) && norm_eps>0,
   "GDN window QKV/epsilon invalid");
  TYLOINFER_RUNTIME_CHECK(real(conv) && real(state) && real(weights) && real(bias) && real(a_log) && real(norm) &&
-  conv.sizes().vec()==std::vector<int64_t>({1,3,channels}) && state.sizes().vec()==std::vector<int64_t>({1,nv,128,128}) &&
+  conv.sizes().vec()==std::vector<int64_t>({batch,3,channels}) && state.sizes().vec()==std::vector<int64_t>({batch,nv,128,128}) &&
   (weights.sizes().vec()==std::vector<int64_t>({channels,1,4}) || weights.sizes().vec()==std::vector<int64_t>({4,channels})) &&
   bias.numel()==nv && a_log.numel()==nv && norm.numel()==128,"GDN window state/weights invalid");
  const auto gate_type=gate.scalar_type();
@@ -433,7 +456,7 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
    x.stride(1)>0 && x.stride(2)>0;
  };
  TYLOINFER_RUNTIME_CHECK((gate_type==tb::kFloat16 || gate_type==tb::kFloat32) && gate.stride(2)==1 &&
-  projection(gate,{1,tokens,nv*128}) && projection(alpha,{1,tokens,nv}) && projection(beta,{1,tokens,nv}),
+  projection(gate,{batch,tokens,nv*128}) && projection(alpha,{batch,tokens,nv}) && projection(beta,{batch,tokens,nv}),
   "GDN window gate projections invalid");
  for(int i=0;i<tokens-confirmed;++i) {
   TYLOINFER_RUNTIME_CHECK(real(checkpoint_conv[i]) && real(checkpoint_state[i]) &&
@@ -443,24 +466,26 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
  }
  const MfqCudaGuard guard(device);
  auto output=mode==GdnWindowMode::Commit?tb::Tensor{}:quantize_output?
-  tb::empty({int64_t(position_major?mfq::cuda::gguf::interleaved_activation_bytes(tokens,int64_t(nv)*128):
-    tokens*nv*4*int64_t(sizeof(block_q8_1)))},qkv.options().dtype(tb::kUInt8)):
-  tb::empty({1,tokens,nv*128},qkv.options().dtype(half?tb::kFloat16:tb::kFloat32));
+  tb::empty({int64_t(position_major?mfq::cuda::gguf::interleaved_activation_bytes(rows,int64_t(nv)*128):
+    int64_t(rows)*nv*4*sizeof(block_q8_1))},qkv.options().dtype(tb::kUInt8)):
+  tb::empty({batch,tokens,nv*128},qkv.options().dtype(half?tb::kFloat16:tb::kFloat32));
  const bool deferred=mode==GdnWindowMode::RecordUpdates || mode==GdnWindowMode::Snapshots;
- auto attended=deferred?tb::empty({1,tokens,nv*128},state.options()):tb::Tensor{};
- auto prepared=mode==GdnWindowMode::RecordUpdates?tb::empty({tokens,nv,386},state.options()):tb::Tensor{};
+ auto attended=deferred?tb::empty({batch,tokens,nv*128},state.options()):tb::Tensor{};
+ auto prepared=mode==GdnWindowMode::RecordUpdates?tb::empty({rows,nv,386},state.options()):tb::Tensor{};
  const bool read_only=mode==GdnWindowMode::ReadOnly || mode==GdnWindowMode::RecordUpdates;
- auto next_conv=read_only && !out_of_place?tb::Tensor{}:tb::empty_like(conv);GdnWindowSnapshots snapshots;snapshots.confirmed=confirmed;
- auto next_state=out_of_place?tb::empty_like(state):state;
- if(out_of_place)snapshots.final_state=next_state.data_ptr<float>();
- auto updates=mode==GdnWindowMode::RecordUpdates || out_of_place?
-  tb::empty({tokens,nv,257},state.options()):tb::Tensor{};
+ auto next_conv=batch_journal || (read_only && !out_of_place)?tb::Tensor{}:tb::empty_like(conv);
+ GdnWindowSnapshots snapshots;snapshots.confirmed=confirmed;
+ auto next_state=batch_journal?tb::Tensor{}:out_of_place?tb::empty_like(state):state;
+ if(out_of_place && !batch_journal)snapshots.final_state=next_state.data_ptr<float>();
+ auto updates=batch_journal?tb::empty({batch,tokens,nv,257},state.options()):
+  mode==GdnWindowMode::RecordUpdates || out_of_place?tb::empty({tokens,nv,257},state.options()):tb::Tensor{};
  if(updates.defined())snapshots.updates=updates.data_ptr<float>();
  if(quantize_output && !deferred)snapshots.quantized=static_cast<block_q8_1*>(output.data_ptr());
  snapshots.position_major=position_major;
  for(int i=0;i<tokens-confirmed;++i) {
   snapshots.conv[i]=checkpoint_conv[i].data_ptr<float>();snapshots.state[i]=checkpoint_state[i].data_ptr<float>();
  }
+ const GdnWindowBatchStrides batch_strides{qkv.stride(0),gate.stride(0),alpha.stride(0),beta.stride(0)};
  const auto launch=[&]<GdnWindowMode Mode>(auto g,auto o) {
   using Gate=decltype(g);using Output=decltype(o);
   const auto kernel=gdn_decode_window_kernel<Gate,Output,Mode>;
@@ -470,15 +495,17 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
    std::fprintf(stderr,"gdn_register_resources mode=%d registers=%d local=%zu shared=%zu\n",int(Mode),a.numRegs,a.localSizeBytes,a.sharedSizeBytes);
   }
   if constexpr(Mode==GdnWindowMode::RecordUpdates)
-   gdn_prepare_window_inputs<Gate><<<dim3(nv,tokens),128,0,mfq_current_cuda_stream()>>>(qkv.data_ptr(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
+   gdn_prepare_window_inputs<Gate><<<dim3(nv,tokens,batch),128,0,mfq_current_cuda_stream()>>>(qkv.data_ptr(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
     conv.data_ptr<float>(),weights.data_ptr<float>(),bias.data_ptr<float>(),a_log.data_ptr<float>(),prepared.data_ptr<float>(),nk,nv,
-    weights.dim()==3?0:1,float(conv_eps),qkv.stride(1),alpha.stride(1),alpha.stride(2),beta.stride(1),beta.stride(2),qkv.scalar_type()==tb::kFloat32,tiled_heads);
-  const dim3 grid(nv,1,Mode==GdnWindowMode::RecordUpdates?8:Mode==GdnWindowMode::Snapshots?4:1);
+    weights.dim()==3?0:1,float(conv_eps),qkv.stride(1),alpha.stride(1),alpha.stride(2),beta.stride(1),beta.stride(2),
+    qkv.scalar_type()==tb::kFloat32,tiled_heads,batch_strides);
+  const dim3 grid(nv,batch,Mode==GdnWindowMode::RecordUpdates?8:Mode==GdnWindowMode::Snapshots?4:1);
   kernel<<<grid,Mode==GdnWindowMode::RecordUpdates?128:256,0,mfq_current_cuda_stream()>>>(qkv.data_ptr(),gate.data_ptr<Gate>(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
    conv.data_ptr<float>(),state.data_ptr<float>(),weights.data_ptr<float>(),bias.data_ptr<float>(),a_log.data_ptr<float>(),norm.data_ptr<float>(),
    (Mode==GdnWindowMode::RecordUpdates || Mode==GdnWindowMode::Snapshots)?attended.data_ptr<Output>():output.defined() && !quantize_output?output.data_ptr<Output>():nullptr,
    next_conv.defined()?next_conv.data_ptr<float>():nullptr,nk,nv,tokens,weights.dim()==3?0:1,transposed,silu,float(conv_eps),norm_eps,
-   qkv.stride(1),gate.stride(1),alpha.stride(1),alpha.stride(2),beta.stride(1),beta.stride(2),snapshots,qkv.scalar_type()==tb::kFloat32,tiled_heads,prepared.defined()?prepared.data_ptr<float>():nullptr);
+   qkv.stride(1),gate.stride(1),alpha.stride(1),alpha.stride(2),beta.stride(1),beta.stride(2),snapshots,qkv.scalar_type()==tb::kFloat32,
+   tiled_heads,prepared.defined()?prepared.data_ptr<float>():nullptr,batch_strides);
  };
  const auto precision=[&]<GdnWindowMode Mode>() {
   if(gate.scalar_type()==tb::kFloat16){if(half)launch.template operator()<Mode>(__half{},__half{});else launch.template operator()<Mode>(__half{},float{});}
@@ -488,8 +515,8 @@ static std::vector<tb::Tensor> gdn_window_impl(const tb::Tensor& qkv,const tb::T
   const auto recorded=[&]<GdnWindowMode Mode>(auto g) {
    using Gate=decltype(g);launch.template operator()<Mode>(g,float{});
    const auto finish=[&](auto half_tag,auto quantized_tag) {
-    gdn_finish_recorded_readout<Gate,decltype(half_tag)::value,decltype(quantized_tag)::value><<<dim3(nv,tokens),128,0,mfq_current_cuda_stream()>>>(
-     attended.data_ptr<float>(),gate.data_ptr<Gate>(),norm.data_ptr<float>(),output.data_ptr(),nv,gate.stride(1),silu,norm_eps,position_major);
+    gdn_finish_recorded_readout<Gate,decltype(half_tag)::value,decltype(quantized_tag)::value><<<dim3(nv,tokens,batch),128,0,mfq_current_cuda_stream()>>>(
+     attended.data_ptr<float>(),gate.data_ptr<Gate>(),norm.data_ptr<float>(),output.data_ptr(),nv,gate.stride(1),gate.stride(0),silu,norm_eps,position_major);
    };
    if(half){if(quantize_output)finish(std::true_type{},std::true_type{});else finish(std::true_type{},std::false_type{});}
    else {if(quantize_output)finish(std::false_type{},std::true_type{});else finish(std::false_type{},std::false_type{});}
@@ -517,9 +544,10 @@ std::vector<tb::Tensor> gdn_verify_window_cuda(const tb::Tensor& qkv,const tb::T
  const tb::Tensor& alpha,const tb::Tensor& beta,const tb::Tensor& conv,const tb::Tensor& state,
  const tb::Tensor& weights,const tb::Tensor& bias,const tb::Tensor& a_log,const tb::Tensor& norm,
  int nk,int nv,double conv_eps,double norm_eps,bool silu,bool half,bool transposed,
- bool tiled_heads,bool quantize_output,bool position_major) {
+ bool tiled_heads,bool quantize_output,bool position_major,bool batch_journal) {
  return gdn_window_impl(qkv,gate,alpha,beta,conv,state,weights,bias,a_log,norm,nk,nv,int(qkv.size(1)),
-  conv_eps,norm_eps,silu,half,transposed,{}, {},tiled_heads,GdnWindowMode::RecordUpdates,quantize_output,position_major,true);
+  conv_eps,norm_eps,silu,half,transposed,{}, {},tiled_heads,GdnWindowMode::RecordUpdates,
+  quantize_output,position_major,true,batch_journal);
 }
 
 std::vector<tb::Tensor> gdn_decode_window_cuda(const tb::Tensor& qkv,const tb::Tensor& gate,

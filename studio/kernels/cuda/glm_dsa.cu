@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "mfq_sparse_attn_mma_f16.cuh"
+#include "selected_attention.h"
 
 namespace {
 
@@ -82,7 +83,8 @@ __device__ __forceinline__ float glm_warp_sum(float value) {
 template<typename T>
 __global__ void dsv4_tail_rope_kernel(const T* x,const int64_t* positions,
         const float* cosine,const float* sine,T* output,int64_t pairs,int heads,int tokens,int width,
-        int rotary_dim,int table_stride,int64_t batch_stride,int64_t head_stride,int64_t token_stride) {
+        int rotary_dim,int table_stride,int64_t batch_stride,int64_t head_stride,int64_t token_stride,
+        bool batched_positions) {
     for(int64_t pair=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;pair<pairs;
             pair+=int64_t(gridDim.x)*blockDim.x) {
         const int column=int(pair%(width/2))*2;
@@ -93,7 +95,8 @@ __global__ void dsv4_tail_rope_kernel(const T* x,const int64_t* positions,
             int64_t(token)*token_stride+column;
         const float a=glm_load(x[source]),b=glm_load(x[source+1]);
         if(column>=width-rotary_dim) {
-            const auto index=positions[token]*table_stride+(column-width+rotary_dim)/2;
+            const auto position=positions[(batched_positions?int64_t(batch)*tokens:0)+token];
+            const auto index=position*table_stride+(column-width+rotary_dim)/2;
             const float c=cosine[index],s=sine[index];
             output[pair*2]=glm_store<T>(a*c-b*s);
             output[pair*2+1]=glm_store<T>(b*c+a*s);
@@ -312,7 +315,8 @@ mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
     TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.dim()==4 && x.stride(3)==1 && x.numel()>0 &&
         (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32) &&
         positions.device()==x.device() && positions.scalar_type()==tb::kInt64 && positions.is_contiguous() &&
-        positions.numel()==x.size(2) && cosine.device()==x.device() && sine.device()==x.device() &&
+        (positions.numel()==x.size(2) || (positions.dim()==2 && positions.size(0)==x.size(0) &&
+            positions.size(1)==x.size(2))) && cosine.device()==x.device() && sine.device()==x.device() &&
         cosine.scalar_type()==tb::kFloat32 && sine.scalar_type()==tb::kFloat32 &&
         cosine.is_contiguous() && sine.is_contiguous() && cosine.dim()==2 && sine.sizes()==cosine.sizes() &&
         x.size(3)%2==0 && rotary_dim>0 && rotary_dim<=x.size(3) && rotary_dim%2==0 &&
@@ -325,7 +329,7 @@ mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
         reinterpret_cast<const TYPE*>(x.data_ptr<PTR>()),positions.data_ptr<int64_t>(), \
         cosine.data_ptr<float>(),sine.data_ptr<float>(),reinterpret_cast<TYPE*>(output.data_ptr<PTR>()), \
         pairs,int(x.size(1)),int(x.size(2)),int(x.size(3)),int(rotary_dim),int(cosine.size(1)), \
-        x.stride(0),x.stride(1),x.stride(2))
+        x.stride(0),x.stride(1),x.stride(2),positions.numel()!=x.size(2))
     if(x.scalar_type()==tb::kFloat16) {TYLOINFER_TAIL_ROPE(half,mfq_half);}
     else {TYLOINFER_TAIL_ROPE(float,float);}
 #undef TYLOINFER_TAIL_ROPE
@@ -474,4 +478,74 @@ mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
         q, cache, cache, indices,
         mfq_tensor_backend::Tensor{}, mfq_tensor_backend::Tensor{},
         meta, scale, "glm_sparse_mla");
+}
+
+mfq_tensor_backend::Tensor attention_mla_latent_selected_cuda(const mfq_tensor_backend::Tensor& q,
+    const mfq_tensor_backend::Tensor& kv, const mfq_tensor_backend::Tensor& indices,
+    const mfq_tensor_backend::Tensor& sinks,double scale) {
+    TYLOINFER_RUNTIME_CHECK(kv.dim()==3 && kv.size(2)==kMlaDq,"latent MLA cache geometry mismatch");
+    const auto cache=kv.unsqueeze(1);
+    const auto tile=mfq_sparse_attn_mma::selection_alignment(kMlaDq,kMlaDv,kMlaHeadsPerTile,q.get_device());
+    auto [safe,mask]=mfq_selected_attention::prepare_indices(indices,kv.size(1),tile);
+    return mfq_sparse_attn_mma::launch<kMlaDq,kMlaDv,1,kMlaHeadsPerTile,true>(
+        q,cache,cache,safe,mask,sinks,{},scale,"selected latent MLA");
+}
+
+namespace {
+__global__ void expand_mla_indices(const int32_t* groups, const int64_t* positions, int32_t* output,
+    int batch, int tokens, int selected, int group_size, int window, int cache_capacity,
+    int live_width, int padded_width, bool packed_positions, bool keep_tail) {
+    const auto end=int64_t(batch)*tokens*padded_width;
+    for (auto at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;at<end;at+=int64_t(gridDim.x)*blockDim.x) {
+        const auto query=at/padded_width;
+        const int column=int(at%padded_width);
+        const int64_t position=positions[packed_positions?query:query%tokens];
+        int64_t key=-1;
+        if (position>=0 && column<live_width) {
+            if (!groups) key=position+1-min(int64_t(window),position+1)+column;
+            else if (column<selected*group_size) {
+                const int group=groups[query*selected+column/group_size];
+                const int64_t last_group=position/group_size;
+                if (group>=0 && (keep_tail?group<last_group:group<=(position+1-group_size)/group_size) &&
+                    int64_t(group)*group_size+group_size-1<=position)
+                    key=int64_t(group)*group_size+column%group_size;
+            } else key=position-position%group_size+(column-selected*group_size);
+        }
+        output[at]=key>=0 && key<=position && key<=INT_MAX?int32_t(cache_capacity?key%cache_capacity:key):-1;
+    }
+}
+}
+
+mfq_tensor_backend::Tensor mla_group_token_indices_cuda(const mfq_tensor_backend::Tensor& groups,
+    const mfq_tensor_backend::Tensor& positions,int64_t batch,int64_t tokens,
+    int64_t group_size,int64_t window,int64_t cache_capacity,bool keep_tail) {
+    namespace tb=mfq_tensor_backend;
+    TYLOINFER_RUNTIME_CHECK(batch>0 && batch<=INT_MAX && tokens>0 && tokens<=INT_MAX &&
+        positions.is_cuda() && positions.is_contiguous() && positions.scalar_type()==tb::kInt64 &&
+        ((positions.dim()==1 && positions.size(0)==tokens) ||
+         (positions.dim()==2 && positions.size(0)==batch && positions.size(1)==tokens)) &&
+        group_size>0 && group_size<=INT_MAX && window>=0 && window<=INT_MAX &&
+        cache_capacity>=0 && cache_capacity<=INT_MAX,"invalid latent MLA query geometry");
+    int64_t selected=0;
+    if (groups.defined()) {
+        TYLOINFER_RUNTIME_CHECK(groups.device()==positions.device() && groups.is_contiguous() &&
+            groups.scalar_type()==tb::kInt32 && groups.dim()==3 && groups.size(0)==batch &&
+            groups.size(1)==tokens && groups.size(2)>0 && groups.size(2)<=INT_MAX/group_size,
+            "invalid latent MLA group selection");
+        selected=groups.size(2);
+    }
+    const auto live=groups.defined()?(selected+int64_t(keep_tail))*group_size:window;
+    TYLOINFER_RUNTIME_CHECK(live>0 && live<=INT_MAX-255 && (!cache_capacity || !groups.defined()),
+        "invalid latent MLA selection width or ring");
+    const auto alignment=mfq_sparse_attn_mma::selection_alignment(kMlaDq,kMlaDv,kMlaHeadsPerTile,positions.get_device());
+    const auto padded=(live+alignment-1)/alignment*alignment;
+    auto indices=tb::empty({batch,tokens,padded},positions.options().dtype(tb::kInt32));
+    constexpr int threads=256;
+    const int blocks=int(std::min<int64_t>((indices.numel()-1)/threads+1,65535));
+    expand_mla_indices<<<blocks,threads,0,mfq_current_cuda_stream()>>>(
+        groups.defined()?groups.data_ptr<int32_t>():nullptr,positions.data_ptr<int64_t>(),indices.data_ptr<int32_t>(),
+        int(batch),int(tokens),int(selected),int(group_size),int(window),int(cache_capacity),int(live),int(padded),
+        positions.dim()==2,keep_tail);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    return indices;
 }

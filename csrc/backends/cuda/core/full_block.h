@@ -82,7 +82,7 @@ struct FullBlock : Block {
         const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
         const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
         int64_t planned_kv_length,
-        int64_t decode_attention_parts, bool cache_only = false);
+        int64_t decode_attention_parts, bool cache_only = false, bool attention_only = false);
     virtual mfq_tensor_backend::Tensor forward_ffn(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor residual,

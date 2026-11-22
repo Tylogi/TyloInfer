@@ -591,6 +591,35 @@ void check_batch_reads(const std::filesystem::path& root) {
     std::vector<std::uint8_t> duplicate(129),gap(137);
     file->read_into_batch({{blocks[0],duplicate.data(),129},{blocks[8],gap.data(),137},{blocks[0],outputs[0].data(),129}});
     assert(duplicate.front()==31 && gap.back()==39);
+
+    const auto group_size = std::size_t{4};
+    const auto row_bytes = std::size_t{16};
+    mfq::cache::QsaKvSequence sequence(file, row_bytes, group_size);
+    std::vector<std::uint8_t> rows(19 * row_bytes);
+    for (std::size_t row = 0; row < 19; ++row)
+        std::fill_n(rows.data() + row * row_bytes, row_bytes, std::uint8_t(row));
+    sequence.append(rows.data(), 19);
+    const auto open_tail = sequence.snapshot();
+    sequence.seal_tail();
+    file->flush();
+    const auto sealed = sequence.snapshot();
+    std::vector<std::uint8_t> gathered(16 * row_bytes, 0xa7);
+    const std::vector<std::size_t> selected{3, 0, 2, 4, 4};
+    const std::array<std::uint8_t, 14> expected{12, 13, 14, 15, 0, 1, 2, 3, 8, 9, 10, 11, 16, 16};
+    for (const auto* snapshot : {&open_tail, &sealed}) {
+        assert(snapshot->read_groups(selected, 17, gathered.data(), gathered.size()) == expected.size());
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            assert(std::all_of(gathered.begin() + i * row_bytes, gathered.begin() + (i + 1) * row_bytes,
+                [&](auto value) { return value == expected[i]; }));
+        assert(gathered[expected.size() * row_bytes] == 0xa7);
+        assert(snapshot->read_groups({1, 2}, 10, gathered.data(), gathered.size()) == 6);
+        assert(gathered[5 * row_bytes] == 9 && gathered[6 * row_bytes] == 2);
+    }
+    try { sealed.read_groups({4}, 16, gathered.data(), gathered.size()); assert(false); }
+    catch (const std::out_of_range&) {}
+    try { sealed.read_groups({0, 1}, 19, gathered.data(), row_bytes); assert(false); }
+    catch (const std::out_of_range&) {}
+
     tq::RamKvStoreConfig ram;ram.pressure.canonical_tier=tq::RamKvTier::Tq4;
     tq::RamKvStore store(ram,allocate,encode,[](const auto&){});
     tq::RamKvSnapshotBlock resident;resident.image=image(11,256,4);

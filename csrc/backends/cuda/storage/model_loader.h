@@ -6,6 +6,8 @@
 #include "models/gemma4/ops.h"
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
+#include "models/hy4_flash/ops.h"
+#include "models/inkling2/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/nemotron_h/ops.h"
 #include "models/qwen35/ops.h"
@@ -130,8 +132,9 @@ auto with_loaded_cuda_model(
     } else source=mfq::open_model_source(options.model_path);
     if(!execution.dflash2_draft_path.empty()) {
         const auto backbone=cuda_backbone(source->resolved_model_graph().backbone);
-        if(backbone!=CudaBackbone::qwen4_exp && backbone!=CudaBackbone::generic_qwen)
-            throw std::invalid_argument("DFlash2 requires a compatible Qwen target model");
+        if(backbone!=CudaBackbone::qwen4_exp && backbone!=CudaBackbone::generic_qwen &&
+           backbone!=CudaBackbone::hy_v4_flash && backbone!=CudaBackbone::inkling2_loop)
+            throw std::invalid_argument("the target model does not support an external block draft");
     }
     auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();
@@ -145,6 +148,7 @@ auto with_loaded_cuda_model(
             source);
         auto runtime_components =
             load_runtime_components(model, load_optional_components);
+        if constexpr(std::is_same_v<Model,Hy4CausalLm>) model.configure_kv_tiers();
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
             prepare_sampling_runtime(model.vocab_size());
         if(execution.kv_memory) {
@@ -194,6 +198,10 @@ auto with_loaded_cuda_model(
             return load.template operator()<DeepseekV41CausalLm>();
         case CudaBackbone::nemotron_h:
             return load.template operator()<NemotronHCausalLm>();
+        case CudaBackbone::inkling2_loop:
+            return load.template operator()<InklingCausalLm>();
+        case CudaBackbone::hy_v4_flash:
+            return load.template operator()<Hy4CausalLm>();
         case CudaBackbone::unsupported:
             throw std::runtime_error("unsupported CUDA model backbone");
     }

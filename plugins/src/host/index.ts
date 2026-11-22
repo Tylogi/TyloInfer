@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import z from '@deepseek-ai/schemastery';
 import { createCoreBridge, readJson } from './core-bridge.js';
 
@@ -24,22 +25,56 @@ export const Config = z.object({
 export function apply(ctx: any, config: HostConfig) {
   const providerSettings = () => ctx.settings.describe({ redactSecrets: true }).find((row: any) => row.ns === 'llm-pi-ai');
   const provider = () => providerSettings()?.value?.providers?.[config.provider];
+  const outputBudget = new AsyncLocalStorage<{ model?: string; maxTokens?: number }>();
+  async function* withOutputBudget(request: { model?: string; maxTokens?: number }, next: () => AsyncIterable<any>): AsyncGenerator<any> {
+    const iterator = outputBudget.run(request, () => next()[Symbol.asyncIterator]());
+    let settled = false;
+    try {
+      while (true) {
+        const item = await outputBudget.run(request, () => iterator.next());
+        if (item.done) {
+          settled = true;
+          return;
+        }
+        yield item.value;
+      }
+    } finally {
+      if (!settled) await outputBudget.run(request, () => iterator.return?.());
+    }
+  }
+  ctx.effect(() => ctx.on('llm/stream', (options: any, next: any) => {
+    if (options.provider !== config.provider) return next();
+    return withOutputBudget({ model: options.model, maxTokens: options.maxTokens }, next);
+  }));
   ctx.effect(() => ctx.on('llm-pi-ai/request-headers', (request: any, _headers: any, next: any) => {
     const headers = next();
-    if (request.provider !== config.provider || headers.get('authorization')?.trim() ||
-        headers.get('cf-aig-authorization')?.trim()) return headers;
+    if (request.provider !== config.provider) return headers;
     const selected = provider();
-    if (!selected?.baseURL || selected.api !== 'openai-completions' || selected.apiKeyEnv) return headers;
+    if (!selected?.baseURL || selected.api !== 'openai-completions') return headers;
+    let target;
     try {
-      const target = new URL(selected.baseURL);
+      target = new URL(selected.baseURL);
       const endpoint = new URL(request.baseURL);
       if (!['http:', 'https:'].includes(target.protocol) ||
-          !['127.0.0.1', '[::1]', 'localhost'].includes(target.hostname) ||
           target.username || target.password || target.search || target.hash ||
           target.href.replace(/\/$/, '') !== endpoint.href.replace(/\/$/, '')) return headers;
     } catch { return headers; }
+
+    const call = outputBudget.getStore();
+    if (call && call.model === request.model) {
+      const savedLimit = selected.models?.find((model: any) => model.id === request.model)?.maxTokens;
+      const limit = call.maxTokens ?? savedLimit;
+      if (limit === undefined || Number.isSafeInteger(limit) && limit >= 1 && limit <= 2147483647) {
+        // Keep the request's limit across pi-ai's approximate context clamp.
+        headers.set('x-tyloinfer-output-budget', limit === undefined ? 'default' : String(limit));
+      }
+    }
+
     // pi-ai requires an authentication header even for an unauthenticated OpenAI-compatible server.
-    headers.set('authorization', 'TyloInfer-Local');
+    if (['127.0.0.1', '[::1]', 'localhost'].includes(target.hostname) && !selected.apiKeyEnv &&
+        !headers.get('authorization')?.trim() && !headers.get('cf-aig-authorization')?.trim()) {
+      headers.set('authorization', 'TyloInfer-Local');
+    }
     return headers;
   }));
   const matchesProvider = (left: any, right: any) => left?.baseURL === right.baseURL && left?.apiKeyEnv === right.apiKeyEnv;

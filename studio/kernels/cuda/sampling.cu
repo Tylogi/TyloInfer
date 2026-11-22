@@ -569,6 +569,54 @@ __global__ void sample_softmax_kernel(
     }
 }
 
+template<class Index>
+__device__ int64_t sample_sorted_top_p(float* values,const Index* indices,float random,int top_k,
+                                      float temperature,float top_p) {
+    float max_v = values[0] / temperature;
+    // Selection is complete; reuse its shared values for probabilities. A
+    // 1024-float thread-local array grows the context's device stack backing
+    // even though only thread zero samples, costing hundreds of MiB on Ampere.
+    float* probs = values;
+    float sum = 0.0f;
+    for (int j = 0; j < top_k; ++j) {
+        probs[j] = expf(values[j] / temperature - max_v);
+        sum += probs[j];
+    }
+    int keep = top_k;
+    float keep_sum = sum;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cutoff = top_p * sum;
+        float c = 0.0f;
+        for (int j = 0; j < top_k; ++j) {
+            c += probs[j];
+            if (c >= cutoff) {
+                keep = j + 1;
+                keep_sum = c;
+                break;
+            }
+        }
+    }
+    float u = fminf(fmaxf(random, 0.0f), 0.99999994f);
+    float target = u * keep_sum;
+    float cdf = 0.0f;
+    int64_t chosen = indices[keep - 1];
+    for (int j = 0; j < keep; ++j) {
+        cdf += probs[j];
+        if (cdf >= target) {
+            chosen = indices[j];
+            break;
+        }
+    }
+    return chosen;
+}
+
+__global__ void sample_sorted_top_k(float* values,const int64_t* indices,const float* random,
+    int64_t* output,int count,float temperature,float top_p) {
+    const auto row=blockIdx.x;
+    const int64_t start=int64_t(row)*count;
+    output[row]=sample_sorted_top_p(values+start,indices+start,random[row],count,temperature,top_p);
+}
+
 template <typename scalar_t>
 __global__ void sample_top_k_top_p_kernel(
     const scalar_t* __restrict__ logits,
@@ -647,42 +695,7 @@ __global__ void sample_top_k_top_p_kernel(
         __syncthreads();
     }
     if (threadIdx.x != 0) return;
-    float max_v = top_vals[0];
-    // Selection is complete; reuse its shared values for probabilities. A
-    // 1024-float thread-local array grows the context's device stack backing
-    // even though only thread zero samples, costing hundreds of MiB on Ampere.
-    float* probs = top_vals;
-    float sum = 0.0f;
-    for (int j = 0; j < top_k; ++j) {
-        probs[j] = expf(top_vals[j] - max_v);
-        sum += probs[j];
-    }
-    int keep = top_k;
-    float keep_sum = sum;
-    if (top_p > 0.0f && top_p < 1.0f) {
-        float cutoff = top_p * sum;
-        float c = 0.0f;
-        for (int j = 0; j < top_k; ++j) {
-            c += probs[j];
-            if (c >= cutoff) {
-                keep = j + 1;
-                keep_sum = c;
-                break;
-            }
-        }
-    }
-    float u = fminf(fmaxf(random[row], 0.0f), 0.99999994f);
-    float target = u * keep_sum;
-    float cdf = 0.0f;
-    int chosen = top_idx[keep - 1];
-    for (int j = 0; j < keep; ++j) {
-        cdf += probs[j];
-        if (cdf >= target) {
-            chosen = top_idx[j];
-            break;
-        }
-    }
-    out[row] = chosen;
+    out[row]=sample_sorted_top_p(top_vals,top_idx,random[row],top_k,1.f,top_p);
 }
 
 mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
@@ -936,6 +949,14 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
                 vals_b.data_ptr<float>(), idxs_b.data_ptr<int>(), random.data_ptr<float>(),
                 out.data_ptr<int64_t>(), count, (int)top_k, (float)temperature, (float)top_p);
         }
+        return out;
+    }
+
+    if (!radix_env || radix_env[0]!='0') {
+        auto [values,indices]=mfq_tensor_backend::topk(logits.to(mfq_tensor_backend::kFloat32),top_k,-1,true,true);
+        sample_sorted_top_k<<<B,1,0,mfq_current_cuda_stream()>>>(values.data_ptr<float>(),indices.data_ptr<int64_t>(),
+            random.data_ptr<float>(),out.data_ptr<int64_t>(),int(top_k),float(temperature),float(top_p));
+        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
     }
 

@@ -16,6 +16,8 @@
 #include "models/gemma4/ops.h"
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
+#include "models/hy4_flash/ops.h"
+#include "models/inkling2/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen35/mtp_graph.h"
@@ -42,6 +44,16 @@
 #include <vector>
 
 using mfq::cuda::internal::PrefillCudaTimer;
+
+int cuda_fixed_mtp_draft_depth() {
+    const auto* setting=std::getenv("TYLOINFER_MTP_FIXED_DRAFT_DEPTH");
+    if(!setting || !*setting)return 0;
+    char* end=nullptr;
+    const long depth=std::strtol(setting,&end,10);
+    if(*end || depth<1 || depth>mfq::engine::mtp::kMaximumReportedDraftDepth)
+        throw std::invalid_argument("TYLOINFER_MTP_FIXED_DRAFT_DEPTH requires a supported positive draft depth");
+    return int(depth);
+}
 
 mfq_tensor_backend::Tensor MtpTarget::embed(mfq_tensor_backend::Tensor ids) const {
     return std::visit([&](auto* target) { return target->embed_forward(std::move(ids)); }, model);
@@ -73,6 +85,7 @@ template <class Model> struct CudaMtpOps {
           .device(mfq_tensor_backend::kCUDA)
           .dtype(mfq_tensor_backend::kInt64);
   Tensor input_ids, counts;
+  int64_t planned_target_horizon=0;
   Tensor known_ids_host, known_ids_device;
   Tensor early_ple_ids_host;
   Tensor projected_target_hidden, projected_target_logits;
@@ -118,7 +131,7 @@ template <class Model> struct CudaMtpOps {
     return result;
   }
   int64_t initial_blockwise_context_window() const noexcept {
-    return mfq::cuda::dflash2::prompt_context_window(mtp);
+    return std::max(mtp.prompt_context_window(),mfq::cuda::dflash2::prompt_context_window(mtp));
   }
   CudaMtpOps(CudaMtpOps&&)=default;
   ~CudaMtpOps() {
@@ -200,13 +213,7 @@ template <class Model> struct CudaMtpOps {
     return mfq::engine::mtp::DraftProbabilityOptions::from_environment();
   }
   int fixed_mtp_draft_depth() const {
-    const auto* setting=std::getenv("TYLOINFER_MTP_FIXED_DRAFT_DEPTH");
-    if(!setting || !*setting)return 0;
-    char* end=nullptr;
-    const long depth=std::strtol(setting,&end,10);
-    if(*end || depth<1 || depth>mfq::engine::mtp::kMaximumReportedDraftDepth)
-      throw std::invalid_argument("TYLOINFER_MTP_FIXED_DRAFT_DEPTH requires a supported positive draft depth");
-    return int(depth);
+    return cuda_fixed_mtp_draft_depth();
   }
   bool metal_mtp_policy() const {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
@@ -257,6 +264,7 @@ template <class Model> struct CudaMtpOps {
     }
   }
   bool stream_prompt_history(int64_t tokens) const {
+    if constexpr (std::is_same_v<Model,mfq::cuda::InklingCausalLm>) return mtp.blockwise_drafting();
     const auto* option=std::getenv("TYLOINFER_MTP_STREAM_PROMPT_HISTORY");
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && tokens>16384 && (!option || option[0]!='0');
   }
@@ -333,6 +341,7 @@ template <class Model> struct CudaMtpOps {
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
+    planned_target_horizon=std::min(model.max_position_embeddings(),input_ids.size(1)+sampling.max_tokens);
     sampler_.emplace(sampling);
     penalties = sampler().has_penalties();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
@@ -394,6 +403,38 @@ template <class Model> struct CudaMtpOps {
       const auto costs_after=target_costs();
       for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]=costs_after[i]-costs_before[i];
     };
+    if constexpr(std::is_same_v<Model,mfq::cuda::InklingCausalLm>) {
+        bool initialized=false;
+        Tensor logits;
+        if (!transformed_prompt) if (auto hidden=mfq::cuda::inkling_graph_hidden(
+                model,ids,raw,confirmed,planned_target_horizon,logits,initialized)) {
+            target_transfer_bytes=mfq::cuda::routed_expert_streamed_bytes(*model.execution)-transfer_before;
+            target_maintenance=target_maintenance || initialized;
+            projected_target_hidden=*hidden;
+            projected_target_logits=std::move(logits);
+            finish_profile();
+            return std::move(*hidden);
+        }
+    }
+    if constexpr(std::is_same_v<Model,mfq::cuda::Hy4CausalLm>) {
+      if (!transformed_prompt) {
+        const auto host_ids=known_ids_device.defined() &&
+            ids.data_ptr()==known_ids_device.data_ptr() && ids.sizes()==known_ids_device.sizes()
+            ? known_ids_host : Tensor{};
+        bool initialized=false;
+        Tensor logits;
+        if (auto hidden=mfq::cuda::hy4_graph_hidden(model,ids,host_ids,confirmed,
+                planned_target_horizon,logits,initialized)) {
+          target_transfer_bytes=mfq::cuda::routed_expert_streamed_bytes(*model.execution)-transfer_before;
+          target_maintenance=target_maintenance || initialized;
+          projected_target_hidden=*hidden;
+          projected_target_logits=std::move(logits);
+          if (raw) *raw=*hidden;
+          finish_profile();
+          return std::move(*hidden);
+        }
+      }
+    }
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
       if(!transformed_prompt && !dense_graph_resource_limited && ids.dim()==2 &&
           ids.size(1)<=1+mfq::engine::mtp::kMaximumReportedDraftDepth &&
@@ -1168,5 +1209,7 @@ TYLOINFER_INSTANTIATE_MTP(mfq::cuda::Qwen4CausalLm);
 TYLOINFER_INSTANTIATE_MTP(mfq::cuda::DeepseekV4CausalLm);
 TYLOINFER_INSTANTIATE_MTP(mfq::cuda::DeepseekV41CausalLm);
 TYLOINFER_INSTANTIATE_MTP(mfq::cuda::NemotronHCausalLm);
+TYLOINFER_INSTANTIATE_MTP(mfq::cuda::InklingCausalLm);
+TYLOINFER_INSTANTIATE_MTP(mfq::cuda::Hy4CausalLm);
 
 #undef TYLOINFER_INSTANTIATE_MTP

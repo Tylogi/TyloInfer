@@ -119,8 +119,11 @@ TokenOutput InferenceOutput::finish() {
     if (finished_) return output;
     finished_ = true;
     if (!emitter_.stopped()) emitter_.flush();
-    parse(emitter_.take(), false, output);
+    const bool exhausted = !stopped_ && result.completion_tokens >= request_.sampling.max_tokens;
+    // A token-limited response can end inside a tool's JSON arguments.
+    parse(emitter_.take(), exhausted, output);
     if (result.cancelled) result.finish_reason = "cancelled";
+    else if (exhausted) result.finish_reason = "length";
     else if (!result.tool_calls.empty()) result.finish_reason = "tool_calls";
     return output;
 }

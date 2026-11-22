@@ -41,6 +41,7 @@ class GpuMemory:
     unified: bool = False
     device_id: str | None = None
     available_bytes: int | None = None
+    device_uuid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,10 @@ def _nvidia_memory() -> tuple[GpuMemory, ...]:
             if library.nvmlDeviceGetName(handle, name, ctypes.c_uint(len(name))) != 0:
                 continue
             label = name.value.decode()
+            uuid = ctypes.create_string_buffer(96)
+            uuid_query = getattr(library, "nvmlDeviceGetUUID", None)
+            device_uuid = (uuid.value.decode() if uuid_query is not None
+                and uuid_query(handle, uuid, ctypes.c_uint(len(uuid))) == 0 else None)
             memory = MemoryInfo()
             measured = library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0
             capacity = memory.total if measured else None
@@ -164,7 +169,7 @@ def _nvidia_memory() -> tuple[GpuMemory, ...]:
                 bandwidth = _positive_int(clock.value * 1_000_000 * 2 * width.value // 8)
             unified = bool(re.search(r"\bGB10\b", label, re.IGNORECASE))
             devices.append(GpuMemory(label, _positive_int(capacity), 273_000_000_000 if unified else bandwidth,
-                unified, str(index), int(memory.free) if measured else None))
+                unified, str(index), int(memory.free) if measured else None, device_uuid))
         return tuple(devices)
     except (AttributeError, OSError, UnicodeError, ValueError):
         return ()

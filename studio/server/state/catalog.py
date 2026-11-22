@@ -24,6 +24,7 @@ from architectures.tensor_schema import (
 from formats.assets import HF_TOKENIZER_CONFIG_ASSET, MODEL_CONFIG_ASSET, is_asset_record
 from formats.compat import canonical_dtype
 from formats.gguf import (
+    gguf_dspark_tensor_count,
     gguf_is_table_component,
     gguf_part_paths,
     is_gguf_path,
@@ -71,6 +72,30 @@ _ALWAYS_STREAMED_RE = re.compile(
     r"|\.position_embedding\.ngram\.shard\.\d+\.(?:weight|scales|biases))$"
 )
 _LOGGER = logging.getLogger(__name__)
+_PUBLIC_MODEL_NAME = re.compile(r"(?:[\w.-]+/)?([A-Za-z0-9][A-Za-z0-9_.-]{0,127})", re.ASCII)
+_DFLASH2_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}?)[-_]dflash[-_]?2(?:[-_].+)?", re.IGNORECASE)
+
+
+def _dflash2_target_name(name: str, config: dict) -> str | None:
+    draft = config["dflash_config"]
+    for value in (
+        draft.get("target_model_name_or_path"),
+        config.get("target_model_name_or_path"),
+        config.get("base_model_name_or_path"),
+    ):
+        if isinstance(value, str) and (match := _PUBLIC_MODEL_NAME.fullmatch(value)):
+            return match[1]
+
+    # The published Flash-Next draft omits the target name and may be installed under an alias.
+    if (
+        config.get("architectures") == ["DFlash2DraftModel"]
+        and (config.get("hidden_size"), config.get("vocab_size"), config.get("num_target_layers")) == (2560, 248320, 48)
+        and draft.get("target_layer_ids") == [5, 15, 25, 35, 45]
+    ):
+        return "Qwen3.8-Flash-Next"
+    if match := _DFLASH2_NAME.fullmatch(name):
+        return match[1]
+    return None
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -841,7 +866,7 @@ class ModelCatalog:
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
         if not is_gguf_path(path):
             artifact = self._inspect(root, path)
-            if is_d1_config(artifact.source_config):
+            if artifact.resource.asset_kind == "dflash2" or is_d1_config(artifact.source_config):
                 return artifact
             decision = artifact.resource.structured_decisions
             if (artifact.resource.format != 'hf' or not artifact.resource.complete
@@ -910,6 +935,16 @@ class ModelCatalog:
                 raise parse_error
             if missing:
                 raise ValueError(f'GGUF checkpoint is missing {missing} shard(s)')
+            if draft_tensors := gguf_dspark_tensor_count(path):
+                resource = ModelArtifactResource(
+                    id=identifier, name=name, architecture='dspark', format='gguf',
+                    asset_kind='dflash2', dflash2_target='Inkling 2 Mini',
+                    shard_count=count, total_bytes=sum(stat.st_size for stat in stats),
+                    tensor_count=draft_tensors, record_count=draft_tensors,
+                    complete=True, loadable=False,
+                    modified_at=datetime.fromtimestamp(max(stat.st_mtime for stat in stats), timezone.utc),
+                )
+                return DiscoveredModel(resource, path, file_paths=paths)
             if gguf_is_table_component(path):
                 raise ValueError('This GGUF is a shared table, not a standalone model')
             metadata = d1_gguf_metadata(path) or self._inspect_native_metadata(path, signature)
@@ -925,7 +960,9 @@ class ModelCatalog:
                 dtype, size = record['dtype'], int(record['nbytes'])
                 if dtype.startswith('GGUF_') and dtype[5:] not in supported:
                     unsupported.add(dtype)
-                if _is_always_streamed_tensor(tensor):
+                if _is_always_streamed_tensor(tensor) or (
+                    architecture == 'hy_v4_flash' and tensor == 'per_layer_token_embd.weight'
+                ):
                     streamed += size
                     continue
                 role = weight_role(tensor)
@@ -1132,6 +1169,8 @@ class ModelCatalog:
             model_type = config.get("model_type") if isinstance(config, dict) else None
             if not isinstance(model_type, str) or not model_type:
                 raise ValueError("HF config.json has no model_type")
+            is_dflash2 = isinstance(config.get("dflash_config"), dict)
+            may_be_dfly2 = model_type == "hy_v4_flash" and type(config.get("dfly_num_hidden_layers")) is int
             index_path = path / "model.safetensors.index.json"
             indexed_names: set[str] | None = None
             if index_path.is_file():
@@ -1144,6 +1183,8 @@ class ModelCatalog:
                     for key, value in weight_map.items()
                 ):
                     raise ValueError("invalid Safetensors weight_map entry")
+                if (is_dflash2 or may_be_dfly2) and any(Path(value).name != value or not value.endswith(".safetensors") for value in weight_map.values()):
+                    raise ValueError("DFlash2 index must reference Safetensors files in the draft directory")
                 indexed_names = set(weight_map)
                 shard_paths = tuple(path / item for item in sorted(set(weight_map.values())))
             else:
@@ -1184,6 +1225,9 @@ class ModelCatalog:
                     dtypes.add(entry["dtype"])
             if indexed_names is not None and not indexed_names.issubset(tensors):
                 raise ValueError("Safetensors index references missing tensors")
+            is_dfly2 = may_be_dfly2 and bool(tensors) and all(
+                tensor.startswith("model.dfly_layers.") for tensor in tensors
+            )
             stats = tuple(item.stat() for item in shard_paths)
             fingerprint = "\0".join(
                 [
@@ -1195,7 +1239,24 @@ class ModelCatalog:
                     ),
                 ]
             )
+            if is_dflash2 or is_dfly2:
+                fingerprint += "\0" + json.dumps(config, sort_keys=True, separators=(",", ":"))
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+            if is_dflash2 or is_dfly2:
+                resource = ModelArtifactResource(
+                    id=identifier, name=name, architecture="dfly2" if is_dfly2 else "dflash2", format="hf",
+                    asset_kind="dflash2",
+                    dflash2_target="Hy4 Flash" if is_dfly2 else _dflash2_target_name(name, config),
+                    shard_count=len(shard_paths),
+                    total_bytes=sum(stat.st_size for stat in stats),
+                    tensor_count=len(tensors), record_count=len(tensors) + 1,
+                    dtypes=sorted(dtypes), complete=True, loadable=False,
+                    modified_at=datetime.fromtimestamp(max(stat.st_mtime for stat in stats), timezone.utc),
+                )
+                files = (path / "config.json", *shard_paths)
+                if index_path.is_file():
+                    files += (index_path,)
+                return DiscoveredModel(resource, path, source_config=config, file_paths=files)
             if d1:
                 d1_assets(path)
             loadable = d1 or graph_spec_for_source_names(config, sorted(tensors)) is not None

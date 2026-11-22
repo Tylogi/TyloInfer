@@ -5,7 +5,8 @@ export interface ModelArtifact {
   name: string;
   architecture: string;
   format: 'tq' | 'hf' | 'gguf';
-  asset_kind?: 'model' | 'ple' | 'engram';
+  asset_kind?: 'model' | 'ple' | 'engram' | 'dflash2';
+  dflash2_target?: string | null;
   owned_file_bytes?: number | null;
   gguf_companion_required?: boolean;
   structured_decisions?: boolean;

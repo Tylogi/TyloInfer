@@ -215,6 +215,7 @@ PLE also adapts its tree convolution and retained history from
 The greedy DFlash2 tree growth and history lookup priors also adapt
 `runtime/metal/kernels/decode/sampling.metal` and `runtime/model/LookupProposals.hpp`.
 Packed row allocation adapts `runtime/model/StepCosts.cpp`.
+Batched QSA split reduction adapts `runtime/metal/kernels/common/paged_attention_tile.h`.
 License: Apache-2.0 (`LICENSE`)
 Source: https://github.com/incoai/splash
 Reference: release 1.7.0, runtime/metal/kernels/decode/gdn.metal

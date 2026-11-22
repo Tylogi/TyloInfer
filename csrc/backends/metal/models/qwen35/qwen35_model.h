@@ -41,6 +41,19 @@ struct Qwen35Config {
     bool attention_output_gate = false;
     std::string output_gate_type;
     std::vector<std::string> layer_types;
+    std::vector<std::int64_t> layer_weight_ids;
+    struct LoopHyperConnection {
+        std::int64_t start;
+        std::int64_t end;
+        int streams;
+        int iterations;
+        float pre_scale;
+    };
+    std::optional<LoopHyperConnection> loop_hyper_connection;
+
+    std::size_t weight_layer(std::size_t visit) const {
+        return layer_weight_ids.empty() ? visit : static_cast<std::size_t>(layer_weight_ids.at(visit));
+    }
     std::int64_t full_attention_interval = 0;
     std::int64_t linear_conv_kernel_dim = 4;
     std::int64_t linear_key_head_dim = 128;

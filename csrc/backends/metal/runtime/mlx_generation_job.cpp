@@ -79,6 +79,8 @@ mfq::engine::Generation consume_mlx_generation(
     // Normal completion also joins before reading statistics or model state.
     cleanup.finish(); // Also preserves failures during coroutine destruction.
     output.metrics.mtp = job.mtp;
+    output.metrics.cached_tokens = job.cached_tokens;
+    output.metrics.prefix_restore_ms = job.prefix_restore_ms;
 }
 
 } // namespace mfq::metal

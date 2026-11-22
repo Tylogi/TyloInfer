@@ -315,12 +315,19 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
     executable = _resolve_runtime_executable(selected_backend, args.running_executable)
     runtime_environment = _mtp_runtime_environment(args, selected_backend)
     if args.dflash2_draft is not None:
-        if selected_backend != "cuda":
-            raise ValueError("--dflash2-draft requires the CUDA runtime")
+        if selected_backend not in {"cuda", "metal"}:
+            raise ValueError("--dflash2-draft requires the CUDA or Metal runtime")
         draft = args.dflash2_draft.expanduser().resolve()
         if not draft.is_dir():
             raise FileNotFoundError(draft)
         runtime_environment["TYLOINFER_DFLASH2_DRAFT"] = str(draft)
+    if args.dfly2_draft is not None:
+        if selected_backend != "metal":
+            raise ValueError("--dfly2-draft requires the Metal runtime")
+        draft = args.dfly2_draft.expanduser().resolve()
+        if not draft.is_file():
+            raise FileNotFoundError(draft)
+        runtime_environment["TYLOINFER_DFLY2_DRAFT"] = str(draft)
     if args.no_prefix_cache:
         runtime_environment["TYLOINFER_RUNTIME_DISABLE_PREFIX_CACHE"] = "1"
     if args.prefix_cache_dir is not None:
@@ -353,6 +360,8 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
         model_catalog_root = model if model.is_dir() else model.parent
         if model_catalog_root not in configured_roots:
             configured_roots.append(model_catalog_root)
+    if args.dflash2_draft is not None and draft not in configured_roots:
+        configured_roots.append(draft)
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     from server.runtime.native_metadata import NativeModelInspector
     catalog = ModelCatalog(configured_roots, native_inspector=NativeModelInspector(executable, selected_backend))
@@ -457,8 +466,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"tyloinfer-server {__version__}")
     parser.add_argument("--model", type=Path, help="optional TyloInfer model to load at startup")
     draft = parser.add_mutually_exclusive_group()
-    draft.add_argument("--dflash2-draft", type=Path, help="DFlash2 checkpoint directory for CUDA Flash-Next generation")
+    draft.add_argument("--dflash2-draft", type=Path, help="DFlash2 checkpoint directory for compatible CUDA or Metal targets")
     draft.add_argument("--mtp-native-draft", type=Path, help="native MTP GGUF companion for a CUDA GGUF target")
+    parser.add_argument("--dfly2-draft", type=Path, help="Hy4 Flash DFly2 safetensors shard for Metal")
     parser.add_argument("--spec-min-p", "--mtp-min-probability", dest="mtp_spec_min_p", type=_probability,
                         help="CUDA greedy draft probability threshold; 0 disables it")
     parser.add_argument("--draft-conf", "--dflash2-draft-confidence", dest="mtp_draft_conf", type=_probability,

@@ -40,9 +40,11 @@
 .model-browser-file > .ui-icon { color: var(--muted); }
 .model-browser-file > span { min-width: 0; overflow-wrap: anywhere; line-height: 1.5; }
 .model-browser-file > small { color: var(--muted); font-size: 10.5px; white-space: nowrap; }
-.model-browser-dialog footer .model-browser-open-finder { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; white-space: nowrap; }
-.model-browser-dialog footer > button { min-height: 32px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; color: var(--ink-soft); background: var(--surface); font-size: 11.5px; }
-.model-browser-dialog footer > button.primary { color: var(--on-accent); }
+.studio-dialog .model-browser-footer { flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 17px; }
+.model-browser-footer-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; min-width: 0; margin-inline-start: auto; }
+.model-browser-footer .model-browser-open-finder { display: inline-flex; align-items: center; gap: 6px; }
+.model-browser-footer button { flex: 0 0 auto; width: auto; max-width: 100%; min-height: 32px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; color: var(--ink-soft); background: var(--surface); font-size: 11.5px; }
+.model-browser-footer button.primary { color: var(--on-accent); }
 @media (max-width: 520px) {
   .model-browser-location { grid-template-columns: minmax(0, 1fr) auto; }
   .model-browser-navigation { grid-column: 1 / -1; }

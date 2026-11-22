@@ -389,18 +389,33 @@ template<typename Input> __global__ void affine_encode_at(const Input* input,int
 // Multi-query warps retain two keys and one head at a time to bound register
 // lifetimes. Both paths accumulate in FP32 before descending XOR reductions.
 constexpr int affine_score_threads=256;
-template<int QT,bool Records=false,bool Pairs=false> __global__ __launch_bounds__(affine_score_threads,QT==1?4:1)
+template<int QT,bool Records=false,bool Pairs=false,bool Weighted=false> __global__ __launch_bounds__(affine_score_threads,QT==1?4:1)
 void affine_scores(const float* query,const int16_t* keys,const uint16_t* scales,
-    const int16_t* zero,const int64_t* positions,float* output,int queries,int heads,int width,int blocks,int pool=4) {
+    const int16_t* zero,const int64_t* positions,float* output,int queries,int heads,int width,int blocks,int pool=4,
+    const float* head_weights=nullptr,bool reserve_tail=false) {
     constexpr int Rows=QT==1?4:2;
     const int lane=threadIdx.x&31,base=(blockIdx.x*(affine_score_threads/32)+threadIdx.x/32)*Rows,first=blockIdx.y*QT;
     if(base>=blocks)return;
+    if constexpr (Weighted) {
+        const auto batch=int64_t(blockIdx.z);
+        query+=batch*queries*heads*width;
+        keys+=batch*blocks*(width+2);
+        positions+=batch*queries;
+        output+=batch*queries*blocks;
+        head_weights+=batch*queries*heads;
+    }
     // Unpacked index rows each represent four tokens.
     const int pooling=Records?pool:4;
     bool active[QT][Rows];bool any=false;
     #pragma unroll
     for(int q=0;q<QT;++q){
-        const auto limit=first+q<queries?(positions?(positions[first+q]+1)/pooling:blocks):0;
+        int64_t limit=0;
+        if (first+q<queries) {
+            if constexpr (Weighted) {
+                const auto position=positions[first+q];
+                if (position>=0) limit=int64_t((uint64_t(position)+!reserve_tail)/pooling);
+            } else limit=positions?(positions[first+q]+1)/pooling:blocks;
+        }
         #pragma unroll
         for(int r=0;r<Rows;++r){active[q][r]=first+q<queries && base+r<blocks && base+r<limit;any|=active[q][r];}
     }
@@ -466,8 +481,14 @@ void affine_scores(const float* query,const int16_t* keys,const uint16_t* scales
         for(int q=0;q<QT;++q){
             #pragma unroll
             for(int h=0;h<HT;++h)if(QT!=1 || first_head+h<heads){
+                float weight=1.f;
+                if constexpr (Weighted) weight=first+q<queries?head_weights[int64_t(first+q)*heads+first_head+h]:0.f;
                 #pragma unroll
-                for(int r=0;r<Rows;++r)score[q][r]+=fmaxf(warp_sum(dot[q][h][r]),0.f);
+                for(int r=0;r<Rows;++r) {
+                    const float positive=fmaxf(warp_sum(dot[q][h][r]),0.f);
+                    if constexpr (Weighted) score[q][r]=fmaf(positive,weight,score[q][r]);
+                    else score[q][r]+=positive;
+                }
             }
         }
     }
@@ -476,7 +497,7 @@ void affine_scores(const float* query,const int16_t* keys,const uint16_t* scales
         for(int q=0;q<QT;++q)if(first+q<queries){
             #pragma unroll
             for(int r=0;r<Rows;++r)if(base+r<blocks)output[int64_t(first+q)*blocks+base+r]=
-                active[q][r]?score[q][r]*(Records?rsqrtf(float(width)):1.f):-CUDART_INF_F;
+                active[q][r]?score[q][r]*(Weighted?rsqrtf(float(width)*heads):Records?rsqrtf(float(width)):1.f):-CUDART_INF_F;
         }
     }
 }
@@ -1351,6 +1372,23 @@ int indexer_affine16_record_scores(const float* query,const int16_t* records,con
 #define RECORD_SCORES(QT) affine_scores<QT,true><<<dim3((blocks+(QT==1?31:15))/(QT==1?32:16),(queries+QT-1)/QT),affine_score_threads,0,stream>>>(query,records,nullptr,nullptr,positions,output,queries,heads,width,blocks,pool)
     if(queries==1){RECORD_SCORES(1);}else if(queries==2){RECORD_SCORES(2);}else {RECORD_SCORES(4);}
 #undef RECORD_SCORES
+    return int(cudaGetLastError());
+}
+int index_pool_affine16_scores(const float* query,const int16_t* records,const float* head_weights,
+    const int64_t* positions,float* output,int queries,int heads,int width,int blocks,int pool,bool reserve_tail,
+    cudaStream_t stream,void* workspace,std::size_t workspace_bytes,int batches) {
+    if(!query || !records || !head_weights || !positions || !output || queries<=0 || heads<=0 ||
+        width<=0 || width>INT_MAX-2 || blocks<=0 || pool<=0 || batches<=0 ||
+        batches>std::numeric_limits<uint16_t>::max() || queries>INT_MAX/batches)
+        return int(cudaErrorInvalidValue);
+    const auto status=launch_affine_scores_integer(query,records,nullptr,nullptr,positions,output,
+        queries,heads,width,blocks,1,pool,workspace,workspace_bytes,stream,head_weights,reserve_tail,batches);
+    if (status!=int(cudaErrorNotSupported)) return status;
+    constexpr int queries_per_block = 4;
+    const dim3 grid(unsigned((int64_t(blocks)+15)/16),
+        unsigned((int64_t(queries)+queries_per_block-1)/queries_per_block),unsigned(batches));
+    affine_scores<queries_per_block,true,false,true><<<grid,affine_score_threads,0,stream>>>(
+        query,records,nullptr,nullptr,positions,output,queries,heads,width,blocks,pool,head_weights,reserve_tail);
     return int(cudaGetLastError());
 }
 int tq8_fit_online(const float* rows,const uint16_t* codebook,const uint8_t* candidates,

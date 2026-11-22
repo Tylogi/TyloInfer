@@ -27,10 +27,10 @@ class BatchDepthPolicy {
 public:
     using Clock = std::chrono::steady_clock;
     BatchDepthPolicy(std::vector<std::string> requests, int maximum, std::size_t ordinary_requests = 0,
-            bool refresh_yields = true)
+            bool refresh_yields = true,bool costly_probes = false)
         : requests_(std::move(requests)), ordinary_requests_(ordinary_requests),
-          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)), current_(maximum_),
-          refresh_yields_(refresh_yields) { committed_mean_.fill(1.); }
+          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)), current_(costly_probes?1:maximum_),
+          first_probe_(current_),refresh_yields_(refresh_yields),costly_probes_(costly_probes) { committed_mean_.fill(1.); }
     const auto& requests() const noexcept { return requests_; }
     std::size_t ordinary_requests() const noexcept { return ordinary_requests_; }
     int maximum() const noexcept { return maximum_; }
@@ -86,7 +86,7 @@ public:
                 last_seen_ = {};
                 committed_mean_.fill(1.);
                 committed_weight_.fill(0.);
-                current_ = maximum_;
+                current_ = first_probe_;
                 losing_ = clear_losing_ = 0;
             }
             return;
@@ -98,6 +98,19 @@ public:
         // retain their existing inter-window host work in the measured cost.
         append(costs_[depth], ms);
         last_seen_[depth] = elapsed_ms_;
+        // A new width can rebuild streamed expert buffers. Try one small
+        // verifier first when that setup is costly, and rotate the first
+        // probe after a cooldown if it loses against the ordinary path.
+        if (costly_probes_ && depth==first_probe_) {
+            if (costs_[depth].size()<3) return;
+            if (costs_[depth].size()==3 && score(depth)<score(0)*.9) {
+                first_probe_=first_probe_%maximum_+1;
+                start_parked(cooldown_);
+                standard_warmup_=2;
+                ++parks_;
+                return;
+            }
+        }
         for (int candidate = maximum_; candidate > 0; --candidate) if (costs_[candidate].size() < 3) {
             current_ = candidate;
             return;
@@ -178,8 +191,8 @@ private:
     }
     std::vector<std::string> requests_;
     std::size_t ordinary_requests_;
-    int maximum_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
-    bool refresh_yields_, confirm_loss_ = false;
+    int maximum_, current_, first_probe_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
+    bool refresh_yields_,costly_probes_,confirm_loss_ = false;
     std::array<double, kMaximumReportedDraftDepth + 1> committed_mean_{};
     std::array<double, kMaximumReportedDraftDepth + 1> committed_weight_{};
     std::array<std::deque<double>, kMaximumReportedDraftDepth + 1> costs_;

@@ -110,7 +110,7 @@ it('displays and changes the real server download folder before submitting anoth
   await screen.findByText('/workspace/models');
   fireEvent.click(screen.getByRole('button', { name: 'Change' }));
   expect(await screen.findByRole('dialog', { name: 'Choose download folder' })).toBeInTheDocument();
-  const use = await screen.findByRole('button', { name: 'Use this folder' });
+  const use = await screen.findByRole('button', { name: 'Select folder' });
   await waitFor(() => expect(use).toBeEnabled());
   fireEvent.click(use);
   await screen.findByText('/chosen/downloads');

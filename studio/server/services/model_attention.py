@@ -18,7 +18,8 @@ def attention_profile(config: dict[str, Any]) -> ModelAttentionProfile | None:
         if type(layers) is int and type(interval) is int and layers > 0 and interval > 0:
             types = ['full_attention' if (i + 1) % interval == 0 else 'linear_attention' for i in range(layers)]
     linear = {'linear_attention', 'gdn', 'kda', 'mamba', 'recurrent_attention'}
-    known_types = {'full_attention', 'sliding_attention', 'sparse_attention', 'deepseek_sparse_attention', 'gqa', 'mha', 'mla', 'qsa', 'dsa', 'csa', 'csa2'}
+    known_types = {'full_attention', 'sliding_attention', 'sparse_attention', 'deepseek_sparse_attention',
+                   'index_pool_attention', 'gqa', 'mha', 'mla', 'qsa', 'dsa', 'csa', 'csa2'}
     if isinstance(types, list) and types:
         if any(not isinstance(value, str) or value not in linear | known_types for value in types):
             return None
@@ -28,7 +29,7 @@ def attention_profile(config: dict[str, Any]) -> ModelAttentionProfile | None:
             return None
         hybrid = False
     sparse_kinds = {'qwen4_exp', 'qwen4_exp_text', 'glm5_next', 'glm5_next_text',
-        'glm_dsa', 'glm_moe_dsa', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'deepseek_v41_text'}
+        'glm_dsa', 'glm_moe_dsa', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'deepseek_v41_text', 'hy_v4_flash'}
     dense_kinds = {'qwen2', 'qwen2_moe', 'qwen3', 'qwen3_moe', 'qwen3_5', 'qwen3_5_text',
         'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'llama', 'mistral', 'mixtral',
         'minicpm', 'minicpmo', 'gemma', 'gemma2', 'gemma3', 'gemma3_text', 'deepseek_v2', 'deepseek_v3'}

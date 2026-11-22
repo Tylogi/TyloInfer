@@ -1,6 +1,7 @@
 #include "qwen35_model.h"
 
 #include "tyloinfer/channel_fp8.h"
+#include "tyloinfer/loop_layer_plan.h"
 #include "tyloinfer/nint_blob.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "mlx_nint.h"
@@ -511,6 +512,30 @@ Qwen35Config Qwen35Config::from_json(std::string_view payload) {
         required_integer(text, "intermediate_size");
     config.num_hidden_layers =
         required_integer(text, "num_hidden_layers");
+    if (config.model_type == "sensenova_loop") {
+        const auto& loop = text.at("loop");
+        const LoopLayerPlan schedule(config.num_hidden_layers, required_integer(loop, "start"),
+            required_integer(loop, "end"), required_integer(loop, "count"), LoopLayerNumbering::execution);
+        config.layer_weight_ids.reserve(schedule.execution_layers());
+        for (int64_t visit = 0; visit < schedule.execution_layers(); ++visit)
+            config.layer_weight_ids.push_back(schedule.source_layer(visit));
+        if (loop.contains("mhc")) {
+            const auto& options = loop.at("mhc");
+            const auto start = schedule.first_visit(required_integer(options, "start"));
+            const auto end = schedule.first_visit(required_integer(options, "end") - 1) + 1;
+            const auto streams = required_integer(options, "streams");
+            const auto iterations = optional_boolean(options, "fixed_identity", false) ?
+                0 : required_integer(options, "iterations");
+            const float pre_scale = optional_number(options, "pre_scale", 1.0);
+            if (start < 0 || end <= start || end > config.num_hidden_layers ||
+                streams < 2 || streams > 4 || iterations < 0 || iterations > 100 ||
+                !std::isfinite(pre_scale)) {
+                throw std::runtime_error("invalid SenseNova mHC configuration");
+            }
+            config.loop_hyper_connection = Qwen35Config::LoopHyperConnection{
+                start, end, static_cast<int>(streams), static_cast<int>(iterations), pre_scale};
+        }
+    }
     config.num_attention_heads =
         required_integer(text, "num_attention_heads");
     config.num_key_value_heads =
@@ -919,7 +944,7 @@ void validate_qwen35_model_bindings(
     for (std::size_t index = 0;
          index < config.layer_types.size();
          ++index) {
-        const auto layer = names.layer(index);
+        const auto layer = names.layer(config.weight_layer(index));
         require_tensor(
             model,
             layer.attention_norm,

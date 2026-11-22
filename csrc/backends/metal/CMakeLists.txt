@@ -16,6 +16,8 @@ set(TYLOINFER_METAL_INCLUDE_DIRS
     ${TYLOINFER_METAL_ROOT}/models/deepseek_v41
     ${TYLOINFER_METAL_ROOT}/models/flash_next
     ${TYLOINFER_METAL_ROOT}/models/qwen35
+    ${TYLOINFER_METAL_ROOT}/models/inkling2
+    ${TYLOINFER_METAL_ROOT}/models/hy4
     ${TYLOINFER_METAL_ROOT}/models/minicpmo45
     ${TYLOINFER_METAL_ROOT}/models/nemotron_h
 )
@@ -367,6 +369,7 @@ add_library(mfq-metal-runtime STATIC
     ops/common/mlx_mx.cpp
     ops/tq/mlx_tq.cpp
     ops/common/mlx_sparse_attention.cpp
+    ops/common/mlx_hyper_connection.cpp
     ops/common/mlx_sparse_prefill_tiles.cpp
     ops/common/mlx_csa2.cpp
     ops/common/mlx_dsa_cache_ops.cpp
@@ -389,6 +392,8 @@ add_library(mfq-metal-runtime STATIC
     models/flash_next/qwen4_ops.cpp
     models/minicpmo45/mlx_minicpmo45.cpp
     models/qwen35/mlx_qwen35_causal_lm.cpp
+    models/inkling2/mlx_inkling2.cpp
+    models/hy4/mlx_hy4.cpp
     models/qwen35/mlx_qwen35_full_attention.cpp
     models/qwen35/mlx_qwen35_linear_attention.cpp
     models/qwen35/qwen35_model.cpp
@@ -552,6 +557,11 @@ target_link_libraries(mfq-metal-runtime PUBLIC
     ${TYLOINFER_IOKIT_FRAMEWORK}
 )
 target_link_libraries(mfq-metal-runtime PRIVATE mfq-json)
+if(TARGET mfq-paged-prefix-cache)
+    target_link_libraries(mfq-metal-runtime PRIVATE mfq-paged-prefix-cache)
+    set_property(SOURCE models/dflash2/mlx_dflash2.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS TYLOINFER_METAL_PAGED_PREFIX_CACHE=1)
+endif()
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
 target_compile_definitions(mfq-metal-runtime PUBLIC
     TYLOINFER_NATIVE_MLX_RUNTIME=1

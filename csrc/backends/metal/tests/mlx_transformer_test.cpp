@@ -1,4 +1,5 @@
 #include "mlx_transformer.h"
+#include "mlx_hyper_connection.h"
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
 #include "mlx_kernel_prepare.h"
@@ -191,6 +192,26 @@ int main() {
     try {
         using namespace mlx::core;
         test_runtime_rope_length_reuse();
+        for (int rows : {1, 6}) {
+            auto residual = reshape(astype(sin(arange(0, rows * 12288, 1, float32)), bfloat16), {1, rows, 4, 3072});
+            auto weight = reshape(cos(arange(0, 8 * 12288, 1, float32) * 0.013f) / 128.0f, {8, 12288});
+            constexpr float eps = 1e-5f;
+            auto expected = matmul(fast::rms_norm(reshape(astype(residual, float32), {1, rows, 12288}),
+                std::nullopt, eps), transpose(weight));
+            auto fused = mfq::metal::mlx_hyper_connection_decode_projection(residual, weight, eps);
+            if (!fused) throw std::runtime_error("small Hy4 iHC projection was not fused");
+            require_array_close(*fused, expected);
+        }
+        {
+            const auto residual = reshape(astype(arange(0, 192, 1, float32) / 128.0f, bfloat16), {1, 3, 2, 32});
+            const auto branch = astype(ones({1, 3, 32}), bfloat16);
+            const auto gates = full({1, 3, 2}, array(0.25f));
+            const auto mixing = broadcast_to(array({0.75f, 0.25f, 0.25f, 0.75f}, {1, 1, 2, 2}), {1, 3, 2, 2});
+            const mfq::metal::MlxHyperConnectionState state{branch, gates, mixing};
+            const auto expected = matmul(astype(mixing, bfloat16), residual) +
+                expand_dims(astype(gates, bfloat16), -1) * expand_dims(branch, -2);
+            require_array_close(mfq::metal::MlxHyperConnection::expand(residual, branch, state), expected);
+        }
         for (const double factor : {2.0, 4.0}) {
             auto scaling = mfq::metal::qwen_yarn_scaling({}, 262144, static_cast<int>(262144 * factor), 4.0);
             require_close(scaling.attention_factor, 1.0 + 0.1 * std::log(factor));
@@ -672,6 +693,12 @@ int main() {
         if (sequence_view.shape() != Shape{1, 3, 2}) {
             throw std::runtime_error("sequence cache view mismatch");
         }
+        mfq::metal::MlxSequenceCache packed_cache(8, 2, uint32);
+        packed_cache.reset(1, 1);
+        const auto packed_rows = array({0xfe123456u, 0u, 0x80000000u, 0xffffffffu}, {1, 2, 2}, uint32);
+        packed_cache.append(packed_rows);
+        if (packed_cache.view().dtype() != uint32 || !all(packed_cache.view() == packed_rows).item<bool>())
+            throw std::runtime_error("packed sequence-cache growth changed its bits");
         sequence_cache.trim(1);
         auto trimmed_sequence = sequence_cache.view();
         trimmed_sequence.eval();
@@ -681,6 +708,30 @@ int main() {
         sequence_cache.clear();
         if (sequence_cache.position() != 0) {
             throw std::runtime_error("sequence cache clear mismatch");
+        }
+
+        const auto relative = reshape(arange(0, 120, 1, float32), {2, 5, 3, 4});
+        const auto sink_logits = reshape(astype(arange(0, 30, 1, float32) / 4.0f, bfloat16), {2, 5, 3});
+        const std::vector<std::int32_t> positions{19, 20, 21, 12, 14, 18};
+        const array key_positions(positions.begin(), {static_cast<int>(positions.size())}, int32);
+        for (const int window : {0, 3}) {
+            std::vector<float> expected;
+            for (int head = 0; head < 6; ++head) {
+                for (int row = 0; row < 3; ++row) {
+                    for (const int key : positions) {
+                        const int distance = 18 + row - key;
+                        const auto index = (head / 3 * 5 + 1 + row) * 3 + head % 3;
+                        const auto bias = distance < 4 ? index * 4 + distance : 0;
+                        expected.push_back(distance >= 0 && (!window || distance < window)
+                            ? static_cast<float>(bias) - index / 4.0f : -std::numeric_limits<float>::infinity());
+                    }
+                }
+            }
+            const auto actual = mfq::metal::mlx_attention_relative_bias(relative, sink_logits, key_positions,
+                1, 3, 18, window, bfloat16);
+            const auto reference = array(expected.begin(), {2, 3, 3, 6}, bfloat16);
+            if (!all(actual == reference).item<bool>())
+                throw std::runtime_error("relative attention bias differs with rotated KV positions");
         }
 
         const array circular_cache(
@@ -713,6 +764,17 @@ int main() {
                     5.0f, 50.0f,
                 },
                 Shape{1, 2, 2}));
+
+        const array appended(
+            {60.0f, 61.0f, 70.0f, 71.0f, 80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f},
+            Shape{1, 5, 2});
+        auto latest = mfq::metal::mlx_circular_cache_append(circular_cache, appended, 6, circular_history);
+        require_array_close(mfq::metal::mlx_circular_cache_history(latest, 11),
+            array({70.0f, 71.0f, 80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f}, Shape{1, 4, 2}));
+        auto decoded = mfq::metal::mlx_circular_cache_append(
+            latest, array({110.0f, 111.0f}, Shape{1, 1, 2}), 11);
+        require_array_close(mfq::metal::mlx_circular_cache_history(decoded, 12),
+            array({80.0f, 81.0f, 90.0f, 91.0f, 100.0f, 101.0f, 110.0f, 111.0f}, Shape{1, 4, 2}));
 
         const array query(
             {0.0f, 0.0f, 0.0f, 0.0f},

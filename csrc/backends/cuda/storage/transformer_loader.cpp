@@ -88,15 +88,13 @@ void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection pr
     using Role = mfq::models::ExpertProjection;
     const auto& record = require_tensor(source, name);
     if (mfq::gguf::is_quantized(record.dtype)) {
-        if (projection == Role::gate_up)
-            throw std::invalid_argument("GGUF routed banks require separate Gate and Up tensors: " + name);
         auto weight = std::make_shared<GgufRoutedWeight>(execution, source, name);
         if (!ffn.moe_gguf) ffn.moe_gguf = std::make_shared<GgufMoeBanks>();
         switch (projection) {
             case Role::gate: ffn.moe_gguf->gate = std::move(weight); break;
             case Role::up: ffn.moe_gguf->up = std::move(weight); break;
             case Role::down: ffn.moe_gguf->down = std::move(weight); break;
-            case Role::gate_up: break;
+            case Role::gate_up: ffn.moe_gguf->gate_up = std::move(weight); break;
         }
         return;
     }
@@ -174,15 +172,17 @@ FFN load_moe_weights(CudaExecutionContext& execution, const mfq::ModelSource& so
     loader.shared_gate_up_compatible_prefix = options.shared_gate_up_compatible_prefix;
     auto result=mfq::models::load_moe_weights<FFN>(
         loader, std::string(prefix), options.layer, options.router_bias_required,
-        options.ungated_experts, options.ungated_shared);
+        options.ungated_experts, options.ungated_shared, options.has_shared_expert);
     if(result.moe_gguf) {
         const auto& banks=*result.moe_gguf;
-        TYLOINFER_RUNTIME_CHECK(!result.moe_tq && banks.up && banks.down &&
-            (options.ungated_experts || banks.gate), "GGUF expert banks cannot be mixed with other routed formats");
-        TYLOINFER_RUNTIME_CHECK(banks.up->experts==banks.down->experts &&
-            banks.up->out==banks.down->input && banks.up->input==banks.down->out &&
-            (!banks.gate || (banks.gate->experts==banks.up->experts &&
-                banks.gate->out==banks.up->out && banks.gate->input==banks.up->input)),
+        const auto& up=banks.gate_up?banks.gate_up:banks.up;
+        TYLOINFER_RUNTIME_CHECK(!result.moe_tq && up && banks.down &&
+            (banks.gate_up || options.ungated_experts || banks.gate),
+            "GGUF expert banks cannot be mixed with other routed formats");
+        TYLOINFER_RUNTIME_CHECK(up->experts==banks.down->experts &&
+            up->out==banks.down->input*(banks.gate_up?2:1) && up->input==banks.down->out &&
+            (!banks.gate || (banks.gate->experts==up->experts &&
+                banks.gate->out==up->out && banks.gate->input==up->input)),
             "GGUF Gate/Up/Down expert dimensions disagree");
     }
     if(result.moe_tq) {

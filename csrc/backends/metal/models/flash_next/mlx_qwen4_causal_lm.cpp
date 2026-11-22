@@ -3331,18 +3331,20 @@ private:
                     for (const auto& output : {decoded.output, decoded.convolution_state,
                             decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
                     if (mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_TREES", false)) {
-                        const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6};
+                        const std::array parents{-1, 0, 1, 2, 3, 4, 5, 6, 7, 8};
                         const MlxGatedDeltaTreeLane full_lane{parents, conv, state};
                         const int key_heads = static_cast<int>(config_.linear_num_key_heads);
                         const int value_heads = static_cast<int>(config_.linear_num_value_heads);
                         // Dispatch signatures differ as a cohort drains and its metadata fits in constant memory.
                         constexpr std::array<std::pair<int, int>, 9> layouts{{
                             {1, 1}, {1, 3}, {1, 8}, {2, 1}, {2, 8}, {3, 1}, {3, 8}, {4, 1}, {4, 8}}};
-                        for (const auto& [count, rows] : layouts) {
+                        const auto prepare_tree = [&](int count, int rows, int last_rows) {
                             std::vector<MlxGatedDeltaTreeLane> lanes(count, full_lane);
                             for (auto& lane : lanes) lane.parents = lane.parents.first(rows);
+                            lanes.back().parents = full_lane.parents.first(last_rows);
                             const auto packed = mlx::core::zeros(
-                                {1, count * rows, static_cast<int>(config_.hidden_size)}, preparation->activation_dtype());
+                                {1, (count - 1) * rows + last_rows, static_cast<int>(config_.hidden_size)},
+                                preparation->activation_dtype());
                             const auto projected = project_inputs(packed);
                             auto result = gated_delta_decode_packed_trees(projected, lanes,
                                 convolution_weight_, dt_bias_, decay_scale_, output_norm_.weight(),
@@ -3357,6 +3359,13 @@ private:
                             auto folded = fold_gated_delta_tree({conv, state}, part(projected[0]), part(projected[1]),
                                 tape.keys, tape.values, tape.decay, tape.beta, retained, config_.linear_tiled_heads);
                             preparation->add(folded.recurrent);
+                        };
+                        for (const auto& [count, rows] : layouts) prepare_tree(count, rows, rows);
+                        if (config_.hidden_size == 2560 && config_.hc_count == 4 && !config_.ple_layer_ids.empty() &&
+                            mlx_apple_chip_is("Apple M5 Max") &&
+                            mfq::engine::environment_enabled("TYLOINFER_METAL_DFLASH2_AUTO_TREE_ROWS", true)) {
+                            // A three-request group can spend most of its 16 rows on one lane.
+                            prepare_tree(3, 3, 10);
                         }
                     }
                     for (const int lanes : {2, 3, 4}) {
@@ -3957,7 +3966,7 @@ public:
                 static_cast<int>(config_.num_key_value_heads), static_cast<int>(config_.head_dim),
                 maximum_, static_cast<int>(config_.indexer_compress_ratio));
             offloaded_pool_ = std::make_unique<MlxQsaIndexOffload>(kv_store_,
-                static_cast<int>(config_.indexer_head_dim), mlx::core::float32, 2);
+                static_cast<int>(config_.indexer_head_dim), mlx::core::float32, kMlxQsaIndexPriority);
         } else cache_ = std::make_unique<MlxKvCache>(
             batch,
             static_cast<int>(config_.num_key_value_heads),
@@ -5387,6 +5396,7 @@ struct MlxQwen4RequestCache {
 struct MlxQwen4TreeTransaction {
     std::vector<std::unique_ptr<MlxQwen4RequestCache>> paths;
     std::vector<int> path_for_node, depth, parents;
+    bool linear_verify_window = false;
     std::vector<std::int64_t> tokens;
     std::vector<std::optional<array>> ple_tape;
     std::vector<std::optional<Qwen4TreeQsaTape>> qsa_tape;
@@ -6498,6 +6508,11 @@ array MlxQwen4CausalLm::project_hidden_logits(const array& hidden) const {
 }
 
 void MlxQwen4CausalLm::resolve_request(MlxQwen4RequestCache& cache, int accepted_drafts) {
+    if (cache.tree && cache.tree->linear_verify_window) {
+        if (accepted_drafts < 0) throw std::invalid_argument("invalid accepted MTP prefix");
+        resolve_request_tree(cache, accepted_drafts);
+        return;
+    }
     if (!cache.speculative_pending || cache.draft_count < 1 || accepted_drafts < 0 ||
         accepted_drafts > cache.draft_count)
         throw std::invalid_argument("Qwen4 request has no matching speculative transaction");
@@ -6517,6 +6532,13 @@ array MlxQwen4CausalLm::forward_request_trees(
     const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
     const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
     int tuned_dflash_width) {
+    return forward_request_trees_with_hidden(caches, trees, dense_qsa_lanes, tuned_dflash_width, nullptr);
+}
+
+array MlxQwen4CausalLm::forward_request_trees_with_hidden(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<MlxQwen4RequestTree>& trees, std::size_t* dense_qsa_lanes,
+    int tuned_dflash_width, std::optional<array>* packed_hidden) {
     if (caches.empty() || trees.size() != caches.size())
         throw std::invalid_argument("Qwen4 tree batch requires one tree per cache");
     std::unordered_set<const MlxQwen4RequestCache*> seen;
@@ -6641,6 +6663,7 @@ array MlxQwen4CausalLm::forward_request_trees(
     }
     if (!captured.empty()) impl_->auxiliary_hidden = mlx::core::concatenate(captured, -1);
     auto logits = project_logits(impl_->output, impl_->embedding, impl_->mixer.mix(streams));
+    if (packed_hidden) packed_hidden->emplace(std::move(streams));
     if (dense_qsa_lanes) for (const auto& transaction : transactions)
         *dense_qsa_lanes += std::count_if(transaction->qsa_tape.begin(), transaction->qsa_tape.end(),
             [](const auto& tape) { return tape.has_value(); });
@@ -6701,6 +6724,13 @@ std::vector<std::pair<array, array>> MlxQwen4CausalLm::forward_request_windows(
     const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
     const std::vector<std::vector<std::int64_t>>& windows,
     std::optional<array>* packed_logits) {
+    return forward_request_windows(caches, windows, packed_logits, false);
+}
+
+std::vector<std::pair<array, array>> MlxQwen4CausalLm::forward_request_windows(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::vector<std::int64_t>>& windows,
+    std::optional<array>* packed_logits, bool native_mtp) {
     if (caches.empty() || windows.size() != caches.size())
         throw std::invalid_argument("Qwen4 batch requires one decode window per cache");
     std::vector<int> offsets{0};
@@ -6712,7 +6742,27 @@ std::vector<std::pair<array, array>> MlxQwen4CausalLm::forward_request_windows(
         tokens.insert(tokens.end(), window.begin(), window.end());
         offsets.push_back(static_cast<int>(tokens.size()));
     }
-    auto output = forward_packed_requests(caches, tokens, offsets, true);
+    const auto forward = [&] {
+        const auto& config = impl_->config;
+        const bool linear_trees = native_mtp && impl_->mtp && caches.size() >= 2 && caches.size() <= 4 &&
+            config.hidden_size == 2560 && config.hc_count == 4 && !config.ple_layer_ids.empty() &&
+            !ssd_expert_payload_bytes() && mlx_apple_chip_is("Apple M5 Max") &&
+            std::ranges::all_of(windows, [](const auto& window) { return window.size() > 1; }) &&
+            std::ranges::all_of(caches, [this](const auto& cache) { return cache && can_verify_request_tree(*cache); });
+        if (!linear_trees) return forward_packed_requests(caches, tokens, offsets, true);
+        std::vector<MlxQwen4RequestTree> trees;
+        trees.reserve(windows.size());
+        for (const auto& window : windows) {
+            std::vector<int> parents(window.size());
+            std::iota(parents.begin(), parents.end(), -1);
+            trees.push_back({window, std::move(parents)});
+        }
+        std::optional<array> hidden;
+        auto logits = forward_request_trees_with_hidden(caches, trees, nullptr, static_cast<int>(caches.size()), &hidden);
+        for (const auto& cache : caches) cache->tree->linear_verify_window = true;
+        return std::pair{std::move(logits), std::move(*hidden)};
+    };
+    auto output = forward();
     if (packed_logits) *packed_logits = output.first;
     std::vector<std::pair<array, array>> result;
     result.reserve(caches.size());

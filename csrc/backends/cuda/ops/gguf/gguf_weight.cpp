@@ -763,6 +763,34 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
     return projection_correction?projection_correction->apply(input,std::move(output)):output;
 }
 
+tb::Tensor GgufWeight::try_forward_batched_logits(const tb::Tensor& input) const {
+    if (type!=GGML_TYPE_Q6_K || quad_storage_rows || prefers_original_input() ||
+        !packed.is_cuda() || !input.is_cuda() || packed.device()!=input.device() ||
+        !packed.is_contiguous() || neuron_len<=0 || input.size(-1)!=neuron_len ||
+        row_bytes!=mfq::gguf::row_bytes(type,neuron_len)) return {};
+    const auto tokens=input.numel()/neuron_len;
+    if (tokens<=8 || tokens>32) return {};
+    const auto* setting=std::getenv("TYLOINFER_GGUF_DENSE_MMQ");
+    if (setting && setting[0]=='0') return {};
+    const auto device=packed.get_device();
+    const MfqCudaGuard guard(device);
+    if (!mmq::direct_fits(type,out,neuron_len,device)) return {};
+    const auto stream=mfq_get_current_cuda_stream(device);
+    const auto activation=GgufPrefillInputScope::prepare_mmq(input,int(type));
+    auto logits=tb::empty({tokens,out},input.options().dtype(tb::kFloat32));
+    for (const auto& tensor:{packed,logits,activation.activation}) mfq_cuda_record_stream(tensor,stream);
+    const void* images[]={packed.data_ptr()};
+    mmq::Context context;
+    context.run({nullptr,int(type),out,neuron_len,packed.nbytes(),1,activation.activation.data_ptr(),nullptr,nullptr,
+        tokens,tokens,logits.data_ptr<float>(),out,images},stream.stream());
+    if (activation.exponents.defined())
+        mfq::cuda::gguf::rescale_f32(logits.data_ptr<float>(),activation.exponents.data_ptr<int32_t>(),
+            tokens,out,stream.stream());
+    auto shape=input.sizes().vec();
+    shape.back()=out;
+    return logits.to(input.scalar_type()==tb::kBFloat16?tb::kFloat16:input.scalar_type()).reshape(shape);
+}
+
 bool GgufWeight::can_forward_prefill_residual(int64_t tokens,const tb::Tensor& residual) const {
     return !correction && !projection_correction && can_prefill_residual(packed,out,neuron_len,tokens,residual);
 }

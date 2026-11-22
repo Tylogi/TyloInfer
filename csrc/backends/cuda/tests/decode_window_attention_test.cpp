@@ -1,10 +1,13 @@
 #include "models/qwen4_exp/model.h"
 #include "runtime/decode_window.h"
 #include "runtime/gdn_decode_plan.h"
+#include "storage/session_state.h"
 #include "gdn_test_options.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_attention_ops.h"
 #include "tyloinfer/runtime.h"
 #include "cuda_execution.h"
+#include "studio/kernels/cuda/loop_mixing.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "../../../tests/nint_row_fixture.h"
 #include "nint.h"
@@ -316,6 +319,81 @@ void grouped_norm_case() {
         equal(mfq_qwen4_exp::grouped_rms_norm(strided,weight,hidden,1e-6),expected.transpose(0,1),"strided grouped RMSNorm");
     }
 }
+void loop_control_case() {
+    for (int width:{257,4096}) {
+        auto state=data({4,5,3,width},93,2.f).to(tb::kFloat32);
+        auto controls=data({4,5,2*width},111,3.f).to(tb::kFloat32);
+        const auto current=state.select(2,0),message=state.select(2,2);
+        const auto gains=controls.narrow(-1,0,width),forgets=controls.narrow(-1,width,width);
+        const auto unit=tb::ones({width},state.options());
+        const auto expected=tb::cat({rms_norm_cuda(current.contiguous(),unit,1e-6),
+            rms_norm_cuda(message.contiguous(),unit,1e-6)},-1);
+        equal(rms_norm_concat_pair_cuda(current,message,unit,1e-6),expected,"loop control RMSNorm pair",0,0);
+        for (const bool contiguous:{false,true}) {
+            const auto gain=contiguous?gains.contiguous():gains,forget=contiguous?forgets.contiguous():forgets;
+            equal(blend_loop_message(current,message,gain,forget),current*(1.0-tb::tanh(forget))+message*tb::tanh(gain),
+                "loop message blend",0,0);
+        }
+    }
+}
+
+void compact_prefix_ring_case() {
+    constexpr int64_t capacity=11,window=5;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
+    for (int64_t position:{3,8,12,14,34}) {
+        const auto input=tb::arange(2*position,options).reshape({2,position,1});
+        const auto history=std::min(position,capacity),count=std::min(position,window);
+        const auto logical=tb::arange(position-history,position,options);
+        auto old=tb::zeros({2,capacity,1},options);
+        old.index_copy_(1,tb::remainder(logical,capacity),input.narrow(1,position-history,history));
+        auto snapshot=capture_session_ring_tensor(old,1,position,window);
+        const auto retained=tb::arange(position-count,position,options);
+        auto expected=tb::zeros({2,window,1},options);
+        expected.index_copy_(1,tb::remainder(retained,window),input.narrow(1,position-count,count));
+        equal(snapshot,expected,"compact prefix ring slots",0,0);
+    }
+}
+
+void relative_swa_verification_case() {
+    constexpr int batch=4,heads=8,kv_heads=2,tokens=4,width=64,window=512,capacity=window+tokens-1,extent=17;
+    const std::vector<int64_t> lengths{12,511,514,735};
+    const auto q=data({batch,heads,tokens,width},91,.35f);
+    const auto k=data({batch,kv_heads,capacity,width},93,.25f);
+    const auto v=data({batch,kv_heads,capacity,width},97,.75f);
+    const auto bias=data({batch,heads,tokens,extent},95,.6f).to(tb::kFloat32);
+    const auto sinks=data({batch,heads,tokens},89,.9f).to(tb::kFloat32);
+    const auto positions=tb::tensor(lengths).to(tb::kCUDA);
+    const auto scale=1/std::sqrt(double(width));
+    const auto actual=attention_cache_relative_swa_cuda(q,k,v,positions,bias,sinks,scale,window,1024);
+    const auto host_q=q.cpu().to(tb::kFloat32),host_k=k.cpu().to(tb::kFloat32),host_v=v.cpu().to(tb::kFloat32);
+    const auto host_bias=bias.cpu(),host_sinks=sinks.cpu();
+    auto expected=tb::empty(q.sizes(),host_q.options());
+    for (int b=0;b<batch;++b) for (int h=0;h<heads;++h) for (int t=0;t<tokens;++t) {
+        const auto row=(b*heads+h)*tokens+t;
+        const auto bank=(b*kv_heads+h/(heads/kv_heads))*capacity;
+        const auto end=lengths[b]-tokens+t+1;
+        const auto first=std::max(int64_t(0),end-window);
+        const auto* query=host_q.data_ptr<float>()+row*width;
+        double normalizer=std::exp(host_sinks.data_ptr<float>()[row]);
+        std::array<double,width> sum{};
+        for (auto pos=first;pos<end;++pos) {
+            const auto offset=(bank+pos%capacity)*width;
+            const auto* key=host_k.data_ptr<float>()+offset;
+            const auto* value=host_v.data_ptr<float>()+offset;
+            double score=0;
+            for (int col=0;col<width;++col) score+=double(query[col])*key[col];
+            const auto distance=end-1-pos;
+            const auto relative=distance<extent?host_bias.data_ptr<float>()[row*extent+distance]:0.f;
+            const auto weight=std::exp(scale*score+relative);
+            normalizer+=weight;
+            for (int col=0;col<width;++col) sum[col]+=weight*value[col];
+        }
+        auto* output=expected.data_ptr<float>()+row*width;
+        for (int col=0;col<width;++col) output[col]=float(sum[col]/normalizer);
+    }
+    equal(actual,expected.to(tb::kFloat16),"batched relative SWA verification",3e-4f,3e-4f);
+}
+
 void gated_residual_case() {
     constexpr int hidden=2560,streams=4;
     for(auto dtype:{tb::kFloat16,tb::kFloat32,tb::kBFloat16})for(int width:{4,320}) {
@@ -1270,6 +1348,9 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
     else if(argc==2 && std::string(argv[1])=="--quota-recovery-check")quota_recovery_case();
     else if(argc==1) {
+        loop_control_case();
+        compact_prefix_ring_case();
+        relative_swa_verification_case();
         qk_prepare_case();layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();gdn_core_q8_case();gdn_independent_q8_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));std::cout.flush();context->end_graph_pool(stream);

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { terminalStates } from './model-api.ts';
 import { Dialog, Switch } from './shared-primitives.tsx';
 import { ModelMonogram } from '../../../studio/web/src/app/display.tsx';
+import { flashNextDraft } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
 import { LoadedModelSettings } from './loaded-model-settings.tsx';
 import { ModelLoadDialog } from './model-load-dialog.tsx';
 import { defaultLoadOptions, loadModelDrafts, saveModelDrafts } from './model-load-options.ts';
@@ -31,7 +32,7 @@ export function OperationPanel({ state, actions, t }) {
   </>;
 }
 
-export function ModelManagement({ state, actions, t, tr, api, mutation, runtime, refresh, refreshKey, renderCatalog }) {
+export function ModelManagement({ state, actions, t, tr, api, mutation, runtime, refresh, refreshKey, renderCatalog, draftDownloadAvailable }) {
   const [selection, setSelection] = useState(null);
   const [drafts, setDrafts] = useState(() => loadModelDrafts(() => window.sessionStorage));
   const [force, setForce] = useState(false);
@@ -49,13 +50,17 @@ export function ModelManagement({ state, actions, t, tr, api, mutation, runtime,
     setDrafts(next); saveModelDrafts(() => window.sessionStorage, next);
   };
   const load = async (request, companionIds) => { if (disabled) return; const accepted = await actions.load(request, companionIds); if (accepted && mounted.current) close(); };
+  const downloadDraft = () => mutation.run(signal => api.download('huggingface', flashNextDraft, signal), 'download');
   const unload = async event => { event.preventDefault(); if (disabled || !selection) return; const accepted = await actions.unload({ instance_id: selection.model.instance_id, force }); if (accepted && mounted.current) close(); };
   const controls = { disabled: Boolean(disabled), openLoad: (model, companionIds) => open('load', model, companionIds), openUnload: model => open('unload', model), openSettings: model => open('configure', model), loadContextForModel: name => drafts[state.inventory.models.find(model => model.name === name)?.id]?.context };
   const loaded = selection && state.inventory.instances.some(item => item.model === selection.model.name && item.state !== 'failed');
   return <div className="tylo-model-management">
     {renderCatalog(controls)}
-    {selection && selection.kind !== 'unload' && !loaded && <ModelLoadDialog key={selection.model.id} model={selection.model} companionIds={selection.companionIds} artifacts={state.inventory.models} mode={selection.kind} options={drafts[selection.model.id] || defaultLoadOptions()} onOptions={update} runtime={runtime} api={api} disabled={Boolean(disabled)} t={t} tr={tr} onClose={close} onLoad={load} triggerRef={trigger} />}
-    {selection && selection.kind === 'configure' && loaded && <LoadedModelSettings key={selection.model.id} model={selection.model} inventory={state.inventory} runtime={runtime} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} tr={tr} onClose={close} triggerRef={trigger} disabled={state.writePending || active || Boolean(state.uncertainty) || Boolean(state.inventoryError)} />}
+    {selection && selection.kind !== 'unload' && !loaded && <ModelLoadDialog key={selection.model.id} model={selection.model} companionIds={selection.companionIds} artifacts={state.inventory.models} mode={selection.kind} options={drafts[selection.model.id] || defaultLoadOptions()} onOptions={update} runtime={runtime} api={api} disabled={Boolean(disabled)} t={t} tr={tr} onClose={close} onLoad={load} triggerRef={trigger}
+      draftDownloadAvailable={draftDownloadAvailable} onDownloadDraft={downloadDraft} />}
+    {selection && selection.kind === 'configure' && loaded && <LoadedModelSettings key={selection.model.id} model={selection.model} inventory={state.inventory} runtime={runtime} api={api} mutation={mutation} refresh={refresh} refreshKey={refreshKey} tr={tr} onClose={close} triggerRef={trigger} disabled={state.writePending || active || Boolean(state.uncertainty) || Boolean(state.inventoryError)}
+      draftDownloadAvailable={draftDownloadAvailable} onDownloadDraft={downloadDraft}
+      onLoadDraft={(draftId, instanceId) => load({ model: selection.model.id, dflash2_artifact_id: draftId, replace_instance_id: instanceId }, [])} />}
     {selection?.kind === 'unload' && <Dialog open title={t('confirmUnload')} closeLabel={tr('关闭', 'Close')} className="model-unload-dialog" returnFocusRef={trigger} onOpenChange={open => { if (!open && !state.writePending) close(); }}>
       <form aria-label={t('confirmUnload')} onSubmit={unload}>
         <div className="model-unload-content">

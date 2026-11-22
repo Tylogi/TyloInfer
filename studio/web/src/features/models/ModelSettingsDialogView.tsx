@@ -14,10 +14,10 @@ import { ModelLoadPolicy } from './ModelLoadPolicy';
 
 import type { useModelCatalog } from './useModelCatalog';
 
-export function ModelSettingsDialogView({ catalog, refreshRuntime, connectionScope, configureInstance, renderContext, renderLoadContext, apiEndpoint, disabled = false, externalError }: {
+export function ModelSettingsDialogView({ catalog, refreshRuntime, connectionScope, configureInstance, renderContext, renderLoadContext, apiEndpoint, disabled = false, externalError, dflash2 }: {
   catalog: ReturnType<typeof useModelCatalog>; refreshRuntime: () => Promise<unknown>; connectionScope: () => () => boolean;
   configureInstance: (...args: Parameters<typeof NativeRuntimeApi.configureInstance>) => Promise<Awaited<ReturnType<typeof NativeRuntimeApi.configureInstance>> | null>;
-  renderContext: (modelName: string) => ReactNode; renderLoadContext: () => ReactNode; apiEndpoint?: string; disabled?: boolean; externalError?: ReactNode;
+  renderContext: (modelName: string) => ReactNode; renderLoadContext: () => ReactNode; apiEndpoint?: string; disabled?: boolean; externalError?: ReactNode; dflash2?: ReactNode;
 }) {
   const { tr } = useSettings();
   const [section, setSection] = useState('context');
@@ -70,6 +70,7 @@ export function ModelSettingsDialogView({ catalog, refreshRuntime, connectionSco
     </div>
     <div className="model-settings-body">
       {externalError}
+      {dflash2}
       {artifact?.structured_decisions && <p className="configuration-effect">
         Jev API: <code style={{ overflowWrap: 'anywhere' }}>POST {apiEndpoint || '/v1/systemone'}</code><br />
         {tr('与 OpenAI 共用端口，无需另设端口。客户端需显式调用此地址，并将 model 设为当前模型名称。',

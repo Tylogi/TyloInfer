@@ -779,7 +779,7 @@ void mlx_prime_mtp_chunk(const array& hidden, const array& ids,
             {*previous_hidden, mlx::core::slice(hidden, Shape{0, 0, 0},
                 Shape{hidden.shape(0), count - 1, hidden.shape(2)})}, 1);
         auto value = fold(rows, ids, offset - 1);
-        value.eval();
+        detail::eval_with_timing(value);
     } else if (count > 1) {
         mlx_prime_mtp_history(hidden, ids,
             [&](const array& rows, const array& shifted, int pair_offset) {

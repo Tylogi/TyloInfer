@@ -1,0 +1,16 @@
+- id: llm-pi-ai
+  config:
+    providers:
+      tyloinfer:
+        displayName: TyloInfer
+        api: openai-completions
+        baseURL: http://127.0.0.1:8090/v1
+        models: []
+        compat:
+          maxTokensField: max_tokens
+          supportsDeveloperRole: false
+- id: connection
+  inject: [webStartup, webServer]
+- insert:
+    - id: tyloinfer-host
+      name: '@tyloinfer/dsh-plugin'

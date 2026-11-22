@@ -123,6 +123,12 @@ public:
         return forward(input, use_cache);
     }
 
+    mlx::core::array forward_attention(const mlx::core::array& input,
+        const mlx::core::array* positions, int position_offset, bool use_cache, int state_tokens = 0);
+    mlx::core::array forward_feed_forward(const mlx::core::array& input) const {
+        return ffn_.forward_normalized(input, ffn_norm_);
+    }
+
     void reset_cache(
         int batch,
         int initial_capacity = 16);
@@ -168,7 +174,7 @@ private:
     std::optional<MlxRmsNorm> key_norm_;
     MlxRmsNorm ffn_norm_;
     MlxQwen35DenseSwiGlu ffn_;
-    std::unique_ptr<MlxKvCache> cache_;
+    std::optional<MlxKvCache> cache_;
     int cache_batch_ = 0;
 };
 

@@ -25,12 +25,20 @@ export function checkpointModelName(name: string): string {
   return base.replace(/[-_\s]+$/, '');
 }
 
-export function groupCheckpoints(artifacts: ModelArtifact[]): CheckpointFamilyGroup[] {
+function checkpointKey(name: string): string {
+  return checkpointModelName(name).replace(/[_\s]+/g, '-').toLowerCase();
+}
+
+export function groupCheckpoints(artifacts: ModelArtifact[], catalog = artifacts): CheckpointFamilyGroup[] {
+  const targets = new Map(catalog.filter(item => !item.asset_kind || item.asset_kind === 'model')
+    .map(item => [checkpointKey(item.name), item]));
   const families = new Map<string, CheckpointFamilyGroup>();
   const modelGroups = new Map<CheckpointFamilyGroup, Map<string, CheckpointModelGroup>>();
   for (const artifact of artifacts) {
-    const vendor = modelVendor(artifact.name, artifact.architecture);
-    const architecture = artifact.architecture?.trim();
+    const target = artifact.asset_kind === 'dflash2' ? artifact.dflash2_target : undefined;
+    const base = target ? targets.get(checkpointKey(target)) : undefined;
+    const architecture = (target ? base?.architecture : artifact.architecture)?.trim();
+    const vendor = modelVendor(target || artifact.name, architecture);
     const declared = architecture && architecture.toLowerCase() !== 'unknown' ? architecture : null;
     const decision = artifact.structured_decisions === true;
     const key = decision ? 'jev' : vendor ?? (declared ? `architecture:${declared.toLowerCase()}` : 'other');
@@ -40,10 +48,10 @@ export function groupCheckpoints(artifacts: ModelArtifact[]): CheckpointFamilyGr
       families.set(key, family);
       modelGroups.set(family, new Map());
     }
-    const identity = artifact.asset_kind && artifact.asset_kind !== 'model'
+    const identity = artifact.asset_kind === 'engram' || artifact.asset_kind === 'ple'
       ? artifact.name.replace(/[-_](?:engram|ple|per[-_]?layer[-_]?(?:token[-_]?)?emb(?:eddings?|d)?)(?:[-_].*)?$/i, '') : artifact.name;
-    const name = checkpointModelName(identity || artifact.name);
-    const modelKey = name.replace(/[_\s]+/g, '-').toLowerCase();
+    const name = checkpointModelName(target || identity || artifact.name);
+    const modelKey = checkpointKey(name);
     let model = modelGroups.get(family)!.get(modelKey);
     if (!model) {
       model = { key: modelKey, name, artifacts: [] };

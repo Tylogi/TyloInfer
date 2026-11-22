@@ -11,18 +11,23 @@
 #include <utility>
 #include <vector>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <span>
 
 struct RopeCache;
+int cuda_fixed_mtp_draft_depth();
 
 struct MtpTarget {
     std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
         mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
         mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
         mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*,
-        mfq::cuda::NemotronHCausalLm*> model;
+        mfq::cuda::NemotronHCausalLm*, mfq::cuda::InklingCausalLm*, mfq::cuda::Hy4CausalLm*> model;
     const RopeCache* rope = nullptr;
-    template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
+    int64_t batch_row = -1;
+    template <class Model> explicit MtpTarget(Model& target, int64_t row = -1)
+        : model(std::in_place_type<Model*>, &target), rope(&target.rope), batch_row(row) {}
     mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;
     mfq_tensor_backend::Tensor logits(mfq_tensor_backend::Tensor hidden) const;
 };
@@ -43,7 +48,15 @@ struct MtpGreedyChain {
 
 // Architecture-specific predictors implement device math and cache state only.
 struct MtpModule {
+    struct DraftLane {
+        MtpModule* session;
+        mfq_tensor_backend::Tensor anchor;
+        int64_t slot;
+        int depth;
+    };
+
     virtual ~MtpModule() = default;
+    virtual std::unique_ptr<MtpModule> fork_session() const { return {}; }
     virtual void reset(int64_t batch = 1) = 0;
     virtual mfq_tensor_backend::Tensor forward(
         const MtpTarget& target,
@@ -76,6 +89,10 @@ struct MtpModule {
         return mfq::engine::mtp::kMaximumDraftDepth;
     }
     virtual bool blockwise_drafting() const noexcept { return false; }
+    virtual bool project_blockwise_prompt_chunks() const noexcept { return false; }
+    virtual int64_t prompt_context_window() const noexcept { return 0; }
+    // Block predictors can reserve graph shapes using the request's context and depth.
+    virtual void prepare_request(int64_t,int) {}
     // Additional transient work beyond the target's sampling/history budget.
     // KV, weights and captured buffers are already charged. An unprepared or
     // unpriced predictor keeps the engine's conservative capture allowance.
@@ -134,6 +151,22 @@ struct MtpModule {
         mfq_tensor_backend::Tensor,
         mfq_tensor_backend::Tensor) {
         throw std::runtime_error("this CUDA MTP predictor has no block-draft adapter");
+    }
+    virtual std::vector<mfq_tensor_backend::Tensor> draft_blocks(
+        const MtpTarget& target,std::span<const DraftLane> lanes) const {
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(lanes.size());
+        auto binding=target;
+        for (const auto& lane:lanes) {
+            binding.batch_row=lane.slot;
+            result.push_back(lane.session->draft_block(binding,lane.anchor,lane.depth));
+        }
+        return result;
+    }
+    virtual mfq_tensor_backend::Tensor draft_next_hidden(
+        mfq_tensor_backend::Tensor,
+        mfq_tensor_backend::Tensor) {
+        throw std::runtime_error("this CUDA MTP predictor has no batched draft projection");
     }
 
     mfq::engine::mtp::GenerationStats last_stats;

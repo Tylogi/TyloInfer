@@ -1543,7 +1543,8 @@ struct MediaTestOps {
     }
     mfq::StepSequence<Tensor> vision(Tensor, Tensor, Tensor) {
         calls += 'V';
-        co_yield Tensor{{1, 4, 3}, 7};
+        Tensor result{{1, 4, 3}, 7};
+        co_yield std::move(result);
     }
     Tensor resample(Tensor t, Tensor) {
         calls += 'R';
@@ -1553,7 +1554,8 @@ struct MediaTestOps {
     void reset_audio() { calls += 'A'; }
     mfq::StepSequence<Tensor> audio(Tensor, Tensor) {
         calls += 'U';
-        co_yield Tensor{{1, 3, 4}, 20};
+        Tensor result{{1, 3, 4}, 20};
+        co_yield std::move(result);
     }
     auto audio_lengths(Tensor) {
         calls += 'L';

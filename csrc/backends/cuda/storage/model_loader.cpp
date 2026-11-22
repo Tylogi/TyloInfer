@@ -294,6 +294,8 @@ TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen4CausalLm);
 TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV4CausalLm);
 TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV41CausalLm);
 TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::NemotronHCausalLm);
+TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::InklingCausalLm);
+TYLOINFER_INSTANTIATE_CAUSAL_LM(mfq::cuda::Hy4CausalLm);
 
 #undef TYLOINFER_INSTANTIATE_CAUSAL_LM
 
@@ -580,9 +582,31 @@ load_runtime_components(
 #define TYLOINFER_INSTANTIATE_COMPONENTS(TYPE)                                  \
     template RuntimeComponents<TYPE> load_runtime_components(TYPE&, bool)
 
+template <>
+RuntimeComponents<mfq::cuda::Hy4CausalLm> load_runtime_components(
+        mfq::cuda::Hy4CausalLm& model,bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::Hy4CausalLm> result{model.graph,model.plan};
+    if (load_optional_components && !model.execution->dflash2_draft_path.empty()) {
+        result.mtp=mfq::cuda::load_hy4_dfly2(model,model.execution->dflash2_draft_path);
+        result.mtp_available=true;
+    }
+    return result;
+}
+
 TYLOINFER_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
 TYLOINFER_INSTANTIATE_COMPONENTS(mfq::cuda::GlmDsaCausalLm);
 TYLOINFER_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
+
+template <>
+RuntimeComponents<mfq::cuda::InklingCausalLm> load_runtime_components(
+        mfq::cuda::InklingCausalLm& model,bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::InklingCausalLm> result{model.graph,model.plan};
+    if (load_optional_components && !model.execution->dflash2_draft_path.empty()) {
+        result.mtp=mfq::cuda::load_inkling_dspark(model,model.execution->dflash2_draft_path);
+        result.mtp_available=true;
+    }
+    return result;
+}
 
 
 #undef TYLOINFER_INSTANTIATE_COMPONENTS

@@ -312,7 +312,13 @@ struct TextProcessor::Impl {
         capabilities.thinking =
             source.find("enable_thinking") != std::string::npos;
         if (source.find("reasoning_effort") != std::string::npos) {
-            for (const char* value : {"high", "max"}) {
+            if (model_type == "hy_v4_flash" && source.find("'no_think'") != std::string::npos)
+                disabled_reasoning_effort = R"("no_think")";
+            if (model_type == "inkling2_loop" && source.find(R"("none")") != std::string::npos)
+                disabled_reasoning_effort = R"("none")";
+            if (disabled_reasoning_effort) capabilities.thinking = true;
+            for (const char* value : {"low", "high", "max"}) {
+                if (std::string_view(value) == "low" && model_type != "hy_v4_flash") continue;
                 if (source.find(std::string("'") + value + "'") !=
                         std::string::npos ||
                     source.find(std::string("\"") + value + "\"") !=
@@ -326,6 +332,7 @@ struct TextProcessor::Impl {
     std::unique_ptr<MfqTokenizer> tokenizer;
     common_chat_templates_ptr templates;
     std::string model_type;
+    const char* disabled_reasoning_effort = nullptr;
     ChatTemplateCapabilities capabilities;
     std::optional<mfq::DecisionModelSpec> decision_model;
     std::map<std::string, std::pair<std::string, bool>> prefix_policies;
@@ -471,6 +478,8 @@ InferenceRequest TextProcessor::prepare(
                     "messages");
             }
             auto inputs = std::move(chat.template_inputs);
+            if (impl_->disabled_reasoning_effort && !inputs.enable_thinking)
+                inputs.chat_template_kwargs.try_emplace("reasoning_effort", impl_->disabled_reasoning_effort);
             if (chat.parallel_tool_calls) {
                 inputs.parallel_tool_calls = *chat.parallel_tool_calls;
             } else {
@@ -572,15 +581,14 @@ InferenceRequest TextProcessor::prepare(
             work.cache_plan.stable_prefix_tokens = work.prompt.size() - suffix_tokens;
         work.vision = std::move(input.media);
     }
-    if (max_context > 0 &&
-            static_cast<std::int64_t>(work.prompt.size()) +
-                    work.sampling.max_tokens > max_context) {
+    // Generation planning caps output using the remaining context.
+    if (max_context > 0 && work.prompt.size() > static_cast<std::size_t>(max_context)) {
         throw InferenceInputError(
             InferenceInputErrorCode::ContextLength,
-            input.media
-                ? "expanded multimodal prompt plus max_tokens exceed the model context window"
-                : "prompt tokens plus max_tokens exceed the model context window",
-            "max_tokens");
+            work.vision
+                ? "expanded multimodal prompt exceeds the model context window"
+                : "prompt exceeds the model context window",
+            input.chat ? "messages" : "prompt");
     }
 
     std::vector<std::string> unique_stops;
