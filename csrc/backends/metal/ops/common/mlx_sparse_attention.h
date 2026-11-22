@@ -67,10 +67,19 @@ mlx::core::array mlx_sparse_selected_mla_attention(
     const mlx::core::array& sinks,
     std::optional<float> scale = std::nullopt, int value_dimension = 0);
 
+mlx::core::array mlx_gather_selected_mla_rows(const mlx::core::array& kv_cache,
+    const mlx::core::array& selected_indices);
+
 // The same latent attention over rows already gathered from paged storage.
 mlx::core::array mlx_gathered_mla_attention(const mlx::core::array& query,
     const mlx::core::array& gathered, const mlx::core::array& mask,
-    const mlx::core::array& sinks, float scale, int value_dimension);
+    const mlx::core::array& sinks, float scale, int value_dimension, bool packed_queries = false);
+
+// FP16 resident KV shared by the queries and heads of each request.
+mlx::core::array mlx_masked_dense_mla_attention(const mlx::core::array& query,
+    const mlx::core::array& rows, const mlx::core::array& mask,
+    const mlx::core::array& sinks, float scale, int value_dimension,
+    const std::optional<mlx::core::array>& kv_lanes = std::nullopt);
 
 // Multi-query sparse MLA over an already chronological local window and a
 // capacity-backed compressed pool. This is the oMLX-style M>1 path: causal

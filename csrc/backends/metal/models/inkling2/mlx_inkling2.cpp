@@ -524,7 +524,7 @@ AttentionPositions attention_positions(const Geometry& g, int offset, int rows) 
     return {std::move(local), arange(end, int32), std::move(scale)};
 }
 
-array apply_layer(const Layer& layer, const Geometry& g, int physical, int offset,
+std::pair<array, array> prepare_layer(const Layer& layer, const Geometry& g, int physical, int offset,
     const array& hidden, array& blocks, const std::optional<array>& messages,
     const AttentionPositions& positions, MlxInkling2VisitCache& cache) {
     const int batch = hidden.shape(0), rows = hidden.shape(1);
@@ -603,9 +603,39 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     }
     auto ffn = mix_stream(depth_mix(blocks, branch, layer.ffn_res_query), 0);
     if (messages) ffn = layer.controls[3](ffn, mix_stream(*messages, 3));
-    ffn = layer.mixture(layer.ffn_norm(ffn), g);
-    return short_convolution(ffn, layer.shortconv[3], cache.convolution[3], std::nullopt, &branch);
+    return {layer.ffn_norm(ffn), std::move(branch)};
 }
+
+array apply_layer(const Layer& layer, const Geometry& g, int physical, int offset,
+    const array& hidden, array& blocks, const std::optional<array>& messages,
+    const AttentionPositions& positions, MlxInkling2VisitCache& cache) {
+    auto [input, branch] = prepare_layer(layer, g, physical, offset, hidden, blocks, messages, positions, cache);
+    return short_convolution(layer.mixture(input, g), layer.shortconv[3], cache.convolution[3], std::nullopt, &branch);
+}
+
+struct LoopResidualHistory {
+    explicit LoopResidualHistory(const array& blocks) : initial_blocks(blocks), previous_blocks(blocks) {}
+
+    void enter(array& hidden, array& blocks) {
+        if (!initial) {
+            initial = hidden;
+            initial_blocks = blocks;
+        } else {
+            previous_blocks = slice(blocks, {0, 0, initial_blocks.shape(2) + 1, 0}, blocks.shape());
+            previous = hidden;
+            hidden = *initial;
+            blocks = initial_blocks;
+        }
+    }
+
+    std::optional<array> messages(const Layer& layer) const {
+        if (previous && layer.message_query) return depth_mix(previous_blocks, *previous, *layer.message_query);
+        return std::nullopt;
+    }
+
+    std::optional<array> initial, previous;
+    array initial_blocks, previous_blocks;
+};
 }  // namespace
 
 struct MlxInkling2Model::Weights {
@@ -652,36 +682,87 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
     cache.batch = tokens.shape(0);
     cache.visits.resize(g.loop.execution_layers());
     auto hidden = weights_->embedding_norm(weights_->embedding(tokens, bfloat16));
-    std::optional<array> prelude, previous_output;
     auto blocks = zeros({tokens.shape(0), count, 0, g.hidden}, float32);
-    auto prelude_blocks = blocks, previous_blocks = blocks;
+    LoopResidualHistory history(blocks);
     for (int visit = 0; visit < g.loop.execution_layers(); ++visit) {
         const int physical = g.loop.source_layer(visit);
-        if (physical == g.loop_start) {
-            if (!prelude) {
-                prelude = hidden;
-                prelude_blocks = blocks;
-            } else {
-                previous_blocks = slice(blocks, {0, 0, prelude_blocks.shape(2) + 1, 0}, blocks.shape());
-                previous_output = hidden;
-                hidden = *prelude;
-                blocks = prelude_blocks;
-            }
-        }
+        if (physical == g.loop_start) history.enter(hidden, blocks);
         const auto& layer = weights_->layers[physical];
-        auto messages = previous_output && layer.message_query ?
-            std::optional<array>(depth_mix(previous_blocks, *previous_output, *layer.message_query)) : std::nullopt;
-        hidden = apply_layer(layer, g, physical, cache.position, hidden, blocks, messages, positions, cache.visits[visit]);
+        hidden = apply_layer(layer, g, physical, cache.position, hidden, blocks,
+            history.messages(layer), positions, cache.visits[visit]);
     }
     if (last_logit_only) {
         hidden = time_slice(hidden, count - 1, count);
         blocks = time_slice(blocks, count - 1, count);
     }
-    hidden = mix_stream(depth_mix(blocks, hidden, weights_->output_query), 0);
-    auto logits = astype(weights_->output(weights_->output_norm(hidden)), float32);
-    if (g.logit_cap > 0) logits = tanh(logits / g.logit_cap) * g.logit_cap;
+    auto logits = project_output(hidden, blocks);
     cache.position += count;
+    return logits;
+}
+
+array MlxInkling2Model::project_output(const array& hidden, const array& blocks) const {
+    const auto& g = weights_->geometry;
+    const auto mixed = mix_stream(depth_mix(blocks, hidden, weights_->output_query), 0);
+    auto logits = astype(weights_->output(weights_->output_norm(mixed)), float32);
+    if (g.logit_cap > 0) logits = tanh(logits / g.logit_cap) * g.logit_cap;
     return slice(logits, {0, 0, 0}, {logits.shape(0), logits.shape(1), g.vocab});
+}
+
+array MlxInkling2Model::decode_batch(std::span<Cache* const> requests, const array& tokens) const {
+    const auto& g = weights_->geometry;
+    const int batch = static_cast<int>(requests.size());
+    if (!batch || tokens.shape() != Shape{batch, 1}) throw std::invalid_argument("invalid Inkling decode batch");
+    const int visits = g.loop.execution_layers();
+    std::vector<AttentionPositions> positions;
+    positions.reserve(batch);
+    for (int row = 0; row < batch; ++row) {
+        const auto* request = requests[row];
+        if (!request || request->position <= 0 || request->position >= g.context || request->batch != 1 ||
+            request->visits.size() != static_cast<std::size_t>(visits) ||
+            std::find(requests.begin(), requests.begin() + row, request) != requests.begin() + row)
+            throw std::invalid_argument("invalid Inkling decode request state");
+        positions.push_back(attention_positions(g, request->position, 1));
+    }
+    if (batch == 1) return forward(tokens, *requests.front(), true);
+
+    auto hidden = weights_->embedding_norm(weights_->embedding(tokens, bfloat16));
+    auto blocks = zeros({batch, 1, 0, g.hidden}, float32);
+    LoopResidualHistory history(blocks);
+    for (int visit = 0; visit < visits; ++visit) {
+        const int physical = g.loop.source_layer(visit);
+        if (physical == g.loop_start) history.enter(hidden, blocks);
+        const auto& layer = weights_->layers[physical];
+        const auto messages = history.messages(layer);
+        std::vector<array> inputs, branches, residuals;
+        inputs.reserve(batch);
+        branches.reserve(batch);
+        residuals.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            auto& request = *requests[row];
+            auto lane_blocks = slice(blocks, {row, 0, 0, 0}, {row + 1, 1, blocks.shape(2), g.hidden});
+            const auto lane_hidden = slice(hidden, {row, 0, 0}, {row + 1, 1, g.hidden});
+            const auto lane_messages = messages ? std::optional(slice(*messages, {row, 0, 0, 0},
+                {row + 1, 1, messages->shape(2), messages->shape(3)})) : std::nullopt;
+            auto [input, branch] = prepare_layer(layer, g, physical, request.position, lane_hidden,
+                lane_blocks, lane_messages, positions[row], request.visits[visit]);
+            inputs.push_back(std::move(input));
+            branches.push_back(std::move(branch));
+            residuals.push_back(std::move(lane_blocks));
+        }
+        const auto ffn = layer.mixture(concatenate(inputs, 0), g);
+        std::vector<array> outputs;
+        outputs.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            auto part = slice(ffn, {row, 0, 0}, {row + 1, 1, g.hidden});
+            outputs.push_back(short_convolution(part, layer.shortconv[3],
+                requests[row]->visits[visit].convolution[3], std::nullopt, &branches[row]));
+        }
+        hidden = concatenate(outputs, 0);
+        blocks = concatenate(residuals, 0);
+    }
+    auto logits = project_output(hidden, blocks);
+    for (auto* request : requests) ++request->position;
+    return logits;
 }
 
 MlxInkling2TextSessionState MlxInkling2Model::capture(const Cache& state,

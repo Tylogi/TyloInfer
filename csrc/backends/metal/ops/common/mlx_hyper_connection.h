@@ -36,10 +36,11 @@ public:
 
     // When supplied, normalize the collapsed branch before returning it.
     MlxHyperConnectionState collapse(const mlx::core::array& residual,
-        const MlxRmsNorm* branch_norm = nullptr) const;
+        const MlxRmsNorm* branch_norm = nullptr, bool packed_decode = false) const;
     std::pair<mlx::core::array, MlxHyperConnectionState> expand_and_collapse(
         const mlx::core::array& residual, const mlx::core::array& branch,
-        const MlxHyperConnectionState& state, const MlxRmsNorm* branch_norm = nullptr) const;
+        const MlxHyperConnectionState& state, const MlxRmsNorm* branch_norm = nullptr,
+        bool packed_decode = false) const;
     static mlx::core::array expand(const mlx::core::array& residual,
         const mlx::core::array& branch, const MlxHyperConnectionState& state);
 

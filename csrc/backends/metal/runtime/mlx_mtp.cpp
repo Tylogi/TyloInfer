@@ -578,6 +578,17 @@ mfq::StepSequence<MtpDraftStep> prepare_mtp_draft(
     if (requested < 0 || requested > kMlxMtpEngineMaximumDraftDepth) {
         throw std::runtime_error("MTP requested draft depth is invalid");
     }
+    if (requested && callbacks.batched_draft_tokens &&
+        (!callbacks.can_batch_draft || callbacks.can_batch_draft())) {
+        co_yield MtpDraftStep{MlxMtpTargetRequest{context.pending_token,
+            mlx::core::zeros(Shape{0}, mlx::core::int32), requested, MlxMtpTargetRequest::Kind::draft_window}};
+        auto proposed = callbacks.batched_draft_tokens();
+        if (proposed.shape() != Shape{requested} || proposed.dtype() != mlx::core::int32)
+            throw std::runtime_error("batched MTP predictor returned incompatible draft tokens");
+        mlx::core::async_eval({proposed});
+        co_yield MtpDraftStep{PreparedMtpDraft{requested, std::move(proposed), {}, {}, {}}};
+        co_return;
+    }
 
     std::vector<array> tokens;
     std::vector<array> compact_indices;
@@ -789,6 +800,11 @@ void mlx_prime_mtp_chunk(const array& hidden, const array& ids,
     previous_hidden = last;
 }
 
+int mlx_mtp_maximum_depth(const MlxSamplingParams& sampling, int predictor_depth) {
+    if (!sampling.greedy() && (sampling.top_k <= 0 || sampling.top_k > 128)) return 1;
+    return std::min(predictor_depth, std::clamp(sampling.mtp_max_draft_tokens, 1, 5));
+}
+
 MlxMtpGeneration mlx_mtp_generation(
     MlxMtpEngineRequest request,
     MlxMtpEngineCallbacks callbacks,
@@ -800,7 +816,9 @@ MlxMtpGeneration mlx_mtp_generation(
             kMlxMtpEngineMaximumDraftDepth ||
         !callbacks.target_cache_position || !callbacks.prepare_draft ||
         !callbacks.verify_target || !callbacks.resolve_target ||
-        (callbacks.prepare_draft_history && !callbacks.draft_logits)) {
+        (callbacks.prepare_draft_history && !callbacks.draft_logits) ||
+        (callbacks.batched_draft_tokens && (!request.sampling.greedy() ||
+            request.sampling.has_penalties() || request.token_counts || callbacks.prepare_draft_history))) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
     if (request.sampling.warmup) {
@@ -895,17 +913,13 @@ MlxMtpGeneration mlx_mtp_generation(
         draft_sampling.temperature = 0.6;
         draft_sampling.top_p = 0.95;
     }
-    const int maximum_depth =
-        (!request.sampling.greedy() && !compact_stochastic)
-        ? 1
-        : std::min(
-              callbacks.predictor.maximum_depth,
-              std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
+    const int maximum_depth = mlx_mtp_maximum_depth(request.sampling, callbacks.predictor.maximum_depth);
     mfq::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(
         maximum_depth, callbacks.predictor.dspark, callbacks.policy_state);
-    const auto desired_depth = [&] {
-        return callbacks.draft_depth ? std::clamp(callbacks.draft_depth(), 0, maximum_depth)
-            : depth_controller.depth();
+    std::optional<int> scheduled_depth;
+    const auto select_depth = [&] {
+        scheduled_depth = callbacks.draft_depth ? callbacks.draft_depth() : std::nullopt;
+        return scheduled_depth ? std::clamp(*scheduled_depth, 0, maximum_depth) : depth_controller.depth();
     };
 
     auto pending = sample_token(
@@ -932,7 +946,7 @@ MlxMtpGeneration mlx_mtp_generation(
     MlxMtpDraftContext initial_context{
         true,
         pending,
-        bounded_depth(desired_depth()),
+        bounded_depth(select_depth()),
         callbacks.target_cache_position(),
         0,
         nullptr,
@@ -968,7 +982,7 @@ MlxMtpGeneration mlx_mtp_generation(
 
     while (generated < request.generation_limit) {
         const int cycle_cache_start = callbacks.target_cache_position();
-        if (callbacks.draft_depth ? draft.depth == 0 : depth_controller.parked()) {
+        if (scheduled_depth ? draft.depth == 0 : depth_controller.parked()) {
             co_yield MlxMtpTargetRequest{pending, draft.tokens, 0};
             auto target = callbacks.decode_target
                 ? callbacks.decode_target(pending)
@@ -981,17 +995,18 @@ MlxMtpGeneration mlx_mtp_generation(
             }
             ++stats.standard_tokens;
             if (!emit(next)) co_return;
-            if (!callbacks.draft_depth) depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
+            if (!scheduled_depth) depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now()-cycle_started).count(), time_sample);
-            stats.selected_depth = desired_depth();
-            if (callbacks.batch_park_count) stats.park_count = callbacks.batch_park_count();
-            if (callbacks.batch_cycle_ms) for (int depth = 0; depth <= maximum_depth; ++depth)
+            stats.selected_depth = select_depth();
+            stats.park_count = scheduled_depth && callbacks.batch_park_count
+                ? callbacks.batch_park_count() : depth_controller.parks();
+            if (scheduled_depth && callbacks.batch_cycle_ms) for (int depth = 0; depth <= maximum_depth; ++depth)
                 if (const auto measured = callbacks.batch_cycle_ms(depth)) stats.measured_depth_ms.at(depth) = *measured;
             stats.reentry_probes = depth_controller.reentries();
             pending = next;
             const std::array<std::int32_t, 1> next_ids{pending};
             MlxMtpDraftContext context{
-                false, pending, bounded_depth(desired_depth()),
+                false, pending, bounded_depth(stats.selected_depth),
                 cycle_cache_start, 0, &target.hidden, next_ids, &time_sample};
             time_sample = true;
             cycle_started = std::chrono::steady_clock::now();
@@ -1263,11 +1278,12 @@ MlxMtpGeneration mlx_mtp_generation(
                 << " cycle_ms=" << cycle_ms
                 << '\n';
         }
-        if (!callbacks.draft_depth) depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
-        stats.selected_depth = desired_depth();
-        stats.park_count = callbacks.batch_park_count ? callbacks.batch_park_count() : depth_controller.parks();
+        if (!scheduled_depth) depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
+        stats.selected_depth = select_depth();
+        stats.park_count = scheduled_depth && callbacks.batch_park_count
+            ? callbacks.batch_park_count() : depth_controller.parks();
         for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
-            const auto measured = callbacks.batch_cycle_ms ? callbacks.batch_cycle_ms(depth)
+            const auto measured = scheduled_depth && callbacks.batch_cycle_ms ? callbacks.batch_cycle_ms(depth)
                 : depth_controller.measured_cycle_ms(depth);
             if (measured) {
                 stats.measured_depth_ms.at(
@@ -1284,7 +1300,7 @@ MlxMtpGeneration mlx_mtp_generation(
         MlxMtpDraftContext next_context{
             false,
             pending,
-            bounded_depth(desired_depth()),
+            bounded_depth(stats.selected_depth),
             cycle_cache_start,
             accepted,
             &target.hidden,

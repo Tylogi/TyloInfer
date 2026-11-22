@@ -533,30 +533,6 @@ array typed_contiguous(const array& input, Dtype dtype) {
     return mlx::core::contiguous(result);
 }
 
-array generic_selected_mla_attention(
-    const array& query,
-    const array& cache,
-    const array& indices,
-    const array& mask,
-    const array& sinks,
-    float scale,
-    int value_dimension) {
-    const int batch = query.shape(0);
-    const int tokens = query.shape(2);
-    const int selected = indices.shape(2);
-    const int dimension = query.shape(3);
-    auto safe_indices = mlx::core::maximum(
-        indices, array(0, mlx::core::int32));
-    auto expanded_cache = mlx::core::broadcast_to(
-        mlx::core::expand_dims(cache, 1),
-        Shape{batch, tokens, cache.shape(1), dimension});
-    auto expanded_indices = mlx::core::broadcast_to(
-        mlx::core::expand_dims(safe_indices, -1),
-        Shape{batch, tokens, selected, dimension});
-    auto gathered = mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
-    return mlx_gathered_mla_attention(query, gathered, mask, sinks, scale, value_dimension);
-}
-
 int checked_grid_product(
     std::initializer_list<int> factors,
     const char* label) {
@@ -1410,8 +1386,98 @@ array mlx_qsa_prefill_attention(
     return outputs.size() == 1 ? outputs.front() : mlx::core::concatenate(outputs, 1);
 }
 
+array mlx_gather_selected_mla_rows(const array& cache, const array& indices) {
+    if (cache.ndim() != 3 || indices.ndim() != 3 || cache.shape(0) != indices.shape(0))
+        throw std::invalid_argument("invalid selected MLA rows");
+    const int batch = cache.shape(0), tokens = indices.shape(1), dimension = cache.shape(2);
+    const auto safe_indices = mlx::core::maximum(indices, array(0, mlx::core::int32));
+    const auto expanded_cache = mlx::core::broadcast_to(mlx::core::expand_dims(cache, 1),
+        Shape{batch, tokens, cache.shape(1), dimension});
+    const auto expanded_indices = mlx::core::broadcast_to(mlx::core::expand_dims(safe_indices, -1),
+        Shape{batch, tokens, indices.shape(2), dimension});
+    return mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
+}
+
+namespace {
+array gathered_mla_sink_softmax(const array& scores, const array& mask, const array& sinks) {
+    using namespace mlx::core;
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("tyloinfer_gathered_mla_sink_softmax", {"scores", "mask", "sinks"},
+            {"probabilities"}, R"MSL(
+            constexpr uint THREADS = 256;
+            const uint task = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint subgroup = simdgroup_index_in_threadgroup;
+            const uint tid = thread_index_in_threadgroup;
+            const uint heads = scores_shape[2];
+            const uint keys = scores_shape[3];
+            const float sink = float(sinks[task % heads]);
+            const auto row = scores + ulong(task) * keys;
+            const auto allowed = mask + ulong(task / heads) * keys;
+            float values[TILES];
+            float peak = -INFINITY;
+            for (uint i = tid; i < keys; i += THREADS) {
+                const float value = BOOLEAN_MASK ? (allowed[i] ? float(row[i]) : -INFINITY)
+                    : float(row[i]) + float(allowed[i]);
+                values[i / THREADS] = value;
+                peak = max(peak, value);
+            }
+            threadgroup float maxima[8], sums[8];
+            peak = simd_max(peak);
+            if (lane == 0) maxima[subgroup] = peak;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            peak = sink;
+            for (uint i = 0; i < 8; ++i) peak = max(peak, maxima[i]);
+            float total = 0.f;
+            for (uint i = tid; i < keys; i += THREADS) {
+                const float exp_value = metal::exp(values[i / THREADS] - peak);
+                values[i / THREADS] = exp_value;
+                total += exp_value;
+            }
+            total = simd_sum(total);
+            if (lane == 0) sums[subgroup] = total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = metal::exp(sink - peak);
+            for (uint i = 0; i < 8; ++i) total += sums[i];
+            auto out = probabilities + ulong(task) * keys;
+            for (uint i = tid; i < keys; i += THREADS) out[i] = half(values[i / THREADS] / total);
+            )MSL", "", true, false, options);
+    }();
+    const int keys = scores.shape(-1), rows = static_cast<int>(scores.size() / keys);
+    return kernel({scores, mask, sinks}, {scores.shape()}, {float16}, {rows * 256, 1, 1},
+        {256, 1, 1}, {{"TILES", (keys + 255) / 256}, {"BOOLEAN_MASK", mask.dtype() == bool_}},
+        std::nullopt, false, {}).front();
+}
+}
+
+array mlx_masked_dense_mla_attention(const array& query, const array& rows, const array& mask,
+    const array& sinks, float scale, int value_dimension, const std::optional<array>& kv_lanes) {
+    using namespace mlx::core;
+    if (query.ndim() != 4 || rows.ndim() != 3 || rows.dtype() != float16 ||
+        (kv_lanes ? kv_lanes->shape() != Shape{query.shape(0)} : query.shape(0) != rows.shape(0)) ||
+        query.shape(3) != rows.shape(2) ||
+        mask.shape() != Shape{query.shape(0), query.shape(2), rows.shape(1)} || mask.dtype() != bool_ ||
+        sinks.size() != static_cast<std::size_t>(query.shape(1)) ||
+        value_dimension <= 0 || value_dimension > rows.shape(2))
+        throw std::invalid_argument("invalid masked dense MLA geometry");
+    const int batch = query.shape(0), heads = query.shape(1), tokens = query.shape(2);
+    const int keys = rows.shape(1), dimension = rows.shape(2);
+    const auto scaled = astype(transpose(query, {0, 2, 1, 3}), float32) * scale;
+    const auto q = reshape(astype(scaled, float16), {batch, tokens * heads, dimension});
+    const auto dot = [&](const array& a, const array& b) {
+        return kv_lanes ? gather_mm(a, b, std::nullopt, kv_lanes) : matmul(a, b);
+    };
+    const auto scores = reshape(dot(q, transpose(rows, {0, 2, 1})), {batch, tokens, heads, keys});
+    const auto probabilities = reshape(gathered_mla_sink_softmax(scores, mask, sinks),
+        {batch, tokens * heads, keys});
+    const auto values = slice(rows, {0, 0, 0}, {rows.shape(0), keys, value_dimension});
+    return reshape(dot(probabilities, values), {batch, tokens, heads, value_dimension});
+}
+
 array mlx_gathered_mla_attention(const array& query, const array& rows, const array& mask,
-    const array& sinks, float scale, int value_dimension) {
+    const array& sinks, float scale, int value_dimension, bool packed_queries) {
     if (query.ndim() != 4 || rows.ndim() != 4 || rows.shape(0) != query.shape(0) ||
         rows.shape(1) != query.shape(2) || rows.shape(3) != query.shape(3) ||
         mask.shape() != Shape{rows.shape(0), rows.shape(1), rows.shape(2)} ||
@@ -1427,6 +1493,14 @@ array mlx_gathered_mla_attention(const array& query, const array& rows, const ar
     auto query_values = mlx::core::astype(
         mlx::core::transpose(query, {0, 2, 1, 3}),
         mlx::core::float32);
+    if (use_half && (batch == 2 || packed_queries) && tokens == 1 && selected == 2048 &&
+        dimension == 576 && value_dimension == 512 && (heads == 32 || heads == 64)) {
+        const auto scores = mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
+            mlx::core::transpose(gathered, {0, 1, 3, 2}));
+        const auto probabilities = gathered_mla_sink_softmax(scores, mask, sinks);
+        const auto value = mlx::core::slice(gathered, {0, 0, 0, 0}, {batch, tokens, selected, value_dimension});
+        return mlx::core::astype(mlx::core::matmul(probabilities, value), mlx::core::float32);
+    }
     auto scores = use_half
         ? mlx::core::astype(mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
             mlx::core::transpose(gathered, {0, 1, 3, 2})), mlx::core::float32)
@@ -1493,14 +1567,8 @@ array mlx_sparse_selected_mla_attention(
     if (heads != 64 || dimension != 512 || value_dimension != dimension) {
         // The gather accepts strides. Materializing a cache view here would copy all
         // historical rows before reading only the selected ones.
-        return generic_selected_mla_attention(
-            selected_query,
-            selected_cache,
-            indices,
-            mask,
-            sink_logits,
-            selected_scale,
-            value_dimension);
+        return mlx_gathered_mla_attention(selected_query, mlx_gather_selected_mla_rows(selected_cache, indices),
+            mask, sink_logits, selected_scale, value_dimension);
     }
     selected_cache = mlx::core::contiguous(selected_cache);
     constexpr int kHeads = 64;

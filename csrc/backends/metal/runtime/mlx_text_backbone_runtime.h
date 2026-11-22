@@ -10,19 +10,99 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace mfq::metal {
 
 class MfqContainer;
 
-// Shared serial generation around backbones that own their cache geometry.
+// Shared text generation around backbones that own their cache geometry.
 // The engine owns prefix lookup, scheduling, token streaming and cancellation.
 template <class Model>
 class MlxTextBackboneRuntime {
+    static_assert(requires(const Model& model, std::span<typename Model::Cache* const> states,
+        const mlx::core::array& ids) { model.decode_batch(states, ids); },
+        "Metal text backbones must implement batched decode");
 public:
     using SessionState = typename Model::TextSessionState;
+    struct BatchCache {
+        typename Model::Cache state;
+        std::optional<mlx::core::array> logits;
+    };
+    int batch_vocabulary() const noexcept { return vocabulary(); }
+    BatchCache make_batch_cache() const { return {}; }
+    BatchCache take_batch_cache() {
+        return {std::exchange(cache_, {}), std::exchange(last_logits_, {})};
+    }
+    mlx::core::array prefill_batch_request(BatchCache& cache, const mlx::core::array& ids) const {
+        cache.logits = mlx_last_token_logits(model_.forward(ids, cache.state, true), vocabulary());
+        return *cache.logits;
+    }
+    mlx::core::array decode_batch_requests(std::span<BatchCache* const> caches,
+        const mlx::core::array& ids) const {
+        std::vector<typename Model::Cache*> states;
+        states.reserve(caches.size());
+        for (auto* cache : caches) states.push_back(&cache->state);
+        auto logits = mlx::core::reshape(model_.decode_batch(states, ids),
+            {static_cast<int>(caches.size()), vocabulary()});
+        for (std::size_t row = 0; row < caches.size(); ++row) {
+            const int index = static_cast<int>(row);
+            caches[row]->logits = mlx::core::slice(logits, {index, 0}, {index + 1, vocabulary()});
+        }
+        return logits;
+    }
+    int batch_cache_position(const BatchCache& cache) const noexcept { return cache.state.position; }
+
+    bool supports_batch_mtp() const noexcept
+        requires requires(const Model& model, typename Model::Cache& state,
+            std::optional<mlx::core::array>& logits) { model.batch_mtp_callbacks(state, logits); } {
+        return supports_mtp();
+    }
+    int batch_context() const noexcept { return model_.context(); }
+    MlxMtpEngineCallbacks batch_mtp_callbacks(BatchCache& cache) const
+        requires requires(const Model& model) { model.batch_mtp_callbacks(cache.state, cache.logits); } {
+        return model_.batch_mtp_callbacks(cache.state, cache.logits);
+    }
+    std::vector<MlxMtpTargetBatch> verify_batch_requests(std::span<BatchCache* const> caches,
+        std::span<const MlxMtpTargetRequest> steps) const
+        requires requires(const Model& model, std::span<typename Model::Cache* const> states,
+            std::span<std::optional<mlx::core::array>* const> result) { model.verify_batch(states, steps, result); } {
+        std::vector<typename Model::Cache*> states;
+        std::vector<std::optional<mlx::core::array>*> logits;
+        states.reserve(caches.size());
+        logits.reserve(caches.size());
+        for (auto* cache : caches) {
+            states.push_back(&cache->state);
+            logits.push_back(&cache->logits);
+        }
+        return model_.verify_batch(states, steps, logits);
+    }
+    std::vector<mlx::core::array> draft_batch_requests(std::span<BatchCache* const> caches,
+        std::span<const MlxMtpTargetRequest> steps) const
+        requires requires(const Model& model, std::span<typename Model::Cache* const> states) {
+            model.draft_batch(states, steps);
+        } {
+        std::vector<typename Model::Cache*> states;
+        states.reserve(caches.size());
+        for (auto* cache : caches) states.push_back(&cache->state);
+        return model_.draft_batch(states, steps);
+    }
+    void discard_batch_verification(BatchCache& cache) const
+        requires requires(const Model& model) { model.discard_batch_verification(cache.state, cache.logits); } {
+        model_.discard_batch_verification(cache.state, cache.logits);
+    }
+    SessionState capture_batch_cache(const BatchCache& cache, const std::vector<std::int64_t>& tokens) const {
+        auto state = model_.capture(cache.state, tokens, true);
+        if (cache.logits) {
+            state.last_logits = cache.logits;
+            state.bytes += cache.logits->nbytes();
+        }
+        return state;
+    }
+
     static constexpr bool prefix_checkpoints = true;
     int vocabulary() const noexcept { return model_.vocabulary(); }
     int preferred_prefill_chunk_size(int requested) const noexcept {
@@ -38,6 +118,7 @@ public:
         if constexpr (requires { model_.supports_mtp(); }) return model_.supports_mtp();
         return false;
     }
+    void record_mtp_stats(MlxMtpGenerationStats stats) noexcept { mtp_stats_ = std::move(stats); }
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept { return mtp_stats_; }
     auto qsa_kv_offload_stats() const
         requires requires(const Model& model) { model.qsa_kv_offload_stats(); } {

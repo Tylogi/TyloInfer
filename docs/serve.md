@@ -366,9 +366,15 @@ wire-format identifier, not the public CLI name. See the
 
 ### Metal native serving
 
-The native Metal HTTP server supports continuous batching on Flash-Next,
-including ordinary decode, native MTP with a compatible single-layer
-predictor without predictor LoRA, and DFlash2 with a matching draft checkpoint.
+The native Metal worker supports continuous batching for text decode on
+Flash-Next, Qwen3.5-family 27B models, SenseNova Loop, Inkling 2, and Hy4 Flash.
+Compatible 27B and Loop checkpoints also batch native MTP target verification.
+Hy4 Flash batches DFly2 target verification when a draft is loaded with
+`--dfly2-draft`. It also batches draft proposals for concurrent greedy
+requests without sampling penalties. Set
+`TYLOINFER_METAL_BATCH_DRAFT=0` to use per-request drafting.
+Flash-Next also supports native MTP with a compatible single-layer predictor
+without predictor LoRA, and DFlash2 with a matching draft checkpoint.
 `--continuous-batching N` sets the maximum concurrent requests for this worker.
 Values of `0` and `1` run serially.
 

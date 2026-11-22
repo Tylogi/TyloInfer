@@ -398,6 +398,33 @@ void check_raw_compact_mixed(bool extended_rows = false) {
     }
 }
 
+void check_paired_routed_ffn() {
+    constexpr int width = 1536, experts = 32, routes = 16;
+    const auto load = [](ggml_type type, unsigned seed) {
+        auto name = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+        return MlxGgufWeight::from_bytes(name, payload(type, width, width * experts, seed, true),
+            {experts, width, width});
+    };
+    const std::array weights{load(GGML_TYPE_IQ2_XXS, 17), load(GGML_TYPE_IQ2_XXS, 197), load(GGML_TYPE_Q4_K, 791)};
+    for (const auto dtype : {bfloat16, float16}) {
+        const auto input = reshape(astype(sin(arange(2 * width, float32) * .013f), dtype), {2, width});
+        for (const int offset : {0, 8, 16}) {
+            const auto ids = reshape(concatenate({arange(routes, int32),
+                array(offset + routes - 1, int32) - arange(routes, int32)}), {2, routes});
+            const auto probabilities = softmax(reshape(arange(2 * routes, float32) * .037f, {2, routes}), -1);
+            const auto grouped = MlxGgufPrefillPlan::from_topk(input, ids, experts, 8);
+            for (const float limit : {0.f, .125f}) {
+                const auto actual = gguf_routed_ffn(weights, input, ids, probabilities, limit, true);
+                if (mlx_kernel_preparation_key(actual.primitive()).find("tinfer_gguf_planes_down_pair_reduce") ==
+                    std::string::npos) throw std::runtime_error("paired FFN fixture missed the pair kernel");
+                const auto hidden = grouped.gate_up(weights[0], weights[1], nullptr, nullptr, limit);
+                compare(actual, grouped.down(weights[2], hidden, probabilities), "paired routed FFN");
+            }
+        }
+    }
+}
+
 void check_mixed_shared() {
     constexpr int h = 512, i = 256, e = 4, r = 3;
     for (const auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q8_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S})
@@ -1124,6 +1151,12 @@ int main(int argc, char** argv) {
             std::cout << "extended compact source rows passed\n";
             return 0;
         }
+        if (argc > 1 && std::string_view(argv[1]) == "check-paired-routed-ffn") {
+            if (!gguf_expert_prefill_available(zeros({7, 512}, float16))) return 77;
+            check_paired_routed_ffn();
+            std::cout << "paired routed GGUF FFN passed\n";
+            return 0;
+        }
         if (argc > 1 && (std::string_view(argv[1]) == "compare" || std::string_view(argv[1]) == "compare-native")) {
             const bool native = std::string_view(argv[1]) == "compare-native";
             Comparison options;
@@ -1192,6 +1225,7 @@ int main(int argc, char** argv) {
         if (!benchmark && !decode_only && !cache_only) {
             check_compact_routes(); check_raw_down_routes(); check_raw_gate_up_dispatch(); check_raw_iq_gate_up();
             check_raw_compact_mixed(); check_raw_compact_mixed(true);
+            if (gguf_expert_prefill_available(zeros({7, 512}, float16))) check_paired_routed_ffn();
         }
         if (wide && selected_case < 0) throw std::invalid_argument("check-wide requires --case");
         run(benchmark, breakdown, decode_only, small_decode, selected_case, wide, cache_only);

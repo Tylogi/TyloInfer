@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <climits>
+#include <cmath>
 #include <stdexcept>
 
 namespace mfq::metal {
@@ -548,6 +549,16 @@ struct GgufColumnInput { device const half* values; uint rows; };
 device const half* gguf_column_row(device const half* x, uint row, uint k) { return x + ulong(row) * k; }
 device const half* gguf_column_row(GgufColumnInput x, uint row, uint k) {
     return x.values + ulong((x.rows >> (row * 3u)) & 7u) * k;
+}
+struct GgufPairedColumnInput { device const half* first; device const half* second; };
+device const half* gguf_column_row(GgufPairedColumnInput x, uint row, uint) {
+    return row == 0u ? x.first : x.second;
+}
+uint gguf_expert_peer(device const int* ids, uint route, uint routes) {
+    const uint opposite = (1u - route / routes) * routes;
+    for (uint rank = 0; rank < routes; ++rank)
+        if (ids[opposite + rank] == ids[route]) return opposite + rank;
+    return 2u * routes;
 }
 template<int F, bool Packed, int L = 1, bool Signed = true, class Auxiliary, class Scales, int Rows, class Input>
 inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
@@ -1254,6 +1265,94 @@ else {
     return kernel;
 }
 
+const fast::CustomKernelFunction& paired_gate_up_kernel() {
+    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_gate_up_pair",
+        {"gate", "gate_aux", "gate_meta", "up", "up_aux", "up_meta", "x", "ids", "params"}, {"y"}, R"METAL(
+const uint route = threadgroup_position_in_grid.y;
+const uint row = route / ROUTES, expert = uint(ids[route]);
+const uint k = params[0], n = params[1];
+if (expert >= params[2]) return;
+const uint peer = gguf_expert_peer(ids, route, ROUTES);
+const bool matched = peer < 2u * ROUTES;
+if (row && matched) return;
+const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+constexpr uint columns = 32u / LANES;
+const uint column = threadgroup_position_in_grid.x * columns + lane / LANES;
+threadgroup uint table[1];
+threadgroup T gates[2u * columns];
+const auto first = x + ulong(row) * k;
+const float limit = as_type<float>(params[3]);
+auto run = [&](auto count, auto input) {
+    constexpr int rows = decltype(count)::value;
+    float sums[rows];
+    if (sg == 0u) column_dot<16, true, LANES>(input, rows, k, gate, gate_aux, gate_meta, expert * n + column, table, sums);
+    else column_dot<16, true, LANES>(input, rows, k, up, up_aux, up_meta, expert * n + column, table, sums);
+    if (sg == 0u && lane % LANES == 0u) {
+        for (uint r = 0; r < rows; ++r) gates[r * columns + lane / LANES] = T(sums[r]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 1u && lane % LANES == 0u) {
+        for (uint r = 0; r < rows; ++r) {
+            float g = float(gates[r * columns + lane / LANES]), u = float(T(sums[r]));
+            if constexpr (CLIPPED) { g = min(g, limit); u = clamp(u, -limit, limit); }
+            y[ulong(r == 0u ? route : peer) * n + column] = T((g / (1.f + exp(-g))) * u);
+        }
+    }
+};
+if (matched) run(integral_constant<int, 2>{}, GgufPairedColumnInput{first, x + ulong(1u - row) * k});
+else run(integral_constant<int, 1>{}, first);
+)METAL", header());
+    return kernel;
+}
+
+const fast::CustomKernelFunction& paired_down_kernel() {
+    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_down_pair_reduce",
+        {"packed", "aux", "meta", "x", "ids", "probabilities", "params"}, {"y"}, R"METAL(
+const uint tid = thread_index_in_threadgroup;
+const uint route = tid / COLUMNS, lane = tid % COLUMNS;
+const uint row = route / ROUTES;
+const uint k = params[0], n = params[1], experts = params[2];
+const uint column = threadgroup_position_in_grid.x * COLUMNS + lane;
+const uint expert = uint(ids[route]);
+const bool live = expert < experts;
+const uint peer = live ? gguf_expert_peer(ids, route, ROUTES) : 2u * ROUTES;
+const bool matched = peer < 2u * ROUTES;
+threadgroup uint table[1];
+threadgroup T values[2u * ROUTES * COLUMNS];
+// The first request computes both results for a shared expert using one stream of weights.
+if (row == 0u || !matched) {
+    float result = 0.f;
+    if (live) {
+        auto first = x + ulong(route) * k;
+        if (matched) {
+            auto second = x + ulong(peer) * k;
+            float sums[2];
+            column_dot<12, true>(GgufPairedColumnInput{first, second}, 2u, k, packed, aux, meta,
+                expert * n + column, table, sums);
+            result = sums[0];
+            values[peer * COLUMNS + lane] = T(sums[1]);
+        } else {
+            float sums[1];
+            column_dot<12, true>(first, 1u, k, packed, aux, meta,
+                expert * n + column, table, sums);
+            result = sums[0];
+        }
+    }
+    values[route * COLUMNS + lane] = T(result);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (route < 2u) {
+    float total = 0.f;
+    for (uint rank = 0; rank < ROUTES; ++rank) {
+        const uint i = route * ROUTES + rank;
+        if (uint(ids[i]) < experts) total += float(values[i * COLUMNS + lane]) * probabilities[i];
+    }
+    y[route * n + column] = T(total);
+}
+)METAL", header());
+    return kernel;
+}
+
 const fast::CustomKernelFunction& weighted_down_kernel() {
     static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_down_reduce",
         {"packed", "aux", "meta", "x", "ids", "probabilities", "params"}, {"y"}, R"METAL(
@@ -1679,8 +1778,10 @@ array MlxGgufStagedPrefill::down(const MlxGgufWeight& weight, const array& input
     if (shared && (!shared->planes_ || shared->shape_ != Shape{n, weight.input_size()}))
         throw std::invalid_argument("GGUF shared Down geometry mismatch");
     if (!shared) shared = &weight;
+    const bool compact_q4_pair = routes.tile_rows == 8 && routes.maximum_live_rows == 2 &&
+        weight.format_ == 12 && weight.input_size() == 1536 && n == 1536;
     const int column_lanes = ((routes.tile_rows == 1 && weight.input_size() > n) ||
-        (routes.tile_rows == 8 && !weight.planes_)) ? 4 : 1;
+        (routes.tile_rows == 8 && !weight.planes_) || compact_q4_pair) ? 4 : 1;
     const auto empty_meta = array({uint16_t(0)}, uint16);
     return down_kernel()({weight.bytes_, contiguous(astype(input, float16)), routes.descriptors, routes.count,
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(input.shape(0)), uint32_t(weight.expert_count()),
@@ -1718,5 +1819,28 @@ array MlxGgufStagedPrefill::weighted_down(const MlxGgufWeight& weight, const arr
 
 bool MlxGgufStagedPrefill::prefers_weighted_down(const MlxGgufWeight& weight) noexcept {
     return weight.planes_ && (weight.format_ < 144 || (weight.format_ <= 151 && weight.format_ != 150));
+}
+
+array MlxGgufStagedPrefill::routed_pair_ffn(const std::array<MlxGgufWeight, 3>& weights,
+    const array& input, const array& ids, const array& probabilities, float limit) {
+    if (!std::isfinite(limit) || limit < 0.f || probabilities.shape() != ids.shape())
+        throw std::invalid_argument("invalid GGUF paired FFN inputs");
+    const auto& [gate, up, down] = weights;
+    constexpr int lanes = 4, columns = 8;
+    const int k = gate.input_size(), n = gate.output_size(), routes = ids.shape(1);
+    const auto dtype = input.dtype();
+    const auto experts = contiguous(astype(ids, int32));
+    const auto hidden = paired_gate_up_kernel()({gate.bytes_, (*gate.planes_)[0], (*gate.planes_)[1],
+        up.bytes_, (*up.planes_)[0], (*up.planes_)[1], contiguous(astype(input, float16)), experts,
+        array({uint32_t(k), uint32_t(n), uint32_t(gate.expert_count()), std::bit_cast<uint32_t>(limit)})},
+        {{2 * routes, n}}, {dtype}, {n / (32 / lanes) * 64, 2 * routes, 1}, {64, 1, 1},
+        {{"T", dtype}, {"LANES", lanes}, {"ROUTES", routes}, {"CLIPPED", limit > 0.f}},
+        std::nullopt, false, {}).front();
+    const int threads = 2 * columns * routes;
+    return paired_down_kernel()({down.bytes_, (*down.planes_)[0], (*down.planes_)[1],
+        contiguous(astype(hidden, float16)), experts, contiguous(astype(probabilities, float32)),
+        array({uint32_t(n), uint32_t(k), uint32_t(down.expert_count())})},
+        {{2, k}}, {dtype}, {k / columns * threads, 1, 1}, {threads, 1, 1},
+        {{"T", dtype}, {"ROUTES", routes}, {"COLUMNS", columns}}, std::nullopt, false, {}).front();
 }
 } // namespace mfq::metal

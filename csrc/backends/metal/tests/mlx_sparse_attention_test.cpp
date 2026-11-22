@@ -35,6 +35,38 @@ mlx::core::array patterned_half(
         mlx::core::float16);
 }
 
+void test_masked_dense_mla() {
+    using namespace mlx::core;
+    constexpr int batch = 4, tokens = 3, heads = 8, keys = 521, dimension = 576, values = 512;
+    constexpr float scale = 0.08f;
+    const auto q = patterned_half(batch * heads * tokens * dimension,
+        {batch, heads, tokens, dimension}, 7, 0.002f);
+    const auto kv = patterned_half(batch * keys * dimension, {batch, keys, dimension}, 11, 0.002f);
+    const auto stop = reshape(array({0, 1, 2, 31, 92, 120, 210, 220, 230, 510, 517, 521}),
+        {batch, tokens, 1});
+    const auto mask = arange(keys, int32) < stop;
+    const auto sinks = astype(arange(heads, int32), float32) * 0.03f - 0.1f;
+    const auto scores = matmul(astype(q, float32),
+        expand_dims(transpose(astype(kv, float32), {0, 2, 1}), 1)) * scale;
+    const auto masked = where(expand_dims(mask, 1), scores, array(-std::numeric_limits<float>::infinity()));
+    const auto logits = concatenate({masked, broadcast_to(reshape(sinks, {1, heads, 1, 1}),
+        {batch, heads, tokens, 1})}, -1);
+    const auto weights = slice(softmax(logits, -1), {0, 0, 0, 0}, {batch, heads, tokens, keys});
+    const auto value = expand_dims(slice(astype(kv, float32), {0, 0, 0}, {batch, keys, values}), 1);
+    const auto expected = transpose(matmul(weights, value), {0, 2, 1, 3});
+    const auto output = mfq::metal::mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, values);
+    const auto error = max(abs(astype(output, float32) - expected)).item<float>();
+    if (!std::isfinite(error) || error > 0.001f)
+        throw std::runtime_error("masked dense MLA differs from the expanded attention reference");
+    const auto packed_q = reshape(transpose(q, {0, 2, 1, 3}), {batch * tokens, heads, 1, dimension});
+    const auto packed = mfq::metal::mlx_masked_dense_mla_attention(packed_q, kv,
+        reshape(mask, {batch * tokens, 1, keys}), sinks, scale, values,
+        floor_divide(arange(batch * tokens, int32), array(tokens)));
+    const auto packed_error = max(abs(astype(reshape(packed, output.shape()), float32) - expected)).item<float>();
+    if (!std::isfinite(packed_error) || packed_error > 0.001f)
+        throw std::runtime_error("packed dense MLA differs from the expanded attention reference");
+}
+
 void test_block_gqa_matches_expanded_reference(
     float query_scale, float key_scale, int batch = 1, int queries = 3,
     int keys = 20, mlx::core::Dtype dtype = mlx::core::float16) {
@@ -579,6 +611,7 @@ void test_latent_value_prefix() {
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
+        test_masked_dense_mla();
         test_latent_value_prefix();
         if (argc == 2 && std::string(argv[1]) == "--latent-only") return 0;
         if (argc == 2 && std::string(argv[1]) == "--small-m-only") {

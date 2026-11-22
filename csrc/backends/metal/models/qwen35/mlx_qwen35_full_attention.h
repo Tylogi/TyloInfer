@@ -129,6 +129,15 @@ public:
         return ffn_.forward_normalized(input, ffn_norm_);
     }
 
+    struct RequestCache {
+        std::optional<MlxKvCache> kv;
+        int batch = 0;
+    };
+    void exchange_request_cache(RequestCache& state) noexcept {
+        cache_.swap(state.kv);
+        std::swap(cache_batch_, state.batch);
+    }
+
     void reset_cache(
         int batch,
         int initial_capacity = 16);

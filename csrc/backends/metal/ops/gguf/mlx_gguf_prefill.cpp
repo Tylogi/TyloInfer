@@ -6,6 +6,7 @@
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_platform.h"
 
+#include <algorithm>
 #include <climits>
 #include <bit>
 #include <cmath>
@@ -481,6 +482,16 @@ array gguf_routed_ffn(const std::array<MlxGgufWeight, 3>& w, const array& input,
         w[2].input_size() != w[0].output_size() || w[2].output_size() != w[0].input_size())
         throw std::invalid_argument("GGUF FFN projections and routes disagree");
     const bool compact_decode = gguf_compact_ffn_available(w[0], w[1], w[2], ids);
+    if (compact_decode && unique_per_token && ids.shape() == Shape{2, 16} &&
+        input.ndim() >= 2 && input.shape(-1) == 1536 && input.size() == 2 * 1536 &&
+        (input.dtype() == bfloat16 || input.dtype() == float16) &&
+        w[0].input_size() == 1536 && w[0].output_size() == 1536 &&
+        w[0].format() == 16 && w[1].format() == 16 && w[2].format() == 12 &&
+        std::all_of(w.begin(), w.end(), [](const auto& weight) {
+            return weight.has_staged_planes() && !weight.has_hadamard();
+        })) {
+        return MlxGgufStagedPrefill::routed_pair_ffn(w, input, ids, probabilities, limit);
+    }
     if ((gguf_expert_prefill_available(input) || compact_decode) &&
         !w[0].has_mixed_formats() && !w[1].has_mixed_formats() && !w[2].has_mixed_formats()) {
         const int tile = gguf_prefill_tile_rows(w[0], w[1], w[2], ids);
@@ -605,13 +616,16 @@ array MlxGgufPrefillPlan::project(const MlxGgufWeight& weight) const {
 array MlxGgufPrefillPlan::gate_up(const MlxGgufWeight& gate, const MlxGgufWeight& up,
     const MlxGgufWeight* shared_gate, const MlxGgufWeight* shared_up, float limit) const {
     if (!std::isfinite(limit) || limit < 0.f) throw std::invalid_argument("invalid GGUF SwiGLU limit");
-    if (grouped_ && grouped_->tile_rows == 8 && tokens_ > 1 && tokens_ <= 8 && source_.dtype() == float16 &&
+    const bool compact_bf16 = source_.dtype() == bfloat16 && gate.format() == 16 && up.format() == 16 &&
+        gate.input_size() == 1536 && gate.output_size() == 1536 && !gate.has_hadamard() && !up.has_hadamard();
+    if (grouped_ && grouped_->tile_rows == 8 && tokens_ > 1 && tokens_ <= 8 &&
+        (source_.dtype() == float16 || compact_bf16) &&
         source_.size() / source_.shape(-1) == std::size_t(tokens_) &&
         MlxGgufStagedPrefill::supports_grouped(gate) && MlxGgufStagedPrefill::supports_grouped(up) &&
         !shared_gate && !shared_up) {
         if (gate.shape_.size() != 3 || gate.shape_ != up.shape_ || gate.input_size() != source_.shape(-1))
             throw std::invalid_argument("GGUF source Gate/Up weights disagree");
-        const auto source = reshape(contiguous(source_), {tokens_, source_.shape(-1)});
+        const auto source = reshape(contiguous(astype(source_, float16)), {tokens_, source_.shape(-1)});
         const auto first = gate.has_hadamard() ? gate.rotate_input(source) : source;
         const bool same = gate.same_rotation(up);
         const auto second = same ? first : up.has_hadamard() ? up.rotate_input(source) : source;

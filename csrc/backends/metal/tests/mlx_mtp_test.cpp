@@ -20,21 +20,34 @@ MfqTokenConstraintPtr alternating_constraint() {
 void check_prepared_target_tokens() {
     using namespace mfq::metal;
     using namespace mlx::core;
-    for (int mode = 0; mode < 4; ++mode) {
+    for (int mode = 0; mode < 6; ++mode) {
         std::vector<std::int64_t> reference;
         MlxMtpGenerationStats reference_stats;
         for (bool prepared : {false, true}) {
             int position = 0;
+            int depth_selections = 0;
             std::vector<std::int64_t> output;
+            std::vector<int> verified_depths;
             MlxMtpEngineCallbacks callbacks;
             callbacks.predictor = MlxMtpPredictorDescriptor::recurrent(2);
             callbacks.draft_depth = [] { return 2; };
+            if (mode == 4) {
+                callbacks.draft_depth = [&]() -> std::optional<int> {
+                    // A batch can park, release a lane, and later schedule it again.
+                    switch (depth_selections++) {
+                    case 0: return 0;
+                    case 1: return std::nullopt;
+                    default: return 1;
+                    }
+                };
+            }
             callbacks.target_cache_position = [&] { return position; };
             callbacks.prepare_draft = [](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
                 for (int row = 0; row < context.requested_depth; ++row)
                     (void)select(array({4.f, 2.f, 0.f}, Shape{1, 3}));
             };
             callbacks.verify_target = [&](std::int32_t, const array&, int depth) {
+                if (mode == 4) verified_depths.push_back(depth);
                 std::vector<float> values((depth + 1) * 3, 0.f);
                 for (int row = 0; row <= depth; ++row) values[row * 3 + (position + row + 1) % 3] = 4.f;
                 auto logits = array(values.begin(), Shape{depth + 1, 3});
@@ -53,12 +66,33 @@ void check_prepared_target_tokens() {
             if (mode == 1) sampling.repetition_penalty = 1.1;
             if (mode == 2) { sampling.temperature = .6; sampling.top_k = 3; }
             MlxMtpGenerationStats stats;
-            const auto generated = run_mlx_mtp_generation({3, 24, 128,
+            MlxMtpEngineRequest request{3, 24, 128,
                 array({4.f, 2.f, 0.f}, Shape{1, 3}), sampling,
                 mode == 1 ? std::optional<array>{zeros(Shape{1, 3}, int32)} : std::nullopt, {},
                 [&](std::int64_t token) { output.push_back(token); return true; }, 0u,
-                mode == 3 ? alternating_constraint() : MfqTokenConstraintPtr{}}, callbacks, stats);
-            if (generated != 24 || position != 23) throw std::runtime_error("prepared MTP cache boundary mismatch");
+                mode == 3 ? alternating_constraint() : MfqTokenConstraintPtr{}};
+            if (mode == 5 && prepared) {
+                int windows = 0;
+                std::optional<array> tokens;
+                callbacks.can_batch_draft = [&] { return windows < 2; };
+                callbacks.batched_draft_tokens = [&] {
+                    if (!tokens) throw std::runtime_error("expected a scheduled draft window");
+                    return *std::exchange(tokens, {});
+                };
+                auto sequence = mlx_mtp_generation(std::move(request), std::move(callbacks), stats);
+                while (auto step = sequence.next()) {
+                    if (step.value && step.value->kind == MlxMtpTargetRequest::Kind::draft_window) {
+                        ++windows;
+                        tokens = zeros(Shape{step.value->draft_count}, int32);
+                    }
+                }
+                if (windows != 2 || tokens) throw std::runtime_error("unexpected draft window scheduling");
+            } else run_mlx_mtp_generation(std::move(request), callbacks, stats);
+            if (output.size() != 24 || position != 23) throw std::runtime_error("prepared MTP cache boundary mismatch");
+            const std::array expected_switch{0, 2, 1};
+            if (mode == 4 && (verified_depths.size() < expected_switch.size() ||
+                    !std::equal(expected_switch.begin(), expected_switch.end(), verified_depths.begin())))
+                throw std::runtime_error("MTP did not switch between cohort and request depth selection");
             if (!prepared) { reference = output; reference_stats = stats; }
             else if (output != reference || stats.accepted_tokens != reference_stats.accepted_tokens ||
                 stats.drafted_tokens != reference_stats.drafted_tokens || stats.cycles != reference_stats.cycles)

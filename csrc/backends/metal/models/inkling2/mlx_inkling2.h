@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace mfq::metal {
@@ -45,6 +46,7 @@ public:
 
     mlx::core::array forward(const mlx::core::array& tokens, MlxInkling2Cache& cache,
         bool last_logit_only = false) const;
+    mlx::core::array decode_batch(std::span<Cache* const> requests, const mlx::core::array& tokens) const;
     TextSessionState capture(const Cache& state, const std::vector<std::int64_t>& tokens,
         bool detached) const;
     Cache restore(const TextSessionState& state) const;
@@ -52,6 +54,7 @@ public:
     int vocabulary() const noexcept;
 
 private:
+    mlx::core::array project_output(const mlx::core::array& hidden, const mlx::core::array& blocks) const;
     struct Weights;
     explicit MlxInkling2Model(std::shared_ptr<const Weights> weights)
         : weights_(std::move(weights)) {}

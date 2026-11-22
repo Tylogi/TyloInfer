@@ -140,7 +140,8 @@ struct LatentRouter {
     array operator()(const array& input) const {
         if (!compact) return projection(input);
         const auto& weight = *projection.dense_weight_ref();
-        if (input.shape() != Shape{1, 3072} || input.dtype() != bfloat16 || default_device() != Device::gpu)
+        if (input.ndim() != 2 || input.shape(1) != 3072 || input.shape(0) < 1 || input.shape(0) > 32 ||
+            input.dtype() != bfloat16 || default_device() != Device::gpu)
             return MlxLinear(astype(weight, float32))(input);
         static const auto kernel = [] {
             CompileOptions options;
@@ -150,29 +151,48 @@ struct LatentRouter {
             #pragma clang fp reassociate(off)
                 const uint lane = thread_index_in_simdgroup;
                 const uint first = (threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup) * 2u;
-                float sum[2] = {};
+                const uint first_row = TILE == 1 ? 0u : threadgroup_position_in_grid.y * TILE;
+                float sum[TILE][2] = {};
                 for (uint k = lane * 4u; k < 3072u; k += 128u) {
-                    const auto activation = float4(*reinterpret_cast<device const bfloat4*>(input + k));
+                    float4 weights_for_output[2];
                     #pragma clang loop unroll(full)
-                    for (uint i = 0u; i < 2u; ++i) {
-                        const auto weight = float4(*reinterpret_cast<device const bfloat4*>(weights + 3072u * (first + i) + k));
-                        sum[i] = fma(weight.x, activation.x, sum[i]);
-                        sum[i] = fma(weight.y, activation.y, sum[i]);
-                        sum[i] = fma(weight.z, activation.z, sum[i]);
-                        sum[i] = fma(weight.w, activation.w, sum[i]);
+                    for (uint i = 0u; i < 2u; ++i)
+                        weights_for_output[i] = float4(*reinterpret_cast<device const bfloat4*>(
+                            weights + 3072u * (first + i) + k));
+                    #pragma clang loop unroll(full)
+                    for (uint r = 0u; r < TILE; ++r) {
+                        const uint row = first_row + r;
+                        if constexpr (TILE > 1) if (row >= uint(input_shape[0])) continue;
+                        const auto activation = float4(*reinterpret_cast<device const bfloat4*>(
+                            input + row * 3072u + k));
+                        #pragma clang loop unroll(full)
+                        for (uint i = 0u; i < 2u; ++i) {
+                            const auto w = weights_for_output[i];
+                            sum[r][i] = fma(w.x, activation.x, sum[r][i]);
+                            sum[r][i] = fma(w.y, activation.y, sum[r][i]);
+                            sum[r][i] = fma(w.z, activation.z, sum[r][i]);
+                            sum[r][i] = fma(w.w, activation.w, sum[r][i]);
+                        }
                     }
                 }
                 // Keep the reduction order of the FP32 router projection.
                 #pragma clang loop unroll(full)
-                for (uint i = 0u; i < 2u; ++i) {
-                    for (ushort offset = 16u; offset > 0u; offset /= 2u)
-                        sum[i] += simd_shuffle_down(sum[i], offset);
-                    if (lane == 0u) logits[first + i] = sum[i];
+                for (uint r = 0u; r < TILE; ++r) {
+                    const uint row = first_row + r;
+                    if constexpr (TILE > 1) if (row >= uint(input_shape[0])) continue;
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0u; i < 2u; ++i) {
+                        for (ushort offset = 16u; offset > 0u; offset /= 2u)
+                            sum[r][i] += simd_shuffle_down(sum[r][i], offset);
+                        if (lane == 0u) logits[row * 512u + first + i] = sum[r][i];
+                    }
                 }
             }
             )METAL", "", true, false, options);
         }();
-        return kernel({input, weight}, {{1, 512}}, {float32}, {8192, 1, 1}, {128, 1, 1}, {},
+        const int rows = input.shape(0), tile = std::min(rows, 4);
+        return kernel({contiguous(input), weight}, {{rows, 512}}, {float32},
+            {8192, (rows + tile - 1) / tile, 1}, {128, 1, 1}, {{"TILE", tile}},
             std::nullopt, false, {}).front();
     }
 };
@@ -384,8 +404,74 @@ array trailing_rope(const array& values, const RotaryPhases& phases, int rotary)
         phases(axis_slice(values, -1, unrotated, values.shape(-1)))}, -1);
 }
 
+array sliding_decode_softmax(const array& scores, const array& sinks) {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("hy4_sliding_decode_sink_softmax", {"scores", "sinks"}, {"probabilities"}, R"METAL(
+            constexpr uint KEYS = 512, GROUPS = 5;
+            const uint task = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup, simd = simdgroup_index_in_threadgroup;
+            const uint begin = thread_index_in_threadgroup * 4u;
+            const auto row = scores + ulong(task) * KEYS;
+            threadgroup float peaks[GROUPS], partials[GROUPS];
+            float values[4], peak = -INFINITY;
+            for (uint i = 0; i < 4u; ++i) {
+                const uint column = begin + i;
+                const float value = column == 0u ? float(sinks[task % scores_shape[1]]) :
+                    column <= KEYS ? float(row[column - 1u]) : -INFINITY;
+                values[i] = value;
+                peak = max(peak, value);
+            }
+            peak = simd_max(peak);
+            if (lane == 0u) peaks[simd] = peak;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0u) {
+                const float largest = simd_max(lane < GROUPS ? peaks[lane] : -INFINITY);
+                if (lane == 0u) peaks[0] = largest;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sum = 0.f;
+            for (uint i = 0; i < 4u; ++i) {
+                values[i] = metal::fast::exp(values[i] - peaks[0]);
+                sum += values[i];
+            }
+            sum = simd_sum(sum);
+            if (lane == 0u) partials[simd] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0u) {
+                const float total = simd_sum(lane < GROUPS ? partials[lane] : 0.f);
+                if (lane == 0u) partials[0] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inverse = 1.f / partials[0];
+            auto out = probabilities + ulong(task) * KEYS;
+            for (uint i = 0; i < 4u; ++i) {
+                const uint column = begin + i;
+                if (column > 0u && column <= KEYS) out[column - 1u] = half(values[i] * inverse);
+            }
+            )METAL", "", true, false, options);
+    }();
+    constexpr int threads = 5 * 32;
+    return kernel({scores, astype(sinks, float16)}, {scores.shape()}, {float16},
+        {scores.shape(0) * scores.shape(1) * threads, 1, 1}, {threads, 1, 1},
+        {}, std::nullopt, false, {}).front();
+}
+
 array latent_attention(const array& query, const array& rows, const array& sinks,
     float scale, int value_dim, const std::optional<array>& mask) {
+    if (query.shape(0) == 2 && query.shape(2) == 1 && rows.shape(1) == 512 &&
+        rows.shape(2) == 576 && rows.dtype() == float16 && value_dim == 512 && !mask &&
+        default_device() == Device::gpu) {
+        const int batch = query.shape(0), heads = query.shape(1), count = rows.shape(1);
+        const auto q = astype(query, float16) * array(scale, float16);
+        const auto keys = expand_dims(transpose(rows, {0, 2, 1}), 1);
+        const auto logits = reshape(matmul(q, keys), {batch, heads, count});
+        const auto probabilities = sliding_decode_softmax(logits, sinks);
+        const auto value = axis_slice(rows, -1, 0, value_dim);
+        // Tile the probability-by-value projection across heads to reuse the cached values.
+        return reshape(matmul(probabilities, value), {batch, 1, heads, value_dim});
+    }
     const auto keys = expand_dims(rows, 1);
     const auto values = axis_slice(keys, -1, 0, value_dim);
     const auto q = astype(query, rows.dtype());
@@ -405,23 +491,29 @@ array as_dense_attention(const array& query, const array& rows, const array& sin
     return latent_attention(query, rows, sinks, scale, value_dim, mask);
 }
 
+array append_sliding_decode(MlxHy4AttentionCache& cache, const Geometry& g, const array& next, int position) {
+    if (!cache.window) cache.window = zeros({1, g.window, next.shape(-1)}, next.dtype());
+    cache.window = mlx_circular_cache_append(*cache.window, next, position);
+    return axis_slice(*cache.window, 1, 0, std::min(position + 1, g.window));
+}
+
+array sliding_attention_rows(const array& window, const array& next, int position, int history) {
+    if (!history) return next;
+    auto chronological = mlx_circular_cache_history(window, position);
+    return concatenate({axis_slice(chronological, 1, chronological.shape(1) - history,
+        chronological.shape(1)), next}, 1);
+}
+
 array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const array& query,
     const array& next, const array& sinks, int position, float scale) {
-    const int width = next.shape(-1), count = next.shape(1);
-    if (!cache.window) cache.window = zeros({1, g.window, width}, next.dtype());
-    if (count == 1) {
-        cache.window = mlx_circular_cache_append(*cache.window, next, position);
-        const auto visible = axis_slice(*cache.window, 1, 0, std::min(position + 1, g.window));
-        return as_dense_attention(query, visible, sinks, position, 0, 0, scale, g.kv_rank);
-    }
+    const int count = next.shape(1);
+    if (count == 1)
+        return as_dense_attention(query, append_sliding_decode(cache, g, next, position),
+            sinks, position, 0, 0, scale, g.kv_rank);
+    if (!cache.window) cache.window = zeros({1, g.window, next.shape(-1)}, next.dtype());
 
     const int history = std::min(position, g.window - 1);
-    auto rows = next;
-    if (history) {
-        auto chronological = mlx_circular_cache_history(*cache.window, position);
-        rows = concatenate({axis_slice(chronological, 1, chronological.shape(1) - history,
-            chronological.shape(1)), next}, 1);
-    }
+    const auto rows = sliding_attention_rows(*cache.window, next, position, history);
     const int first = position - history;
     constexpr int tile = 256;
     std::vector<array> output;
@@ -437,11 +529,95 @@ array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const ar
     return attention;
 }
 
-void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
-    const array& input, const std::optional<RotaryPhases>& pool_phases, VerifiedLayerRows* verified) {
-    const int width = g.index_width;
+array batch_decode_queries(const array& packed) {
+    return expand_dims(transpose(squeeze(packed, 0), {1, 0, 2}), 2);
+}
+
+array batch_dense_mla_decode(const array& packed_queries, std::vector<array> visible,
+    const array& sinks, float scale, int value_dim) {
+    const int batch = static_cast<int>(visible.size());
+    std::vector<int> lengths;
+    lengths.reserve(batch);
+    for (const auto& lane : visible) lengths.push_back(lane.shape(1));
+    const auto [shortest, longest] = std::minmax_element(lengths.begin(), lengths.end());
+    std::optional<array> mask;
+    if (*shortest != *longest) {
+        const auto length = array(lengths.begin(), {batch, 1, 1, 1}, int32);
+        mask = arange(*longest, int32) < length;
+        for (int row = 0; row < batch; ++row)
+            if (lengths[row] < *longest)
+                visible[row] = pad(visible[row], {1}, {0}, {*longest - lengths[row]});
+    }
+    auto result = latent_attention(batch_decode_queries(packed_queries), concatenate(visible, 0),
+        sinks, scale, value_dim, mask);
+    return reshape(result, {1, batch, result.shape(2), result.shape(3)});
+}
+
+struct MlaWindow {
+    array rows;
+    array mask;
+};
+
+array batch_dense_mla_windows(const array& packed_queries, std::span<const MlaWindow> windows,
+    const array& sinks, float scale, int value_dim) {
+    const int batch = static_cast<int>(windows.size());
+    const int total = packed_queries.shape(2), heads = packed_queries.shape(1);
+    const int query_count = windows.front().mask.shape(1);
+    bool uniform = true;
+    int max_keys = 0;
+    for (const auto& window : windows) {
+        uniform &= window.mask.shape(1) == query_count;
+        max_keys = std::max(max_keys, window.rows.shape(1));
+    }
+    std::vector<array> rows, masks;
+    rows.reserve(batch);
+    masks.reserve(batch);
+    for (const auto& window : windows) {
+        const int key_pad = max_keys - window.rows.shape(1);
+        rows.push_back(key_pad ? pad(window.rows, {1}, {0}, {key_pad}) : window.rows);
+        masks.push_back(key_pad ? pad(window.mask, {2}, {0}, {key_pad}) : window.mask);
+    }
+    const auto kv = concatenate(rows, 0);
+    const bool fp16_gpu = default_device() == Device::gpu && kv.dtype() == float16;
+    if (uniform) {
+        const auto q = transpose(reshape(packed_queries, {heads, batch, query_count, packed_queries.shape(-1)}),
+            {1, 0, 2, 3});
+        const auto mask = concatenate(masks, 0);
+        const auto result = fp16_gpu ? mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, value_dim)
+            : latent_attention(q, kv, sinks, scale, value_dim, expand_dims(mask, 1));
+        return reshape(result, {1, total, heads, value_dim});
+    }
+    std::vector<int> query_lanes;
+    query_lanes.reserve(total);
+    for (int lane = 0; lane < batch; ++lane)
+        query_lanes.insert(query_lanes.end(), windows[lane].mask.shape(1), lane);
+    const auto lanes = array(query_lanes.begin(), {total}, int32);
+    const auto q = batch_decode_queries(packed_queries);
+    const auto mask = reshape(concatenate(masks, 1), {total, 1, max_keys});
+    const auto result = fp16_gpu ? mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, value_dim, lanes)
+        : latent_attention(q, take(kv, lanes, 0), sinks, scale, value_dim, expand_dims(mask, 1));
+    return reshape(result, {1, total, heads, value_dim});
+}
+
+array project_index_pairs(const IndexPool& index, const array& input) {
     const auto key = index.key_norm(index.key(input));
-    auto pairs = concatenate({astype(index.value(key), float32), astype(index.gate(key), float32)}, -1);
+    return concatenate({astype(index.value(key), float32), astype(index.gate(key), float32)}, -1);
+}
+
+struct IndexScores {
+    array query, weights;
+};
+
+IndexScores project_index_scores(const IndexPool& index, const Geometry& g,
+    const array& input, const array& low, const RotaryPhases& phases) {
+    const float scale = 1.0f / std::sqrt(float(g.index_heads * g.index_width));
+    return {trailing_rope(reshape(index.query(low), {1, input.shape(1), g.index_heads, g.index_width}),
+        phases, g.rotary), astype(index.weights(input), float32) * scale};
+}
+
+void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
+    array pairs, const std::optional<RotaryPhases>& pool_phases, VerifiedLayerRows* verified) {
+    const int width = g.index_width;
     if (cache.index_tail) pairs = concatenate({*cache.index_tail, pairs}, 1);
     if (verified) verified->index_pairs = pairs;
     const int complete = pairs.shape(1) / g.group_size;
@@ -490,6 +666,26 @@ array decode_token_selection(const array& groups, const Geometry& g, int positio
         {{"GROUP", g.group_size}, {"HISTORY", groups.shape(-1)}}, std::nullopt, false, {}).front();
 }
 
+std::pair<array, array> gather_index_pair(std::span<const array> views, std::span<const array> indices) {
+    static const auto kernel = fast::metal_kernel("hy4_decode_gather_index_pair",
+        {"left", "right", "ids_left", "ids_right"}, {"data", "mask"}, R"METAL(
+        const uint token = threadgroup_position_in_grid.x, lane = threadgroup_position_in_grid.y;
+        const uint i = thread_index_in_threadgroup;
+        const int chosen = lane == 0u ? ids_left[token] : ids_right[token];
+        const auto source = (lane == 0u ? left : right) + ulong(max(chosen, 0)) * WIDTH;
+        auto dest = data + (ulong(lane) * SELECTED + token) * WIDTH;
+        for (uint d = i * 4u; d < WIDTH; d += 256u)
+            for (uint j = 0; j < 4u; ++j) dest[d + j] = source[d + j];
+        if (i == 0u) mask[lane * SELECTED + token] = half(chosen >= 0 ? 0.0f : -INFINITY);
+        )METAL");
+    const int width = views[0].shape(2), selected = indices[0].shape(2);
+    auto out = kernel({views[0], views[1], indices[0], indices[1]},
+        {{2, 1, selected, width}, {2, 1, selected}}, {float16, float16},
+        {selected * 64, 2, 1}, {64, 1, 1}, {{"WIDTH", width}, {"SELECTED", selected}},
+        std::nullopt, false, {});
+    return {std::move(out[0]), std::move(out[1])};
+}
+
 array choose_resident_tokens(const array& groups, const Geometry& g,
     const array& query, const array& weights, int position) {
     const int take = query.shape(1);
@@ -520,12 +716,9 @@ array choose_resident_tokens(const array& groups, const Geometry& g,
     return token_selection(concatenate({ids, current}, -1), g, position);
 }
 
-array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
-    const array& query, const array& latent, const array& input, const array& query_low,
-    const RotaryPhases& phases, const std::optional<RotaryPhases>& pool_phases,
-    const array& sinks, int position, float scale, const std::shared_ptr<QsaKvStore>& offload,
-    VerifiedLayerRows* verified) {
-    const int count = latent.shape(1), end = position + count;
+array append_indexed_cache(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
+    const array& latent, const array& index_pairs, const std::optional<RotaryPhases>& pool_phases,
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
     const auto stored = g.indexed_kv.pack(latent);
     if (!cache.latent && !cache.offloaded_latent) {
         if (offload) {
@@ -538,7 +731,48 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     }
     if (cache.offloaded_latent) cache.offloaded_latent->append(stored);
     else cache.latent->append(stored);
-    append_index_pool(cache, index, g, input, pool_phases, verified);
+    append_index_pool(cache, index, g, index_pairs, pool_phases, verified);
+    return stored;
+}
+
+array batch_resident_indexed_mla(const array& query, std::span<const array> caches,
+    std::span<const array> selections, const array& sinks, float scale, int value_dim, bool dense) {
+    if (dense) {
+        std::vector<MlaWindow> windows;
+        for (std::size_t lane = 0; lane < caches.size(); ++lane) {
+            const auto& ids = selections[lane];
+            const int keys = caches[lane].shape(1);
+            const auto visible = put_along_axis(zeros({1, ids.shape(1), keys + 1}, bool_),
+                where(ids >= 0, ids, array(keys, int32)), ids >= 0, -1);
+            windows.push_back({caches[lane], axis_slice(visible, -1, 0, keys)});
+        }
+        return batch_dense_mla_windows(query, windows, sinks, scale, value_dim);
+    }
+
+    int selected = 0;
+    for (const auto& ids : selections) selected = std::max(selected, ids.shape(-1));
+    std::vector<array> rows, masks;
+    for (std::size_t lane = 0; lane < caches.size(); ++lane) {
+        const auto& raw = selections[lane];
+        const int extra = selected - raw.shape(-1);
+        const auto ids = extra ? pad(raw, {-1}, {0}, {extra}, array(-1, int32)) : raw;
+        const int count = ids.shape(1);
+        rows.push_back(reshape(mlx_gather_selected_mla_rows(caches[lane], ids),
+            {count, 1, selected, caches[lane].shape(-1)}));
+        masks.push_back(reshape(where(ids >= 0, array(0.f), array(-std::numeric_limits<float>::infinity())),
+            {count, 1, selected}));
+    }
+    auto result = mlx_gathered_mla_attention(batch_decode_queries(query), concatenate(rows, 0),
+        concatenate(masks, 0), sinks, scale, value_dim, true);
+    return reshape(result, {1, query.shape(2), query.shape(1), value_dim});
+}
+
+array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
+    const array& query, const array& latent, const array& index_pairs, const std::optional<IndexScores>& scoring,
+    const std::optional<RotaryPhases>& pool_phases, const array& sinks, int position, float scale,
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
+    const int count = latent.shape(1), end = position + count;
+    const auto stored = append_indexed_cache(cache, index, g, latent, index_pairs, pool_phases, offload, verified);
 
     if (end <= g.index_budget) {
         cache.last_indices = reshape(arange(0, end, 1, int32), {1, 1, end});
@@ -548,10 +782,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
         return as_dense_attention(query, g.indexed_kv.unpack(rows), sinks, position, 0, 0, scale, g.kv_rank);
     }
 
-    const float weight_scale = 1.0f / std::sqrt(float(g.index_heads * g.index_width));
-    const auto iq = trailing_rope(reshape(index.query(query_low), {1, count, g.index_heads, g.index_width}),
-        phases, g.rotary);
-    const auto head_weights = astype(index.weights(input), float32) * weight_scale;
+    const auto& [iq, head_weights] = scoring.value();
     const auto& quantization = g.indexed_kv.quantization;
     std::optional<array> resident;
     // A bounded packed view can supply every query tile of a prefill chunk.
@@ -617,10 +848,13 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
 }
 
 std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, const array& kv,
-    const MlxRmsNorm& query_norm, const MlxRmsNorm& latent_norm, const RotaryPhases& phases, const Geometry& g) {
-    if (g.kv_rank != 512 || g.rotary != 64 || query.shape() != Shape{1, 1, 1024} ||
-        kv.shape() != Shape{1, 1, 576} || query.dtype() != bfloat16 || kv.dtype() != bfloat16 ||
-        query_norm.width() != 1024 || latent_norm.width() != 512 || phases.cosine.size() != 32 ||
+    const MlxRmsNorm& query_norm, const MlxRmsNorm& latent_norm, const RotaryPhases& phases,
+    const Geometry& g, bool packed) {
+    const int count = query.shape(1);
+    if (g.kv_rank != 512 || g.rotary != 64 || count <= 0 || count > (packed ? 64 : 1) ||
+        query.shape() != Shape{1, count, 1024} || kv.shape() != Shape{1, count, 576} ||
+        query.dtype() != bfloat16 || kv.dtype() != bfloat16 || query_norm.width() != 1024 ||
+        latent_norm.width() != 512 || phases.cosine.size() != std::size_t(count) * 32 ||
         phases.cosine.shape() != phases.sine.shape() ||
         default_device() != Device::gpu)
         return std::nullopt;
@@ -629,7 +863,12 @@ std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, 
         options.math_mode = MathMode::Fast;
         return fast::metal_kernel("hy4_mla_decode_norm_rope",
             {"qa", "kv", "qw", "kw", "cosines", "sines", "epsilon"}, {"low", "latent"}, R"METAL(
-            const bool key = threadgroup_position_in_grid.x == 1u;
+            const uint row = PACKED_ROWS ? threadgroup_position_in_grid.x >> 1u : 0u;
+            const bool key = (threadgroup_position_in_grid.x & 1u) != 0u;
+            const auto query_input = qa + row * 1024u;
+            const auto key_input = kv + row * 576u;
+            const auto query_output = low + row * 1024u;
+            const auto key_output = latent + row * 576u;
             const uint tid = thread_index_in_threadgroup;
             const uint lane = thread_index_in_simdgroup;
             const uint simd = simdgroup_index_in_threadgroup;
@@ -637,20 +876,20 @@ std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, 
                 const uint rotary_column = tid - 128u;
                 const uint pair = rotary_column >> 1u;
                 const uint pair_base = 512u + (pair << 1u);
-                const float cosine = cosines[pair];
-                const float sine = sines[pair];
-                const float first = float(kv[pair_base]);
-                const float second = float(kv[pair_base + 1u]);
+                const float cosine = cosines[row * 32u + pair];
+                const float sine = sines[row * 32u + pair];
+                const float first = float(key_input[pair_base]);
+                const float second = float(key_input[pair_base + 1u]);
                 const float result = (rotary_column & 1u) == 0u
                     ? first * cosine - second * sine
                     : first * sine + second * cosine;
-                latent[512u + rotary_column] = half(float(bfloat(result)));
+                key_output[512u + rotary_column] = half(float(bfloat(result)));
             }
             {
             #pragma clang fp reassociate(off)
                 const uint width = key ? 512u : 1024u;
                 const uint column = tid * 4u;
-                const auto input = key ? kv : qa;
+                const auto input = key ? key_input : query_input;
                 float values[4] = {};
                 float total = 0.0f;
                 if (column < width) {
@@ -675,8 +914,8 @@ std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, 
                     #pragma clang loop unroll(full)
                     for (uint i = 0; i < 4u; ++i) {
                         const bfloat result = bfloat((values[i] * inv_rms) * weights[column + i]);
-                        if (key) latent[column + i] = half(float(result));
-                        else low[column + i] = result;
+                        if (key) key_output[column + i] = half(float(result));
+                        else query_output[column + i] = result;
                     }
                 }
             }
@@ -684,7 +923,7 @@ std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, 
     }();
     auto outputs = kernel({query, kv, query_norm.weight(), latent_norm.weight(), phases.cosine, phases.sine,
         array({query_norm.eps(), latent_norm.eps()}, float32)}, {query.shape(), kv.shape()}, {bfloat16, float16},
-        {512, 1, 1}, {256, 1, 1}, {}, std::nullopt, false, {});
+        {count * 512, 1, 1}, {256, 1, 1}, {{"PACKED_ROWS", count > 1}}, std::nullopt, false, {});
     return std::pair{std::move(outputs[0]), std::move(outputs[1])};
 }
 
@@ -692,15 +931,53 @@ struct MlaRows {
     array query, latent, query_low, gate;
 };
 
+array absorb_mla_query(const array& query, const array& weights) {
+    const auto source = astype(query, weights.dtype());
+    const int heads = source.shape(1);
+    if (source.shape(2) != 2 || source.shape(3) != 192 || weights.shape() != Shape{heads, 192, 512} ||
+        weights.dtype() != float16 || default_device() != Device::gpu)
+        return matmul(source, weights);
+    static const auto kernel = fast::metal_kernel("hy4_decode_absorb_query_pair", {"x", "w"}, {"out"}, R"METAL(
+        constexpr uint DIM = 192, WIDTH = 512;
+        const uint head = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup, subgroup = simdgroup_index_in_threadgroup;
+        const uint column = (threadgroup_position_in_grid.x * 32u + lane) * 4u;
+        const auto first = x + head * 2u * DIM;
+        const auto second = first + DIM;
+        const auto weight = w + head * DIM * WIDTH + column;
+        float4 first_sum(0.f), second_sum(0.f);
+        // Reuse each weight vector for both queries of this head.
+        for (uint k = subgroup; k < DIM; k += 4u) {
+            const auto v = float4(*reinterpret_cast<device const half4*>(weight + k * WIDTH));
+            first_sum = fma(v, float4(first[k]), first_sum);
+            second_sum = fma(v, float4(second[k]), second_sum);
+        }
+        threadgroup float4 partial[4][2][32];
+        partial[subgroup][0][lane] = first_sum;
+        partial[subgroup][1][lane] = second_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (subgroup == 0u) {
+            first_sum = (first_sum + partial[1][0][lane]) + (partial[2][0][lane] + partial[3][0][lane]);
+            second_sum = (second_sum + partial[1][1][lane]) + (partial[2][1][lane] + partial[3][1][lane]);
+            auto dest = out + head * 2u * WIDTH + column;
+            *reinterpret_cast<device half4*>(dest) = half4(first_sum);
+            *reinterpret_cast<device half4*>(dest + WIDTH) = half4(second_sum);
+        }
+        )METAL");
+    return kernel({source, weights}, {{1, heads, 2, 512}}, {float16},
+        {512, heads, 1}, {128, 1, 1}, {}, std::nullopt, false, {}).front();
+}
+
 template <class Attention>
-MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const RotaryPhases& phases) {
+MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const RotaryPhases& phases,
+    bool packed = false) {
     const int count = in.shape(1), plain = g.q_dim - g.rotary;
     const auto projected = layer.projections(in);
-    auto normalized = normalize_mla_decode(projected[0], projected[1], layer.query_norm, layer.latent_norm, phases, g);
+    auto normalized = normalize_mla_decode(projected[0], projected[1], layer.query_norm, layer.latent_norm, phases, g, packed);
     auto low = normalized ? std::move(normalized->first) : layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
     const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
-    const auto absorbed = matmul(astype(no_rope, layer.key_absorption.dtype()), layer.key_absorption);
+    const auto absorbed = absorb_mla_query(no_rope, layer.key_absorption);
     const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
     auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
     auto latent = normalized ? std::move(normalized->second) : astype(concatenate({
@@ -723,47 +1000,67 @@ struct PendingResidual {
     MlxHyperConnectionState mixer;
 };
 
-array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
+MlxHyperConnectionState prepare_attention_input(const Layer& layer, const Geometry& g, array& streams,
+    const std::optional<array>& engram, const PendingResidual* deferred, bool packed_decode = false) {
+    if (engram) {
+        if (deferred) streams = MlxHyperConnection::expand(streams, deferred->branch, deferred->mixer);
+        streams = (*layer.engram)(streams, *engram, g);
+    } else if (deferred) {
+        auto [updated, gates] = layer.attention_hc.expand_and_collapse(
+            streams, deferred->branch, deferred->mixer, &layer.attention_norm, packed_decode);
+        streams = std::move(updated);
+        return gates;
+    }
+    return layer.attention_hc.collapse(streams, &layer.attention_norm, packed_decode);
+}
+
+std::pair<array, MlxHyperConnectionState> prepare_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
     const std::optional<array>& engram, const RotaryPhases& phases,
     const std::optional<RotaryPhases>& pool_phases, int offset,
     const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified,
     std::optional<PendingResidual>* deferred) {
-    const auto mix = [&] {
-        if (engram) {
-            if (deferred && *deferred) {
-                streams = MlxHyperConnection::expand(streams, (*deferred)->branch, (*deferred)->mixer);
-            }
-            streams = (*layer.engram)(streams, *engram, g);
-        } else if (deferred && *deferred) {
-            auto [updated, gates] = layer.attention_hc.expand_and_collapse(
-                streams, (*deferred)->branch, (*deferred)->mixer, &layer.attention_norm);
-            streams = std::move(updated);
-            return gates;
-        }
-        return layer.attention_hc.collapse(streams, &layer.attention_norm);
-    }();
+    const auto mix = prepare_attention_input(layer, g, streams, engram,
+        deferred && *deferred ? &**deferred : nullptr);
     const auto& in = mix.branch;
     const auto rows = project_mla(layer, g, in, phases);
     if (verified && layer.sliding) {
         verified->old_window = cache.window;
         verified->new_window = rows.latent;
+        if (cache.window) cache.window = *cache.window + zeros_like(*cache.window);
     }
     const float scale = 1.0f / std::sqrt(float(g.q_dim));
-    const auto attention = layer.sliding ? sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale)
-        : run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent, in, rows.query_low, phases, pool_phases,
-            layer.sinks, offset, scale, offload, verified);
+    const auto attention = [&] {
+        if (layer.sliding) return sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale);
+        std::optional<IndexScores> scoring;
+        if (offset + in.shape(1) > g.index_budget)
+            scoring = project_index_scores(*layer.index, g, in, rows.query_low, phases);
+        return run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent,
+            project_index_pairs(*layer.index, in), scoring, pool_phases, layer.sinks, offset, scale, offload, verified);
+    }();
     const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
     auto [updated_streams, ffn_mix] = layer.ffn_hc.expand_and_collapse(
         streams, attn_out, mix, &layer.ffn_norm);
     streams = std::move(updated_streams);
-    const auto& ffn_in = ffn_mix.branch;
-    const auto ffn = layer.dense ? (*layer.dense)(ffn_in) : (*layer.moe)(ffn_in, g);
-    const auto ffn_out = layer.post_ffn_norm(ffn);
+    return {std::move(streams), std::move(ffn_mix)};
+}
+
+array project_ffn(const Layer& layer, const Geometry& g, const array& input) {
+    return layer.post_ffn_norm(layer.dense ? (*layer.dense)(input) : (*layer.moe)(input, g));
+}
+
+array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
+    const std::optional<array>& engram, const RotaryPhases& phases,
+    const std::optional<RotaryPhases>& pool_phases, int offset,
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified,
+    std::optional<PendingResidual>* deferred) {
+    auto [updated, ffn_mix] = prepare_layer(layer, g, cache, std::move(streams),
+        engram, phases, pool_phases, offset, offload, verified, deferred);
+    auto ffn_out = project_ffn(layer, g, ffn_mix.branch);
     if (deferred) {
-        deferred->emplace(ffn_out, std::move(ffn_mix));
-        return streams;
+        deferred->emplace(std::move(ffn_out), std::move(ffn_mix));
+        return updated;
     }
-    return MlxHyperConnection::expand(streams, ffn_out, ffn_mix);
+    return MlxHyperConnection::expand(updated, ffn_out, ffn_mix);
 }
 
 using DraftTensors = std::unordered_map<std::string, array>;
@@ -892,27 +1189,115 @@ struct DflyDraft {
         const int position = cache.position;
         const auto phases = rotary_phases(arange(position, position + 1 + depth, 1, int32), g.rotary, g.rotary_base);
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            const auto& cached = cache.layers[target_layers[i]];
-            auto selected = *cache.layers[index_layers[i]].last_indices;
-            if (local_window) {
-                const int begin = std::max(0, position - local_window);
-                selected = where(selected < begin, selected, array(-1, int32));
-                const auto local = reshape(arange(begin, position, 1, int32), {1, 1, position - begin});
-                selected = concatenate({selected, local}, -1);
-            }
-            const auto shape = Shape{1, selected.shape(-1), g.indexed_kv.width()};
-            auto history = cached.offloaded_latent ? reshape(cached.offloaded_latent->gather(selected), shape)
-                : take(cached.latent->view(), reshape(maximum(selected, array(0, int32)), {-1}), 1);
-            auto valid = reshape(selected >= array(0, int32), {1, selected.shape(-1)});
-            hidden = layers[i](g, hidden, phases, g.indexed_kv.unpack(history), valid);
+            const auto [history, valid] = selected_history(g, cache, i);
+            hidden = layers[i](g, hidden, phases, history, valid);
         }
         hidden = output_norm(hidden);
         for (int i = 1; i <= depth; ++i) {
             const auto row = axis_slice(hidden, 1, i, i + 1);
-            const auto prior = correction_embedding_norm(embedding(previous, bfloat16));
-            const auto corrected = row + correction(concatenate({correction_hidden_norm(row), prior}, -1));
+            const auto corrected = correct(row, previous, embedding);
             previous = reshape(select(mlx_last_token_logits(output(corrected), g.vocab)), {1, 1});
         }
+    }
+
+    std::vector<array> propose_batch(const Geometry& g, std::span<MlxHy4Cache* const> caches,
+        std::span<const MlxMtpTargetRequest> steps, const MlxEmbedding& embedding, const MlxLinear& output) const {
+        const int batch = static_cast<int>(caches.size());
+        if (batch == 1) {
+            std::vector<array> proposed;
+            propose(g, *caches.front(), embedding, output, steps.front().pending_token, steps.front().draft_count,
+                [&](const array& logits) {
+                    auto token = reshape(sample_greedy(logits), {1});
+                    proposed.push_back(token);
+                    return token;
+                });
+            return {concatenate(proposed, 0)};
+        }
+        std::vector<int> offsets{0}, ids, positions;
+        std::vector<array> target_hidden;
+        int max_drafts = 0;
+        for (int lane = 0; lane < batch; ++lane) {
+            const auto& step = steps[lane];
+            ids.push_back(step.pending_token);
+            ids.insert(ids.end(), step.draft_count, mask_id);
+            for (int token = 0; token <= step.draft_count; ++token)
+                positions.push_back(caches[lane]->position + token);
+            offsets.push_back(static_cast<int>(ids.size()));
+            target_hidden.push_back(*caches[lane]->last_hidden);
+            max_drafts = std::max(max_drafts, step.draft_count);
+        }
+        const int total = offsets.back();
+        const auto embedded = embedding(array(ids.begin(), {1, total}, int32), bfloat16);
+        const auto anchors = take(embedded, array(offsets.begin(), {batch}, int32), 1);
+        const auto fused = anchors + fuse_gate *
+            fuse(concatenate({embedding_norm(anchors), target_norm(concatenate(target_hidden, 1))}, -1));
+        std::vector<array> inputs;
+        for (int lane = 0; lane < batch; ++lane) {
+            inputs.push_back(axis_slice(fused, 1, lane, lane + 1));
+            inputs.push_back(axis_slice(embedded, 1, offsets[lane] + 1, offsets[lane + 1]));
+        }
+        auto hidden = concatenate(inputs, 1);
+        const auto phases = rotary_phases(array(positions.begin(), {total}, int32), g.rotary, g.rotary_base);
+        const float scale = 1.0f / std::sqrt(float(g.q_dim));
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            const auto& layer = layers[index];
+            const auto rows = project_mla(layer, g, layer.attention_norm(hidden), phases, true);
+            std::vector<MlaWindow> windows;
+            for (int lane = 0; lane < batch; ++lane) {
+                const auto [history, valid] = selected_history(g, *caches[lane], index);
+                const auto current = axis_slice(rows.latent, 1, offsets[lane], offsets[lane + 1]);
+                const int count = current.shape(1);
+                const auto slots = arange(count, int32);
+                const auto causal = expand_dims(slots <= expand_dims(slots, 1), 0);
+                const auto past = broadcast_to(expand_dims(valid, 1), {1, count, history.shape(1)});
+                windows.push_back({concatenate({history, current}, 1), concatenate({past, causal}, -1)});
+            }
+            const auto attention = batch_dense_mla_windows(rows.query, windows, layer.sinks, scale, g.kv_rank);
+            auto residual = hidden + expand_mla(layer, g, attention, rows.gate, hidden.dtype());
+            hidden = residual + layer.ffn(layer.ffn_norm(residual));
+        }
+        hidden = output_norm(hidden);
+        std::vector<std::vector<array>> proposed(batch);
+        for (int slot = 1; slot <= max_drafts; ++slot) {
+            std::vector<int> lanes, rows;
+            std::vector<array> prior;
+            for (int lane = 0; lane < batch; ++lane) if (slot <= steps[lane].draft_count) {
+                lanes.push_back(lane);
+                rows.push_back(offsets[lane] + slot);
+                prior.push_back(slot == 1 ? array({steps[lane].pending_token}, {1}, int32) : proposed[lane].back());
+            }
+            const int count = static_cast<int>(lanes.size());
+            const auto row = take(hidden, array(rows.begin(), {count}, int32), 1);
+            const auto previous = reshape(concatenate(prior, 0), {1, count});
+            const auto selected = sample_greedy(reshape(output(correct(row, previous, embedding)), {count, g.vocab}));
+            for (int i = 0; i < count; ++i)
+                proposed[lanes[i]].push_back(axis_slice(selected, 0, i, i + 1));
+        }
+        std::vector<array> result;
+        for (const auto& lane : proposed) result.push_back(concatenate(lane, 0));
+        return result;
+    }
+
+private:
+    array correct(const array& hidden, const array& previous, const MlxEmbedding& embedding) const {
+        const auto prior = correction_embedding_norm(embedding(previous, bfloat16));
+        return hidden + correction(concatenate({correction_hidden_norm(hidden), prior}, -1));
+    }
+
+    std::pair<array, array> selected_history(const Geometry& g, const MlxHy4Cache& cache, std::size_t layer) const {
+        const auto& cached = cache.layers[target_layers[layer]];
+        auto selected = *cache.layers[index_layers[layer]].last_indices;
+        if (local_window) {
+            const int begin = std::max(0, cache.position - local_window);
+            selected = where(selected < begin, selected, array(-1, int32));
+            const auto local = reshape(arange(begin, cache.position, 1, int32), {1, 1, cache.position - begin});
+            selected = concatenate({selected, local}, -1);
+        }
+        const int keys = selected.shape(-1);
+        auto values = cached.offloaded_latent
+            ? reshape(cached.offloaded_latent->gather(selected), {1, keys, g.indexed_kv.width()})
+            : take(cached.latent->view(), reshape(maximum(selected, array(0, int32)), {-1}), 1);
+        return {g.indexed_kv.unpack(values), reshape(selected >= array(0, int32), {1, keys})};
     }
 };
 
@@ -1018,7 +1403,7 @@ struct MlxHy4Model::Weights {
     }
 };
 
-struct MlxHy4Model::Verification {
+struct MlxHy4Verification {
     int position = 0;
     std::vector<VerifiedLayerRows> layers;
     std::vector<std::int32_t> engram_tokens;
@@ -1100,6 +1485,291 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
     return astype(w.output(hidden), float32);
 }
 
+array MlxHy4Model::decode_batch(std::span<Cache* const> requests, const array& tokens) const {
+    const int batch = static_cast<int>(requests.size());
+    if (!batch || tokens.shape() != Shape{batch, 1}) throw std::invalid_argument("invalid Hy4 decode batch");
+    std::vector<BatchInput> inputs;
+    inputs.reserve(batch);
+    for (int row = 0; row < batch; ++row)
+        inputs.push_back({requests[row], axis_slice(tokens, 0, row, row + 1)});
+    auto outputs = forward_batch(inputs);
+    return outputs.size() == 1 ? std::move(outputs.front()) : concatenate(outputs, 0);
+}
+
+std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs) const {
+    const auto& w = *weights_;
+    const auto& g = w.g;
+    const int batch = static_cast<int>(inputs.size());
+    if (!batch) throw std::invalid_argument("empty Hy4 decode batch");
+    std::vector<Cache*> requests;
+    std::vector<array> tokens;
+    requests.reserve(batch);
+    tokens.reserve(batch);
+    int total = 0;
+    for (const auto& input : inputs) {
+        const auto* request = input.cache;
+        if (!request || input.tokens.ndim() != 2 || input.tokens.shape(0) != 1 || input.tokens.shape(1) <= 0 ||
+            request->position <= 0 || input.tokens.shape(1) > g.context - request->position ||
+            request->layers.size() != static_cast<std::size_t>(g.layers) ||
+            std::find(requests.begin(), requests.end(), request) != requests.end())
+            throw std::invalid_argument("invalid Hy4 decode request state");
+        requests.push_back(input.cache);
+        tokens.push_back(input.tokens);
+        total += input.tokens.shape(1);
+    }
+    if (batch == 1) {
+        const auto& input = inputs.front();
+        return {forward_impl(input.tokens, *input.cache, false, input.verification)};
+    }
+    struct Sequence {
+        std::optional<RotaryPhases> pooled;
+        std::vector<std::int32_t> history;
+        std::size_t first;
+        int begin, end;
+    };
+    auto ids = contiguous(astype(concatenate(tokens, 1), int32));
+    if (w.engram) ids.eval();
+    auto hidden = w.token_embedding(ids, bfloat16);
+    auto streams = broadcast_to(expand_dims(hidden, 2), {1, total, g.streams, g.hidden});
+    std::vector<Sequence> sequences;
+    std::vector<std::int32_t> positions;
+    sequences.reserve(batch);
+    positions.reserve(total);
+    bool score_index = false, all_scored = true;
+    bool singleton_batch = total == batch;
+    int max_window = 0, max_end = 0;
+    for (const auto& input : inputs) {
+        const auto& cache = *input.cache;
+        const int count = input.tokens.shape(1), end = cache.position + count;
+        const int begin = static_cast<int>(positions.size());
+        for (int position = cache.position; position < end; ++position) positions.push_back(position);
+        score_index |= end > g.index_budget;
+        all_scored &= end > g.index_budget;
+        singleton_batch &= !input.verification;
+        max_window = std::max(max_window, count);
+        max_end = std::max(max_end, end);
+        const int first_group = cache.position - cache.position % g.group_size;
+        const int complete = (end - first_group) / g.group_size;
+        std::optional<RotaryPhases> pooled;
+        if (complete)
+            pooled = rotary_phases(arange(first_group, first_group + complete * g.group_size,
+                g.group_size, int32), g.rotary, g.rotary_base);
+        auto history = cache.engram_tail;
+        const auto first = history.size();
+        if (w.engram) {
+            const auto* row = ids.data<std::int32_t>() + begin;
+            history.insert(history.end(), row, row + count);
+        }
+        if (input.verification) {
+            input.verification->position = cache.position;
+            input.verification->layers.resize(g.layers);
+            if (w.engram) input.verification->engram_tokens = history;
+        }
+        sequences.push_back({std::move(pooled), std::move(history), first, begin, begin + count});
+    }
+
+    const auto positions_array = array(positions.begin(), {total}, int32);
+    const auto indexed_phases = rotary_phases(positions_array, g.rotary, g.rotary_base);
+    const auto sliding_phases = rotary_phases(positions_array, g.rotary, g.window_rotary_base);
+    const bool verify_windows = !singleton_batch && max_window <= kMlxMtpEngineMaximumDraftDepth + 1;
+    std::vector<array> verify_sliding_masks;
+    if (verify_windows) {
+        verify_sliding_masks.reserve(batch);
+        for (const auto& input : inputs) {
+            const int history = std::min(input.cache->position, g.window - 1);
+            const int count = input.tokens.shape(1);
+            const auto queries = reshape(arange(history, history + count, 1, int32), {1, count, 1});
+            const auto keys = arange(history + count, int32);
+            verify_sliding_masks.push_back(logical_and(keys <= queries, keys > queries - g.window));
+        }
+    }
+    const float scale = 1.0f / std::sqrt(float(g.q_dim));
+    std::optional<PendingResidual> deferred;
+    for (int index = 0; index < g.layers; ++index) {
+        const auto& layer = w.layers[index];
+        std::optional<array> engram;
+        if (layer.engram) {
+            std::vector<array> rows;
+            rows.reserve(batch);
+            for (const auto& sequence : sequences)
+                rows.push_back(w.engram->gather(index, sequence.history, sequence.first));
+            engram = concatenate(rows, 1);
+        }
+        const auto mix = prepare_attention_input(layer, g, streams, engram,
+            deferred ? &*deferred : nullptr, true);
+        const auto& in = mix.branch;
+        const auto& phases = layer.sliding ? sliding_phases : indexed_phases;
+        const auto rows = project_mla(layer, g, in, phases, true);
+        const auto pairs = layer.index ? std::optional(project_index_pairs(*layer.index, in)) : std::nullopt;
+        const auto scoring = layer.index && score_index
+            ? std::optional(project_index_scores(*layer.index, g, in, rows.query_low, phases)) : std::nullopt;
+        const auto attention = [&] {
+            if (singleton_batch && layer.sliding) {
+                std::vector<array> visible;
+                visible.reserve(batch);
+                for (int row = 0; row < batch; ++row) {
+                    auto& request = *requests[row];
+                    visible.push_back(append_sliding_decode(request.layers[index], g,
+                        axis_slice(rows.latent, 1, row, row + 1), request.position));
+                }
+                return batch_dense_mla_decode(rows.query, std::move(visible), layer.sinks, scale, g.kv_rank);
+            }
+            if (singleton_batch && layer.index && !w.offload && !g.indexed_kv.quantization.enabled() &&
+                (!score_index || all_scored)) {
+                const bool pair_gather = batch == 2 && scoring && g.index_budget == 2048 &&
+                    rows.latent.shape(-1) == 576 && rows.latent.dtype() == float16 && default_device() == Device::gpu;
+                std::vector<array> visible, masks, indices;
+                visible.reserve(batch);
+                (pair_gather ? indices : masks).reserve(batch);
+                for (int row = 0; row < batch; ++row) {
+                    auto& request = *requests[row];
+                    auto& cache = request.layers[index];
+                    append_indexed_cache(cache, *layer.index, g, axis_slice(rows.latent, 1, row, row + 1),
+                        axis_slice(*pairs, 1, row, row + 1), sequences[row].pooled, nullptr, nullptr);
+                    auto view = cache.latent->view();
+                    if (scoring) {
+                        auto selected = choose_resident_tokens(cache.groups->view(), g,
+                            axis_slice(scoring->query, 1, row, row + 1),
+                            axis_slice(scoring->weights, 1, row, row + 1), request.position);
+                        if (pair_gather) {
+                            visible.push_back(std::move(view));
+                            indices.push_back(selected);
+                        } else {
+                            masks.push_back(where(selected >= 0, array(0.0f, float16),
+                                array(-std::numeric_limits<float>::infinity(), float16)));
+                            visible.push_back(mlx_gather_selected_mla_rows(view, selected));
+                        }
+                        cache.last_indices = std::move(selected);
+                    } else {
+                        const int end = request.position + 1;
+                        cache.last_indices = reshape(arange(0, end, 1, int32), {1, 1, end});
+                        visible.push_back(g.indexed_kv.unpack(view));
+                    }
+                }
+                if (!scoring)
+                    return batch_dense_mla_decode(rows.query, std::move(visible), layer.sinks, scale, g.kv_rank);
+                const auto [data, mask] = pair_gather ? gather_index_pair(visible, indices) :
+                    std::pair{concatenate(visible, 0), concatenate(masks, 0)};
+                auto result = mlx_gathered_mla_attention(batch_decode_queries(rows.query), data,
+                    mask, layer.sinks, scale, g.kv_rank);
+                return reshape(result, {1, batch, result.shape(2), result.shape(3)});
+            }
+            if (verify_windows && layer.sliding) {
+                std::vector<MlaWindow> windows;
+                std::vector<array> updates;
+                for (int row = 0; row < batch; ++row) {
+                    const auto& sequence = sequences[row];
+                    auto& request = *requests[row];
+                    auto& cache = request.layers[index];
+                    auto next = axis_slice(rows.latent, 1, sequence.begin, sequence.end);
+                    if (!cache.window) cache.window = zeros({1, g.window, next.shape(-1)}, next.dtype());
+                    if (inputs[row].verification) {
+                        auto& saved = inputs[row].verification->layers[index];
+                        saved.old_window = cache.window;
+                        saved.new_window = next;
+                        cache.window = *cache.window + zeros_like(*cache.window);
+                    }
+                    const int history = std::min(request.position, g.window - 1);
+                    auto visible = sliding_attention_rows(*cache.window, next, request.position, history);
+                    windows.push_back({std::move(visible), verify_sliding_masks[row]});
+                    updates.push_back(std::move(next));
+                }
+                auto result = batch_dense_mla_windows(rows.query, windows, layer.sinks, scale, g.kv_rank);
+                for (int row = 0; row < batch; ++row) {
+                    auto& request = *requests[row];
+                    auto& cache = request.layers[index];
+                    cache.window = mlx_circular_cache_append(*cache.window, updates[row], request.position,
+                        axis_slice(result, 1, sequences[row].begin, sequences[row].end));
+                }
+                return result;
+            }
+            if (verify_windows && layer.index && !w.offload && !g.indexed_kv.quantization.enabled()) {
+                std::vector<array> visible, selections;
+                for (int row = 0; row < batch; ++row) {
+                    const auto& sequence = sequences[row];
+                    auto& request = *requests[row];
+                    auto& cache = request.layers[index];
+                    auto* verified = inputs[row].verification ? &inputs[row].verification->layers[index] : nullptr;
+                    const auto latent = axis_slice(rows.latent, 1, sequence.begin, sequence.end);
+                    append_indexed_cache(cache, *layer.index, g, latent,
+                        axis_slice(*pairs, 1, sequence.begin, sequence.end), sequence.pooled, nullptr, verified);
+                    const int count = latent.shape(1), end = request.position + count;
+                    if (end <= g.index_budget) {
+                        cache.last_indices = reshape(arange(end, int32), {1, 1, end});
+                        const auto queries = reshape(arange(request.position, end, 1, int32), {1, count, 1});
+                        selections.push_back(where(*cache.last_indices <= queries, *cache.last_indices, array(-1)));
+                    } else {
+                        auto ids = choose_resident_tokens(astype(cache.groups->view(), float32), g,
+                            axis_slice(scoring->query, 1, sequence.begin, sequence.end),
+                            axis_slice(scoring->weights, 1, sequence.begin, sequence.end), request.position);
+                        if (verified) verified->selections = ids;
+                        cache.last_indices = axis_slice(ids, 1, count - 1, count);
+                        selections.push_back(std::move(ids));
+                    }
+                    visible.push_back(cache.latent->view());
+                }
+                return batch_resident_indexed_mla(rows.query, visible, selections, layer.sinks,
+                    scale, g.kv_rank, max_end <= 2 * g.index_budget);
+            }
+            std::vector<array> attended;
+            attended.reserve(batch);
+            // The projections use packed rows. Each cache owns its own key positions and rollback window.
+            for (int row = 0; row < batch; ++row) {
+                const auto& sequence = sequences[row];
+                auto& request = *requests[row];
+                auto& cache = request.layers[index];
+                auto* verified = inputs[row].verification ? &inputs[row].verification->layers[index] : nullptr;
+                const auto query = axis_slice(rows.query, 2, sequence.begin, sequence.end);
+                const auto latent = axis_slice(rows.latent, 1, sequence.begin, sequence.end);
+                if (layer.sliding) {
+                    if (verified) {
+                        verified->old_window = cache.window;
+                        verified->new_window = latent;
+                        if (cache.window) cache.window = *cache.window + zeros_like(*cache.window);
+                    }
+                    attended.push_back(sliding_attention(cache, g, query, latent, layer.sinks, request.position, scale));
+                } else {
+                    std::optional<IndexScores> lane_scores;
+                    if (scoring && request.position + latent.shape(1) > g.index_budget)
+                        lane_scores.emplace(axis_slice(scoring->query, 1, sequence.begin, sequence.end),
+                            axis_slice(scoring->weights, 1, sequence.begin, sequence.end));
+                    attended.push_back(run_indexed_attention(cache, *layer.index, g, query, latent,
+                        axis_slice(*pairs, 1, sequence.begin, sequence.end), lane_scores,
+                        sequence.pooled, layer.sinks, request.position, scale, w.offload, verified));
+                }
+            }
+            return concatenate(attended, 1);
+        }();
+        const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
+        auto [updated, ffn_mix] = layer.ffn_hc.expand_and_collapse(streams, attn_out, mix, &layer.ffn_norm, true);
+        streams = std::move(updated);
+        auto output = project_ffn(layer, g, ffn_mix.branch);
+        deferred.emplace(std::move(output), std::move(ffn_mix));
+    }
+    if (deferred) streams = MlxHyperConnection::expand(streams, deferred->branch, deferred->mixer);
+    streams = astype(streams, float32);
+    const auto flattened = reshape(streams, {1, total, g.streams * g.hidden});
+    const auto gates = sigmoid(matmul(rms(flattened, g.eps), w.head_weight) * w.head_scale + w.head_bias) + g.gate_eps;
+    hidden = w.output_norm(sum(streams * expand_dims(gates, -1), 2), bfloat16);
+    const auto logits = astype(w.output(hidden), float32);
+    std::vector<array> outputs;
+    outputs.reserve(batch);
+    for (int row = 0; row < batch; ++row) {
+        auto& cache = *requests[row];
+        const auto& sequence = sequences[row];
+        if (w.engram) {
+            const auto keep = std::min(sequence.history.size(), std::size_t(w.engram->grams - 1));
+            cache.engram_tail.assign(sequence.history.end() - keep, sequence.history.end());
+        }
+        if (inputs[row].verification)
+            inputs[row].verification->hidden = axis_slice(hidden, 1, sequence.begin, sequence.end);
+        cache.last_hidden = axis_slice(hidden, 1, sequence.end - 1, sequence.end);
+        cache.position += sequence.end - sequence.begin;
+        outputs.push_back(axis_slice(logits, 1, sequence.begin, sequence.end));
+    }
+    return outputs;
+}
+
 int MlxHy4Model::context() const noexcept { return weights_->g.context; }
 int MlxHy4Model::vocabulary() const noexcept { return weights_->g.vocab; }
 bool MlxHy4Model::supports_mtp() const noexcept { return weights_->draft.has_value(); }
@@ -1125,75 +1795,19 @@ std::size_t MlxHy4Model::kv_cache_bytes(const Cache& cache) const noexcept {
 int MlxHy4Model::generate_speculative(Cache& cache, MlxMtpEngineRequest request,
     const MlxPrefixCacheHooks& prefix, MlxMtpGenerationStats& stats, std::optional<array>& last_logits) const {
     const auto& w = *weights_;
-    const auto& draft = *w.draft;
     const auto& g = w.g;
-    std::optional<Verification> verification;
-    std::optional<array> logits;
     const int input_end = cache.position;
     std::optional<std::int32_t> last_emitted;
     request.callback = [callback = std::move(request.callback), &last_emitted](std::int64_t token) {
         last_emitted = static_cast<std::int32_t>(token);
         return !callback || callback(token);
     };
-    MlxMtpEngineCallbacks callbacks;
-    callbacks.predictor = MlxMtpPredictorDescriptor::recurrent(draft.max_depth);
-    callbacks.target_cache_position = [&] { return cache.position; };
-    callbacks.prepare_draft = [&](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
-        if (context.requested_depth)
-            draft.propose(g, cache, w.token_embedding, w.output, context.pending_token,
-                context.requested_depth, select);
-    };
+    auto callbacks = batch_mtp_callbacks(cache, last_logits);
     callbacks.verify_target = [&](std::int32_t pending, const array& drafts, int count) {
-        auto ids = mlx_mtp_verification_ids(pending, drafts, count);
-        if (count) verification.emplace();
-        auto target = reshape(forward_impl(ids, cache, false, verification ? &*verification : nullptr),
-            {count + 1, g.vocab});
-        if (count) logits = target;
-        else last_logits = target;
-        return MlxMtpTargetBatch{std::move(target), verification ? *verification->hidden : *cache.last_hidden};
-    };
-    callbacks.resolve_target = [&](int accepted, int proposed) {
-        if (!proposed) return;
-        const auto& trace = *verification;
-        const int keep = accepted + 1, position = trace.position + keep;
-        if (accepted != proposed) {
-            for (int i = 0; i < g.layers; ++i) {
-                auto& layer = cache.layers[i];
-                const auto& saved = trace.layers[i];
-                if (g.sliding[i]) {
-                    const auto new_rows = axis_slice(*saved.new_window, 1, 0, keep);
-                    layer.window = mlx_circular_cache_append(*saved.old_window, new_rows, trace.position);
-                    continue;
-                }
-                if (layer.offloaded_latent) {
-                    layer.offloaded_latent->trim(position);
-                    layer.offloaded_groups->trim(position / g.group_size);
-                } else {
-                    layer.latent->trim(proposed - accepted);
-                    layer.groups->trim(layer.groups->position() - position / g.group_size);
-                }
-                const int owed = position % g.group_size;
-                if (owed) {
-                    const int end = trace.position % g.group_size + keep;
-                    layer.index_tail = axis_slice(*saved.index_pairs, 1, end - owed, end);
-                } else {
-                    layer.index_tail.reset();
-                }
-                layer.last_indices = saved.selections
-                    ? axis_slice(*saved.selections, 1, accepted, keep)
-                    : reshape(arange(0, position, 1, int32), {1, 1, position});
-            }
-            if (w.engram) {
-                const auto end = trace.engram_tokens.end() - (proposed - accepted);
-                const int length = std::min(position, w.engram->grams - 1);
-                cache.engram_tail.assign(end - length, end);
-            }
-            cache.last_hidden = axis_slice(*trace.hidden, 1, accepted, keep);
-            cache.position = position;
-        }
-        last_logits = axis_slice(*logits, 0, accepted, keep);
-        verification.reset();
-        logits.reset();
+        const std::array states{&cache};
+        const std::array steps{MlxMtpTargetRequest{pending, drafts, count}};
+        const std::array logits{&last_logits};
+        return std::move(verify_batch(states, steps, logits).front());
     };
     if (prefix) {
         callbacks.draft_limit = [&](int position, int depth) { return prefix.draft_limit(position, depth); };
@@ -1206,6 +1820,127 @@ int MlxHy4Model::generate_speculative(Cache& cache, MlxMtpEngineRequest request,
     }
     prefix.checkpoint(cache.position, true);
     return generated;
+}
+
+void MlxHy4Model::resolve_verification(Cache& cache, const Verification& trace, const array& logits,
+    int accepted, int proposed, std::optional<array>& last_logits) const {
+    const auto& w = *weights_;
+    const auto& g = w.g;
+    const int keep = accepted + 1, position = trace.position + keep;
+    if (accepted != proposed) {
+        for (int i = 0; i < g.layers; ++i) {
+            auto& layer = cache.layers[i];
+            const auto& saved = trace.layers[i];
+            if (g.sliding[i]) {
+                const auto new_rows = axis_slice(*saved.new_window, 1, 0, keep);
+                layer.window = mlx_circular_cache_append(*saved.old_window, new_rows, trace.position);
+                continue;
+            }
+            if (layer.offloaded_latent) {
+                layer.offloaded_latent->trim(position);
+                layer.offloaded_groups->trim(position / g.group_size);
+            } else {
+                layer.latent->trim(proposed - accepted);
+                layer.groups->trim(layer.groups->position() - position / g.group_size);
+            }
+            const int owed = position % g.group_size;
+            if (owed) {
+                const int end = trace.position % g.group_size + keep;
+                layer.index_tail = axis_slice(*saved.index_pairs, 1, end - owed, end);
+            } else {
+                layer.index_tail.reset();
+            }
+            layer.last_indices = saved.selections
+                ? axis_slice(*saved.selections, 1, accepted, keep)
+                : reshape(arange(0, position, 1, int32), {1, 1, position});
+        }
+        if (w.engram) {
+            const auto end = trace.engram_tokens.end() - (proposed - accepted);
+            const int length = std::min(position, w.engram->grams - 1);
+            cache.engram_tail.assign(end - length, end);
+        }
+        cache.last_hidden = axis_slice(*trace.hidden, 1, accepted, keep);
+        cache.position = position;
+    }
+    last_logits = axis_slice(logits, 0, accepted, keep);
+}
+
+MlxMtpEngineCallbacks MlxHy4Model::batch_mtp_callbacks(Cache& cache,
+    std::optional<array>& last_logits) const {
+    const auto& w = *weights_;
+    if (!w.draft) throw std::logic_error("Hy4 does not have a loaded draft");
+    MlxMtpEngineCallbacks callbacks;
+    callbacks.predictor = MlxMtpPredictorDescriptor::recurrent(w.draft->max_depth);
+    callbacks.target_cache_position = [&cache] { return cache.position; };
+    callbacks.prepare_draft = [this, &cache](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
+        const auto& w = *weights_;
+        if (context.requested_depth)
+            w.draft->propose(w.g, cache, w.token_embedding, w.output, context.pending_token,
+                context.requested_depth, select);
+    };
+    callbacks.resolve_target = [this, &cache, &last_logits](int accepted, int proposed) {
+        if (!proposed) return;
+        resolve_verification(cache, *cache.pending_verification, *cache.pending_logits,
+            accepted, proposed, last_logits);
+        cache.pending_verification.reset();
+        cache.pending_logits.reset();
+    };
+    return callbacks;
+}
+
+std::vector<array> MlxHy4Model::draft_batch(std::span<Cache* const> requests,
+    std::span<const MlxMtpTargetRequest> steps) const {
+    const auto& w = *weights_;
+    if (!w.draft || requests.empty() || requests.size() != steps.size())
+        throw std::invalid_argument("invalid Hy4 draft batch");
+    for (std::size_t lane = 0; lane < steps.size(); ++lane) {
+        const auto& step = steps[lane];
+        const auto* cache = requests[lane];
+        if (!cache || !cache->last_hidden || cache->layers.size() != static_cast<std::size_t>(w.g.layers) ||
+            step.kind != MlxMtpTargetRequest::Kind::draft_window ||
+            step.draft_count <= 0 || step.draft_count > w.draft->max_depth ||
+            step.pending_token < 0 || step.pending_token >= w.g.vocab ||
+            cache->position <= 0 || cache->position > w.g.context - step.draft_count - 1)
+            throw std::invalid_argument("invalid Hy4 draft window");
+    }
+    return w.draft->propose_batch(w.g, requests, steps, w.token_embedding, w.output);
+}
+
+std::vector<MlxMtpTargetBatch> MlxHy4Model::verify_batch(std::span<Cache* const> requests,
+    std::span<const MlxMtpTargetRequest> steps, std::span<std::optional<array>* const> last_logits) const {
+    if (requests.size() != steps.size() || requests.size() != last_logits.size())
+        throw std::logic_error("Hy4 target batch has inconsistent lanes");
+    std::vector<BatchInput> inputs;
+    inputs.reserve(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        auto& request = *requests[i];
+        const auto& work = steps[i];
+        if (request.pending_verification || work.kind != MlxMtpTargetRequest::Kind::target)
+            throw std::logic_error("Hy4 target batch contains an unresolved step");
+        if (work.draft_count) request.pending_verification = std::make_shared<Verification>();
+        inputs.push_back({&request, mlx_mtp_verification_ids(work.pending_token, work.draft_tokens, work.draft_count),
+            request.pending_verification.get()});
+    }
+    const auto outputs = forward_batch(inputs);
+    std::vector<MlxMtpTargetBatch> results;
+    results.reserve(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        auto& request = *requests[i];
+        auto logits = reshape(outputs[i], {steps[i].draft_count + 1, vocabulary()});
+        if (request.pending_verification) request.pending_logits = logits;
+        else *last_logits[i] = logits;
+        results.push_back({std::move(logits), request.pending_verification
+            ? *request.pending_verification->hidden : *request.last_hidden});
+    }
+    return results;
+}
+
+void MlxHy4Model::discard_batch_verification(Cache& cache, std::optional<array>& logits) const {
+    if (!cache.pending_verification || !cache.pending_logits) return;
+    resolve_verification(cache, *cache.pending_verification, *cache.pending_logits, 0,
+        cache.pending_logits->shape(0) - 1, logits);
+    cache.pending_verification.reset();
+    cache.pending_logits.reset();
 }
 
 MlxHy4TextSessionState MlxHy4Model::capture(const Cache& cache,
