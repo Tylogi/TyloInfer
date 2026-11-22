@@ -29,6 +29,7 @@ struct InklingWeights {
     struct Controller {QuantLinear down;QuantLinearGroup gain_forget;};
     QuantLinear k,v,output,key_taps,value_taps;
     QuantLinearGroup query_projections;
+    std::optional<QuantLinearGroup> sliding_qkv;
     Tensor q_norm,k_norm,v_norm,ffn_norm,query_clip,relative_clip,relative_bias;
     Tensor attention_query,ffn_query,loop_query,unit;
     std::array<Tensor,4> convolution;
@@ -157,12 +158,15 @@ struct InklingBlock final : Block {
         const auto dynamic=[&](const QuantLinear& project,const Tensor& input) {
             return sliding?Tensor{}:shaped(project,input,kv_heads,taps);
         };
-        auto projected=w.query_projections.forward(execution,x[0]);
+        const bool grouped_kv=sliding && !repeated && w.sliding_qkv.has_value();
+        auto projected=(grouped_kv?*w.sliding_qkv:w.query_projections).forward(execution,x[0]);
         auto query=clip_norm(projected[0].to(tb::kFloat32).reshape({b,t,q_heads,head_dim}),w.query_clip,qk_clip);
         auto position=clip_norm(projected[1].to(tb::kFloat32).reshape({b,t,q_heads,relative_dim}),
             w.relative_clip,relative_clip);
-        auto key=conv(w.k.forward(execution,x[1]),0,dynamic(w.key_taps,x[1])).reshape({b,t,kv_heads,head_dim});
-        auto value=conv(w.v.forward(execution,x[2]),1,dynamic(w.value_taps,x[2])).reshape({b,t,kv_heads,head_dim});
+        auto key=conv(grouped_kv?std::move(projected[4]):w.k.forward(execution,x[1]),0,
+            dynamic(w.key_taps,x[1])).reshape({b,t,kv_heads,head_dim});
+        auto value=conv(grouped_kv?std::move(projected[5]):w.v.forward(execution,x[2]),1,
+            dynamic(w.value_taps,x[2])).reshape({b,t,kv_heads,head_dim});
         key=clip_norm(key,{},qk_clip);
         value=normalize_loop_attention_projection(value,{},float(eps),false);
         if (!sliding && log_alpha>0) {
@@ -542,6 +546,12 @@ std::unique_ptr<Block> InklingModel::adapter_load_block(const mfq::ModelSource& 
         w.query_projections=loader.projections({attn+"query.weight",attn+"relative.query.weight",
             attn+"sink_projection.weight",attn+"gate.weight"});
         w.k=loader.linear(attn+"key.weight");w.v=loader.linear(attn+"value.weight");
+        if (sliding && w.query_projections.layers.size()==w.query_projections.outs.size()) {
+            auto projections=w.query_projections.layers;
+            projections.push_back(w.k);
+            projections.push_back(w.v);
+            w.sliding_qkv=make_quant_group(*execution,std::move(projections),false);
+        }
         w.output=loader.linear(attn+"output.weight");
         w.q_norm=loader.dense(attn+(sliding?"norm.weight":"query_input_norm.weight"));
         w.k_norm=sliding?w.q_norm:loader.dense(attn+"key_input_norm.weight");

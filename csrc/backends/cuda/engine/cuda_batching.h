@@ -34,7 +34,8 @@ struct CudaBatchMtpState {
 
 inline bool batch_mtp_sampling_supported(const MfqSamplingParams& sampling,const MfqTokenConstraintPtr& constraint) {
     return sampling.max_tokens>1 && !constraint && sampling.presence_penalty==0.0 &&
-        sampling.frequency_penalty==0.0 && sampling.repetition_penalty==1.0;
+        sampling.frequency_penalty==0.0 && sampling.repetition_penalty==1.0 &&
+        (sampling.temperature<=0.0 || sampling.top_k>0);
 }
 
 class CudaBatchSpeculation {
