@@ -497,7 +497,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
             output.push_back(latent_attention(queries, *dense_rows, sinks, scale, g.kv_rank,
                 expand_dims(axis_slice(visible, -1, 0, end), 1)));
         } else {
-            const auto staged = cache.offloaded_latent && !verified ?
+            const auto staged = cache.offloaded_latent ?
                 cache.offloaded_latent->gather_union(ids, resident ? &*resident : nullptr) : std::nullopt;
             if (staged) {
                 output.push_back(latent_attention(queries, g.indexed_kv.unpack(staged->rows), sinks,
