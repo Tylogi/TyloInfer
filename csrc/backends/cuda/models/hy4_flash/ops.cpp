@@ -862,7 +862,8 @@ void Hy4Model::configure_kv_tiers() {
         if (row_bytes>tiers.buffer_bytes/2/size_t(config.group_size))
             throw std::invalid_argument("kv_memory_insufficient: Hy4 streamed KV budget cannot stage one IndexPool group");
         tiers.preallocate=true;
-        tiers.ram_budget_bytes=std::min({tiers.ram_budget_bytes,ram,layers*context*row_bytes});
+        tiers.ram_growth_limit=std::min(tiers.ram_budget_bytes,ram);
+        tiers.ram_budget_bytes=std::min(tiers.ram_growth_limit,layers*context*row_bytes);
         shared->offload=std::make_shared<KvOffloadStore>(std::move(tiers));
         execution->qsa_kv_store=shared->offload;
         return;
@@ -888,7 +889,7 @@ void Hy4Model::configure_kv_tiers() {
     tiers.ram_preallocated=option.ram_preallocated;
     tiers.ssd_enabled=option.placement=="auto_ssd";
     tiers.directory=option.directory;
-    if (tiers.ram_preallocated && !tiers.ssd_enabled)
+    if (tiers.ram_preallocated)
         tiers.ram_growth_limit=option.ram_limit_set?ram:SIZE_MAX;
     if (tiers.ssd_enabled && (!tiers.ram_preallocated || needed>ram)) {
         const auto spill=tiers.ram_preallocated?needed-ram:needed;
