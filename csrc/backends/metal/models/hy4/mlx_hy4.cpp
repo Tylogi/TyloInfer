@@ -121,8 +121,65 @@ struct FeedForward {
     array operator()(const array& input) const { return down(projections.swiglu(input)); }
 };
 
+struct LatentRouter {
+    MlxLinear projection;
+    bool compact = false;
+
+    explicit LatentRouter(MlxLinear loaded) : projection(std::move(loaded)) {
+        const auto* weight = projection.dense_weight_ref();
+        if (!weight || weight->dtype() != float32 || weight->shape() != Shape{512, 3072} ||
+            default_device() != Device::gpu)
+            return;
+        auto bf16 = astype(*weight, bfloat16);
+        if (!array_equal(astype(bf16, float32), *weight).item<bool>()) return;
+        MlxWeightResidency::track(bf16);
+        projection = MlxLinear(std::move(bf16));
+        compact = true;
+    }
+
+    array operator()(const array& input) const {
+        if (!compact) return projection(input);
+        const auto& weight = *projection.dense_weight_ref();
+        if (input.shape() != Shape{1, 3072} || input.dtype() != bfloat16 || default_device() != Device::gpu)
+            return MlxLinear(astype(weight, float32))(input);
+        static const auto kernel = [] {
+            CompileOptions options;
+            options.math_mode = MathMode::Fast;
+            return fast::metal_kernel("hy4_f32_router_from_bf16", {"input", "weights"}, {"logits"}, R"METAL(
+            {
+            #pragma clang fp reassociate(off)
+                const uint lane = thread_index_in_simdgroup;
+                const uint first = (threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup) * 2u;
+                float sum[2] = {};
+                for (uint k = lane * 4u; k < 3072u; k += 128u) {
+                    const auto activation = float4(*reinterpret_cast<device const bfloat4*>(input + k));
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0u; i < 2u; ++i) {
+                        const auto weight = float4(*reinterpret_cast<device const bfloat4*>(weights + 3072u * (first + i) + k));
+                        sum[i] = fma(weight.x, activation.x, sum[i]);
+                        sum[i] = fma(weight.y, activation.y, sum[i]);
+                        sum[i] = fma(weight.z, activation.z, sum[i]);
+                        sum[i] = fma(weight.w, activation.w, sum[i]);
+                    }
+                }
+                // Keep the reduction order of the FP32 router projection.
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 2u; ++i) {
+                    for (ushort offset = 16u; offset > 0u; offset /= 2u)
+                        sum[i] += simd_shuffle_down(sum[i], offset);
+                    if (lane == 0u) logits[first + i] = sum[i];
+                }
+            }
+            )METAL", "", true, false, options);
+        }();
+        return kernel({input, weight}, {{1, 512}}, {float32}, {8192, 1, 1}, {128, 1, 1}, {},
+            std::nullopt, false, {}).front();
+    }
+};
+
 struct LatentMoe {
-    MlxLinear router, reduce_input, expand_output;
+    LatentRouter router;
+    MlxLinear reduce_input, expand_output;
     array bias;
     std::array<MlxGgufWeight, 3> experts;
     FeedForward shared;
@@ -406,24 +463,6 @@ void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, cons
     else cache.groups->append(rotated);
 }
 
-array choose_resident_groups(const array& groups, const Geometry& g,
-    const array& query, const array& weights, int position) {
-    const int take = query.shape(1);
-    const int budget = g.index_budget / g.group_size - 1;
-    const auto current = reshape(floor_divide(arange(position, position + take, 1, int32),
-        array(g.group_size)), {1, take, 1});
-    const auto all_visible = reshape(arange(0, budget, 1, int32), {1, 1, budget});
-    const int available = std::min(groups.shape(1), (position + take - 1) / g.group_size);
-    if (available <= budget)
-        return concatenate({where(all_visible < current, all_visible, array(-1, int32)), current}, -1);
-    const auto history = reshape(arange(0, available, 1, int32), {1, 1, available});
-    auto scores = mlx_sparse_indexer_weighted_scores(query, axis_slice(groups, 1, 0, available), weights);
-    scores = where(history < current, scores, array(-std::numeric_limits<float>::infinity()));
-    auto ids = astype(sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1), int32);
-    ids = where(current <= budget, all_visible, ids);
-    return concatenate({where(ids < current, ids, array(-1, int32)), current}, -1);
-}
-
 array token_selection(const array& groups, const Geometry& g, int position) {
     const int rows = groups.shape(1);
     const auto offsets = arange(0, g.group_size, 1, int32);
@@ -434,6 +473,51 @@ array token_selection(const array& groups, const Geometry& g, int position) {
     const int extra = (32 - ids.shape(-1) % 32) % 32;
     if (extra) ids = concatenate({ids, full({1, rows, extra}, array(-1, int32), int32)}, -1);
     return ids;
+}
+
+constexpr int index_token_threads = 128;
+
+array decode_token_selection(const array& groups, const Geometry& g, int position) {
+    static const auto kernel = fast::metal_kernel("hy4_index_decode_token_ids", {"groups", "position"}, {"ids"}, R"METAL(
+        const uint index = thread_position_in_grid.x;
+        const uint slot = index / GROUP;
+        const int group = slot < HISTORY ? groups[slot] : position / GROUP;
+        const int row = group * GROUP + int(index % GROUP);
+        ids[index] = row <= position ? row : -1;
+        )METAL");
+    return kernel({groups, array(position, int32)}, {{1, 1, g.index_budget}}, {int32},
+        {g.index_budget, 1, 1}, {index_token_threads, 1, 1},
+        {{"GROUP", g.group_size}, {"HISTORY", groups.shape(-1)}}, std::nullopt, false, {}).front();
+}
+
+array choose_resident_tokens(const array& groups, const Geometry& g,
+    const array& query, const array& weights, int position) {
+    const int take = query.shape(1);
+    const int budget = g.index_budget / g.group_size - 1;
+    const int available = std::min(groups.shape(1), (position + take - 1) / g.group_size);
+    const bool direct = take == 1 && available > budget && g.index_budget % index_token_threads == 0 &&
+        default_device() == Device::gpu;
+    const auto select = [budget](const array& scores) {
+        return astype(sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1), int32);
+    };
+    if (direct) {
+        // All scored groups end before the current group. Only its final rows need masking.
+        const auto scores = mlx_sparse_indexer_weighted_scores(query, axis_slice(groups, 1, 0, available), weights);
+        return decode_token_selection(select(scores), g, position);
+    }
+    const auto current = reshape(floor_divide(arange(position, position + take, 1, int32),
+        array(g.group_size)), {1, take, 1});
+    const auto all_visible = reshape(arange(0, budget, 1, int32), {1, 1, budget});
+    if (available <= budget) {
+        const auto ids = where(all_visible < current, all_visible, array(-1, int32));
+        return token_selection(concatenate({ids, current}, -1), g, position);
+    }
+    const auto history = reshape(arange(0, available, 1, int32), {1, 1, available});
+    const auto scores = mlx_sparse_indexer_weighted_scores(query, axis_slice(groups, 1, 0, available), weights);
+    const auto masked = where(history < current, scores, array(-std::numeric_limits<float>::infinity()));
+    auto ids = where(current <= budget, all_visible, select(masked));
+    ids = where(ids < current, ids, array(-1, int32));
+    return token_selection(concatenate({ids, current}, -1), g, position);
 }
 
 array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
@@ -488,9 +572,9 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
         const int stop = std::min(count, start + query_tile);
         const auto q = axis_slice(iq, 1, start, stop);
         const auto weights = axis_slice(head_weights, 1, start, stop);
-        const auto groups = pooled ? choose_resident_groups(*pooled, g, q, weights, position + start)
-            : cache.offloaded_groups->select(q, position + start, g.group_size, g.index_budget, weights, true);
-        const auto ids = token_selection(groups, g, position + start);
+        const auto ids = pooled ? choose_resident_tokens(*pooled, g, q, weights, position + start)
+            : token_selection(cache.offloaded_groups->select(
+                  q, position + start, g.group_size, g.index_budget, weights, true), g, position + start);
         if (verified) verified->selections = ids;
         const auto queries = axis_slice(query, 2, start, stop);
         if (dense_rows && stop - start >= 4) {
@@ -532,6 +616,78 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     return output.size() == 1 ? output.front() : concatenate(output, 1);
 }
 
+std::optional<std::pair<array, array>> normalize_mla_decode(const array& query, const array& kv,
+    const MlxRmsNorm& query_norm, const MlxRmsNorm& latent_norm, const RotaryPhases& phases, const Geometry& g) {
+    if (g.kv_rank != 512 || g.rotary != 64 || query.shape() != Shape{1, 1, 1024} ||
+        kv.shape() != Shape{1, 1, 576} || query.dtype() != bfloat16 || kv.dtype() != bfloat16 ||
+        query_norm.width() != 1024 || latent_norm.width() != 512 || phases.cosine.size() != 32 ||
+        phases.cosine.shape() != phases.sine.shape() ||
+        default_device() != Device::gpu)
+        return std::nullopt;
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return fast::metal_kernel("hy4_mla_decode_norm_rope",
+            {"qa", "kv", "qw", "kw", "cosines", "sines", "epsilon"}, {"low", "latent"}, R"METAL(
+            const bool key = threadgroup_position_in_grid.x == 1u;
+            const uint tid = thread_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint simd = simdgroup_index_in_threadgroup;
+            if (key && tid >= 128u && tid < 192u) {
+                const uint rotary_column = tid - 128u;
+                const uint pair = rotary_column >> 1u;
+                const uint pair_base = 512u + (pair << 1u);
+                const float cosine = cosines[pair];
+                const float sine = sines[pair];
+                const float first = float(kv[pair_base]);
+                const float second = float(kv[pair_base + 1u]);
+                const float result = (rotary_column & 1u) == 0u
+                    ? first * cosine - second * sine
+                    : first * sine + second * cosine;
+                latent[512u + rotary_column] = half(float(bfloat(result)));
+            }
+            {
+            #pragma clang fp reassociate(off)
+                const uint width = key ? 512u : 1024u;
+                const uint column = tid * 4u;
+                const auto input = key ? kv : qa;
+                float values[4] = {};
+                float total = 0.0f;
+                if (column < width) {
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0; i < 4u; ++i) {
+                        values[i] = float(input[column + i]);
+                        total += values[i] * values[i];
+                    }
+                }
+                total = simd_sum(total);
+                threadgroup float groups[8];
+                threadgroup float inv_rms;
+                if (lane == 0u) groups[simd] = total;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd == 0u) {
+                    const float square_sum = simd_sum(lane < 8u ? groups[lane] : 0.0f);
+                    if (lane == 0u) inv_rms = precise::rsqrt(square_sum / float(width) + epsilon[key ? 1u : 0u]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (column < width) {
+                    const auto weights = key ? kw : qw;
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0; i < 4u; ++i) {
+                        const bfloat result = bfloat((values[i] * inv_rms) * weights[column + i]);
+                        if (key) latent[column + i] = half(float(result));
+                        else low[column + i] = result;
+                    }
+                }
+            }
+            )METAL", "", true, false, options);
+    }();
+    auto outputs = kernel({query, kv, query_norm.weight(), latent_norm.weight(), phases.cosine, phases.sine,
+        array({query_norm.eps(), latent_norm.eps()}, float32)}, {query.shape(), kv.shape()}, {bfloat16, float16},
+        {512, 1, 1}, {256, 1, 1}, {}, std::nullopt, false, {});
+    return std::pair{std::move(outputs[0]), std::move(outputs[1])};
+}
+
 struct MlaRows {
     array query, latent, query_low, gate;
 };
@@ -540,15 +696,17 @@ template <class Attention>
 MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const RotaryPhases& phases) {
     const int count = in.shape(1), plain = g.q_dim - g.rotary;
     const auto projected = layer.projections(in);
-    auto low = layer.query_norm(projected[0]);
+    auto normalized = normalize_mla_decode(projected[0], projected[1], layer.query_norm, layer.latent_norm, phases, g);
+    auto low = normalized ? std::move(normalized->first) : layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
     const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
     const auto absorbed = matmul(astype(no_rope, layer.key_absorption.dtype()), layer.key_absorption);
     const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
     auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
-    const auto latent = concatenate({layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
-        astype(phases(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary)), float32)}, -1);
-    return {std::move(query), astype(latent, float16), std::move(low), projected[2]};
+    auto latent = normalized ? std::move(normalized->second) : astype(concatenate({
+        layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
+        astype(phases(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary)), float32)}, -1), float16);
+    return {std::move(query), std::move(latent), std::move(low), projected[2]};
 }
 
 template <class Attention>
@@ -560,13 +718,31 @@ array expand_mla(const Attention& layer, const Geometry& g, const array& attenti
     return layer.post_attention_norm(layer.output(astype(gated, dtype)));
 }
 
+struct PendingResidual {
+    array branch;
+    MlxHyperConnectionState mixer;
+};
+
 array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
     const std::optional<array>& engram, const RotaryPhases& phases,
     const std::optional<RotaryPhases>& pool_phases, int offset,
-    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
-    if (engram) streams = (*layer.engram)(streams, *engram, g);
-    const auto mix = layer.attention_hc.collapse(streams);
-    const auto in = layer.attention_norm(mix.branch);
+    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified,
+    std::optional<PendingResidual>* deferred) {
+    const auto mix = [&] {
+        if (engram) {
+            if (deferred && *deferred) {
+                streams = MlxHyperConnection::expand(streams, (*deferred)->branch, (*deferred)->mixer);
+            }
+            streams = (*layer.engram)(streams, *engram, g);
+        } else if (deferred && *deferred) {
+            auto [updated, gates] = layer.attention_hc.expand_and_collapse(
+                streams, (*deferred)->branch, (*deferred)->mixer, &layer.attention_norm);
+            streams = std::move(updated);
+            return gates;
+        }
+        return layer.attention_hc.collapse(streams, &layer.attention_norm);
+    }();
+    const auto& in = mix.branch;
     const auto rows = project_mla(layer, g, in, phases);
     if (verified && layer.sliding) {
         verified->old_window = cache.window;
@@ -577,11 +753,17 @@ array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cac
         : run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent, in, rows.query_low, phases, pool_phases,
             layer.sinks, offset, scale, offload, verified);
     const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
-    streams = MlxHyperConnection::expand(streams, attn_out, mix);
-    const auto ffn_mix = layer.ffn_hc.collapse(streams);
-    const auto ffn_in = layer.ffn_norm(ffn_mix.branch);
+    auto [updated_streams, ffn_mix] = layer.ffn_hc.expand_and_collapse(
+        streams, attn_out, mix, &layer.ffn_norm);
+    streams = std::move(updated_streams);
+    const auto& ffn_in = ffn_mix.branch;
     const auto ffn = layer.dense ? (*layer.dense)(ffn_in) : (*layer.moe)(ffn_in, g);
-    return MlxHyperConnection::expand(streams, layer.post_ffn_norm(ffn), ffn_mix);
+    const auto ffn_out = layer.post_ffn_norm(ffn);
+    if (deferred) {
+        deferred->emplace(ffn_out, std::move(ffn_mix));
+        return streams;
+    }
+    return MlxHyperConnection::expand(streams, ffn_out, ffn_mix);
 }
 
 using DraftTensors = std::unordered_map<std::string, array>;
@@ -892,13 +1074,17 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
         history.insert(history.end(), data, data + count);
         if (verification) verification->engram_tokens = history;
     }
+    std::optional<PendingResidual> deferred;
+    const bool merge_layers = count == 1 && g.streams == 4 && g.hidden == 3072;
     for (int layer = 0; layer < g.layers; ++layer) {
         std::optional<array> rows;
         if (w.layers[layer].engram) rows = w.engram->gather(layer, history, first);
         const auto& phases = g.sliding[layer] ? window_phases : indexed_phases;
         streams = run_layer(w.layers[layer], g, cache.layers[layer], std::move(streams), rows,
-            phases, pool_phases, offset, w.offload, verification ? &verification->layers[layer] : nullptr);
+            phases, pool_phases, offset, w.offload, verification ? &verification->layers[layer] : nullptr,
+            merge_layers ? &deferred : nullptr);
     }
+    if (deferred) streams = MlxHyperConnection::expand(streams, deferred->branch, deferred->mixer);
     if (w.engram) {
         const auto keep = std::min(history.size(), std::size_t(w.engram->grams - 1));
         cache.engram_tail.assign(history.end() - keep, history.end());

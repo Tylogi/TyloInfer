@@ -139,10 +139,15 @@ public:
             if (counts) *counts = sample_token_counts_add(*counts, next);
             ++generated;
             const bool keep = !callback || callback(token);
-            if (prefix.wants(cache_.position + 1, !keep || generated == limit) || (keep && generated < limit)) {
+            const bool terminal = !keep || generated == limit;
+            const bool checkpoint = prefix.wants(cache_.position + 1, terminal);
+            if (checkpoint || !terminal) {
                 last_logits_ = mlx_last_token_logits(model_.forward(next, cache_, true), vocab);
-                last_logits_->eval();
-                prefix.checkpoint(cache_.position, !keep || generated == limit);
+                if (checkpoint) {
+                    last_logits_->eval();
+                    prefix.checkpoint(cache_.position, terminal);
+                }
+                // The next token's sampling evaluates these logits with the model graph.
             }
             if (!keep) break;
         }

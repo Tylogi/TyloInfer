@@ -1461,7 +1461,7 @@ array mlx_sparse_selected_mla_attention(
         ? mlx::core::bfloat16
         : mlx::core::float16;
     auto selected_query = typed_contiguous(query, mlx::core::float32);
-    auto selected_cache = typed_contiguous(kv_cache, cache_dtype);
+    auto selected_cache = mlx::core::astype(kv_cache, cache_dtype);
     auto indices = typed_contiguous(selected_indices, mlx::core::int32);
     auto mask = typed_contiguous(selected_mask, mlx::core::float16);
     auto sink_logits = typed_contiguous(sinks, mlx::core::float32);
@@ -1491,6 +1491,8 @@ array mlx_sparse_selected_mla_attention(
             "selected-token sparse MLA scale must be finite and positive");
     }
     if (heads != 64 || dimension != 512 || value_dimension != dimension) {
+        // The gather accepts strides. Materializing a cache view here would copy all
+        // historical rows before reading only the selected ones.
         return generic_selected_mla_attention(
             selected_query,
             selected_cache,
@@ -1500,6 +1502,7 @@ array mlx_sparse_selected_mla_attention(
             selected_scale,
             value_dimension);
     }
+    selected_cache = mlx::core::contiguous(selected_cache);
     constexpr int kHeads = 64;
     constexpr int kDimension = 512;
     SparseSelectedMlaParams params{

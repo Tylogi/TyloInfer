@@ -1,10 +1,13 @@
 #pragma once
 
 #include <optional>
+#include <utility>
 
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
+
+class MlxRmsNorm;
 
 struct MlxHyperConnectionConfig {
     int streams = 0;
@@ -31,7 +34,12 @@ public:
         MlxHyperConnectionConfig config,
         std::optional<mlx::core::array> projection_scale = std::nullopt);
 
-    MlxHyperConnectionState collapse(const mlx::core::array& residual) const;
+    // When supplied, normalize the collapsed branch before returning it.
+    MlxHyperConnectionState collapse(const mlx::core::array& residual,
+        const MlxRmsNorm* branch_norm = nullptr) const;
+    std::pair<mlx::core::array, MlxHyperConnectionState> expand_and_collapse(
+        const mlx::core::array& residual, const mlx::core::array& branch,
+        const MlxHyperConnectionState& state, const MlxRmsNorm* branch_norm = nullptr) const;
     static mlx::core::array expand(const mlx::core::array& residual,
         const mlx::core::array& branch, const MlxHyperConnectionState& state);
 

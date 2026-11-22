@@ -1,9 +1,12 @@
 #include "mlx_hyper_connection.h"
+#include "mlx_transformer.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace mfq::metal {
 using namespace mlx::core;
@@ -44,9 +47,26 @@ array sinkhorn(array logits, int iterations) {
     }
     return exp(logits);
 }
-}
 
-std::optional<array> mlx_hyper_connection_decode_projection(const array& residual, const array& weight, float epsilon) {
+struct DecodeGateEpilogue {
+    const array& scale;
+    const array& bias;
+    float post_scale;
+    float gate_epsilon;
+};
+
+struct DecodeResidualUpdate {
+    const array& branch;
+    const array& post;
+};
+
+struct DecodeProjection {
+    array values;
+    std::optional<array> residual;
+};
+
+std::optional<DecodeProjection> decode_projection(const array& residual, const array& weight, float epsilon,
+    const DecodeGateEpilogue* epilogue, const DecodeResidualUpdate* update = nullptr) {
     if (residual.ndim() != 4 || weight.ndim() != 2 || weight.dtype() != float32 ||
         residual.shape(0) <= 0 || residual.shape(1) <= 0 || residual.shape(2) <= 0 ||
         residual.shape(0) > 6 / residual.shape(1) || !std::isfinite(epsilon) || epsilon <= 0 ||
@@ -58,11 +78,7 @@ std::optional<array> mlx_hyper_connection_decode_projection(const array& residua
         return std::nullopt;
     const int rows = residual.shape(0) * residual.shape(1);
     const int threads = width >= 8192 && rows <= 3 ? (rows == 1 ? 1024 : 512) : 256;
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = MathMode::Safe;
-        return fast::metal_kernel("tyloinfer_hyper_decode_projection", {"residual", "weight", "params"},
-            {"output"}, R"METAL(
+    constexpr const char* source = R"METAL(
             const uint row = threadgroup_position_in_grid.x / OUTPUTS;
             const uint projection = threadgroup_position_in_grid.x % OUTPUTS;
             const uint tid = thread_index_in_threadgroup;
@@ -71,7 +87,19 @@ std::optional<array> mlx_hyper_connection_decode_projection(const array& residua
             float product = 0.0f, square = 0.0f;
             for (uint column = tid * 4u; column < uint(WIDTH); column += THREADS * 4u) {
                 const auto source = residual + ulong(row) * WIDTH + column;
+#if TYLOINFER_HC_UPDATE_RESIDUAL
+                const uint stream = column / 3072u;
+                const uint channel = column % 3072u;
+                const float coefficient = float(bfloat(post[stream]));
+                const auto delta = float4(*reinterpret_cast<device const bfloat4*>(branch + channel));
+                const auto prior = float4(*reinterpret_cast<device const bfloat4*>(source));
+                // Preserve the BF16 rounding between multiplication and addition.
+                const auto next = bfloat4(prior + float4(bfloat4(delta * coefficient)));
+                if (projection == 0u) *reinterpret_cast<device bfloat4*>(updated + column) = next;
+                const float4 x(float(next.x), float(next.y), float(next.z), float(next.w));
+#else
                 const float4 x(source[0], source[1], source[2], source[3]);
+#endif
                 const auto w = reinterpret_cast<device const float4*>(weight + projection * WIDTH)[column / 4u];
                 product += dot(x, w);
                 square += dot(x, x);
@@ -84,15 +112,110 @@ std::optional<array> mlx_hyper_connection_decode_projection(const array& residua
             if (group == 0u) {
                 product = simd_sum(lane < THREADS / 32u ? products[lane] : 0.0f);
                 square = simd_sum(lane < THREADS / 32u ? squares[lane] : 0.0f);
-                if (lane == 0u) output[row * OUTPUTS + projection] =
-                    product * metal::precise::rsqrt(square / float(WIDTH) + params[0]);
+                if (lane == 0u) {
+                    float value = product * metal::precise::rsqrt(square / float(WIDTH) + params[0]);
+                    if constexpr (GATES) {
+#pragma clang fp contract(off)
+                        value = value * scales[projection];
+                        value = value + bias[projection];
+                        value = 1.f / (1.f + metal::exp(-value));
+                        if (projection >= OUTPUTS / 2u) value *= params[1];
+                        if (params[2] != 0.f) value += params[2];
+                    }
+                    output[row * OUTPUTS + projection] = value;
+                }
             }
-            )METAL", "", true, false, options);
-    }();
-    return kernel({contiguous(residual), contiguous(weight), array({epsilon})},
-        {{residual.shape(0), residual.shape(1), outputs}}, {float32},
+            )METAL";
+    const auto make_kernel = [source](bool update_residual) {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        std::vector<std::string> inputs{"residual", "weight", "params", "scales", "bias"};
+        std::vector<std::string> outputs{"output"};
+        if (update_residual) {
+            inputs.insert(inputs.end(), {"branch", "post"});
+            outputs.push_back("updated");
+        }
+        return fast::metal_kernel(update_residual ? "tyloinfer_hyper_expand_collapse" : "tyloinfer_hyper_decode_projection",
+            inputs, outputs, source, update_residual ? "#define TYLOINFER_HC_UPDATE_RESIDUAL 1\n" : "#define TYLOINFER_HC_UPDATE_RESIDUAL 0\n",
+            true, false, options);
+    };
+    static const auto projection_kernel = make_kernel(false);
+    static const auto residual_kernel = make_kernel(true);
+    std::vector<array> inputs{contiguous(residual), contiguous(weight),
+        array({epsilon, epilogue ? epilogue->post_scale : 1.f, epilogue ? epilogue->gate_epsilon : 0.f}),
+        epilogue ? epilogue->scale : weight, epilogue ? epilogue->bias : weight};
+    std::vector<Shape> shapes{{residual.shape(0), residual.shape(1), outputs}};
+    std::vector<Dtype> dtypes{float32};
+    if (update) {
+        inputs.insert(inputs.end(), {update->branch, update->post});
+        shapes.push_back(residual.shape());
+        dtypes.push_back(residual.dtype());
+    }
+    auto result = (update ? residual_kernel : projection_kernel)(inputs, shapes, dtypes,
         {rows * outputs * threads, 1, 1}, {threads, 1, 1},
-        {{"WIDTH", width}, {"OUTPUTS", outputs}, {"THREADS", threads}}, std::nullopt, false, {}).front();
+        {{"WIDTH", width}, {"OUTPUTS", outputs}, {"THREADS", threads}, {"GATES", epilogue != nullptr}},
+        std::nullopt, false, {});
+    std::optional<array> updated;
+    if (update) updated = std::move(result[1]);
+    return DecodeProjection{std::move(result[0]), std::move(updated)};
+}
+
+array decode_collapse_norm(const array& residual, const array& pre, const MlxRmsNorm& norm) {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("hy4_ihc_collapse_norm_exact", {"residual", "pre", "weights", "eps"}, {"output"}, R"METAL(
+        {
+        #pragma clang fp reassociate(off)
+            const uint tid = thread_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const uint column = tid * 4u;
+            float4 partial(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint stream = 0u; stream < 4u; ++stream) {
+                const auto v = float4(*reinterpret_cast<device const bfloat4*>(residual + stream * 3072u + column));
+                partial = fma(v, float4(float(bfloat(pre[stream]))), partial);
+            }
+            // Round the collapsed stream before calculating its RMS.
+            const auto value = float4(bfloat4(partial));
+            float squares = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i) squares += value[i] * value[i];
+            squares = simd_sum(squares);
+            threadgroup float groups[24];
+            threadgroup float inverse;
+            if (lane == 0u) groups[group] = squares;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (group == 0u) {
+                const float total = simd_sum(lane < 24u ? groups[lane] : 0.0f);
+                if (lane == 0u) inverse = precise::rsqrt(total / float(residual_shape[3]) + eps[0]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i)
+                output[column + i] = bfloat((value[i] * inverse) * weights[column + i]);
+        }
+        )METAL", "", true, false, options);
+    }();
+    return kernel({residual, pre, norm.weight(), array({norm.eps()}, float32)}, {{1, 1, 3072}},
+        {bfloat16}, {768, 1, 1}, {768, 1, 1}, {}, std::nullopt, false, {}).front();
+}
+
+array collapse_branch(const array& residual, const array& pre, float scale, const MlxRmsNorm* branch_norm) {
+    if (branch_norm && residual.shape() == Shape{1, 1, 4, 3072} && pre.shape() == Shape{1, 1, 4} &&
+        residual.dtype() == bfloat16 && branch_norm->width() == 3072 && scale == 1.f &&
+        default_device() == Device::gpu)
+        return decode_collapse_norm(residual, pre, *branch_norm);
+    auto branch = squeeze(matmul(expand_dims(astype(pre, residual.dtype()), -2), residual), -2);
+    if (scale != 1.f) branch = branch * array(scale, branch.dtype());
+    return branch_norm ? (*branch_norm)(branch) : branch;
+}
+}  // namespace
+
+std::optional<array> mlx_hyper_connection_decode_projection(const array& residual, const array& weight, float epsilon) {
+    if (auto projected = decode_projection(residual, weight, epsilon, nullptr)) return std::move(projected->values);
+    return std::nullopt;
 }
 
 MlxHyperConnection::MlxHyperConnection(array weight, array bias,
@@ -118,7 +241,7 @@ MlxHyperConnection::MlxHyperConnection(array weight, array bias,
     eval(weight_, prefill_weight_);
 }
 
-MlxHyperConnectionState MlxHyperConnection::collapse(const array& residual) const {
+MlxHyperConnectionState MlxHyperConnection::collapse(const array& residual, const MlxRmsNorm* branch_norm) const {
     const int streams = config_.streams;
     if (residual.ndim() != 4 || residual.shape(0) <= 0 || residual.shape(1) <= 0 ||
         residual.shape(2) != streams ||
@@ -127,23 +250,33 @@ MlxHyperConnectionState MlxHyperConnection::collapse(const array& residual) cons
     }
     const int batch = residual.shape(0);
     const int tokens = residual.shape(1);
+    std::optional<DecodeGateEpilogue> epilogue;
+    if (!config_.sinkhorn_iterations && projection_scale_ && batch == 1 && tokens == 1 &&
+        streams == 4 && residual.dtype() == bfloat16 && weight_.shape(1) == 12288) {
+        epilogue.emplace(*projection_scale_, bias_, config_.post_scale, config_.gate_epsilon);
+    }
+    auto projected = decode_projection(residual, weight_, config_.norm_epsilon, epilogue ? &*epilogue : nullptr);
+    const bool fused_gates = projected && epilogue;
     auto mixes = [&] {
-        if (auto projected = mlx_hyper_connection_decode_projection(residual, weight_, config_.norm_epsilon))
-            return std::move(*projected);
+        if (projected) return std::move(projected->values);
         const auto flat = reshape(astype(residual, float32), {batch, tokens, weight_.shape(1)});
         return matmul(fast::rms_norm(flat, std::nullopt, config_.norm_epsilon), prefill_weight_);
     }();
-    if (projection_scale_) mixes = mixes * *projection_scale_;
-    mixes = mixes + bias_;
-    auto pre = sigmoid(slice(mixes, {0, 0, 0}, {batch, tokens, streams}));
-    auto post = sigmoid(slice(mixes, {0, 0, streams}, {batch, tokens, 2 * streams})) *
-        array(config_.post_scale);
-    if (config_.gate_epsilon != 0) {
-        pre = pre + array(config_.gate_epsilon);
-        post = post + array(config_.gate_epsilon);
+    if (!fused_gates) {
+        if (projection_scale_) mixes = mixes * *projection_scale_;
+        mixes = mixes + bias_;
     }
-    auto branch = squeeze(matmul(expand_dims(astype(pre, residual.dtype()), -2), residual), -2);
-    if (config_.pre_scale != 1.0f) branch = branch * array(config_.pre_scale, branch.dtype());
+    auto pre = slice(mixes, {0, 0, 0}, {batch, tokens, streams});
+    auto post = slice(mixes, {0, 0, streams}, {batch, tokens, 2 * streams});
+    if (!fused_gates) {
+        pre = sigmoid(pre);
+        post = sigmoid(post) * array(config_.post_scale);
+        if (config_.gate_epsilon != 0) {
+            pre = pre + array(config_.gate_epsilon);
+            post = post + array(config_.gate_epsilon);
+        }
+    }
+    auto branch = collapse_branch(residual, pre, config_.pre_scale, branch_norm);
 
     std::optional<array> combination;
     if (config_.sinkhorn_iterations) {
@@ -152,6 +285,28 @@ MlxHyperConnectionState MlxHyperConnection::collapse(const array& residual) cons
         combination = sinkhorn(std::move(log_mix), config_.sinkhorn_iterations);
     }
     return {std::move(branch), std::move(post), std::move(combination)};
+}
+
+std::pair<array, MlxHyperConnectionState> MlxHyperConnection::expand_and_collapse(
+    const array& residual, const array& branch, const MlxHyperConnectionState& state,
+    const MlxRmsNorm* branch_norm) const {
+    if (!state.combination && !config_.sinkhorn_iterations && projection_scale_ &&
+        config_.streams == 4 && weight_.shape(1) == 12288 &&
+        residual.shape() == Shape{1, 1, 4, 3072} && branch.shape() == Shape{1, 1, 3072} &&
+        state.post.shape() == Shape{1, 1, 4} && residual.dtype() == bfloat16 && branch.dtype() == bfloat16) {
+        const DecodeGateEpilogue epilogue{*projection_scale_, bias_, config_.post_scale, config_.gate_epsilon};
+        const DecodeResidualUpdate update{branch, state.post};
+        if (auto projected = decode_projection(residual, weight_, config_.norm_epsilon, &epilogue, &update)) {
+            auto updated = std::move(*projected->residual);
+            const auto pre = slice(projected->values, {0, 0, 0}, {1, 1, 4});
+            auto post = slice(projected->values, {0, 0, 4}, {1, 1, 8});
+            auto collapsed = collapse_branch(updated, pre, config_.pre_scale, branch_norm);
+            return {std::move(updated), {std::move(collapsed), std::move(post), std::nullopt}};
+        }
+    }
+    auto updated = expand(residual, branch, state);
+    auto collapsed = collapse(updated, branch_norm);
+    return {std::move(updated), std::move(collapsed)};
 }
 
 array MlxHyperConnection::expand(const array& residual, const array& branch,
