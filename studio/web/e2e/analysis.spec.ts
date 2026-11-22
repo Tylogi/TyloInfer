@@ -124,6 +124,7 @@ test('checkpoint analysis charts and controls fit desktop and mobile', async ({ 
   await expect(page.locator('.projection-bars .precision-chart-average')).toHaveText('Average 5.200 bpw');
   await page.getByRole('combobox', { name: 'Select model' }).selectOption(analysisArtifacts[1].id);
   await expect(page.locator('.analysis-fact-architecture')).toContainText('qwen3_5');
+  await page.getByRole('tab', { name: 'Attention & other projections' }).click();
   await expect(page.getByRole('combobox', { name: 'Select projection' }).getByRole('option', { name: 'GQA · query' })).toHaveCount(1);
   await expect(page.locator('.analysis-projection-table')).toContainText('GQA');
   await expect(page.locator('.kv-cache-planner')).not.toHaveAttribute('open', '');

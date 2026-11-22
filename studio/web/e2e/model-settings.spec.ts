@@ -95,6 +95,11 @@ test('model library comes first and load settings remain scoped to the chosen mo
   await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
   await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [] } }));
   await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: { runtime_state: 'idle' } }));
+  await page.route('**/api/v1/models/*/load-plan?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    return route.fulfill({ json: { max_context: 131072, context_size: Number(query.get('context_size') ?? 32768),
+      precision: 16, precisions: [4, 8, 16], usable: true, reason: null } });
+  });
   await page.route('**/api/v1/models/*/cache-profile*', route => route.fulfill({ json: {
     max_context: 131072, fixed_bytes: 0, fixed_components: [], components: [
       { group: 'GQA', name: 'raw_kv', bytes_per_row: 1024, tokens_per_row: 1, allocation: 'exact', minimum_rows: 0 },
@@ -112,25 +117,25 @@ test('model library comes first and load settings remain scoped to the chosen mo
   const trigger = page.getByRole('button', { name: 'Configure model: Model A', exact: true });
   await trigger.click();
   let dialog = page.getByRole('dialog', { name: 'Model A', exact: true });
-  await expect(dialog.getByRole('spinbutton', { name: 'Load context' })).toHaveValue('');
+  await expect(dialog.getByRole('spinbutton', { name: 'Context length' })).toHaveValue('32768');
   await expect(dialog.getByRole('combobox', { name: 'Model to estimate' })).toHaveCount(0);
-  await expect(dialog.getByRole('status', { name: 'Estimated total memory' })).toContainText('4.1 GiB');
-  await dialog.getByRole('spinbutton', { name: 'Load context' }).fill('65536');
+  await expect(dialog.getByRole('radio', { name: /Balanced/ })).toBeChecked();
+  await dialog.getByRole('spinbutton', { name: 'Context length' }).fill('65536');
   await dialog.getByRole('tab', { name: 'Residency and device' }).click();
   await dialog.getByRole('switch', { name: 'Pin in memory' }).check();
   await dialog.getByRole('tab', { name: 'Context and KV' }).click();
-  await expect(dialog.getByRole('spinbutton', { name: 'Load context' })).toHaveValue('65536');
+  await expect(dialog.getByRole('spinbutton', { name: 'Context length' })).toHaveValue('65536');
   await page.keyboard.press('Escape');
   await expect(trigger).toBeFocused();
   dialog = await openModelSettings(page, 'Model B');
-  await expect(dialog.getByRole('spinbutton', { name: 'Load context' })).toHaveValue('');
+  await expect(dialog.getByRole('spinbutton', { name: 'Context length' })).toHaveValue('32768');
   await dialog.getByRole('tab', { name: 'Residency and device' }).click();
   await expect(dialog.getByRole('switch', { name: 'Pin in memory' })).not.toBeChecked();
   await page.keyboard.press('Escape');
   await page.locator('.model-row').filter({ hasText: 'Model B' }).getByRole('button', { name: 'Load', exact: true }).click();
   await expect.poll(() => writes.length).toBe(1);
   expect(writes[0]).toMatchObject({ model: 'Model B', context_size: null, pin: false });
-  expect(writes[0]).not.toHaveProperty('context_management');
+  expect(writes[0]).toMatchObject({ context_management: { reserve_percent: 10, precision: null, vram_preallocated: true } });
   await page.locator('.model-row').filter({ hasText: 'Model A' }).getByRole('button', { name: 'Load', exact: true }).click();
   await expect.poll(() => writes.length).toBe(2);
   expect(writes[1]).toMatchObject({ model: 'Model A', context_size: 65536 });

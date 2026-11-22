@@ -11,6 +11,8 @@ for (const moe of [true, false]) {
     await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'idle', backend: 'cuda', memory_architecture: 'discrete', unified_memory: false,
       device_memory_total_bytes: 24 * GiB, host_memory_total_bytes: 64 * GiB,
+      host_memory_available_bytes: 60 * GiB,
+      gpu_devices: [{ id: '0', name: 'Fixture GPU', memory_total_bytes: 24 * GiB, memory_available_bytes: 20 * GiB }],
       active_requests: 0, sampling_defaults: {},
     } }));
     await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
@@ -30,7 +32,8 @@ for (const moe of [true, false]) {
     for (const path of ['/models', '/model-hub']) {
       await page.goto(path);
       const combined = moe;
-      const label = combined ? '显存 + 内存压力: 94.3%' : moe ? '显存压力: 8.3%' : '显存压力: 116.7%';
+      const percentage = path === '/models' ? (moe ? '103.8%' : '140.0%') : (moe ? '94.3%' : '116.7%');
+      const label = `${combined ? '显存 + 内存压力' : '显存压力'}: ${percentage}`;
       await expect(page.getByRole('progressbar', { name: label })).toBeVisible();
       await expect(page.getByRole('progressbar', { name: 'RAM 压力: 126.6%' })).toHaveCount(moe && !combined ? 1 : 0);
       if (moe) {

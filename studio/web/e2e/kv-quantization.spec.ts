@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
-import { openModelSettings } from './modelSettings';
+import { modelArtifact, openModelSettings } from './modelSettings';
 
 for (const language of ['zh-CN', 'en'] as const) {
   test(`KV quantization uses the model settings bundle and preserves Indexer (${language})`, async ({ page }, testInfo) => {
@@ -12,7 +12,9 @@ for (const language of ['zh-CN', 'en'] as const) {
       model_overrides: { [model.model]: 678920 }, model_yarn_enabled: { [model.model]: true }, model_kv_quantization: {} } }));
     await page.route('**/api/v1/runtime/yarn/*', route => route.fulfill({ json: { supported: true,
       native_context: 262144, maximum_context: 1048576, maximum_factor: 4, enabled: true } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact', name: model.model }] } }));
+    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
+      modelArtifact('artifact', model.model, { architecture: 'qwen4_exp' }),
+    ] } }));
     await page.route('**/api/v1/models/*/cache-profile', route => route.fulfill({ json: { max_context: 262144,
       fixed_bytes: 29978, fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [
         { group: 'QSA', name: 'raw_kv', layers: 13, head_dimension: 256, kv_heads: 2, bytes_per_row: 26624,
