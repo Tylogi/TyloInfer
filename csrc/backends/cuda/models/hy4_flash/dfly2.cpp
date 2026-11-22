@@ -411,7 +411,7 @@ std::unique_ptr<::MtpModule> load_hy4_dfly2(Hy4CausalLm& model,const std::filesy
         draft->correction_embedding_norm=loader.dense(base+"embed_norm.weight");
         draft->correction=draft_ffn(loader,base);
     }
-    std::vector<int64_t> index_layers;
+    std::vector<int64_t> index_layers,reusable_history;
     const auto nope=target.metadata.head_dim-target.metadata.rotary_dim;
     for (size_t i=0;i<config.layers.size();++i) {
         const auto root=prefix+std::to_string(i)+".",attn=root+"self_attn.";
@@ -435,8 +435,10 @@ std::unique_ptr<::MtpModule> load_hy4_dfly2(Hy4CausalLm& model,const std::filesy
         layer.value_b=expanded.narrow(1,nope,target.value_head_dim).contiguous();
         layer.ffn=draft_ffn(loader,root+"mlp.");
         index_layers.push_back(layer.config.target_index_layer);
+        if (!config.recent_window && layer.config.target_kv_layer==layer.config.target_index_layer)
+            reusable_history.push_back(layer.config.target_kv_layer);
     }
-    enable_hy4_draft_history(model,index_layers);
+    enable_hy4_draft_history(model,index_layers,reusable_history);
     return std::make_unique<Dfly2>(std::move(draft));
 }
 

@@ -8,11 +8,17 @@
 
 namespace mfq::cuda::hy4 {
 
+struct DraftKvHistory {
+    int64_t position=0;
+    mfq_tensor_backend::Tensor rows,indices;
+};
+
 struct LayerCache {
     mfq_tensor_backend::Tensor kv,records,pending_values,pending_logits;
     std::vector<std::unique_ptr<KvOffloadSequence>> sequences;
     mfq_tensor_backend::Tensor last_selection;
     std::vector<mfq_tensor_backend::Tensor> batch_selections;
+    std::vector<DraftKvHistory> batch_draft_kv;
 };
 
 struct BatchCache {
@@ -37,6 +43,7 @@ void commit_batch_selections(Hy4CausalLm&,std::span<const uint8_t> active);
 struct Verification {
     int64_t start=0;
     mfq_tensor_backend::Tensor pending_values,pending_logits,values,logits,positions,selections;
+    mfq_tensor_backend::Tensor gathered_kv,gathered_indices;
 };
 using BatchVerification=std::vector<Verification>;
 void set_batch_verification(Hy4CausalLm&,bool);

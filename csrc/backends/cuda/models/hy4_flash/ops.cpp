@@ -106,15 +106,17 @@ struct Hy4Block final : Block {
         std::vector<KvOffloadSequence::GatherSlice> slices;
     };
     std::shared_ptr<ColdStage> eager_cold;
-    bool expose_selection=false;
+    bool expose_selection=false,reuse_draft_kv=false;
     Tensor last_selection;
     std::vector<Tensor> batch_selections;
+    std::vector<hy4::DraftKvHistory> batch_draft_kv;
     std::optional<hy4::Verification> verification;
 
     void reset(int64_t batch) override {
         verification.reset();
         last_selection={};
         batch_selections.clear();
+        batch_draft_kv.clear();
         sequences.clear();
         if (kv.defined() && kv.size(0)!=batch) kv={};
         if (records.defined() && records.size(0)!=batch) {
@@ -260,6 +262,10 @@ struct Hy4Block final : Block {
             gather();
         }
         auto selected=state->decode_kv(stage->gather->rows.reshape({batch,capacity,width}),stage->lengths);
+        if (reuse_draft_kv && state->batch_verification && verification) {
+            verification->gathered_kv=selected;
+            verification->gathered_indices=stage->indices;
+        }
         return attention_mla_latent_selected_cuda(query,selected,stage->indices,sinks,scale);
     }
 
@@ -536,7 +542,7 @@ BatchCache take_cache(Hy4CausalLm& model) {
         result.layers.push_back({std::exchange(block.kv,{}),std::exchange(block.records,{}),
             std::exchange(block.pending_values,{}),std::exchange(block.pending_logits,{}),
             std::exchange(block.sequences,{}),std::exchange(block.last_selection,{}),
-            std::exchange(block.batch_selections,{})});
+            std::exchange(block.batch_selections,{}),std::exchange(block.batch_draft_kv,{})});
     }
     auto& shared=*model.shared;
     if (!shared.batch_hashes.empty()) result.hashes=std::exchange(shared.batch_hashes,{});
@@ -564,6 +570,7 @@ void bind_cache(Hy4CausalLm& model,BatchCache&& cache,int64_t position,bool deco
         block.sequences=std::move(incoming.sequences);
         block.last_selection=std::move(incoming.last_selection);
         block.batch_selections=std::move(incoming.batch_selections);
+        block.batch_draft_kv=std::move(incoming.batch_draft_kv);
     }
     if (decoding) shared.batch_hashes=std::move(cache.hashes);
     else {
@@ -598,6 +605,7 @@ void reserve_slots(Hy4CausalLm& model,BatchCache& cache,const BatchCache& protot
         const auto& example=prototype.layers.at(i);
         auto& layer=cache.layers[i];
         if (block.expose_selection) layer.batch_selections.resize(slots);
+        if (block.reuse_draft_kv && model.shared->offload) layer.batch_draft_kv.resize(slots);
         const auto ring=config.window+int64_t(mfq::engine::mtp::kMaximumBlockwiseDraftDepth);
         const auto length=std::min(limit,block.sliding?ring:(positions+1023)/1024*1024);
         if (block.sliding || !model.shared->offload) reserve_cache(layer.kv,example.kv,slots,length);
@@ -640,6 +648,8 @@ void release_slot(Hy4CausalLm& model,BatchCache& cache,int64_t slot,bool bound) 
         if (block.sliding) continue;
         auto& sequences=bound?block.sequences:cache.layers.at(i).sequences;
         sequences.at(slot).reset();
+        auto& draft_kv=bound?block.batch_draft_kv:cache.layers.at(i).batch_draft_kv;
+        if (!draft_kv.empty()) draft_kv.at(slot)={};
     }
 }
 
@@ -744,8 +754,17 @@ void retain_batch_prefix(Hy4CausalLm& model,const BatchVerification& journals,co
             if (!kept[row]) continue;
             if (!block.sequences.empty() && kept[row]<width)
                 block.sequences.at(row)->truncate(positions[row*size_t(width)]+kept[row]);
-            if (block.expose_selection)
+            if (block.expose_selection) {
                 block.batch_selections[row]=journal.selections.narrow(0,int64_t(row),1).narrow(1,kept[row]-1,1).clone();
+                if (journal.gathered_kv.defined()) {
+                    const auto mapped=journal.gathered_indices.select(0,int64_t(row)).select(0,kept[row]-1);
+                    const auto position=positions[row*size_t(width)]+kept[row];
+                    auto rows=journal.gathered_kv.narrow(0,int64_t(row),1)
+                        .index_select(1,tb::clamp_min(mapped,0).to(tb::kInt64));
+                    auto slots=tb::arange(mapped.numel(),mapped.options()).reshape({1,-1});
+                    block.batch_draft_kv[row]={position,std::move(rows),tb::where(mapped>=0,slots,-1)};
+                }
+            }
         }
         if (block.indexed) index_pool_retain_prefix(journal.values,journal.logits,journal.positions,lengths,
             journal.pending_values,journal.pending_logits,block.pending_values,block.pending_logits);
@@ -937,8 +956,10 @@ void Hy4Model::adapter_rollback_speculative(int64_t keep) {
     if (shared->engram) shared->engram->hash->rollback_speculative(keep);
 }
 
-void enable_hy4_draft_history(Hy4CausalLm& model,const std::vector<int64_t>& layers) {
+void enable_hy4_draft_history(Hy4CausalLm& model,const std::vector<int64_t>& layers,
+        const std::vector<int64_t>& reusable) {
     for (const auto i:layers) static_cast<Hy4Block&>(*model.blocks.at(i)).expose_selection=true;
+    for (const auto i:reusable) static_cast<Hy4Block&>(*model.blocks.at(i)).reuse_draft_kv=true;
 }
 
 const RopeCache& hy4_full_rope(const Hy4CausalLm& model) {return model.shared->rope;}
@@ -1116,6 +1137,10 @@ std::pair<Tensor,Tensor> hy4_draft_history(const Hy4CausalLm& model,int64_t kv_l
                                         int64_t position,int window,int64_t slot) {
     const auto& source=static_cast<const Hy4Block&>(*model.blocks.at(kv_layer));
     const auto& index=static_cast<const Hy4Block&>(*model.blocks.at(index_layer));
+    if (!window && kv_layer==index_layer && slot>=0 && size_t(slot)<source.batch_draft_kv.size()) {
+        const auto& prepared=source.batch_draft_kv[slot];
+        if (prepared.position==position) return {prepared.rows,prepared.indices};
+    }
     const auto& selected=slot<0?index.last_selection:index.batch_selections.at(slot);
     if (!selected.defined() || selected.size(0)!=1 || position<1)
         throw std::logic_error("DFly2 target history is unavailable");

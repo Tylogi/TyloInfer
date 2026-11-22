@@ -32,7 +32,7 @@ struct Hy4Model : CausalResources {
     void adapter_rollback_speculative(int64_t keep);
 };
 
-void enable_hy4_draft_history(Hy4CausalLm&,const std::vector<int64_t>& layers);
+void enable_hy4_draft_history(Hy4CausalLm&,const std::vector<int64_t>& layers,const std::vector<int64_t>& reusable);
 const RopeCache& hy4_full_rope(const Hy4CausalLm&);
 int64_t hy4_draft_selection_width(const Hy4CausalLm&,int64_t layer,int64_t slot=-1);
 std::pair<mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor> hy4_draft_history(
