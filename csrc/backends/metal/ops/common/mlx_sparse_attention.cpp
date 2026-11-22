@@ -1391,7 +1391,7 @@ array mlx_gather_selected_mla_rows(const array& cache, const array& indices) {
     if (cache.ndim() != 3 || indices.ndim() != 3 || cache.shape(0) != indices.shape(0))
         throw std::invalid_argument("invalid selected MLA rows");
     const int batch = cache.shape(0), tokens = indices.shape(1), dimension = cache.shape(2);
-    if (batch == 1 && tokens >= 8 && dimension == 576 && cache.dtype() == float16 &&
+    if (batch == 1 && dimension == 576 && cache.dtype() == float16 &&
         cache.shape(1) > 0 && cache.strides(1) == dimension && cache.strides(2) == 1 &&
         cache.offset() % 16 == 0 && indices.dtype() == int32 &&
         indices.size() > 0 && indices.size() <= (std::numeric_limits<int>::max() - 127) / 32 &&
