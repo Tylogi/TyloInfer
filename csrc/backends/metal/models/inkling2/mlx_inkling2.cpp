@@ -177,10 +177,56 @@ struct Controller {
     }
 
     array operator()(const array& current, const array& message) const {
-        const auto inputs = reshape(rms(stack({current, message}, -2)),
-            {current.shape(0), current.shape(1), current.shape(2) * 2});
-        const auto low = down(inputs);
         const int width = current.shape(-1);
+        const auto low = [&] {
+            const auto* weight = down.dense_weight_ref();
+            if (weight && weight->dtype() == float32 && down.output_size() == 64 &&
+                down.input_size() == 2 * width && width % 4 == 0 && current.shape() == message.shape() &&
+                promote_types(current.dtype(), message.dtype()) == float32 && current.size() / width <= 4 &&
+                default_device() == Device::gpu) {
+                // Fold each FP32 stream's RMS scale into its projected dot product.
+                static const auto projection = [] {
+                    CompileOptions options;
+                    options.math_mode = MathMode::Safe;
+                    return fast::metal_kernel("tyloinfer_inkling_message_down", {"current", "message", "weight"},
+                        {"low"}, R"MSL(
+                        const uint row = threadgroup_position_in_grid.x;
+                        const uint sample = row / 64u;
+                        const uint tid = thread_index_in_threadgroup;
+                        const uint group = simdgroup_index_in_threadgroup;
+                        const uint lane = thread_index_in_simdgroup;
+                        const auto weights = reinterpret_cast<device const float4*>(weight + (row % 64u) * WIDTH * 2);
+                        const auto main = current + ulong(sample) * WIDTH;
+                        const auto other = message + ulong(sample) * WIDTH;
+                        float4 sums(0.f);
+                        for (uint col = tid; col < WIDTH / 4; col += 256) {
+                            const uint i = col * 4;
+                            const float4 x(main[i], main[i + 1], main[i + 2], main[i + 3]);
+                            const float4 y(other[i], other[i + 1], other[i + 2], other[i + 3]);
+                            sums += float4(dot(x, weights[col]), dot(y, weights[col + WIDTH / 4]), dot(x, x), dot(y, y));
+                        }
+                        sums = float4(simd_sum(sums.x), simd_sum(sums.y), simd_sum(sums.z), simd_sum(sums.w));
+                        threadgroup float4 partial[8];
+                        if (lane == 0) partial[group] = sums;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (tid == 0) {
+                            sums = float4(0.f);
+                            for (uint i = 0; i < 8; ++i) sums += partial[i];
+                            const float a = metal::precise::rsqrt(sums.z / float(WIDTH) + 1e-6f);
+                            const float b = metal::precise::rsqrt(sums.w / float(WIDTH) + 1e-6f);
+                            low[row] = sums.x * a + sums.y * b;
+                        }
+                        )MSL", "", true, false, options);
+                }();
+                const Shape shape{current.shape(0), current.shape(1), 64};
+                return projection({current, message, *weight}, {shape}, {float32},
+                    {current.shape(0) * current.shape(1) * 64 * 256, 1, 1}, {256, 1, 1},
+                    {{"WIDTH", width}}, std::nullopt, false, {}).front();
+            }
+            const auto inputs = reshape(rms(stack({current, message}, -2)),
+                {current.shape(0), current.shape(1), width * 2});
+            return down(inputs);
+        }();
         if (decode_gates && default_device() == Device::gpu && low.dtype() == float32 && low.shape(-1) == 64 &&
             current.shape() == message.shape() && width == decode_gates->first.shape(0) &&
             current.size() / width <= 4 && current.size() <= std::size_t(std::numeric_limits<int>::max() / 8)) {
