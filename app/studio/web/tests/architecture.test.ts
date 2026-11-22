@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const root = resolve('src');
+const root = resolve(import.meta.dirname, '../src');
 function source(path: string) { return readFileSync(join(root, path), 'utf8'); }
 function files(path: string): string[] {
   return readdirSync(path, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? files(join(path, entry.name)) : /\.tsx?$/.test(entry.name) && !entry.name.includes('.test.') ? [join(path, entry.name)] : []);

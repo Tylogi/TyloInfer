@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useSettings } from './SettingsProvider';
 import type { UiLanguage, UiTheme } from './configuration';
 import { Icon, type IconName } from '../../app/display';
-import studioPackage from '../../../package.json';
+import studioPackage from '../../../../../package.json';
 import './settings-panel.css';
 
 const sections: { id: string; label: [string, string]; icon: IconName }[] = [

@@ -1,6 +1,6 @@
 #include <cuda_fp16.h>
-#include "studio/kernels/cuda/deepseek_v4_hc.h"
-#include "studio/kernels/cuda/deepseek_v41.h"
+#include "app/studio/kernels/cuda/deepseek_v4_hc.h"
+#include "app/studio/kernels/cuda/deepseek_v41.h"
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 

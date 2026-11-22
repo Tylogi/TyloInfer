@@ -1,4 +1,4 @@
-import { version } from '../../../package.json';
+import { version } from '../../../../../package.json';
 import type { StudioRelease, StudioUpdateStatus } from '../../shared/platform/studio';
 
 declare const __TYLOINFER_STUDIO_BUILD__: { version: string; release: boolean };

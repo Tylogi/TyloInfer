@@ -1,6 +1,6 @@
 #include <math_constants.h>
 #include <cuda_runtime.h>
-#include "studio/kernels/cuda/deepseek_v4_attention.h"
+#include "app/studio/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq_tensor_backend.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

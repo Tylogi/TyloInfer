@@ -132,6 +132,9 @@ def _validate_web_root(path: Path, *, source: str) -> Path:
 
 # The Web UI lives in the same checkout as this server module.
 WEB_DIR = Path(__file__).resolve().parent / "web"
+# The shared frontend toolchain, lockfile and build entry sit one level above the
+# two applications, so a source checkout is recognised by app/package.json.
+APP_DIR = WEB_DIR.parent.parent
 
 
 def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None:
@@ -150,7 +153,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
         if bundled_root.is_dir():
             return _validate_web_root(bundled_root, source="bundled")
     web_dir = WEB_DIR
-    package = web_dir / "package.json"
+    package = APP_DIR / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"
     if not package.is_file():
@@ -164,6 +167,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
     inputs = [
         *(path for path in web_dir.iterdir() if path.is_file()),
         *(path for path in (web_dir / "src").rglob("*") if path.is_file()),
+        *(path for path in (APP_DIR / "shared").rglob("*") if path.is_file()),
     ]
     newest_input = max(
         (path.stat().st_mtime_ns for path in inputs if path.is_file()),
@@ -172,7 +176,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
     if index.is_file() and index.stat().st_mtime_ns >= newest_input:
         return output
 
-    # app/studio/web is pnpm-managed (pnpm-lock.yaml); npm cannot install from it.
+    # The app/ workspace is pnpm-managed (app/pnpm-lock.yaml); npm cannot install from it.
     pnpm = shutil.which("pnpm")
     if pnpm is None:
         raise RuntimeError(
@@ -182,8 +186,8 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
         )
     print("Building TyloInfer Web UI...", flush=True)
     try:
-        subprocess.run([pnpm, "install", "--frozen-lockfile"], cwd=web_dir, check=True)
-        subprocess.run([pnpm, "run", "build"], cwd=web_dir, check=True)
+        subprocess.run([pnpm, "--dir", str(APP_DIR), "install", "--frozen-lockfile"], check=True)
+        subprocess.run([pnpm, "--dir", str(APP_DIR), "run", "build:studio"], check=True)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"TyloInfer Web UI build failed with exit code {error.returncode}") from error
     if not index.is_file():

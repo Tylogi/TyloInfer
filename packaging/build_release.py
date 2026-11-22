@@ -32,7 +32,8 @@ import zipfile
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT = SCRIPT_DIR.parent
-STUDIO = PROJECT / "app" / "studio" / "web"
+APP = PROJECT / "app"
+STUDIO = APP / "studio" / "web"
 PYTHON_PROJECT = PROJECT / "app" / "studio"
 SERVER_ENTRY = PYTHON_PROJECT / "serve.py"
 SERVER_NAME = "tyloinfer-server"
@@ -564,10 +565,10 @@ def build_studio(context: Context) -> None:
                "--config", f"src-tauri/tauri.release-{'windows' if context.windows else 'macos'}.conf.json"]
     if not context.windows and context.signing_identity != "-":
         command += ["--config", '{"bundle":{"macOS":{"hardenedRuntime":true}}}']
-    # app/studio/web is pnpm-managed (pnpm-lock.yaml); npm ci cannot install from it.
+    # The app/ workspace is pnpm-managed (app/pnpm-lock.yaml); npm ci cannot install from it.
     pnpm = "pnpm.cmd" if context.windows else "pnpm"
-    run([pnpm, "install", "--frozen-lockfile"], cwd=STUDIO, env=environment)
-    run([pnpm, "run", "check"], cwd=STUDIO, env=environment)
+    run([pnpm, "--dir", str(APP), "install", "--frozen-lockfile"], env=environment)
+    run([pnpm, "--dir", str(APP), "run", "check:studio"], env=environment)
     run([pnpm, "exec"] + command + ["--target", context.triple], cwd=STUDIO, env=environment)
     if context.windows:
         # The PyInstaller workpath is rebuilt by --clean. Reclaim it before Tauri

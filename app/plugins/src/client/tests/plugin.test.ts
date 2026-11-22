@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-const require = createRequire(new URL('../../../studio/web/package.json', import.meta.url));
+const require = createRequire(new URL('../../package.json', import.meta.url));
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 const artifact = await readFile(new URL('../../../lib/client.js', import.meta.url), 'utf8');

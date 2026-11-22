@@ -1,4 +1,4 @@
-#include "studio/kernels/cuda/index_pool.h"
+#include "app/studio/kernels/cuda/index_pool.h"
 
 #include <climits>
 #include <cmath>

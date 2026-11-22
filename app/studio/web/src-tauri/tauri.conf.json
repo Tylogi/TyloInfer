@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.tylogi.tyloinfer",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeDevCommand": { "script": "pnpm run dev:studio", "cwd": "../.." },
+    "beforeBuildCommand": { "script": "pnpm run build:studio", "cwd": "../.." },
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },

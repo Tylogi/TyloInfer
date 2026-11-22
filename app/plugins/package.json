@@ -48,16 +48,7 @@
     "@deepseek-ai/schemastery": "3.19.0"
   },
   "devDependencies": {
-    "@phosphor-icons/react": "2.1.10",
-    "@types/node": "24.10.1",
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
-    "dompurify": "3.4.16",
-    "marked": "18.0.11",
-    "postcss": "8.5.32",
     "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "typescript": "7.0.2",
-    "vite": "8.2.1"
+    "react-dom": "18.2.0"
   }
 }

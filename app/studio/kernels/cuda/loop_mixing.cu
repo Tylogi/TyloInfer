@@ -1,4 +1,4 @@
-#include "studio/kernels/cuda/loop_mixing.h"
+#include "app/studio/kernels/cuda/loop_mixing.h"
 
 #include <algorithm>
 #include <climits>

@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-import { version } from '../../../package.json';
+import { version } from '../../../../../package.json';
 import { browserUpdateStatus, cachedBrowserStatus, compareVersions, releaseCatalog, setBrowserAutomatic } from './releases';
 
 beforeEach(() => { localStorage.clear(); });

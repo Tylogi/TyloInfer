@@ -117,7 +117,7 @@ describe('test_studio_renders_video_first_frame_posters（行为；接线单独�
   });
 
   it('过渡源码契约：输入框附件预览复用静音首帧组件（非行为）', () => {
-    const composer = readFileSync(resolve('src/features/chat/components/ChatComposer.tsx'), 'utf8');
+    const composer = readFileSync(resolve(import.meta.dirname, '../src/features/chat/components/ChatComposer.tsx'), 'utf8');
     expect(composer).toContain('<VideoWithFirstFrame muted src={attachment.previewUrl} />');
   });
 });

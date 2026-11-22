@@ -51,7 +51,7 @@ describe('test_assistant_markdown_recovers_fully_escaped_structural_line_breaks'
   });
 
   it('过渡源码：持久消息仅为助手角色启用修复（非行为）', () => {
-    const saved = readFileSync(resolve('src/features/chat/SavedMessageList.tsx'), 'utf8');
+    const saved = readFileSync(resolve(import.meta.dirname, '../src/features/chat/SavedMessageList.tsx'), 'utf8');
     expect(saved).toContain('renderMarkdown(parts.text, false, message.role === "assistant")');
     expect(saved).toContain('renderMarkdown(parts.reasoning, false, message.role === "assistant")');
   });

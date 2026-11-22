@@ -1,4 +1,4 @@
-#include "studio/kernels/cuda/independent_hc.h"
+#include "app/studio/kernels/cuda/independent_hc.h"
 
 #include <climits>
 #include <cmath>

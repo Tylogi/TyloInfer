@@ -1,5 +1,10 @@
 
 import { defineConfig } from '@playwright/test';
+import { fileURLToPath } from 'node:url';
+
+// The build entry lives in app/package.json, so the preview server is started
+// through it by absolute path instead of relying on the test runner's cwd.
+const app = fileURLToPath(new URL('../../', import.meta.url));
 
 export default defineConfig({
   testDir: './e2e',
@@ -28,7 +33,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'pnpm build && pnpm preview --host 127.0.0.1 --port 5187 --strictPort',
+    command: `pnpm --dir ${app} exec vite preview --config studio/web/vite.config.ts --host 127.0.0.1 --port 5187 --strictPort`,
     url: 'http://127.0.0.1:5187',
     reuseExistingServer: false,
     timeout: 60_000,

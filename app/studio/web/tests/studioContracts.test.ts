@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const sourceRoot = resolve(process.cwd(), 'src');
+const sourceRoot = resolve(import.meta.dirname, '../src');
 
 
 function readSources(...paths: string[]): string {

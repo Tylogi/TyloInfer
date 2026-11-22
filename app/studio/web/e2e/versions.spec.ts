@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import packageInfo from '../package.json' with { type: 'json' };
+import packageInfo from '../../../package.json' with { type: 'json' };
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {

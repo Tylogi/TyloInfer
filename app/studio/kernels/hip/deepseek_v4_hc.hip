@@ -2,7 +2,7 @@
 #include "mfq_hip_compat.h"
 #include <hip/hip_fp16.h>
 #include "deepseek_v4_hc.h"
-#include "studio/kernels/cuda/deepseek_v41.h"
+#include "app/studio/kernels/cuda/deepseek_v41.h"
 #include "mfq_tensor_backend.h"
 #include <hip/hip_runtime.h>
 

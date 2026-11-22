@@ -138,7 +138,7 @@ it('历史推理默认折叠，流式推理默认展开且只显示当前会话'
 
 it('聊天容器拥有垂直滚动，推理正文不引入独立限高滚动区', () => {
   const style = document.createElement('style');
-  style.textContent = readFileSync(resolve('src/features/chat/chat.css'), 'utf8');
+  style.textContent = readFileSync(resolve(import.meta.dirname, '../src/features/chat/chat.css'), 'utf8');
   document.head.append(style);
   try {
     const rules = Array.from(style.sheet!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule);
