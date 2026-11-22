@@ -2279,22 +2279,21 @@ static common_chat_params common_chat_params_init_inkling2(const common_chat_tem
     data.grammar_lazy = allow_tools && !required;
 
     const auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto reasoning = p.eps();
-        if (inputs.enable_thinking || !required) {
-            const auto block = p.literal(model + thinking);
-            const auto body = p.until(message_end);
-            reasoning = p.optional(inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE
-                ? block + p.reasoning(body) + p.literal(message_end)
-                : p.content(block + body + p.literal(message_end)));
-        }
-
-        const auto content_body = p.content(p.until_one_of({message_end, turn_end})) +
-            p.optional(p.literal(message_end));
+        const auto close = p.literal(message_end);
+        const auto thought_header = p.literal(model + thinking);
+        const auto thought_body = p.until(message_end);
+        const auto thought = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE
+            ? thought_header + p.reasoning(thought_body) + close
+            : p.content(thought_header + thought_body + close);
+        const auto content_body = p.content(p.until_one_of({message_end, turn_end}));
         const auto content = p.literal(model + text) + content_body;
-        const auto start = p.literal(data.generation_prompt) + p.space() + reasoning;
+        const auto completed = required
+            ? (inputs.enable_thinking ? p.zero_or_more(thought) : p.eps())
+            : p.zero_or_more(p.choice({thought, content + close}));
+        const auto start = p.literal(data.generation_prompt) + p.space() + completed;
         const auto end = p.optional(p.literal(turn_end)) + p.end();
         if (!allow_tools) {
-            return start + p.choice({content, content_body}) + end;
+            return start + p.choice({content, content_body}) + p.optional(close) + end;
         }
 
         auto tools = p.choice();
@@ -2315,7 +2314,7 @@ static common_chat_params common_chat_params_init_inkling2(const common_chat_tem
                 p.space() + p.tool_close(p.literal("}") + p.literal(message_end))));
         });
         const auto calls = p.trigger_rule("tool-call", p.repeat(tools, 1, inputs.parallel_tool_calls ? -1 : 1));
-        const auto body = required ? calls : p.choice({p.optional(content) + calls, content});
+        const auto body = required ? calls : p.choice({calls, p.optional(content)});
         return start + body + end;
     });
     data.parser = parser.save();

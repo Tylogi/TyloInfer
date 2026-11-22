@@ -115,11 +115,16 @@ int main() try {
                 "Inkling tool grammar does not match the requested tool choice");
             common_chat_parser_params parser(format);
             parser.parser.load(format.parser);
-            const auto parsed = common_chat_parse(
-                R"(<|message_model|>record_satellite<|content_invoke_tool_json|>{"name":"record_satellite","args":{"body":"Moon"}}<|end_message|>)",
-                false, parser);
+            const std::string call = R"(<|message_model|>record_satellite<|content_invoke_tool_json|>{"name":"record_satellite","args":{"body":"Moon"}}<|end_message|>)";
+            const auto parsed = common_chat_parse(call, false, parser);
             require(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "record_satellite" &&
                 parsed.tool_calls[0].arguments == R"({"body":"Moon"})", "Inkling tool call was not decoded");
+            if (selection == COMMON_CHAT_TOOL_CHOICE_AUTO) {
+                const auto multi = common_chat_parse("<|message_model|><|content_text|>I will record it. <|end_message|>"
+                    "<|message_model|><|content_text|>Using the satellite name.<|end_message|>" + call, false, parser);
+                require(multi.content == "I will record it. Using the satellite name." && multi.tool_calls.size() == 1,
+                    "Inkling split a sequence of text blocks from the following tool call");
+            }
         }
         inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
         inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
