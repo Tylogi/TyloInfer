@@ -40,7 +40,7 @@ public:
     std::pair<mlx::core::array, MlxHyperConnectionState> expand_and_collapse(
         const mlx::core::array& residual, const mlx::core::array& branch,
         const MlxHyperConnectionState& state, const MlxRmsNorm* branch_norm = nullptr,
-        bool packed_decode = false) const;
+        bool packed_decode = false, const MlxRmsNorm* update_norm = nullptr) const;
     static mlx::core::array expand(const mlx::core::array& residual,
         const mlx::core::array& branch, const MlxHyperConnectionState& state);
 

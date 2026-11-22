@@ -933,6 +933,61 @@ struct MlaRows {
     array query, latent, query_low, gate;
 };
 
+std::optional<array> absorb_mla_decode_query(const array& query, const array& weights,
+    const RotaryPhases& phases) {
+    const int heads = query.shape(2);
+    if (query.shape() != Shape{1, 1, heads, 256} || query.dtype() != bfloat16 ||
+        weights.shape() != Shape{heads, 192, 512} || weights.dtype() != float16 ||
+        phases.cosine.size() != 32 || phases.sine.shape() != phases.cosine.shape() ||
+        default_device() != Device::gpu)
+        return std::nullopt;
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return fast::metal_kernel("hy4_decode_absorb_rope", {"q", "w", "cs", "sn"}, {"output"}, R"METAL(
+            const uint head = threadgroup_position_in_grid.y;
+            const uint stripe = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint subgroup = simdgroup_index_in_threadgroup;
+            const auto query = q + head * 256u;
+            auto out = output + head * 576u;
+            if (stripe == 16u) {
+                const uint at = thread_index_in_threadgroup;
+                const uint pair = at / 2u;
+                const float first = float(query[192u + 2u * pair]);
+                const float second = float(query[193u + 2u * pair]);
+                const float value = (at & 1u) ? first * sn[pair] + second * cs[pair]
+                    : first * cs[pair] - second * sn[pair];
+                out[512u + at] = float(bfloat(value));
+                return;
+            }
+            {
+            #pragma clang fp reassociate(off)
+                const uint column = stripe * 32u + subgroup * 16u + (lane & 3u) * 4u;
+                const uint part = lane / 4u;
+                const auto weights = w + head * 192u * 512u + column;
+                float4 acc(0.0f);
+                for (uint k = part * 4u; k < 192u; k += 32u) {
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0u; i < 4u; ++i) {
+                        const float activation = float(half(float(query[k + i])));
+                        const auto values = float4(*reinterpret_cast<device const half4*>(weights + (k + i) * 512u));
+                        acc = fma(values, float4(activation), acc);
+                    }
+                }
+                for (ushort offset = 16u; offset >= 4u; offset /= 2u)
+                    acc += simd_shuffle_down(acc, offset);
+                if (part == 0u) {
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0u; i < 4u; ++i) out[column + i] = float(half(acc[i]));
+                }
+            }
+            )METAL", "", true, false, options);
+    }();
+    return kernel({query, weights, phases.cosine, phases.sine}, {{1, heads, 1, 576}}, {float32},
+        {17 * 64, heads, 1}, {64, 1, 1}, {}, std::nullopt, false, {}).front();
+}
+
 array absorb_mla_query(const array& query, const array& weights) {
     const auto source = astype(query, weights.dtype());
     const int heads = source.shape(1);
@@ -978,10 +1033,14 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
     auto normalized = normalize_mla_decode(projected[0], projected[1], layer.query_norm, layer.latent_norm, phases, g, packed);
     auto low = normalized ? std::move(normalized->first) : layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
-    const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
-    const auto absorbed = absorb_mla_query(no_rope, layer.key_absorption);
-    const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
-    auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
+    auto query = [&] {
+        if (count == 1 && plain == 192 && g.rotary == 64)
+            if (auto fused = absorb_mla_decode_query(q, layer.key_absorption, phases)) return std::move(*fused);
+        const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
+        const auto absorbed = absorb_mla_query(no_rope, layer.key_absorption);
+        const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
+        return concatenate({absorbed, astype(rope_q, float32)}, -1);
+    }();
     auto latent = normalized ? std::move(normalized->second) : astype(concatenate({
         layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
         astype(phases(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary)), float32)}, -1), float16);
@@ -989,27 +1048,32 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
 }
 
 template <class Attention>
-array expand_mla(const Attention& layer, const Geometry& g, const array& attention, const array& gate, Dtype dtype) {
+array expand_mla(const Attention& layer, const Geometry& g, const array& attention, const array& gate,
+    Dtype dtype, bool normalize = true) {
     const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), layer.value_expansion.dtype()),
         layer.value_expansion);
     const auto gated = reshape(transpose(expanded, {0, 2, 1, 3}),
         {1, attention.shape(1), layer.heads * g.v_dim}) * sigmoid(astype(gate, float32));
-    return layer.post_attention_norm(layer.output(astype(gated, dtype)));
+    auto output = layer.output(astype(gated, dtype));
+    return normalize ? layer.post_attention_norm(output) : output;
 }
 
 struct PendingResidual {
     array branch;
     MlxHyperConnectionState mixer;
+    const MlxRmsNorm* norm = nullptr;
+
+    array normalized() const { return norm ? (*norm)(branch) : branch; }
 };
 
 MlxHyperConnectionState prepare_attention_input(const Layer& layer, const Geometry& g, array& streams,
     const std::optional<array>& engram, const PendingResidual* deferred, bool packed_decode = false) {
     if (engram) {
-        if (deferred) streams = MlxHyperConnection::expand(streams, deferred->branch, deferred->mixer);
+        if (deferred) streams = MlxHyperConnection::expand(streams, deferred->normalized(), deferred->mixer);
         streams = (*layer.engram)(streams, *engram, g);
     } else if (deferred) {
         auto [updated, gates] = layer.attention_hc.expand_and_collapse(
-            streams, deferred->branch, deferred->mixer, &layer.attention_norm, packed_decode);
+            streams, deferred->branch, deferred->mixer, &layer.attention_norm, packed_decode, deferred->norm);
         streams = std::move(updated);
         return gates;
     }
@@ -1035,15 +1099,16 @@ std::pair<array, MlxHyperConnectionState> prepare_layer(const Layer& layer, cons
         return run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent,
             project_index_pairs(*layer.index, in), scoring, pool_phases, layer.sinks, offset, scale, offload, verified);
     }();
-    const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
+    const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype(), !deferred);
     auto [updated_streams, ffn_mix] = layer.ffn_hc.expand_and_collapse(
-        streams, attn_out, mix, &layer.ffn_norm);
+        streams, attn_out, mix, &layer.ffn_norm, false, deferred ? &layer.post_attention_norm : nullptr);
     streams = std::move(updated_streams);
     return {std::move(streams), std::move(ffn_mix)};
 }
 
-array project_ffn(const Layer& layer, const Geometry& g, const array& input) {
-    return layer.post_ffn_norm(layer.dense ? (*layer.dense)(input) : (*layer.moe)(input, g));
+array project_ffn(const Layer& layer, const Geometry& g, const array& input, bool normalize = true) {
+    auto output = layer.dense ? (*layer.dense)(input) : (*layer.moe)(input, g);
+    return normalize ? layer.post_ffn_norm(output) : output;
 }
 
 array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
@@ -1053,9 +1118,9 @@ array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cac
     std::optional<PendingResidual>* deferred) {
     auto [updated, ffn_mix] = prepare_layer(layer, g, cache, std::move(streams),
         engram, phases, pool_phases, offset, offload, verified, deferred);
-    auto ffn_out = project_ffn(layer, g, ffn_mix.branch);
+    auto ffn_out = project_ffn(layer, g, ffn_mix.branch, !deferred);
     if (deferred) {
-        deferred->emplace(std::move(ffn_out), std::move(ffn_mix));
+        deferred->emplace(std::move(ffn_out), std::move(ffn_mix), &layer.post_ffn_norm);
         return updated;
     }
     return MlxHyperConnection::expand(updated, ffn_out, ffn_mix);
@@ -1467,7 +1532,7 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
             phases, pool_phases, offset, w.offload, verification ? &verification->layers[layer] : nullptr,
             merge_layers ? &deferred : nullptr);
     }
-    if (deferred) streams = MlxHyperConnection::expand(streams, deferred->branch, deferred->mixer);
+    if (deferred) streams = MlxHyperConnection::expand(streams, deferred->normalized(), deferred->mixer);
     if (w.engram) {
         const auto keep = std::min(history.size(), std::size_t(w.engram->grams - 1));
         cache.engram_tail.assign(history.end() - keep, history.end());
