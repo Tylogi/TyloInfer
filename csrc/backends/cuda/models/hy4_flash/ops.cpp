@@ -865,6 +865,8 @@ void Hy4Model::configure_kv_tiers() {
     tiers.ram_preallocated=option.ram_preallocated;
     tiers.ssd_enabled=option.placement=="auto_ssd";
     tiers.directory=option.directory;
+    if (tiers.ram_preallocated && !tiers.ssd_enabled)
+        tiers.ram_growth_limit=option.ram_limit_set?ram:SIZE_MAX;
     if (tiers.ssd_enabled && (!tiers.ram_preallocated || needed>ram)) {
         const auto spill=tiers.ram_preallocated?needed-ram:needed;
         auto directory=std::filesystem::path(tiers.directory);

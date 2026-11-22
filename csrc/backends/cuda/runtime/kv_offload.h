@@ -14,6 +14,7 @@ class KvExpertLoan;
 struct KvOffloadConfig {
     std::size_t gpu_budget_bytes = 0;
     std::size_t ram_budget_bytes = 0;
+    std::size_t ram_growth_limit = 0;
     std::size_t buffer_bytes = 64ULL << 20;
     std::string directory;
     bool preallocate = false;
