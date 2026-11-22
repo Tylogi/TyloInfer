@@ -20,6 +20,7 @@
 namespace mfq::metal {
 
 class MlxDFlash2;
+template <class Model> class MlxTextBackboneRuntime;
 
 // Native payload translation is private to the Metal engine. The scheduler
 // receives owned values from the generation job, never these device functions.
@@ -40,6 +41,14 @@ struct MlxEngineComponents {
     MlxDuplexComponent duplex;
     bool mtp_available = false;
 };
+
+template <class Model>
+MlxEngineComponents make_mlx_engine_components(const MfqModelGraph*,
+    std::shared_ptr<std::mutex>,
+    std::shared_ptr<std::optional<MlxTextBackboneRuntime<Model>>> runtime,
+    mlx::core::Stream) {
+    return {.mtp_available = runtime && *runtime && (*runtime)->supports_mtp()};
+}
 
 std::vector<MlxDeepseekV41ImageInput> prepare_deepseek_v41_images(
     const std::vector<std::int64_t>& prompt, const MfqMultimodalInput& media,

@@ -1396,6 +1396,26 @@ MlxMoeTopKResult moe_topk(
     };
 }
 
+MlxMoeTopKResult moe_sigmoid_topk(const array& logits, int top_k,
+    const std::optional<array>& bias, float scale) {
+    if (logits.ndim() != 2 || top_k <= 0 || top_k > logits.shape(-1))
+        throw std::invalid_argument("invalid sigmoid MoE router geometry");
+    constexpr float norm_floor = 0x1p-14f;
+    const auto values = mlx::core::astype(logits, mlx::core::float32);
+    if (top_k <= kMaximumRoutes && logits.shape(-1) <= kMaximumExperts &&
+        mlx::core::default_device() == mlx::core::Device::gpu)
+        return moe_topk(values, top_k, true, false, true, false,
+            bias, std::nullopt, norm_floor, scale, false);
+
+    const auto probability = mlx::core::sigmoid(values);
+    const auto score = bias ? probability + *bias : probability;
+    auto ids = mlx::core::slice(mlx::core::argpartition(-score, top_k - 1, -1),
+        {0, 0}, {logits.shape(0), top_k});
+    auto weights = mlx::core::take_along_axis(probability, ids, -1);
+    weights = weights * scale / mlx::core::maximum(mlx::core::sum(weights, -1, true), array(norm_floor));
+    return {std::move(ids), std::move(weights), std::nullopt};
+}
+
 bool moe_dense_router_logits_supported(
     const array& input,
     const array& weight) noexcept {

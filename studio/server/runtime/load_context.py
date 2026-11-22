@@ -4,22 +4,29 @@ from server.protocol.models import (
 )
 
 
+def supports_kv_quantization(architecture: str, backend: str) -> bool:
+    kind = architecture.casefold()
+    return backend in {'cuda', 'metal'} and (kind == 'hy_v4_flash' or kind.startswith(
+        ('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35', 'sensenova_loop')))
+
+
 def apply_load_context(request: ModelLoadRequest, architecture: str, backend: str, *, fixed_qsa: bool = False) -> ModelLoadRequest:
     defaults = request.context_management
     if defaults is None:
         return request
     kind = architecture.casefold()
-    qsa = kind.startswith('qwen4_exp') and backend in {'cuda', 'metal'}
-    hy4 = backend == 'cuda' and kind == 'hy_v4_flash'
-    quantized = backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35', 'sensenova_loop'))
+    qsa = (kind.startswith('qwen4_exp') and backend in {'cuda', 'metal'}) or (
+        kind == 'hy_v4_flash' and backend == 'metal')
+    cuda_hy4 = backend == 'cuda' and kind == 'hy_v4_flash'
+    quantized = supports_kv_quantization(kind, backend)
     if defaults.reserve_percent is not None:
         bits = defaults.precision or 16
-        changes = {'kv_quantization': KvQuantizationSettings(enabled=(quantized or hy4) and not fixed_qsa and bits < 16,
+        changes = {'kv_quantization': KvQuantizationSettings(enabled=quantized and not fixed_qsa and bits < 16,
                    bits=bits if bits < 16 else 4), 'qsa_kv_offload': QsaKvOffloadPolicy()}
         if fixed_qsa:
             changes['kv_memory'] = KvMemorySettings(qsa_mode={16: 'fp16', 8: 'affine8', 4: 'tq4'}[bits],
                 placement='auto_ssd', ram_preallocated=defaults.vram_preallocated)
-        elif hy4 and not defaults.automatic:
+        elif cuda_hy4 and not defaults.automatic:
             changes['kv_memory'] = KvMemorySettings(placement='auto_ssd' if defaults.ssd_kv else 'auto',
                 ram_preallocated=defaults.ram_preallocated)
         return request.model_copy(update={key: value for key, value in changes.items() if key not in request.model_fields_set})
@@ -29,12 +36,12 @@ def apply_load_context(request: ModelLoadRequest, architecture: str, backend: st
     # A load can still specify exact per-model settings. Browser defaults only
     # fill missing fields, and become explicit before saved settings are read.
     if 'kv_quantization' not in request.model_fields_set and not use_server_qsa_defaults:
-        changes['kv_quantization'] = (defaults.kv_quantization if manual and (quantized or hy4)
-                                      else KvQuantizationSettings(enabled=quantized, bits=8))
+        changes['kv_quantization'] = (defaults.kv_quantization if manual and quantized
+                                      else KvQuantizationSettings(enabled=quantized and kind != 'hy_v4_flash', bits=8))
     if 'kv_memory' not in request.model_fields_set and not use_server_qsa_defaults:
         changes['kv_memory'] = KvMemorySettings(
-            placement='auto_ssd' if manual and (qsa or hy4) and backend == 'cuda' and defaults.ssd_kv else 'auto',
-            ram_preallocated=defaults.ram_preallocated if manual and (qsa or hy4) and backend == 'cuda' else True,
+            placement='auto_ssd' if manual and (qsa or cuda_hy4) and backend == 'cuda' and defaults.ssd_kv else 'auto',
+            ram_preallocated=defaults.ram_preallocated if manual and (qsa or cuda_hy4) and backend == 'cuda' else True,
         )
     if 'qsa_kv_offload' not in request.model_fields_set:
         changes['qsa_kv_offload'] = QsaKvOffloadPolicy(enabled=manual and qsa and backend == 'metal' and defaults.ssd_kv)

@@ -3,6 +3,7 @@
 #include "tyloinfer/token_constraint.h"
 #include "tyloinfer/decision_model.h"
 #include "decision.h"
+#include "mlx_hyper_connection.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "mlx_mtp.h"
@@ -308,6 +309,13 @@ private:
     Qwen35Config config_;
     Qwen35Embedding embedding_;
     std::vector<MlxQwen35Layer> layers_;
+    struct LoopHyperConnections {
+        MlxHyperConnection attention;
+        MlxHyperConnection feed_forward;
+        bool enter;
+        bool leave;
+    };
+    std::vector<std::optional<LoopHyperConnections>> loop_hyper_connections_;
     MlxRmsNorm output_norm_;
     std::optional<Qwen35Linear> output_;
     mlx::core::Dtype activation_dtype_;

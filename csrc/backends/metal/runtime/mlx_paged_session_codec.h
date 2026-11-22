@@ -2,6 +2,8 @@
 
 #include "mfq_paged_prefix_cache.h"
 #include "mlx_minicpmo45.h"
+#include "mlx_inkling2.h"
+#include "mlx_hy4.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_deepseek_v41_causal_lm.h"
@@ -55,6 +57,32 @@ struct MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState> {
         const std::vector<MlxPagedPayload>& payloads,
         const std::vector<std::int64_t>& tokens,
         std::size_t block_size);
+};
+
+template <>
+struct MlxPagedSessionCodec<MlxInkling2TextSessionState> {
+    static constexpr bool available = true;
+    static constexpr bool refresh_final_block = true;
+    static constexpr bool supports_tail_blocks = true;
+    static constexpr std::string_view name = "inkling2-loop-kv-conv-v1";
+
+    static MlxPagedPayload encode_block(const MlxInkling2TextSessionState& state,
+        std::size_t block_size, std::size_t index);
+    static MlxInkling2TextSessionState decode(const std::vector<MlxPagedPayload>& payloads,
+        const std::vector<std::int64_t>& tokens, std::size_t block_size);
+};
+
+template <>
+struct MlxPagedSessionCodec<MlxHy4TextSessionState> {
+    static constexpr bool available = true;
+    static constexpr bool refresh_final_block = true;
+    static constexpr bool supports_tail_blocks = true;
+    static constexpr std::string_view name = "hy4-flash-indexpool-mla-v1";
+
+    static MlxPagedPayload encode_block(const MlxHy4TextSessionState& state,
+        std::size_t block_size, std::size_t index);
+    static MlxHy4TextSessionState decode(const std::vector<MlxPagedPayload>& payloads,
+        const std::vector<std::int64_t>& tokens, std::size_t block_size);
 };
 
 template <>

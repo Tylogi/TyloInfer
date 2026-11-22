@@ -960,7 +960,9 @@ class ModelCatalog:
                 dtype, size = record['dtype'], int(record['nbytes'])
                 if dtype.startswith('GGUF_') and dtype[5:] not in supported:
                     unsupported.add(dtype)
-                if _is_always_streamed_tensor(tensor):
+                if _is_always_streamed_tensor(tensor) or (
+                    architecture == 'hy_v4_flash' and tensor == 'per_layer_token_embd.weight'
+                ):
                     streamed += size
                     continue
                 role = weight_role(tensor)

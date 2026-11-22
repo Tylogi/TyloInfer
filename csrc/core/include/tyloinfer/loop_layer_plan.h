@@ -39,6 +39,12 @@ public:
     int64_t execution_layers() const noexcept { return execution_layers_; }
     int64_t weight_layers() const noexcept { return weight_layers_; }
 
+    int64_t first_visit(int64_t layer) const {
+        if (layer < 0 || layer >= weight_layers_)
+            throw std::out_of_range("loop weight layer is out of range");
+        return layer < end_ ? layer : layer + extra_;
+    }
+
     int64_t physical_layer(int64_t visit) const {
         if (visit < 0 || visit >= execution_layers_)
             throw std::out_of_range("loop layer visit is out of range");

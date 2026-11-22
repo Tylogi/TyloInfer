@@ -539,9 +539,9 @@ array generic_selected_mla_attention(
     const array& indices,
     const array& mask,
     const array& sinks,
-    float scale) {
+    float scale,
+    int value_dimension) {
     const int batch = query.shape(0);
-    const int heads = query.shape(1);
     const int tokens = query.shape(2);
     const int selected = indices.shape(2);
     const int dimension = query.shape(3);
@@ -553,34 +553,8 @@ array generic_selected_mla_attention(
     auto expanded_indices = mlx::core::broadcast_to(
         mlx::core::expand_dims(safe_indices, -1),
         Shape{batch, tokens, selected, dimension});
-    auto gathered = mlx::core::astype(
-        mlx::core::take_along_axis(
-            expanded_cache, expanded_indices, 2),
-        mlx::core::float32);
-    auto query_values = mlx::core::astype(
-        mlx::core::transpose(query, {0, 2, 1, 3}),
-        mlx::core::float32);
-    auto scores = mlx::core::sum(
-        mlx::core::expand_dims(query_values, 3) *
-            mlx::core::expand_dims(gathered, 2),
-        -1) * scale;
-    scores = scores + mlx::core::expand_dims(
-        mlx::core::astype(mask, mlx::core::float32), 2);
-    auto sink_values = mlx::core::reshape(
-        mlx::core::astype(sinks, mlx::core::float32),
-        Shape{1, 1, heads});
-    auto maximum = mlx::core::maximum(
-        mlx::core::max(scores, -1), sink_values);
-    auto exponentials = mlx::core::exp(
-        scores - mlx::core::expand_dims(maximum, -1));
-    auto denominator = mlx::core::sum(exponentials, -1) +
-        mlx::core::exp(sink_values - maximum);
-    auto probabilities = exponentials /
-        mlx::core::expand_dims(denominator, -1);
-    return mlx::core::sum(
-        mlx::core::expand_dims(probabilities, -1) *
-            mlx::core::expand_dims(gathered, 2),
-        3);
+    auto gathered = mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
+    return mlx_gathered_mla_attention(query, gathered, mask, sinks, scale, value_dimension);
 }
 
 int checked_grid_product(
@@ -1338,6 +1312,34 @@ array mlx_sparse_indexer_dot_scores(const array& query, const array& pooled_keys
         {{"T", query.dtype()}, {"HEADS", query.shape(2)}, {"DIM", query.shape(3)}}, std::nullopt, false, {}).front();
 }
 
+array mlx_sparse_indexer_head_scores(const array& query, const array& pooled_keys) {
+    if (query.ndim() != 4 || pooled_keys.ndim() != 3 ||
+        query.shape(0) != pooled_keys.shape(0) ||
+        query.shape(3) != pooled_keys.shape(2)) {
+        throw std::invalid_argument("sparse index query and key dimensions disagree");
+    }
+    if (query.shape(1) >= 1 && query.shape(1) <= 8 && query.shape(2) <= 8 &&
+        query.shape(3) >= 4 && query.shape(3) <= 1024 && query.shape(3) % 4 == 0 &&
+        pooled_keys.dtype() == mlx::core::float32)
+        return mlx_sparse_indexer_dot_scores(query, pooled_keys);
+    auto keys = mlx::core::transpose(
+        mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1});
+    return mlx::core::reshape(
+        mlx::core::matmul(
+            mlx::core::reshape(mlx::core::astype(query, mlx::core::float32),
+                Shape{query.shape(0), query.shape(1) * query.shape(2), query.shape(3)}), keys),
+        Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
+}
+
+array mlx_sparse_indexer_weighted_scores(const array& query, const array& pooled_keys, const array& weights) {
+    using namespace mlx::core;
+    if (query.ndim() != 4 || pooled_keys.ndim() != 3 || query.shape(0) != pooled_keys.shape(0) ||
+        query.shape(3) != pooled_keys.shape(2) || weights.shape() != Shape{query.shape(0), query.shape(1), query.shape(2)})
+        throw std::invalid_argument("sparse index weights do not match query heads");
+    return sum(maximum(mlx_sparse_indexer_head_scores(query, pooled_keys), array(0.0f)) *
+        expand_dims(astype(weights, float32), -1), -2);
+}
+
 array mlx_qsa_prefill_attention(
     const array& query,
     const array& key,
@@ -1408,13 +1410,53 @@ array mlx_qsa_prefill_attention(
     return outputs.size() == 1 ? outputs.front() : mlx::core::concatenate(outputs, 1);
 }
 
+array mlx_gathered_mla_attention(const array& query, const array& rows, const array& mask,
+    const array& sinks, float scale, int value_dimension) {
+    if (query.ndim() != 4 || rows.ndim() != 4 || rows.shape(0) != query.shape(0) ||
+        rows.shape(1) != query.shape(2) || rows.shape(3) != query.shape(3) ||
+        mask.shape() != Shape{rows.shape(0), rows.shape(1), rows.shape(2)} ||
+        sinks.size() != static_cast<std::size_t>(query.shape(1)) ||
+        value_dimension <= 0 || value_dimension > rows.shape(3) || !std::isfinite(scale) || scale <= 0)
+        throw std::invalid_argument("invalid gathered sparse MLA geometry");
+    const int batch = query.shape(0), heads = query.shape(1), tokens = query.shape(2);
+    const int selected = rows.shape(2), dimension = rows.shape(3);
+    const bool use_half = rows.dtype() == mlx::core::float16 && value_dimension < dimension &&
+        mlx::core::default_device() == mlx::core::Device::gpu;
+    const auto dtype = use_half ? mlx::core::float16 : mlx::core::float32;
+    auto gathered = mlx::core::astype(rows, dtype);
+    auto query_values = mlx::core::astype(
+        mlx::core::transpose(query, {0, 2, 1, 3}),
+        mlx::core::float32);
+    auto scores = use_half
+        ? mlx::core::astype(mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
+            mlx::core::transpose(gathered, {0, 1, 3, 2})), mlx::core::float32)
+        : mlx::core::matmul(query_values, mlx::core::transpose(gathered, {0, 1, 3, 2})) * scale;
+    scores = scores + mlx::core::expand_dims(
+        mlx::core::astype(mask, mlx::core::float32), 2);
+    auto sink_values = mlx::core::reshape(
+        mlx::core::astype(sinks, mlx::core::float32),
+        Shape{1, 1, heads});
+    auto maximum = mlx::core::maximum(
+        mlx::core::max(scores, -1), sink_values);
+    auto exponentials = mlx::core::exp(
+        scores - mlx::core::expand_dims(maximum, -1));
+    auto denominator = mlx::core::sum(exponentials, -1) +
+        mlx::core::exp(sink_values - maximum);
+    auto probabilities = exponentials /
+        mlx::core::expand_dims(denominator, -1);
+    const auto value = value_dimension == dimension ? gathered :
+        mlx::core::slice(gathered, {0, 0, 0, 0}, {batch, tokens, selected, value_dimension});
+    return mlx::core::astype(mlx::core::matmul(mlx::core::astype(probabilities, dtype), value), mlx::core::float32);
+}
+
 array mlx_sparse_selected_mla_attention(
     const array& query,
     const array& kv_cache,
     const array& selected_indices,
     const array& selected_mask,
     const array& sinks,
-    std::optional<float> scale) {
+    std::optional<float> scale,
+    int value_dimension) {
     const Dtype cache_dtype = kv_cache.dtype() == mlx::core::bfloat16
         ? mlx::core::bfloat16
         : mlx::core::float16;
@@ -1439,20 +1481,24 @@ array mlx_sparse_selected_mla_attention(
     }
     const int heads = selected_query.shape(1);
     const int dimension = selected_query.shape(3);
+    if (!value_dimension) value_dimension = dimension;
+    if (value_dimension < 1 || value_dimension > dimension)
+        throw std::invalid_argument("selected-token sparse MLA value width exceeds the key width");
     const float selected_scale = scale.value_or(
         1.0f / std::sqrt(static_cast<float>(dimension)));
     if (!std::isfinite(selected_scale) || selected_scale <= 0.0f) {
         throw std::invalid_argument(
             "selected-token sparse MLA scale must be finite and positive");
     }
-    if (heads != 64 || dimension != 512) {
+    if (heads != 64 || dimension != 512 || value_dimension != dimension) {
         return generic_selected_mla_attention(
             selected_query,
             selected_cache,
             indices,
             mask,
             sink_logits,
-            selected_scale);
+            selected_scale,
+            value_dimension);
     }
     constexpr int kHeads = 64;
     constexpr int kDimension = 512;

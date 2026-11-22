@@ -569,6 +569,23 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
             config["situ_beta"] = number("activation.situ_beta");
             config["situ_linear_beta"] = number("activation.situ_linear_beta");
             config["final_logit_softcapping"] = number("final_logit_softcapping", 0.0);
+            for (const auto* name : {"num_attention_heads", "num_key_value_heads"}) {
+                const auto heads = config.value(name, json());
+                if (heads.is_array() && !heads.empty() &&
+                    std::all_of(heads.begin(), heads.end(), [&](const json& value) { return value == heads.front(); }))
+                    config[name] = heads.front();
+            }
+            int64_t convolution_elements = 0;
+            for (int64_t visit = 0; visit < plan.execution_layers(); ++visit) {
+                const auto prefix = "model.block." + std::to_string(plan.source_layer(visit)) + ".";
+                for (const auto* name : {"attention.key_conv.weight", "attention.value_conv.weight",
+                                        "attention.output_conv.weight", "mlp.output_conv.weight"}) {
+                    const auto weight = shapes.find(prefix + name);
+                    if (weight != shapes.end() && weight->size() == 2)
+                        convolution_elements += weight->at(0).get<int64_t>() * (weight->at(1).get<int64_t>() - 1);
+                }
+            }
+            config["shortconv_state_elements"] = convolution_elements;
         }
     }
     if (arch == "hy_v4_flash") {
@@ -654,8 +671,22 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         config["linear_value_head_dim"] = number("ssm.state_size", 128);
         config["linear_num_key_heads"] = number("ssm.group_count", 0);
         config["linear_num_value_heads"] = number("ssm.time_step_rank", 0);
-        if (arch == "sensenova_loop")
+        if (arch == "sensenova_loop") {
             config["mtp_use_dedicated_embeddings"] = shapes.contains("predictor.token_embedding.weight");
+            config["rope_parameters"] = {
+                {"rope_type", number("rope.scaling.type", "default")},
+                {"factor", number("rope.scaling.factor", 1.0)},
+                {"original_max_position_embeddings", number("rope.scaling.original_context_length",
+                    config.value("max_position_embeddings", json(0)))},
+            };
+            if (const auto sections = number("rope.dimension_sections"); sections.is_array()) {
+                std::vector<int64_t> active;
+                for (const auto& section : sections)
+                    if (section.get<int64_t>() > 0) active.push_back(section.get<int64_t>());
+                config["rope_parameters"]["mrope_section"] = active;
+                config["rope_parameters"]["mrope_interleaved"] = true;
+            }
+        }
         if (arch == "qwen35") {
             const auto nextn = number("nextn_predict_layers", 0);
             if (!nextn.is_number_integer()) throw std::runtime_error("invalid GGUF NextN layer count");

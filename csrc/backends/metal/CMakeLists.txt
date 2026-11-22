@@ -16,6 +16,8 @@ set(TYLOINFER_METAL_INCLUDE_DIRS
     ${TYLOINFER_METAL_ROOT}/models/deepseek_v41
     ${TYLOINFER_METAL_ROOT}/models/flash_next
     ${TYLOINFER_METAL_ROOT}/models/qwen35
+    ${TYLOINFER_METAL_ROOT}/models/inkling2
+    ${TYLOINFER_METAL_ROOT}/models/hy4
     ${TYLOINFER_METAL_ROOT}/models/minicpmo45
     ${TYLOINFER_METAL_ROOT}/models/nemotron_h
 )
@@ -367,6 +369,7 @@ add_library(mfq-metal-runtime STATIC
     ops/common/mlx_mx.cpp
     ops/tq/mlx_tq.cpp
     ops/common/mlx_sparse_attention.cpp
+    ops/common/mlx_hyper_connection.cpp
     ops/common/mlx_sparse_prefill_tiles.cpp
     ops/common/mlx_csa2.cpp
     ops/common/mlx_dsa_cache_ops.cpp
@@ -389,6 +392,8 @@ add_library(mfq-metal-runtime STATIC
     models/flash_next/qwen4_ops.cpp
     models/minicpmo45/mlx_minicpmo45.cpp
     models/qwen35/mlx_qwen35_causal_lm.cpp
+    models/inkling2/mlx_inkling2.cpp
+    models/hy4/mlx_hy4.cpp
     models/qwen35/mlx_qwen35_full_attention.cpp
     models/qwen35/mlx_qwen35_linear_attention.cpp
     models/qwen35/qwen35_model.cpp

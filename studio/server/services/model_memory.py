@@ -109,16 +109,24 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, pre
             sliding = types.count('sliding_attention')
             indexed = types.count('index_pool_attention')
             full = types.count('full_attention')
-            state('MLA', 'sliding_window', sliding, sliding * min(maximum, window + 7) * width * 2)
-            state('MLA', 'index_pool_pending', indexed, indexed * group_size * index_width * 8)
+            window_rows = min(maximum, window + 7) if cuda else window
+            state('MLA', 'sliding_window', sliding, sliding * window_rows * width * 2)
+            pending_groups = group_size if cuda else group_size - 1
+            state('MLA', 'index_pool_pending', indexed, indexed * pending_groups * index_width * 8)
+            if not cuda:
+                state('MLA', 'indexer_selection', indexed, indexed * token_budget * 4)
             for count, limit in ((indexed, token_budget), (full, None)):
                 if count:
                     components.append(ModelCacheComponent(group='MLA', name='latent_kv', layers=count,
                         bytes_per_row=count * width * 2, max_read_rows_per_token=limit,
-                        head_dimension=integer('kv_lora_rank')))
+                        head_dimension=integer('kv_lora_rank'),
+                        allocation='exact' if cuda else 'power_of_two', minimum_rows=0 if cuda else 16))
             if indexed:
+                row_bytes = (index_width + 2) * 2 if cuda else index_width * 4
                 components.append(ModelCacheComponent(group='MLA', name='index_pool', subgroup='indexer',
-                    layers=indexed, bytes_per_row=indexed * (index_width + 2) * 2, tokens_per_row=group_size))
+                    layers=indexed, bytes_per_row=indexed * row_bytes, tokens_per_row=group_size,
+                    allocation='exact' if cuda else 'power_of_two', minimum_rows=0 if cuda else 16,
+                    row_rounding='ceil' if cuda else 'floor'))
         elif kind == 'inkling2_loop':
             types = text.get('layer_types')
             if (not isinstance(types, list) or len(types) != layers
@@ -130,10 +138,14 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, pre
                 return None
             sliding, full = types.count('sliding_attention'), types.count('full_attention')
             row_bytes = heads * dim * 4
-            state('GQA', 'sliding_window', sliding, sliding * min(maximum, window + 7) * row_bytes)
+            window_rows = min(maximum, window + 7) if cuda else window
+            state('GQA', 'sliding_window', sliding, sliding * window_rows * row_bytes)
+            if include_recurrent and not cuda:
+                state('GQA', 'short_convolution', layers, integer('shortconv_state_elements', 0) * 2)
             if full:
                 components.append(ModelCacheComponent(group='GQA', name='raw_kv', layers=full,
-                    bytes_per_row=full * row_bytes, head_dimension=dim, kv_heads=heads))
+                    bytes_per_row=full * row_bytes, head_dimension=dim, kv_heads=heads,
+                    allocation='exact' if cuda else 'power_of_two', minimum_rows=0 if cuda else 16))
         elif kind in {'qwen4_exp', 'qwen4_exp_text', 'qwen3_5', 'qwen3_5_text', 'qwen3_5_moe', 'qwen3_5_moe_text',
                       'qwen3_next', 'sensenova_loop'}:
             types = text.get('layer_types')

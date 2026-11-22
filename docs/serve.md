@@ -402,6 +402,37 @@ curl -fsS http://127.0.0.1:8080/runtime/generate \
   }'
 ```
 
+### SenseNova Loop-9B and Inkling 2 Mini on Metal
+
+Load the text GGUF with `--model`. Prefix cache saves the attention and
+recurrent state for each pass through the repeated layers. SenseNova Loop-9B
+can use the NextN predictor embedded in its GGUF. Use the per-request
+`enable_mtp` setting to control it.
+
+### Hy4 Flash on Metal
+
+Keep the two numbered GGUF shards in the same directory and pass the first shard
+to the native worker. The worker reads Engram rows from the CPU-mapped second
+shard. Set `TYLOINFER_QSA_KV_BUDGET_BYTES` to enable the shared RAM/SSD store for
+IndexPool and latent KV.
+
+The TurboQuant KV setting compresses the indexed MLA cache and stores pooled
+IndexPool keys in FP16 in GPU memory and in the RAM/SSD store. Index scores and
+incomplete pooling groups use FP32. Set `TYLOINFER_KV_TURBOQUANT_BITS` when
+launching the native worker directly.
+
+To enable DFly2, keep the official BF16 draft shard and its `config.json` in the
+same directory. The per-request `enable_mtp` and `mtp_max_draft_tokens` settings
+control draft use and depth.
+
+```shell
+mfq-decode-metal --server --model /models/Hy4-flash-IQ2_AH-00001-of-00002.gguf \
+  --dfly2-draft /models/hy4-bf16/model-00148-of-00148.safetensors
+```
+
+Studio's `python -m serve --backend metal` accepts the same `--dfly2-draft`
+option for Hy4 Flash workers.
+
 ## Jev decision-model weight placement
 
 For supported CUDA decision models, `--jev-weights stream` is the default.

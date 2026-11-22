@@ -24,24 +24,33 @@ def _configuration(artifact: DiscoveredModel) -> tuple[dict, bool]:
 
 
 def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes: int | None = None,
-    *, maximum_context: int | None = None, cuda: bool = False) -> int:
+    *, maximum_context: int | None = None, cuda: bool = False, packed_kv: bool = False) -> int:
     config, has_predictor = _configuration(artifact)
     text = config.get("text_config", config)
-    if cuda and isinstance(text, dict) and text.get("model_type") == "hy_v4_flash":
+    model_type = text.get("model_type") if isinstance(text, dict) else None
+    if model_type == "hy_v4_flash":
         from server.services.model_memory import cache_profile
-        profile = cache_profile(config, cuda=True)
+        profile = cache_profile(config, cuda=cuda)
         if profile is None or not 512 <= context <= (maximum_context or profile.max_context):
             raise ValueError("IndexPool target context exceeds the model capacity")
         index = next((item for item in profile.components if item.subgroup == 'indexer'), None)
         if index is None:
             raise ValueError("the model has no IndexPool layers")
         width = text['kv_lora_rank'] + text['rotary_dim']
-        staging = max(4096, min(context, text['index_pool']['token_budget']) * width * 2)
-        if budget_bytes is not None and min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < staging:
-            raise ValueError(f"IndexPool KV budget needs at least {staging * 4} bytes for selected rows")
-        return (context + index.tokens_per_row - 1) // index.tokens_per_row * index.bytes_per_row
-    if not isinstance(text, dict) or text.get("model_type") not in {"qwen4_exp", "qwen4_exp_text"}:
-        raise ValueError("KV offload currently supports QSA only")
+        if cuda:
+            staging = max(4096, min(context, text['index_pool']['token_budget']) * width * 2)
+            if budget_bytes is not None and min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < staging:
+                raise ValueError(f"IndexPool KV budget needs at least {staging * 4} bytes for selected rows")
+            return (context + index.tokens_per_row - 1) // index.tokens_per_row * index.bytes_per_row
+        ratio = index.tokens_per_row
+        index_width = text['index_pool']['key_head_dim']
+        buffer = max(4096, width * 4 * ratio * 4, index_width * 16 * 4 * 2)
+        if budget_bytes is not None and min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < buffer:
+            raise ValueError(f"IndexPool KV budget needs at least {buffer * 4} bytes for microblock I/O")
+        key_bytes = 2 if packed_kv else 4
+        return index.layers * (index_width * ((ratio + 5) * 2 + (context // ratio) * key_bytes) + 2)
+    if model_type not in {"qwen4_exp", "qwen4_exp_text"}:
+        raise ValueError("KV offload requires a supported sparse attention model")
 
     def integer(name: str, default: int | None = None) -> int:
         value: Any = text.get(name, default)

@@ -1,5 +1,6 @@
 #include "mlx_qsa_kv_offload.h"
 #include "qwen4_ops.h"
+#include "mlx_sparse_attention.h"
 #include "mlx_resident_budget.h"
 #include "mlx_mtp.h"
 
@@ -345,51 +346,250 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     const auto& state = rows_.view();
     if (static_cast<std::size_t>(count) * state.row_bytes > state.store->config().buffer_bytes / 2)
         throw std::invalid_argument("offloaded QSA index range exceeds read buffer");
+    const auto begin = static_cast<std::size_t>(start), end = begin + count;
+    if (end > state.position) throw std::out_of_range("QSA KV read exceeds its snapshot");
     auto keys = array(mlx::core::allocator::malloc(count * state.row_bytes), Shape{1, count, width_}, dtype_);
-    state.read_rows(start, count, keys.data<std::uint8_t>());
+    auto* output = keys.data<std::uint8_t>();
+    const auto first_block = (begin + state.block_rows - 1) / state.block_rows;
+    const auto stop_block = std::min(end / state.block_rows, state.blocks.size());
+    if (stop_block <= first_block + 1) {
+        state.read_rows(begin, count, output);
+        return keys;
+    }
+    // A scan reads a bounded view once. Coalesce its complete disk blocks
+    // without evicting the hot KV rows selected by preceding queries.
+    const auto first_row = first_block * state.block_rows;
+    const auto stop_row = stop_block * state.block_rows;
+    state.read_rows(begin, first_row - begin, output);
+    std::vector<QsaKvStore::ReadRequest> blocks;
+    blocks.reserve(stop_block - first_block);
+    for (auto block = first_block; block < stop_block; ++block) {
+        const auto offset = block * state.block_rows - begin;
+        blocks.push_back({state.blocks[block], output + offset * state.row_bytes,
+            state.block_rows * state.row_bytes});
+    }
+    state.store->read_into_batch(blocks);
+    state.read_rows(stop_row, end - stop_row, output + (stop_row - begin) * state.row_bytes);
     return keys;
 }
 
-array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int budget) const {
+std::optional<array> MlxQsaIndexOffload::try_view() const {
+    const auto& state = rows_.view();
+    if (!state.position || state.position > state.store->config().buffer_bytes / 2 / state.row_bytes)
+        return std::nullopt;
+    const auto bytes = state.position * state.row_bytes;
+    if (!MlxResidentBudgetScope::permits_optional(bytes)) return std::nullopt;
+    MlxResidentBudgetScope::reserve(bytes);
+    return view(0, position());
+}
+
+array MlxQsaIndexOffload::gather(const array& indices) const {
+    if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
+        indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)
+        throw std::invalid_argument("offloaded indexed rows require int32 [1, query, selection]");
+    auto ids = mlx::core::contiguous(indices);
+    ids.eval();
+    const auto& state = rows_.view();
+    if (ids.size() > std::numeric_limits<std::size_t>::max() / state.row_bytes)
+        throw std::invalid_argument("offloaded indexed row allocation is too large");
+    const auto max_read = std::max<std::size_t>(1, state.store->config().buffer_bytes / 2 / state.row_bytes);
+    const auto size = ids.size() * state.row_bytes;
+    MlxResidentBudgetScope::reserve(size);
+    auto result = array(mlx::core::allocator::malloc(size),
+        Shape{1, ids.shape(1), ids.shape(2), width_}, dtype_);
+    auto* output = result.data<std::uint8_t>();
+    const auto* values = ids.data<std::int32_t>();
+    if (ids.shape(1) > 1) {
+        // Keep one copy of a recalled block while filling every query that
+        // selected it. Nearby queries commonly share most of their history.
+        struct BlockRecall {
+            std::size_t first, last;
+        };
+        const auto no_slot = ids.size();
+        const auto block_count = state.position / state.block_rows + (state.position % state.block_rows != 0);
+        std::vector<BlockRecall> recalls(block_count, {state.position, 0});
+        std::vector<std::size_t> row_slots(state.position, no_slot), next(ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (values[i] < 0) {
+                std::memset(output + i * state.row_bytes, 0, state.row_bytes);
+                continue;
+            }
+            const auto row = static_cast<std::size_t>(values[i]);
+            if (row >= state.position) throw std::invalid_argument("selected offloaded row is outside the cache");
+            auto& recall = recalls[row / state.block_rows];
+            recall.first = std::min(recall.first, row);
+            recall.last = std::max(recall.last, row);
+            next[i] = row_slots[row];
+            row_slots[row] = i;
+        }
+        std::vector<std::uint8_t> block(state.block_rows * state.row_bytes);
+        for (const auto& recall : recalls) {
+            if (recall.first > recall.last) continue;
+            state.read_rows(recall.first, recall.last - recall.first + 1, block.data());
+            for (auto row = recall.first; row <= recall.last; ++row) {
+                const auto* data = block.data() + (row - recall.first) * state.row_bytes;
+                for (auto slot = row_slots[row]; slot != no_slot; slot = next[slot])
+                    std::memcpy(output + slot * state.row_bytes, data, state.row_bytes);
+            }
+        }
+        return result;
+    }
+    for (std::size_t begin = 0; begin < ids.size();) {
+        const auto row = values[begin];
+        if (row < 0) {
+            std::memset(output + begin * state.row_bytes, 0, state.row_bytes);
+            ++begin;
+            continue;
+        }
+        if (row >= position()) throw std::invalid_argument("selected offloaded row is outside the cache");
+        std::size_t count = 1;
+        while (count < max_read && count < ids.size() - begin &&
+            count < static_cast<std::size_t>(position() - row) && values[begin + count] == row + static_cast<int>(count))
+            ++count;
+        state.read_rows(row, count, output + begin * state.row_bytes);
+        begin += count;
+    }
+    return result;
+}
+
+std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& indices, const array* resident, bool allow_remap) const {
+    if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
+        indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)
+        throw std::invalid_argument("offloaded indexed rows require int32 [1, query, selection]");
+    const int queries = indices.shape(1), count = position();
+    if (resident && (resident->shape() != Shape{1, count, width_} || resident->dtype() != dtype_))
+        throw std::invalid_argument("staged QSA rows do not match the offloaded cache");
+    const auto& state = rows_.view();
+    const auto buffer = state.store->config().buffer_bytes / 2;
+    if (queries < 4 || static_cast<std::size_t>(count) > buffer / sizeof(int)) return std::nullopt;
+    const auto dense_limit = std::min(buffer / (state.row_bytes + queries),
+        static_cast<std::size_t>(indices.shape(2)) * 2);
+    const auto row_limit = allow_remap && indices.nbytes() < buffer
+        ? std::max(dense_limit, (buffer - indices.nbytes()) / state.row_bytes) : dense_limit;
+    if (!row_limit) return std::nullopt;
+
+    auto ids = mlx::core::contiguous(indices);
+    ids.eval();
+    const auto* values = ids.data<std::int32_t>();
+    std::vector<int> offsets(count, -1);
+    std::vector<int> selected;
+    selected.reserve(std::min(row_limit, static_cast<std::size_t>(count)));
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const int row = values[i];
+        if (row < 0) continue;
+        if (row >= count) throw std::invalid_argument("selected offloaded row is outside the cache");
+        if (offsets[row] >= 0) continue;
+        if (selected.size() == row_limit) return std::nullopt;
+        offsets[row] = 0;
+        selected.push_back(row);
+    }
+    if (selected.empty()) return std::nullopt;
+    std::sort(selected.begin(), selected.end());
+    const auto width = static_cast<int>(selected.size());
+    const auto row_bytes = selected.size() * state.row_bytes;
+    const bool remapped = selected.size() > dense_limit;
+    const auto selection_bytes = remapped ? indices.nbytes() : selected.size() * queries;
+    MlxResidentBudgetScope::reserve(row_bytes + selection_bytes);
+    auto rows = [&] {
+        if (resident)
+            return mlx::core::take(*resident, array(selected.begin(), {width}, mlx::core::int32), 1);
+        auto staged = array(mlx::core::allocator::malloc(row_bytes), Shape{1, width, width_}, dtype_);
+        for (std::size_t begin = 0; begin < selected.size();) {
+            auto end = begin + 1;
+            while (end < selected.size() && selected[end] == selected[end - 1] + 1) ++end;
+            state.read_rows(selected[begin], end - begin, staged.data<std::uint8_t>() + begin * state.row_bytes);
+            begin = end;
+        }
+        return staged;
+    }();
+    for (std::size_t i = 0; i < selected.size(); ++i) offsets[selected[i]] = static_cast<int>(i);
+
+    if (remapped) {
+        auto selection = array(mlx::core::allocator::malloc(selection_bytes), indices.shape(), mlx::core::int32);
+        auto* slots = selection.data<std::int32_t>();
+        for (std::size_t i = 0; i < ids.size(); ++i) slots[i] = values[i] < 0 ? -1 : offsets[values[i]];
+        return MlxQsaStagedRows{std::move(rows), std::move(selection), true};
+    }
+    auto mask = array(mlx::core::allocator::malloc(selection_bytes), Shape{1, 1, queries, width}, mlx::core::bool_);
+    auto* visible = mask.data<std::uint8_t>();
+    std::memset(visible, 0, selection_bytes);
+    for (int q = 0; q < queries; ++q) {
+        for (int i = 0; i < ids.shape(2); ++i) {
+            const int row = values[std::size_t(q) * ids.shape(2) + i];
+            if (row >= 0) visible[std::size_t(q) * width + offsets[row]] = 1;
+        }
+    }
+    return MlxQsaStagedRows{std::move(rows), std::move(mask)};
+}
+
+array MlxQsaIndexOffload::select(const array& query, int offset, int ratio, int budget,
+    const std::optional<array>& head_weights, bool reserve_current_group) const {
+    if (ratio <= 0 || budget < ratio || offset < 0 || query.ndim() != 4 || query.shape(0) != 1 ||
+        query.shape(1) <= 0 || query.shape(2) <= 0 || query.shape(3) != width_ ||
+        offset >= std::numeric_limits<int>::max() - query.shape(1) ||
+        (head_weights && head_weights->shape() != Shape{1, query.shape(1), query.shape(2)}))
+        throw std::invalid_argument("invalid offloaded sparse index selection");
     const int complete = position();
-    const int count = std::min(complete, budget / ratio);
-    if (count <= 0 || query.ndim() != 4 || query.shape(0) != 1 || query.shape(3) != width_)
-        throw std::invalid_argument("invalid offloaded QSA index selection");
+    const int group_budget = budget / ratio - int(reserve_current_group);
+    const int count = std::min(complete, group_budget);
+    if (count <= 0) {
+        if (reserve_current_group && group_budget >= 0)
+            return mlx::core::reshape(mlx::core::floor_divide(
+                mlx::core::arange(offset, offset + query.shape(1), 1, mlx::core::int32),
+                array(ratio, mlx::core::int32)), Shape{1, query.shape(1), 1});
+        throw std::invalid_argument("offloaded sparse index selection has no visible groups");
+    }
     const auto& state = rows_.view();
     const int key_chunk = static_cast<int>(std::max<std::size_t>(1,
         std::min<std::size_t>(complete, state.store->config().buffer_bytes / 8 / state.row_bytes)));
+    // Reuse each streamed key range across more queries for weighted indexes.
+    const int query_tile = head_weights ? 16 : 8;
     std::vector<array> results;
-    for (int token = 0; token < query.shape(1); token += 8) {
-        const int take = std::min(8, query.shape(1) - token);
-        auto queries = mlx::core::slice(query, Shape{0, token, 0, 0},
-            Shape{1, token + take, query.shape(2), width_});
+    for (int token = 0; token < query.shape(1); token += query_tile) {
+        const int take = std::min(query_tile, query.shape(1) - token);
+        const int first_position = offset + token + int(!reserve_current_group);
         const auto visible = mlx::core::reshape(mlx::core::floor_divide(
-            mlx::core::arange(offset + token + 1, offset + token + take + 1, 1, mlx::core::int32),
+            mlx::core::arange(first_position, first_position + take, 1, mlx::core::int32),
             array(ratio, mlx::core::int32)), Shape{1, take, 1});
-        std::optional<array> scores, indices;
-        for (int start = 0; start < complete; start += key_chunk) {
-            const int length = std::min(key_chunk, complete - start);
-            auto ids = mlx::core::broadcast_to(mlx::core::reshape(
-                mlx::core::arange(start, start + length, 1, mlx::core::int32), Shape{1, 1, length}),
-                Shape{1, take, length});
-            auto values = mlx::core::where(ids < visible,
-                qwen4_qsa_block_scores(queries, view(start, length)), array(-std::numeric_limits<float>::infinity()));
-            if (scores) {
-                values = mlx::core::concatenate({*scores, values}, -1);
-                ids = mlx::core::concatenate({*indices, ids}, -1);
-            }
-            const int keep = std::min(count, values.shape(-1));
-            if (keep < values.shape(-1)) {
-                auto selected = mlx::core::slice(mlx::core::argpartition(-values, keep - 1, -1),
-                    Shape{0, 0, 0}, Shape{1, take, keep});
-                scores = mlx::core::take_along_axis(values, selected, -1);
-                indices = mlx::core::take_along_axis(ids, selected, -1);
-            } else { scores = std::move(values); indices = std::move(ids); }
-            mlx::core::eval(*scores, *indices);
-        }
-        auto canonical = mlx::core::broadcast_to(mlx::core::reshape(
+        const auto canonical = mlx::core::broadcast_to(mlx::core::reshape(
             mlx::core::arange(0, count, 1, mlx::core::int32), Shape{1, 1, count}), Shape{1, take, count});
-        results.push_back(mlx::core::sort(mlx::core::where(visible <= count, canonical, *indices), -1));
+        const int visible_end = std::min(complete, (first_position + take - 1) / ratio);
+        auto selected = canonical;
+        if (visible_end > count) {
+            const auto queries = mlx::core::slice(query, Shape{0, token, 0, 0},
+                Shape{1, token + take, query.shape(2), width_});
+            std::optional<array> weights;
+            if (head_weights)
+                weights = mlx::core::slice(*head_weights, Shape{0, token, 0}, Shape{1, token + take, query.shape(2)});
+            std::optional<array> scores, indices;
+            for (int start = 0; start < visible_end; start += key_chunk) {
+                const int length = std::min(key_chunk, visible_end - start);
+                auto ids = mlx::core::broadcast_to(mlx::core::reshape(
+                    mlx::core::arange(start, start + length, 1, mlx::core::int32), Shape{1, 1, length}),
+                    Shape{1, take, length});
+                const auto keys = view(start, length);
+                auto values = weights ? mlx_sparse_indexer_weighted_scores(queries, keys, *weights)
+                    : qwen4_qsa_block_scores(queries, keys);
+                values = mlx::core::where(ids < visible, values, array(-std::numeric_limits<float>::infinity()));
+                if (scores) {
+                    values = mlx::core::concatenate({*scores, values}, -1);
+                    ids = mlx::core::concatenate({*indices, ids}, -1);
+                }
+                const int keep = std::min(count, values.shape(-1));
+                if (keep < values.shape(-1)) {
+                    const auto ranked = mlx::core::slice(mlx::core::argpartition(-values, keep - 1, -1),
+                        Shape{0, 0, 0}, Shape{1, take, keep});
+                    scores = mlx::core::take_along_axis(values, ranked, -1);
+                    indices = mlx::core::take_along_axis(ids, ranked, -1);
+                } else { scores = std::move(values); indices = std::move(ids); }
+                mlx::core::eval(*scores, *indices);
+            }
+            selected = mlx::core::sort(mlx::core::where(visible <= count, canonical, *indices), -1);
+        }
+        if (reserve_current_group)
+            selected = mlx::core::concatenate({
+                mlx::core::where(selected < visible, selected, array(-1, mlx::core::int32)), visible}, -1);
+        results.push_back(std::move(selected));
     }
     return results.size() == 1 ? results.front() : mlx::core::concatenate(results, 1);
 }

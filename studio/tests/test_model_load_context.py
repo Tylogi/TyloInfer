@@ -80,6 +80,12 @@ def test_hy4_load_plans_latent_kv_and_index_pool_separately():
     assert plan_model_load(artifact, status, **options).usable
 
 
+def test_hy4_load_preserves_the_metal_ssd_kv_selection():
+    request = ModelLoadRequest(model='hy4', context_management={'automatic': False, 'ssd_kv': True})
+    result = apply_load_context(request, 'hy_v4_flash', 'metal')
+    assert result.qsa_kv_offload.enabled and not result.kv_quantization.enabled
+
+
 def test_explicit_settings_survive_context_defaults_and_legacy_requests_are_unchanged():
     legacy = ModelLoadRequest(model='test')
     assert apply_load_context(legacy, 'qwen4_exp', 'cuda') is legacy
@@ -175,3 +181,26 @@ def test_planned_precision_is_applied_to_the_existing_native_configuration():
     sparse = apply_load_context(request, 'qwen4_exp', 'cuda', fixed_qsa=True)
     assert sparse.kv_memory.qsa_mode == 'affine8' and sparse.kv_memory.placement == 'auto_ssd'
     assert not sparse.kv_memory.ram_preallocated
+
+
+def test_hy4_load_plan_accounts_for_packed_latent_and_rotary_coordinates():
+    config = {'model_type': 'hy_v4_flash', 'max_position_embeddings': 16384,
+        'num_hidden_layers': 42, 'layer_types': ['sliding_attention'] * 30 + ['index_pool_attention'] * 12,
+        'kv_lora_rank': 512, 'rotary_dim': 64, 'sliding_window': 512,
+        'index_pool': {'group_size': 4, 'key_head_dim': 128, 'token_budget': 2048}}
+    weights = 4 << 30
+    artifact = SimpleNamespace(resource=SimpleNamespace(complete=True, architecture=config['model_type'],
+        estimated_resident_weight_bytes=weights, estimated_weight_bytes_by_role={}, structured_decisions=False),
+        routed_expert_bytes=0, source_config=config)
+    status = {'backend': 'metal', 'runtime_memory_headroom_bytes': weights + (110 << 20)}
+
+    def plan(precision):
+        return plan_model_load(artifact, status, maximum=16384, requested=8192, reserve=0, precision=precision,
+            preallocate=True, device_id='0', streamed_jev=False)
+
+    raw, packed = plan(None), plan(8)
+    assert raw.precision == 16 and not raw.usable
+    assert packed.precision == 8 and packed.usable and packed.max_context > raw.max_context
+    request = ModelLoadRequest(model='hy4', context_management={'reserve_percent': 10, 'precision': 8})
+    assert apply_load_context(request, 'hy_v4_flash', 'metal').kv_quantization.enabled
+    assert apply_load_context(request, 'hy_v4_flash', 'cuda').kv_quantization.enabled

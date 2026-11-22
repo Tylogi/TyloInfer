@@ -701,6 +701,7 @@ class RuntimePool:
         configured_draft = self.runtime_environment.get("TYLOINFER_DFLASH2_DRAFT")
         draft_path = draft.path if draft is not None else (
             Path(configured_draft) if configured_draft and self.backend in {"cuda", "metal"} and not is_d1_config(artifact.source_config)
+            and artifact.resource.architecture != "hy_v4_flash"
             else None
         )
         if is_d1_config(artifact.source_config):
@@ -744,7 +745,7 @@ class RuntimePool:
             planned_vram_limit = plan.gpu_budget_bytes
             request = request.model_copy(update={"context_size": plan.context_size,
                 "context_management": defaults.model_copy(update={"precision": plan.precision})})
-        from server.runtime.load_context import apply_load_context
+        from server.runtime.load_context import apply_load_context, supports_kv_quantization
         try:
             request = apply_load_context(request, artifact.resource.architecture, self.backend, fixed_qsa=fixed_qsa)
         except ValueError as error:
@@ -776,8 +777,7 @@ class RuntimePool:
                 if (request.kv_memory.placement == 'vram' or request.kv_memory.allocation == 'dynamic'
                         or request.kv_quantization.bits not in {2, 3, 4, 6, 8}):
                     raise _job_error("kv_quantization_unsupported", "Hy4 packed latent KV requires preallocated automatic or RAM placement and a whole-bit precision")
-            elif self.backend not in {"cuda", "metal"} or not architecture.startswith(
-                    ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35", "sensenova_loop")):
+            elif not supports_kv_quantization(architecture, self.backend):
                 raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
         if request.yarn_enabled and (self.backend not in {"cuda", "metal"} or artifact.resource.yarn_context_capacity is None):
             raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
@@ -1288,12 +1288,14 @@ class RuntimePool:
             self.inference_policy = policy.model_copy()
         return self.inference_policy.model_dump()
 
-    async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *, yarn_enabled: bool | None = None) -> int:
+    async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *,
+        yarn_enabled: bool | None = None, packed_kv: bool = False) -> int:
         if self.backend not in {"metal", "cuda"}:
             raise _job_error("qsa_kv_offload_unsupported", "KV offload requires a Metal or CUDA QSA backend")
         try:
             return await asyncio.to_thread(qsa_index_requirement, artifact, policy.target_context,
-                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled), cuda=self.backend == "cuda")
+                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled),
+                cuda=self.backend == "cuda", packed_kv=packed_kv)
         except (ValueError, OSError, KeyError) as error:
             raise _job_error("qsa_kv_configuration_invalid", str(error)) from error
 
@@ -1308,7 +1310,8 @@ class RuntimePool:
         policy = request.qsa_kv_offload
         target = target_context or instance.context_size
         policy = policy.model_copy(update={"target_context": instance.context_size})
-        required = await self._validate_qsa_kv_policy(instance.artifact, policy.model_copy(update={"target_context": target})) if supported else None
+        required = await self._validate_qsa_kv_policy(instance.artifact, policy.model_copy(update={"target_context": target}),
+            packed_kv=request.kv_quantization.enabled) if supported else None
         return {"supported": supported, "architecture": architecture, "policy": policy.model_dump(),
             "required_index_bytes": required, "buffer_bytes": min(QSA_KV_BUFFER_BYTES, policy.budget_bytes // 4),
             "target_context": target, "reason": None if supported else "model_or_backend_unsupported"}
@@ -5025,6 +5028,9 @@ class RuntimePool:
         command.extend(native_gguf_companion_arguments(artifact.path, request.gguf_companions, self.backend))
         if dflash2_path is not None:
             command.extend(["--dflash2-draft", str(dflash2_path)])
+        if self.backend == "metal" and artifact.resource.architecture == "hy_v4_flash":
+            if dfly2_path := self.runtime_environment.get("TYLOINFER_DFLY2_DRAFT"):
+                command.extend(["--dfly2-draft", dfly2_path])
         if request.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
 
