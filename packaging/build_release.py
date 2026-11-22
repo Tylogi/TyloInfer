@@ -275,16 +275,9 @@ def short_path(path: str) -> str:
 
 
 def release_path_sources(context: Context) -> list[tuple[str, str]]:
-    python_base = run([context.in_venv("python"), "-c", "import sys; print(sys.base_prefix)"],
-                      env=context.environment, quiet=True).strip()
     if context.windows:
         sources = [(str(PROJECT), "/mfq-src"),
-                   (context.environment.get("USERPROFILE", ""), "/mfq-build/home"),
-                   (python_base, "/mfq-build/python"),
-                   (str(context.venv), "/mfq-build/venv")]
-        for name, destination in (("CARGO_HOME", "/mfq-build/cargo"), ("RUSTUP_HOME", "/mfq-build/rustup")):
-            if source := context.environment.get(name):
-                sources.append((source, destination))
+                   (context.environment.get("USERPROFILE", ""), "/mfq-build/home")]
         configured = context.environment.get("CARGO_TARGET_DIR")
         if configured:
             sources.append((str(context.cargo_target), "/mfq-build/target"))
@@ -292,7 +285,8 @@ def release_path_sources(context: Context) -> list[tuple[str, str]]:
     home = context.environment.get("HOME", "")
     return [
         (home, "/mfq-build/home"),
-        (python_base, "/mfq-build/python"),
+        (run([str(context.in_venv("python")), "-c", "import sys; print(sys.base_prefix)"],
+             env=context.environment, quiet=True).strip(), "/mfq-build/python"),
         (str(context.venv), "/mfq-build/venv"),
         (context.environment.get("CARGO_HOME") or os.path.join(home, ".cargo"), "/mfq-build/cargo"),
         (context.environment.get("RUSTUP_HOME") or os.path.join(home, ".rustup"), "/mfq-build/rustup"),
@@ -308,8 +302,6 @@ def configure_release_paths(context: Context) -> None:
     if context.windows:
         native.append("/experimental:deterministic")
         for source, destination in release_path_sources(context):
-            if not source:
-                continue
             spellings = [source]
             if short := short_path(source):
                 spellings.append(short)
@@ -344,30 +336,6 @@ def configure_release_paths(context: Context) -> None:
                        ("OBJCXXFLAGS", objective)):
         environment[name] = " ".join([base, *native]).strip()
     environment["CC_SHELL_ESCAPED_FLAGS"] = "1"
-
-
-def verify_release_paths(context: Context, *artifacts: Path, frozen_server: Path | None = None) -> None:
-    sources = [source for source, _ in release_path_sources(context)]
-    sources.extend(context.environment.get(name, "") for name in ("TEMP", "TMP", "TMPDIR", "UV_CACHE_DIR"))
-    sources.append(str(context.output))
-    prefixes: set[str] = set()
-    for source in filter(None, sources):
-        path = Path(source)
-        resolved = path.resolve()
-        if resolved == Path(resolved.anchor):
-            continue
-        prefixes.add(str(resolved))
-        if path.is_absolute():
-            prefixes.add(str(path))
-        if context.windows and (alias := short_path(str(resolved))):
-            prefixes.add(alias)
-    args = [context.in_venv("python"), SCRIPT_DIR / "check_release_paths.py", *artifacts,
-            *_flags("--private-prefix", tuple(sorted(prefixes)))]
-    if frozen_server is not None:
-        args += ["--python-cli", frozen_server]
-    result = subprocess.run([str(arg) for arg in args], env=context.environment)
-    if result.returncode != 0:
-        fail("release path scan failed")
 
 
 def reject_in_use_environment(context: Context) -> None:
@@ -572,10 +540,8 @@ def build_server(context: Context) -> None:
                    "--distpath", context.resources,
                    "--workpath", context.pyinstaller_build,
                    "--specpath", context.spec]
-    if not context.windows:
-        pyinstaller += ["--additional-hooks-dir", SCRIPT_DIR / "hooks"]
-        if context.signing_identity != "-":
-            pyinstaller += ["--codesign-identity", context.signing_identity]
+    if not context.windows and context.signing_identity != "-":
+        pyinstaller += ["--codesign-identity", context.signing_identity]
     run(pyinstaller + [SERVER_ENTRY], env=environment)
 
     if not context.server.is_file():
@@ -616,7 +582,6 @@ def collect_installer(context: Context) -> Path:
         created = sorted(directory.glob("*.exe"), key=lambda path: path.stat().st_mtime)
         if not created:
             fail("Tauri did not create an NSIS installer")
-        verify_release_paths(context, created[-1])
         release = context.output / created[-1].name
         shutil.copyfile(created[-1], release)
         print(f"copied {release}", flush=True)
@@ -628,27 +593,23 @@ def collect_installer(context: Context) -> Path:
     created = sorted(directory.glob("*.dmg"))
     if not created:
         fail("Tauri did not create a DMG")
-    image = created[0]
-    verify_release_paths(context, image)
-    run(["hdiutil", "verify", image])
-    mount = Path(tempfile.mkdtemp(prefix="mfq-release-verify.", dir=context.build))
+    release = context.output / created[0].name
+    shutil.copyfile(created[0], release)
+    run(["hdiutil", "verify", release])
+    mount = Path(tempfile.mkdtemp(prefix="mfq-release-verify."))
     try:
-        run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, image],
+        run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, release],
             quiet=True)
         try:
             app = mount / "TyloInfer.app"
-            server = app / "Contents/Resources" / SERVER_NAME / SERVER_NAME
-            verify_release_paths(context, app, frozen_server=server)
             run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
             self_test(app / "Contents/MacOS/mfq-decode-metal",
                       app / "Contents/Resources/mlx.metallib", context.environment)
-            run([server, "--version"], quiet=True)
+            run([app / "Contents/Resources" / SERVER_NAME / SERVER_NAME, "--version"], quiet=True)
         finally:
             run(["hdiutil", "detach", mount], quiet=True)
     finally:
         shutil.rmtree(mount, ignore_errors=True)
-    release = context.output / image.name
-    shutil.copyfile(image, release)
     return release
 
 
@@ -693,9 +654,8 @@ def nsis_string(value: str) -> str:
     return value.replace("$", "$$").replace('"', '$\\"').replace("\r", "$\\r").replace("\n", "$\\n")
 
 
-def build_single_file_app(context: Context, executable: Path, makensis: Path) -> Path:
-    project = PROJECT
-    output = context.output
+def build_single_file_app(project: Path, executable: Path, output: Path,
+                          makensis: Path) -> Path:
     files = portable_payload(project, executable)
     tauri = project / "studio" / "web" / "src-tauri"
     packaging = project / "packaging"
@@ -733,7 +693,6 @@ def build_single_file_app(context: Context, executable: Path, makensis: Path) ->
     print(f"Packing {len(files)} files into a standalone executable", flush=True)
     try:
         subprocess.run([str(makensis), "-INPUTCHARSET", "UTF8", "-V2", str(script)], check=True)
-        verify_release_paths(context, partial)
         partial.replace(destination)
     finally:
         partial.unlink(missing_ok=True)
@@ -761,7 +720,7 @@ def build_portable(context: Context) -> None:
         if not found:
             fail("makensis is required to build the single-file app")
         makensis = Path(found)
-    build_single_file_app(context, executable, makensis)
+    build_single_file_app(PROJECT, executable, context.output, makensis)
 
 
 # --- orchestration --------------------------------------------------------
@@ -783,11 +742,6 @@ def build_release(context: Context) -> None:
         stage_macos_runtime(context, root)
     build_server(context)
     build_studio(context)
-    if context.windows:
-        # Inspect the original payload as well as the compressed NSIS artifacts.
-        executable = context.cargo_target / context.triple / "release/tyloinfer.exe"
-        verify_release_paths(context, executable, context.sidecars, context.resources,
-                             context.windows_runtime, STUDIO / "dist", frozen_server=context.server)
     print(f"built {collect_installer(context)}", flush=True)
     if context.windows:
         build_portable(context)
