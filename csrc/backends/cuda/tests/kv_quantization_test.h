@@ -3,6 +3,21 @@
 
 void kv_quantization_case() {
     using namespace mfq::cuda;
+    for (int bits:{2,4,8}) {
+        constexpr int latent=512,rotary=64,batch=3,capacity=9;
+        const auto x=cuda_kv_encode(data({batch,capacity,latent},27,.5f),bits,false);
+        const auto y=cuda_kv_encode(data({batch,capacity,rotary},33,.5f),bits,false);
+        auto expected=tb::cat({cuda_kv_decode(x,latent,bits,false),cuda_kv_decode(y,rotary,bits,false)},-1).to(tb::kCPU);
+        auto lengths=tb::tensor(std::vector<int32_t>{2,0,capacity}).to(tb::kCUDA);
+        auto decoded=cuda_kv_decode_mla(tb::cat({x,y},-1),latent,rotary,bits,lengths).to(tb::kCPU);
+        for (int row:{0,2}) {
+            const auto count=row==0?2:capacity;
+            const auto a=expected.select(0,row).narrow(0,0,count);
+            const auto b=decoded.select(0,row).narrow(0,0,count);
+            if (std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes())!=0)
+                throw std::runtime_error("Compact MLA dequantization changed a populated row");
+        }
+    }
     for(double bits:{2.,2.5,3.,3.5,4.,6.,8.})for(int d:{8,64,128,256,384,512}) {
         constexpr int b=2,h=6,kh=2,t=3,length=513;
         KvQuantization quant{bits};

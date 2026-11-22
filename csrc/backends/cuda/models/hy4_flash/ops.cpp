@@ -71,12 +71,9 @@ struct Shared {
             cuda_kv_encode(rows.narrow(-1,config.kv_rank,config.metadata.rotary_dim),cold_bits,false)},-1);
     }
 
-    Tensor decode_kv(const Tensor& rows) const {
+    Tensor decode_kv(const Tensor& rows,const Tensor& lengths={}) const {
         if (!cold_bits) return rows;
-        const auto latent=cuda_kv_packed_width(int(config.kv_rank),cold_bits);
-        return tb::cat({cuda_kv_decode(rows.narrow(-1,0,latent),int(config.kv_rank),cold_bits,false),
-            cuda_kv_decode(rows.narrow(-1,latent,rows.size(-1)-latent),int(config.metadata.rotary_dim),
-                cold_bits,false)},-1);
+        return cuda_kv_decode_mla(rows,int(config.kv_rank),int(config.metadata.rotary_dim),cold_bits,lengths);
     }
     std::vector<mfq::models::deepseek_v41::EngramHashSnapshot> batch_hashes;
     std::vector<uint8_t> active_rows;
@@ -103,7 +100,7 @@ struct Hy4Block final : Block {
     Tensor kv,records,pending_values,pending_logits;
     std::vector<std::unique_ptr<KvOffloadSequence>> sequences;
     struct ColdStage {
-        Tensor rows,indices,host_indices,host_positions;
+        Tensor rows,indices,lengths,metadata,host_metadata,host_positions;
         std::shared_ptr<KvOffloadStore::GatherWorkspace> gather;
         std::vector<std::vector<int64_t>> requested;
         std::vector<KvOffloadSequence::GatherSlice> slices;
@@ -191,15 +188,17 @@ struct Hy4Block final : Block {
     }
 
     Tensor staged_cold_attention(const Tensor& query,const Tensor& rows,const Tensor& indices,
-        const Tensor& positions,double scale,DecodeWindow* window) {
+        const Tensor& positions,int64_t planned,double scale,DecodeWindow* window) {
         const auto batch=rows.size(0),tokens=rows.size(1),width=rows.size(2);
-        const auto capacity=tokens*indices.size(2);
+        const auto slots=tokens*indices.size(2),capacity=std::min(slots,planned);
         const auto make_stage=[&] {
             ResidentAllocationScope resident;
             auto stage=std::make_shared<ColdStage>();
             stage->rows=tb::empty(rows.sizes(),rows.options());
-            stage->indices=tb::zeros(indices.sizes(),indices.options());
-            stage->host_indices=tb::empty(indices.sizes(),indices.options().device(tb::kCPU).pinned_memory(true));
+            stage->metadata=tb::zeros({indices.numel()+batch},indices.options());
+            stage->indices=stage->metadata.narrow(0,0,indices.numel()).reshape(indices.sizes());
+            stage->lengths=stage->metadata.narrow(0,indices.numel(),batch);
+            stage->host_metadata=tb::empty(stage->metadata.sizes(),indices.options().device(tb::kCPU).pinned_memory(true));
             stage->host_positions=tb::empty(positions.sizes(),positions.options().device(tb::kCPU).pinned_memory(true));
             stage->gather=state->offload->gather_workspace(batch*capacity,width,rows.scalar_type());
             stage->requested.resize(batch);
@@ -209,21 +208,24 @@ struct Hy4Block final : Block {
         std::shared_ptr<ColdStage> stage;
         if (window) stage=window->workspace<ColdStage>(this,make_stage);
         else {
-            if (!eager_cold || eager_cold->indices.sizes()!=indices.sizes()) eager_cold=make_stage();
+            if (!eager_cold || eager_cold->indices.sizes()!=indices.sizes() ||
+                eager_cold->gather->rows.size(0)!=batch*capacity) eager_cold=make_stage();
             stage=eager_cold;
         }
         stage->rows.copy_(rows);
         const auto stream=mfq_current_cuda_stream();
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(stage->host_indices.data_ptr(),indices.data_ptr(),indices.nbytes(),cudaMemcpyDeviceToHost,stream));
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(stage->host_metadata.data_ptr(),indices.data_ptr(),indices.nbytes(),cudaMemcpyDeviceToHost,stream));
         TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(stage->host_positions.data_ptr(),positions.data_ptr(),positions.nbytes(),cudaMemcpyDeviceToHost,stream));
-        const auto gather=[this,stage,batch,tokens,capacity,stream] {
-            auto* selected=stage->host_indices.data_ptr<int32_t>();
+        const auto gather=[this,stage,batch,tokens,slots,capacity,stream] {
+            auto* selected=stage->host_metadata.data_ptr<int32_t>();
+            auto* lengths=selected+batch*slots;
             const auto* offsets=stage->host_positions.data_ptr<int64_t>();
             stage->slices.clear();
             for (int64_t row=0;row<batch;++row) {
-                auto* ids=selected+row*capacity;
+                auto* ids=selected+row*slots;
                 if (!state->active_rows.empty() && !state->active_rows.at(row)) {
-                    std::fill_n(ids,capacity,-1);
+                    std::fill_n(ids,slots,-1);
+                    lengths[row]=0;
                     continue;
                 }
                 auto& sequence=*sequences.at(row);
@@ -233,29 +235,31 @@ struct Hy4Block final : Block {
                 auto& requested=stage->requested[row];
                 requested.clear();
                 if (tokens==1) {
-                    for (int64_t i=0;i<capacity;++i) if (ids[i]>=0) {
+                    for (int64_t i=0;i<slots;++i) if (ids[i]>=0) {
                         requested.push_back(ids[i]);
                         ids[i]=int32_t(requested.size()-1);
                     }
                 } else {
                     std::unordered_map<int32_t,int32_t> compact;
-                    for (int64_t i=0;i<capacity;++i) if (ids[i]>=0) {
+                    for (int64_t i=0;i<slots;++i) if (ids[i]>=0) {
                         const auto [slot,added]=compact.try_emplace(ids[i],int32_t(requested.size()));
                         if (added) requested.push_back(ids[i]);
                         ids[i]=slot->second;
                     }
                 }
+                if (int64_t(requested.size())>capacity) throw std::logic_error("Hy4 selected KV exceeds its compact workspace");
+                lengths[row]=int32_t(requested.size());
                 stage->slices.push_back({&sequence,requested,row*capacity});
             }
             if (!stage->slices.empty()) stage->slices.front().sequence->gather_into(stage->slices,*stage->gather);
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(stage->indices.data_ptr(),selected,stage->indices.nbytes(),cudaMemcpyHostToDevice,stream));
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(stage->metadata.data_ptr(),selected,stage->metadata.nbytes(),cudaMemcpyHostToDevice,stream));
         };
         if (window) window->host_barrier(gather);
         else {
             TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
             gather();
         }
-        auto selected=state->decode_kv(stage->gather->rows.reshape({batch,capacity,width}));
+        auto selected=state->decode_kv(stage->gather->rows.reshape({batch,capacity,width}),stage->lengths);
         return attention_mla_latent_selected_cuda(query,selected,stage->indices,sinks,scale);
     }
 
@@ -464,7 +468,7 @@ struct Hy4Block final : Block {
         auto result=[&] {
             if (!offloaded) return attention_mla_latent_selected_cuda(q,kv,selected,sinks,scale);
             auto* window=DecodeWindow::recording();
-            if (window || b>1) return staged_cold_attention(q,state->encode_kv(rows),selected,positions,scale,window);
+            if (window || b>1) return staged_cold_attention(q,state->encode_kv(rows),selected,positions,planned,scale,window);
             return cold_attention(q,rows,selected,start,scale);
         }();
         result=tb::matmul(result.transpose(1,2).to(value_b.scalar_type()),value_b.transpose(1,2))

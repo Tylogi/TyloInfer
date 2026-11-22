@@ -372,6 +372,9 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
     const auto draft_ms=std::chrono::duration<double,std::milli>(mfq::engine::Clock::now()-draft_started).count();
     for (const auto& proposal:drafts) if (proposal.request && proposal.depth>0)
         proposal.request->mtp_stats.head_ms+=draft_ms;
+    const bool full_verification=std::all_of(slots_.begin(),slots_.end(),[&](const auto* request) {
+        return request && request->eligible && int64_t(drafts[request->slot].tokens.size())+1==width;
+    });
     const std::span<const int64_t> host_ids{data,size_t(batch*width)};
     const std::span<const int64_t> host_positions{positions,size_t(batch*width)};
     if constexpr (std::is_same_v<Model,Hy4CausalLm>) {
@@ -428,7 +431,10 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         if (returned) restore_routed_decode_workspace_after_capture(execution_);
         ++graph_captures_;
     }
-    RoutedCacheLearningScope learning(execution_,false);
+    RoutedSpeculativeRoutes routes;
+    std::optional<RoutedCacheLearningScope> ignore_padding;
+    if (full_verification) routes.begin(execution_,int(batch*width));
+    else ignore_padding.emplace(execution_,false);
     graph->window->run();
     ++graph_replays_;
     const auto candidates=rank_cuda_batch_logits(graph->logits,top_k);
@@ -482,6 +488,7 @@ StatefulCudaBatchOperations<Model,Adapter>::verify_speculative(State& state) {
         hy4::retain_batch_prefix(model_,graph->journals,lengths_kept,host_positions,kept,width);
         hy4::commit_batch_engram(model_,host_ids,host_positions,kept,width);
     } else inkling::retain_batch_prefix(model_,graph->journals,lengths_kept);
+    if (full_verification) routes.resolve(int(std::accumulate(kept.begin(),kept.end(),int64_t(0))),false);
     speculation_.observe(int(width-1),observed,cycle_start,graph_ready,!state.prefilling.empty());
     const auto parked_after=speculation_.parked_rounds();
     const auto cycle_ms=std::chrono::duration<double,std::milli>(CudaBatchSpeculation::Clock::now()-cycle_start).count();
