@@ -127,9 +127,11 @@ ctest --test-dir build
 pnpm --dir studio/web install --frozen-lockfile
 pnpm --dir studio/web test
 
-# DSH plugins
-node --test plugins/host/tests/*.test.mjs
-npm --prefix plugins/studio test
+# DSH plugin workspace
+npm --prefix plugins ci
+npm --prefix plugins run build
+npm --prefix plugins run typecheck
+node --test plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
 ```
 
 The C++ cases under `csrc/tests/` run anywhere; the CUDA and Metal cases need that hardware. Full notes are in the [build guide](docs/build.md#testing).

@@ -105,7 +105,7 @@ def test_page_bridge_real_api_registration_analysis_policies_and_controlled_down
     thread.start()
     try:
         assert ready.wait(10), "controlled page API did not start"
-        subprocess.run([node, "plugins/host/tests/page-api-smoke.mjs", f"http://127.0.0.1:{port}"], cwd=root, check=True, timeout=30)
+        subprocess.run([node, "plugins/src/host/tests/page-api-smoke.ts", f"http://127.0.0.1:{port}"], cwd=root, check=True, timeout=30)
         assert [item["repo_id"] for item in downloads] == ["example/success", "example/pending"]
         assert [item[0] for item in hub.calls] == ["search", "info", "official"]
         assert not runtime._instances

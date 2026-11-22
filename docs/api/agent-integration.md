@@ -1,6 +1,6 @@
 # Agent integration
 
-The supported Agent product uses the complete official DSH Host plus external TyloInfer Host and Client plugins. Start it through the independent [Host launcher](../agent-host.md). Native sessions, settings, permissions, providers and credentials remain owned by DSH.
+The supported Agent product uses the complete official DSH Host plus the TyloInfer plugin bundle, which contains both Host and Client. Start it with the official `dsh` CLI as described in [Host startup](../agent-host.md). Native sessions, settings, permissions, providers and credentials remain owned by DSH.
 
 The Python inference core remains a separate HTTP service and does not require the Python DSH SDK. Legacy SDK task and settings carriers are not part of this product. Existing user data is not automatically converted into native DSH sessions.
 

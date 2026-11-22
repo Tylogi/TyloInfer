@@ -57,7 +57,7 @@ def test_model_details_bridge_reads_native_profiles_and_directories_without_load
     try:
         assert ready.wait(10), "model detail fixture API did not start"
         subprocess.run(
-            [node, "plugins/host/tests/model-details-api-smoke.mjs", f"http://127.0.0.1:{port}", known_id, unknown_id],
+            [node, "plugins/src/host/tests/model-details-api-smoke.ts", f"http://127.0.0.1:{port}", known_id, unknown_id],
             cwd=root, check=True, timeout=30,
         )
         assert backend.calls == []

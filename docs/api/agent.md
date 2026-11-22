@@ -1,14 +1,14 @@
 # Agent integration
 
-The TyloInfer Agent product runs the complete official DSH Host with external TyloInfer Host and Client plugins. Use the independent [Host launcher](../agent-host.md); native sessions, tasks, settings, providers, permissions and credentials belong to DSH. The inference core remains a separate HTTP service and does not require the Python DSH SDK.
+The TyloInfer Agent product runs the complete official DSH Host with the TyloInfer plugin bundle, which contains both Host and Client. Start it with the official `dsh` CLI as described in [Host startup](../agent-host.md); native sessions, tasks, settings, providers, permissions and credentials belong to DSH. The inference core remains a separate HTTP service and does not require the Python DSH SDK.
 
 ## Retired Python facade
 
-The earlier `/api/v1/agent` task and display-settings facade is no longer mounted by the inference core. Its source was moved outside the inference package to a non-distributed compatibility-test directory under `plugins/host/legacy-python/`. It is not an alternative shipping Agent implementation and is excluded from the Host bundle's package file list.
+The earlier `/api/v1/agent` task and display-settings facade is no longer mounted by the inference core, and its source is no longer kept in this repository. It is not an alternative shipping Agent implementation.
 
 The former `agent` Python extra and instructions to start a second SDK settings carrier do not apply to the supported product. Core health, inference, model management, jobs, sessions and standalone Studio APIs remain independent of DSH. Native Agent access uses the authenticated Host entry, not the core origin.
 
-No existing Agent database, settings profile, credential or native Host session is moved, deleted or automatically converted by this change. Source relocation is not a data migration. Earlier facade regression tests opt in to its compatibility factory; they are not evidence that the core still publishes those routes.
+No existing Agent database, settings profile, credential or native Host session is moved, deleted or automatically converted by this change. Deleting the source is not a data migration. Nothing in this repository now publishes, imports or tests that facade.
 
 ## Standalone Studio
 

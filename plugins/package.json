@@ -1,0 +1,63 @@
+{
+  "name": "@tyloinfer/dsh-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TyloInfer inference provider and Web Client for DeepSeek Harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-rc.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/host/index.d.ts",
+      "default": "./lib/host/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./src/host/locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src/host/locale",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.host.json && node build.mts",
+    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.19.0"
+  },
+  "devDependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "dompurify": "3.4.16",
+    "marked": "18.0.11",
+    "postcss": "8.5.32",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.1"
+  }
+}

@@ -134,7 +134,7 @@ def test_model_actions_bridge_real_api_with_isolated_deletion_and_controlled_wor
     thread.start()
     try:
         assert ready.wait(10), "model action fixture API did not start"
-        subprocess.run([node, "plugins/host/tests/model-actions-api-smoke.mjs", f"http://127.0.0.1:{port}",
+        subprocess.run([node, "plugins/src/host/tests/model-actions-api-smoke.ts", f"http://127.0.0.1:{port}",
             artifact_id, str(failed.id)], cwd=root, check=True, timeout=30)
         assert runtime.policy_updates == [{"pinned": True, "idle_ttl_seconds": None}]
         assert len(runtime.context_updates) == 1

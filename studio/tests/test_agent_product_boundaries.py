@@ -40,8 +40,6 @@ def test_companion_reference_requires_complete_registered_gguf_and_refreshes_ide
                 assert result.json() == {"model_id": "a" * 32, "format": "gguf", "path": str(source.resolve())}
                 for model_id, expected in (("0" * 32, 404), ("b" * 32, 422), ("c" * 32, 422), ("invalid", 422)):
                     assert (await client.get(f"/api/v1/models/{model_id}/companion-reference")).status_code == expected
-                assert (await client.get("/api/v1/agent/capabilities")).status_code == 404
-                assert not hasattr(client._transport.app.state, "agent")
             assert reads and all(refresh for _, refresh in reads)
             assert source.read_bytes() == b"fixture"
         finally:

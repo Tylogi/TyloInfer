@@ -62,7 +62,7 @@ def test_model_bridge_real_api_tickets_completion_cancel_and_validation(tmp_path
         assert ready.wait(10), "controlled core API did not start"
         root = Path(__file__).resolve().parents[2]
         subprocess.run(
-            [node, "plugins/host/tests/core-api-smoke.mjs", f"http://127.0.0.1:{port}"],
+            [node, "plugins/src/host/tests/core-api-smoke.ts", f"http://127.0.0.1:{port}"],
             cwd=root, check=True, timeout=30,
         )
         assert [item["model"] for item in runtime.loads] == ["bridge-fixture-success", "bridge-fixture-pending"]

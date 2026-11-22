@@ -127,9 +127,11 @@ ctest --test-dir build
 pnpm --dir studio/web install --frozen-lockfile
 pnpm --dir studio/web test
 
-# DSH 插件
-node --test plugins/host/tests/*.test.mjs
-npm --prefix plugins/studio test
+# DSH 插件工作区
+npm --prefix plugins ci
+npm --prefix plugins run build
+npm --prefix plugins run typecheck
+node --test plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
 ```
 
 `csrc/tests/` 下的 C++ 用例任意机器都能跑；CUDA 与 Metal 用例需要对应硬件。详见[构建指南](docs/build.md#testing)。

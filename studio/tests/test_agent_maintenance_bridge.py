@@ -124,7 +124,7 @@ def test_maintenance_bridge_real_api_scope_partial_failure_directory_and_events(
     thread.start()
     try:
         assert ready.wait(10), "maintenance fixture API did not start"
-        subprocess.run([node, "plugins/host/tests/maintenance-api-smoke.mjs", f"http://127.0.0.1:{port}", str(fixture_job.id)], cwd=root, check=True, timeout=30)
+        subprocess.run([node, "plugins/src/host/tests/maintenance-api-smoke.ts", f"http://127.0.0.1:{port}", str(fixture_job.id)], cwd=root, check=True, timeout=30)
         assert backend.controls == [("clear", INSTANCE_ID), ("trim", INSTANCE_ID, 0)]
         assert image_releases == [True]
         assert backend.calls == [] and not pool._instances
