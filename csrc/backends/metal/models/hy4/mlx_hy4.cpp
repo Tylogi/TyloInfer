@@ -38,11 +38,15 @@ array rms(const array& input, float eps) {
     return fast::rms_norm(input, std::nullopt, eps);
 }
 
-array rotate(const array& x, const array& positions, float base) {
-    const int dim = x.shape(-1);
-    auto inverse = exp(astype(arange(0, dim, 2, int32), float32) * (-std::log(base) / dim));
+struct RotaryPhases {
+    array cosine, sine;
+    array operator()(const array& values) const { return mlx_rope_adjacent(values, cosine, sine); }
+};
+
+RotaryPhases rotary_phases(const array& positions, int dim, float base) {
+    const auto inverse = exp(astype(arange(0, dim, 2, int32), float32) * (-std::log(base) / dim));
     const auto angle = expand_dims(astype(positions, float32), -1) * inverse;
-    return mlx_rope_adjacent(x, cos(angle), sin(angle));
+    return {cos(angle), sin(angle)};
 }
 
 struct Geometry {
@@ -315,11 +319,11 @@ struct VerifiedLayerRows {
     std::optional<array> old_window, new_window, index_pairs, selections;
 };
 
-array trailing_rope(const array& values, const array& positions, int rotary, float base) {
+array trailing_rope(const array& values, const RotaryPhases& phases, int rotary) {
     const int unrotated = values.shape(-1) - rotary;
-    if (unrotated == 0) return rotate(values, positions, base);
+    if (unrotated == 0) return phases(values);
     return concatenate({axis_slice(values, -1, 0, unrotated),
-        rotate(axis_slice(values, -1, unrotated, values.shape(-1)), positions, base)}, -1);
+        phases(axis_slice(values, -1, unrotated, values.shape(-1)))}, -1);
 }
 
 array latent_attention(const array& query, const array& rows, const array& sinks,
@@ -376,7 +380,7 @@ array sliding_attention(MlxHy4AttentionCache& cache, const Geometry& g, const ar
 }
 
 void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
-    const array& input, int position, VerifiedLayerRows* verified) {
+    const array& input, const std::optional<RotaryPhases>& pool_phases, VerifiedLayerRows* verified) {
     const int width = g.index_width;
     const auto key = index.key_norm(index.key(input));
     auto pairs = concatenate({astype(index.value(key), float32), astype(index.gate(key), float32)}, -1);
@@ -396,9 +400,7 @@ void append_index_pool(MlxHy4AttentionCache& cache, const IndexPool& index, cons
     const auto gates = axis_slice(groups, -1, width, 2 * width);
     const auto masses = softmax(gates + index.positions, 2);
     const auto pooled = index.pool_norm(sum(masses * values, 2), float32);
-    const int first = position - position % g.group_size;
-    const auto positions = arange(first, first + split, g.group_size, int32);
-    const auto rotated = astype(trailing_rope(pooled, positions, g.rotary, g.rotary_base), g.index_pool_dtype());
+    const auto rotated = astype(trailing_rope(pooled, *pool_phases, g.rotary), g.index_pool_dtype());
     if (cache.offloaded_groups) cache.offloaded_groups->append(rotated);
     else cache.groups->append(rotated);
 }
@@ -435,8 +437,9 @@ array token_selection(const array& groups, const Geometry& g, int position) {
 
 array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
     const array& query, const array& latent, const array& input, const array& query_low,
-    const array& positions, const array& sinks, int position, float scale,
-    const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
+    const RotaryPhases& phases, const std::optional<RotaryPhases>& pool_phases,
+    const array& sinks, int position, float scale, const std::shared_ptr<QsaKvStore>& offload,
+    VerifiedLayerRows* verified) {
     const int count = latent.shape(1), end = position + count;
     const auto stored = g.indexed_kv.pack(latent);
     if (!cache.latent && !cache.offloaded_latent) {
@@ -450,7 +453,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     }
     if (cache.offloaded_latent) cache.offloaded_latent->append(stored);
     else cache.latent->append(stored);
-    append_index_pool(cache, index, g, input, position, verified);
+    append_index_pool(cache, index, g, input, pool_phases, verified);
 
     if (end <= g.index_budget) {
         cache.last_indices = reshape(arange(0, end, 1, int32), {1, 1, end});
@@ -462,7 +465,7 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
 
     const float weight_scale = 1.0f / std::sqrt(float(g.index_heads * g.index_width));
     const auto iq = trailing_rope(reshape(index.query(query_low), {1, count, g.index_heads, g.index_width}),
-        positions, g.rotary, g.rotary_base);
+        phases, g.rotary);
     const auto head_weights = astype(index.weights(input), float32) * weight_scale;
     const auto& quantization = g.indexed_kv.quantization;
     std::optional<array> resident;
@@ -527,17 +530,17 @@ struct MlaRows {
 };
 
 template <class Attention>
-MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const array& positions, float base) {
+MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const RotaryPhases& phases) {
     const int count = in.shape(1), plain = g.q_dim - g.rotary;
     const auto projected = layer.projections(in);
     auto low = layer.query_norm(projected[0]);
     const auto q = reshape(layer.query_b(low), {1, count, layer.heads, g.q_dim});
     const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
     const auto absorbed = matmul(astype(no_rope, layer.key_absorption.dtype()), layer.key_absorption);
-    const auto rope_q = transpose(rotate(axis_slice(q, -1, plain, g.q_dim), positions, base), {0, 2, 1, 3});
+    const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
     auto query = concatenate({absorbed, astype(rope_q, float32)}, -1);
     const auto latent = concatenate({layer.latent_norm(axis_slice(projected[1], -1, 0, g.kv_rank), float32),
-        astype(rotate(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary), positions, base), float32)}, -1);
+        astype(phases(axis_slice(projected[1], -1, g.kv_rank, g.kv_rank + g.rotary)), float32)}, -1);
     return {std::move(query), astype(latent, float16), std::move(low), projected[2]};
 }
 
@@ -551,20 +554,21 @@ array expand_mla(const Attention& layer, const Geometry& g, const array& attenti
 }
 
 array run_layer(const Layer& layer, const Geometry& g, MlxHy4AttentionCache& cache, array streams,
-    const std::optional<array>& engram, const array& positions, int offset,
+    const std::optional<array>& engram, const RotaryPhases& phases,
+    const std::optional<RotaryPhases>& pool_phases, int offset,
     const std::shared_ptr<QsaKvStore>& offload, VerifiedLayerRows* verified) {
     if (engram) streams = (*layer.engram)(streams, *engram, g);
     const auto mix = layer.attention_hc.collapse(streams);
     const auto in = layer.attention_norm(mix.branch);
-    const auto rows = project_mla(layer, g, in, positions, layer.sliding ? g.window_rotary_base : g.rotary_base);
+    const auto rows = project_mla(layer, g, in, phases);
     if (verified && layer.sliding) {
         verified->old_window = cache.window;
         verified->new_window = rows.latent;
     }
     const float scale = 1.0f / std::sqrt(float(g.q_dim));
     const auto attention = layer.sliding ? sliding_attention(cache, g, rows.query, rows.latent, layer.sinks, offset, scale)
-        : run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent, in, rows.query_low, positions, layer.sinks,
-            offset, scale, offload, verified);
+        : run_indexed_attention(cache, *layer.index, g, rows.query, rows.latent, in, rows.query_low, phases, pool_phases,
+            layer.sinks, offset, scale, offload, verified);
     const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
     streams = MlxHyperConnection::expand(streams, attn_out, mix);
     const auto ffn_mix = layer.ffn_hc.collapse(streams);
@@ -627,9 +631,9 @@ struct DflyLayer {
         return contiguous(astype(weight, float16));
     }
 
-    array operator()(const Geometry& g, const array& input, const array& positions,
+    array operator()(const Geometry& g, const array& input, const RotaryPhases& phases,
         const array& history, const array& valid) const {
-        const auto rows = project_mla(*this, g, attention_norm(input), positions, g.rotary_base);
+        const auto rows = project_mla(*this, g, attention_norm(input), phases);
         const auto keys = concatenate({history, rows.latent}, 1);
         const int count = input.shape(1);
         auto relative = arange(0, count, 1, int32);
@@ -697,7 +701,7 @@ struct DflyDraft {
             fuse(concatenate({embedding_norm(anchor), target_norm(*cache.last_hidden)}, -1));
         auto hidden = concatenate({corrected_anchor, axis_slice(embeds, 1, 1, depth + 1)}, 1);
         const int position = cache.position;
-        const auto positions = arange(position, position + 1 + depth, 1, int32);
+        const auto phases = rotary_phases(arange(position, position + 1 + depth, 1, int32), g.rotary, g.rotary_base);
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& cached = cache.layers[target_layers[i]];
             auto selected = *cache.layers[index_layers[i]].last_indices;
@@ -711,7 +715,7 @@ struct DflyDraft {
             auto history = cached.offloaded_latent ? reshape(cached.offloaded_latent->gather(selected), shape)
                 : take(cached.latent->view(), reshape(maximum(selected, array(0, int32)), {-1}), 1);
             auto valid = reshape(selected >= array(0, int32), {1, selected.shape(-1)});
-            hidden = layers[i](g, hidden, positions, g.indexed_kv.unpack(history), valid);
+            hidden = layers[i](g, hidden, phases, g.indexed_kv.unpack(history), valid);
         }
         hidden = output_norm(hidden);
         for (int i = 1; i <= depth; ++i) {
@@ -855,6 +859,16 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
     const int count = tokens.shape(1), offset = cache.position;
     if (cache.layers.empty()) cache.layers.resize(g.layers);
     const auto positions = arange(offset, offset + count, 1, int32);
+    const auto indexed_phases = rotary_phases(positions, g.rotary, g.rotary_base);
+    const auto window_phases = rotary_phases(positions, g.rotary, g.window_rotary_base);
+    // Pool groups use the same absolute positions in every indexed layer.
+    const int first_group = offset - offset % g.group_size;
+    const int complete = (offset + count - first_group) / g.group_size;
+    std::optional<RotaryPhases> pool_phases;
+    if (complete) {
+        const auto groups = arange(first_group, first_group + complete * g.group_size, g.group_size, int32);
+        pool_phases = rotary_phases(groups, g.rotary, g.rotary_base);
+    }
     auto hidden = w.token_embedding(tokens, bfloat16);
     auto streams = broadcast_to(expand_dims(hidden, 2), {1, count, g.streams, g.hidden});
     if (verification) {
@@ -874,8 +888,9 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
     for (int layer = 0; layer < g.layers; ++layer) {
         std::optional<array> rows;
         if (w.layers[layer].engram) rows = w.engram->gather(layer, history, first);
+        const auto& phases = g.sliding[layer] ? window_phases : indexed_phases;
         streams = run_layer(w.layers[layer], g, cache.layers[layer], std::move(streams), rows,
-            positions, offset, w.offload, verification ? &verification->layers[layer] : nullptr);
+            phases, pool_phases, offset, w.offload, verification ? &verification->layers[layer] : nullptr);
     }
     if (w.engram) {
         const auto keep = std::min(history.size(), std::size_t(w.engram->grams - 1));
