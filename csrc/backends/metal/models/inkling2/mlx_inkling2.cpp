@@ -474,7 +474,7 @@ array mix_stream(const array& mixed, int stream) {
 }
 
 array attention_rows(const array& query, const array& key, const array& value,
-    const array& table, const array& key_pos, int offset, int window, float scale) {
+    const array& table, const array& sink_logits, const array& key_pos, int offset, int window, float scale) {
     const int batch = query.shape(0), heads = query.shape(1), rows = query.shape(2);
     const int keys = key.shape(2);
     const auto sinks = zeros({heads}, query.dtype());
@@ -488,7 +488,7 @@ array attention_rows(const array& query, const array& key, const array& value,
             std::max(0, keys - rows + first - window + 1) : 0;
         const int key_end = window && rows > 1 ? keys - rows + last : keys;
         const auto selected_positions = slice(key_pos, {key_start}, {key_end});
-        auto scores = mlx_attention_relative_bias(bias, selected_positions, first, last - first,
+        auto scores = mlx_attention_relative_bias(bias, sink_logits, selected_positions, first, last - first,
             offset + first, window, query.dtype());
         const auto q = slice(query, {0, 0, first, 0}, {batch, heads, last, query.shape(3)});
         const auto k = slice(key, {0, 0, key_start, 0}, {key.shape(0), key.shape(1), key_end, key.shape(3)});
@@ -556,10 +556,7 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
         q = q * scale;
         r = r * scale;
     }
-    auto relative = matmul(r, layer.relative_table);
-    relative = concatenate({relative, zeros({batch, rows, g.heads, 1}, float32)}, -1);
-    relative = transpose(relative - reshape(astype(projections[2], float32), {batch, rows, g.heads, 1}),
-        {0, 2, 1, 3});
+    const auto relative = matmul(r, layer.relative_table);
 
     array keys = next_k, values = next_v;
     std::optional<array> appended;
@@ -588,8 +585,8 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     }
     q = transpose(astype(q, dtype), {0, 2, 1, 3});
     const auto& key_positions = layer.sliding ? positions.sliding : positions.global;
-    auto attended = attention_rows(q, keys, values, relative, key_positions, offset, layer.sliding ? g.window : 0,
-        1.0f / std::sqrt(float(g.dim)));
+    auto attended = attention_rows(q, keys, values, relative, projections[2], key_positions, offset,
+        layer.sliding ? g.window : 0, 1.0f / std::sqrt(float(g.dim)));
     if (appended && rows > 1) {
         cache.window = mlx_circular_cache_append(*cache.window, *appended, offset, attended);
         attended = depends({attended}, {*cache.window}).front();
