@@ -44,7 +44,7 @@ def test_hy4_load_plans_latent_kv_and_index_pool_separately():
     gib = 1 << 30
     architecture = 'hy_v4_flash'
     artifact = SimpleNamespace(resource=SimpleNamespace(complete=True, architecture=architecture,
-        estimated_resident_weight_bytes=6*gib, estimated_weight_bytes_by_role={}, structured_decisions=False),
+        format='gguf', estimated_resident_weight_bytes=6*gib, estimated_weight_bytes_by_role={}, structured_decisions=False),
         routed_expert_bytes=0, source_tensors={},
         source_config=dict(model_type=architecture, max_position_embeddings=262144, num_hidden_layers=3,
             layer_types=['index_pool_attention', 'sliding_attention', 'full_attention'],
@@ -73,6 +73,11 @@ def test_hy4_load_plans_latent_kv_and_index_pool_separately():
     status['host_memory_available_bytes'] = 4*mib
     status['gpu_devices'][0]['memory_available_bytes'] = 7*gib + 8*mib
     assert not plan_model_load(artifact, status, ssd_bytes=gib, **options).usable
+    artifact.resource.estimated_resident_weight_bytes += 56*gib
+    artifact.routed_expert_bytes = 56*gib
+    status['host_memory_available_bytes'] = 48*gib
+    status['gpu_devices'][0]['memory_available_bytes'] = 24*gib
+    assert plan_model_load(artifact, status, **options).usable
 
 
 def test_explicit_settings_survive_context_defaults_and_legacy_requests_are_unchanged():

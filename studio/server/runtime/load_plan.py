@@ -47,6 +47,7 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
     cuda = backend == 'cuda'
     profile = checkpoint_cache_profile(artifact, cuda=cuda, include_recurrent=True)
     kind = resource.architecture.casefold()
+    hy4 = cuda and kind == 'hy_v4_flash'
     components = profile.components if profile is not None else ()
     has_qsa = any(item.group == 'QSA' for item in components)
     has_sparse_attention = has_qsa or any(item.subgroup == 'indexer' for item in components)
@@ -56,7 +57,7 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
     raw = [item for item in components if item.name == 'raw_kv']
     quantized = (backend in {'cuda', 'metal'} and kind.startswith(('qwen4_exp', 'qwen3.5', 'qwen3_5', 'qwen35', 'sensenova_loop'))
                  and raw and all(item.head_dimension and item.kv_heads and item.layers for item in raw))
-    if cuda and kind == 'hy_v4_flash':
+    if hy4:
         precisions = (8, 6, 4, 3, 2, 16)
     else:
         precisions = (8, 4) if fixed_qsa else STANDARD_PRECISIONS if quantized else (16,)
@@ -89,7 +90,8 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
 
     weights = resource.estimated_resident_weight_bytes
     roles = resource.estimated_weight_bytes_by_role
-    host_weights = min(weights or 0, artifact.routed_expert_bytes) if separate else 0
+    experts = min(weights or 0, artifact.routed_expert_bytes) if separate else 0
+    host_weights = experts
     if resource.structured_decisions and resource.jev_weight_memory is not None:
         size = resource.jev_weight_memory
         weights = size.stream_vram_bytes + size.stream_ram_bytes if streamed_jev else size.resident_vram_bytes
@@ -113,7 +115,9 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
     if resource.structured_decisions and hosted < host_weights:
         return reply(0, requested, 'memory_limit')
     pool = (gpu if separate else ram) or 0
-    fixed = weights - hosted + workspace + (profile.fixed_bytes if profile else 0)
+    # Hy4 GGUF expert banks can stay in their checkpoint when RAM is full.
+    streamed = max(0, experts - hosted) if hy4 and getattr(resource, 'format', None) == 'gguf' else 0
+    fixed = weights - hosted - streamed + workspace + (profile.fixed_bytes if profile else 0)
     if fixed > pool:
         return reply(0, requested, 'memory_limit')
     remaining = pool - fixed
@@ -125,7 +129,7 @@ def plan_model_load(artifact, status: dict, *, maximum: int, requested: int | No
         device_budget = pool if gqa and not artifact.routed_expert_bytes else fixed + room_gpu
 
     def fits(tokens: int, bits: float) -> bool:
-        if cuda and kind == 'hy_v4_flash' and separate:
+        if hy4 and separate:
             index_bytes = sum(math.ceil(tokens / item.tokens_per_row) * item.bytes_per_row
                               for item in components if item.subgroup == 'indexer')
             index_on_gpu = index_bytes <= room_gpu
