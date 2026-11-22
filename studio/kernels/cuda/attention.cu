@@ -1133,7 +1133,10 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
     const int visible_keys = planned_length > 0
         ? std::min<int64_t>(window, planned_length)
         : static_cast<int>(window);
-    int parts = total < 128 && visible_keys >= 512 ? (visible_keys + 255) / 256 : 1;
+    // Short verification windows still benefit from limiting the serial
+    // softmax chain when batch lanes multiply the number of query rows.
+    const bool split_verification=relative && T>1 && T<=8;
+    int parts = (total < 128 || split_verification) && visible_keys >= 512 ? (visible_keys + 255) / 256 : 1;
     parts = std::max(1, std::min(parts, 16));
     cudaStream_t stream = mfq_current_cuda_stream();
     if (relative && (D==64 || D==128 || D==256)) {
@@ -1156,7 +1159,8 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
                     po.data_ptr<float>(),pm.data_ptr<float>(),pl.data_ptr<float>(),out.data_ptr<scalar_t>(),total,parts,D);
             };
             const auto dispatch=[&]<int Width>() {
-                if (parts>1) launch.template operator()<Width,1,true>();
+                if (parts>1 && total>=128) launch.template operator()<Width,4,true>();
+                else if (parts>1) launch.template operator()<Width,1,true>();
                 else if (total<256) launch.template operator()<Width,1,false>();
                 else launch.template operator()<Width,4,false>();
             };

@@ -17268,6 +17268,26 @@
               "title": "Streamed Jev",
               "type": "boolean"
             }
+          },
+          {
+            "in": "query",
+            "name": "ssd_kv",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Ssd Kv",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ram_preallocated",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Ram Preallocated",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

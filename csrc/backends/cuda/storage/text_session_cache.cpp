@@ -1283,6 +1283,26 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
     }
 }
 
+mfq_tensor_backend::Tensor capture_session_ring_tensor(
+    const mfq_tensor_backend::Tensor& source,int64_t dimension,int64_t position,int64_t window) {
+    namespace tb=mfq_tensor_backend;
+    if (!source.defined() || dimension<0 || dimension>=source.dim() || position<=0 ||
+        source.size(dimension)<=0 || window<=0)
+        throw CudaSessionStateError("invalid session ring layout");
+    const auto capacity=source.size(dimension);
+    if (capacity<=window) return source.clone();
+    auto shape=source.sizes().vec();
+    shape[dimension]=window;
+    auto saved=position<window?tb::zeros(shape,source.options()):tb::empty(shape,source.options());
+    for (auto token=std::max(int64_t(0),position-window);token<position;) {
+        const auto from=token%capacity,to=token%window;
+        const auto extent=std::min({position-token,capacity-from,window-to});
+        saved.narrow(dimension,to,extent).copy_(source.narrow(dimension,from,extent));
+        token+=extent;
+    }
+    return saved;
+}
+
 FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
                                                            int64_t cache_pos, size_t &bytes) {
     const auto& cache=block.cache;

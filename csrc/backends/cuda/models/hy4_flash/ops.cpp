@@ -1223,9 +1223,12 @@ TextSessionState CudaSessionCodec<Hy4Model>::capture(const Model& model,const st
         } else {
             if (!source.kv.defined() || source.kv.size(0)!=1)
                 throw CudaSessionStateError("Hy4 checkpoint requires one active sequence");
-            const auto capacity=source.kv.size(1);
-            const auto saved=source.sliding?capacity:model.cache_pos;
-            layer.full_attention={source.kv.narrow(1,0,saved).unsqueeze(1).clone(),{},capacity,source.sliding};
+            if (source.sliding) {
+                auto rows=capture_session_ring_tensor(source.kv,1,model.cache_pos,model.config.window);
+                const auto capacity=rows.size(1);
+                layer.full_attention={rows.unsqueeze(1),{},capacity,true};
+            } else layer.full_attention={source.kv.narrow(1,0,model.cache_pos).unsqueeze(1).clone(),
+                {},source.kv.size(1),false};
         }
         if (source.indexed) {
             layer.group_size=model.config.group_size;

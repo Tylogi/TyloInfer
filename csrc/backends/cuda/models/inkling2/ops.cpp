@@ -653,11 +653,18 @@ TextSessionState CudaSessionCodec<InklingModel>::capture(const Model& model,cons
         const auto& layer=static_cast<const InklingBlock&>(*block);
         if (!layer.cache.defined() || layer.cache.batch_size()!=1)
             throw CudaSessionStateError("Inkling checkpoint has no single-request cache");
-        const auto capacity=layer.cache.k.size(2);
-        const auto length=layer.sliding?capacity:model.cache_pos;
         HybridBlockSessionState saved;
         saved.kind=HybridBlockSessionStateKind::AttentionConvolution;
-        saved.full_attention={layer.cache.k.narrow(2,0,length).clone(),layer.cache.v.narrow(2,0,length).clone(),capacity,layer.sliding};
+        if (layer.sliding) {
+            auto keys=capture_session_ring_tensor(layer.cache.k,2,model.cache_pos,layer.window);
+            auto values=capture_session_ring_tensor(layer.cache.v,2,model.cache_pos,layer.window);
+            const auto capacity=keys.size(2);
+            saved.full_attention={std::move(keys),std::move(values),capacity,true};
+        } else {
+            const auto length=model.cache_pos;
+            saved.full_attention={layer.cache.k.narrow(2,0,length).clone(),
+                layer.cache.v.narrow(2,0,length).clone(),layer.cache.k.size(2),false};
+        }
         saved.convolution_state=tb::cat(std::vector<Tensor>(layer.history.begin(),layer.history.end()),2);
         result.bytes+=session_tensor_bytes(saved.full_attention.k)+session_tensor_bytes(saved.full_attention.v)+
             session_tensor_bytes(saved.convolution_state);

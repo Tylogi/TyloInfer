@@ -289,6 +289,10 @@ void restore_session_prefix_tensor(
     int64_t dimension,
     int64_t capacity);
 
+// Retain the latest visible rows in the physical slots of a smaller ring.
+mfq_tensor_backend::Tensor capture_session_ring_tensor(
+    const mfq_tensor_backend::Tensor& source,int64_t dimension,int64_t position,int64_t window);
+
 FullBlockSessionState capture_full_attention_session_state(
     const FullBlock& block,
     int64_t cache_pos,
