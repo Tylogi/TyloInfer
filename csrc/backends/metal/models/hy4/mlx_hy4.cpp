@@ -464,16 +464,17 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     const auto iq = trailing_rope(reshape(index.query(query_low), {1, count, g.index_heads, g.index_width}),
         positions, g.rotary, g.rotary_base);
     const auto head_weights = astype(index.weights(input), float32) * weight_scale;
+    const auto& quantization = g.indexed_kv.quantization;
     std::optional<array> resident;
+    // A bounded packed view can supply every query tile of a prefill chunk.
     if (cache.latent) resident = cache.latent->view();
-    else if (!verified && count >= 4 && end <= 2 * g.index_budget)
+    else if (!verified && count >= 4 && (end <= 2 * g.index_budget || (count >= 64 && quantization.enabled())))
         resident = cache.offloaded_latent->try_view();
     std::optional<array> dense_rows;
     if (resident && count >= 4 && end <= 2 * g.index_budget)
         dense_rows = g.indexed_kv.unpack(*resident);
     auto pooled = cache.groups ? std::optional<array>(cache.groups->view()) : cache.offloaded_groups->try_view();
     if (pooled && pooled->dtype() != float32) pooled = astype(*pooled, float32);
-    const auto& quantization = g.indexed_kv.quantization;
     // Packed recalls can share more SSD blocks across queries within one gather.
     const int query_tile = cache.offloaded_latent && end > 2 * g.index_budget &&
         quantization.enabled() && quantization.value_bits() <= 4
@@ -495,26 +496,25 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
             auto visible = put_along_axis(zeros({1, stop - start, end + 1}, bool_), selected, ids >= 0, -1);
             output.push_back(latent_attention(queries, *dense_rows, sinks, scale, g.kv_rank,
                 expand_dims(axis_slice(visible, -1, 0, end), 1)));
-        } else if (cache.offloaded_latent) {
-            const auto staged = verified ? std::nullopt : cache.offloaded_latent->gather_union(ids);
+        } else {
+            const auto staged = cache.offloaded_latent && !verified ?
+                cache.offloaded_latent->gather_union(ids, resident ? &*resident : nullptr) : std::nullopt;
             if (staged) {
                 output.push_back(latent_attention(queries, g.indexed_kv.unpack(staged->rows), sinks,
                     scale, g.kv_rank, staged->mask));
             } else {
                 const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
-                const auto gathered = cache.offloaded_latent->gather(ids);
-                output.push_back(mlx_gathered_mla_attention(queries, g.indexed_kv.unpack(gathered),
-                    mask, sinks, scale, g.kv_rank));
-            }
-        } else {
-            const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
-            if (g.indexed_kv.quantization.enabled()) {
-                const auto safe = reshape(maximum(ids, array(0, int32)), {-1});
-                const auto packed = reshape(take(*resident, safe, 1), {1, ids.shape(1), ids.shape(2), stored.shape(-1)});
-                output.push_back(mlx_gathered_mla_attention(queries, g.indexed_kv.unpack(packed),
-                    mask, sinks, scale, g.kv_rank));
-            } else {
-                output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
+                if (resident && !quantization.enabled()) {
+                    output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
+                } else {
+                    const auto packed = [&] {
+                        if (!resident) return cache.offloaded_latent->gather(ids);
+                        const auto safe = reshape(maximum(ids, array(0, int32)), {-1});
+                        return reshape(take(*resident, safe, 1), {1, ids.shape(1), ids.shape(2), stored.shape(-1)});
+                    }();
+                    output.push_back(mlx_gathered_mla_attention(queries, g.indexed_kv.unpack(packed),
+                        mask, sinks, scale, g.kv_rank));
+                }
             }
         }
         if (stop == count) cache.last_indices = axis_slice(ids, 1, stop - start - 1, stop - start);

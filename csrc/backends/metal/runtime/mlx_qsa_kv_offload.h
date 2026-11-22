@@ -41,7 +41,8 @@ public:
     std::optional<mlx::core::array> try_view() const;
     mlx::core::array gather(const mlx::core::array& indices) const;
     // Read overlapping selections into a shared key buffer when it fits.
-    std::optional<MlxQsaStagedRows> gather_union(const mlx::core::array& indices) const;
+    std::optional<MlxQsaStagedRows> gather_union(const mlx::core::array& indices,
+        const mlx::core::array* resident = nullptr) const;
     // With reserve_current_group, the last index is the query's own group.
     // Unused history entries in that mode are represented by -1.
     mlx::core::array select(const mlx::core::array& query, int offset, int ratio, int budget,

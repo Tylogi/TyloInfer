@@ -254,6 +254,9 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
         all(staged->mask == array({false, true, true, false, false, false, false, true, false, true,
             true, true, false, true, false, true, false, true, true, false}, Shape{1, 1, 4, 5}, bool_)).item<bool>(),
         "offloaded row union lost selected rows or per-query visibility");
+    const auto staged_from_view = cache.gather_union(overlap, &keys);
+    require(staged_from_view && all(staged_from_view->rows == staged->rows).item<bool>() &&
+        all(staged_from_view->mask == staged->mask).item<bool>(), "staged view changed sparse row selection");
     auto selected = cache.select(query, offset, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});

@@ -352,12 +352,12 @@ array MlxQsaIndexOffload::view(int start, int count) const {
     auto* output = keys.data<std::uint8_t>();
     const auto first_block = (begin + state.block_rows - 1) / state.block_rows;
     const auto stop_block = std::min(end / state.block_rows, state.blocks.size());
-    if (state.priority != kMlxQsaIndexPriority || stop_block <= first_block + 1) {
+    if (stop_block <= first_block + 1) {
         state.read_rows(begin, count, output);
         return keys;
     }
-    // An index scan reads a bounded view once. Coalesce its complete disk
-    // blocks without evicting the hot KV rows selected by preceding queries.
+    // A scan reads a bounded view once. Coalesce its complete disk blocks
+    // without evicting the hot KV rows selected by preceding queries.
     const auto first_row = first_block * state.block_rows;
     const auto stop_row = stop_block * state.block_rows;
     state.read_rows(begin, first_row - begin, output);
@@ -452,11 +452,13 @@ array MlxQsaIndexOffload::gather(const array& indices) const {
     return result;
 }
 
-std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& indices) const {
+std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& indices, const array* resident) const {
     if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
         indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)
         throw std::invalid_argument("offloaded indexed rows require int32 [1, query, selection]");
     const int queries = indices.shape(1), count = position();
+    if (resident && (resident->shape() != Shape{1, count, width_} || resident->dtype() != dtype_))
+        throw std::invalid_argument("staged QSA rows do not match the offloaded cache");
     const auto& state = rows_.view();
     const auto buffer = state.store->config().buffer_bytes / 2;
     if (queries < 4 || static_cast<std::size_t>(count) > buffer / sizeof(int)) return std::nullopt;
@@ -485,14 +487,19 @@ std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& in
     const auto row_bytes = selected.size() * state.row_bytes;
     const auto mask_bytes = selected.size() * queries;
     MlxResidentBudgetScope::reserve(row_bytes + mask_bytes);
-    auto rows = array(mlx::core::allocator::malloc(row_bytes), Shape{1, width, width_}, dtype_);
-    for (std::size_t begin = 0; begin < selected.size();) {
-        auto end = begin + 1;
-        while (end < selected.size() && selected[end] == selected[end - 1] + 1) ++end;
-        state.read_rows(selected[begin], end - begin, rows.data<std::uint8_t>() + begin * state.row_bytes);
-        for (auto i = begin; i < end; ++i) offsets[selected[i]] = static_cast<int>(i);
-        begin = end;
-    }
+    auto rows = [&] {
+        if (resident)
+            return mlx::core::take(*resident, array(selected.begin(), {width}, mlx::core::int32), 1);
+        auto staged = array(mlx::core::allocator::malloc(row_bytes), Shape{1, width, width_}, dtype_);
+        for (std::size_t begin = 0; begin < selected.size();) {
+            auto end = begin + 1;
+            while (end < selected.size() && selected[end] == selected[end - 1] + 1) ++end;
+            state.read_rows(selected[begin], end - begin, staged.data<std::uint8_t>() + begin * state.row_bytes);
+            begin = end;
+        }
+        return staged;
+    }();
+    for (std::size_t i = 0; i < selected.size(); ++i) offsets[selected[i]] = static_cast<int>(i);
 
     auto mask = array(mlx::core::allocator::malloc(mask_bytes), Shape{1, 1, queries, width}, mlx::core::bool_);
     auto* visible = mask.data<std::uint8_t>();
