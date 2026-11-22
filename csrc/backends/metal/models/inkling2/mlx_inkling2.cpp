@@ -499,9 +499,33 @@ array attention_rows(const array& query, const array& key, const array& value,
     return chunks.size() == 1 ? chunks.front() : concatenate(chunks, 2);
 }
 
+struct AttentionPositions {
+    array sliding;
+    array global;
+    std::optional<array> global_scale;
+};
+
+AttentionPositions attention_positions(const Geometry& g, int offset, int rows) {
+    const int end = offset + rows;
+    auto local = rows == 1 ? arange(std::min(g.window, end), int32)
+        : arange(std::max(0, offset - g.window), end, 1, int32);
+    if (rows == 1 && end > g.window) {
+        // Decode reads the slots in ring order. Prefill reads chronological history.
+        const int first = end - g.window;
+        local = array(first) + remainder(local + array(g.window - first % g.window), array(g.window));
+    }
+    std::optional<array> scale;
+    if (end > g.log_floor && g.log_alpha != 0.0f) {
+        const auto positions = astype(arange(offset + 1, end + 1, 1, int32), float32);
+        scale = reshape(array(1.0f) + log(maximum(positions / float(g.log_floor), array(1.0f))) * g.log_alpha,
+            {1, rows, 1, 1});
+    }
+    return {std::move(local), arange(end, int32), std::move(scale)};
+}
+
 array apply_layer(const Layer& layer, const Geometry& g, int physical, int offset,
     const array& hidden, array& blocks, const std::optional<array>& messages,
-    MlxInkling2VisitCache& cache) {
+    const AttentionPositions& positions, MlxInkling2VisitCache& cache) {
     const int batch = hidden.shape(0), rows = hidden.shape(1);
     const auto dtype = hidden.dtype();
     const auto attention_input = layer.attn_res_query ?
@@ -527,10 +551,8 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     auto r = clip_norm(reshape(projections[1], {batch, rows, g.heads, g.relative}), layer.relative_clip, g.r_clip);
     next_k = astype(clip_norm(reshape(next_k, {batch, rows, g.kv_heads, g.dim}), std::nullopt, g.q_clip), dtype);
     next_v = rms(reshape(next_v, {batch, rows, g.kv_heads, g.dim}), g.eps);
-    if (!layer.sliding) {
-        const auto position = astype(arange(offset + 1, offset + rows + 1, 1, int32), float32);
-        auto scale = reshape(array(1.0f) + log(maximum(position / float(g.log_floor), array(1.0f))) * g.log_alpha,
-            {1, rows, 1, 1});
+    if (!layer.sliding && positions.global_scale) {
+        const auto& scale = *positions.global_scale;
         q = q * scale;
         r = r * scale;
     }
@@ -539,7 +561,7 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
     relative = transpose(relative - reshape(astype(projections[2], float32), {batch, rows, g.heads, 1}),
         {0, 2, 1, 3});
 
-    array keys = next_k, values = next_v, positions = arange(offset, offset + rows, 1, int32);
+    array keys = next_k, values = next_v;
     std::optional<array> appended;
     if (layer.sliding) {
         const int width = g.kv_heads * g.dim;
@@ -551,14 +573,8 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
             cache.window = mlx_circular_cache_append(*cache.window, *appended, offset);
             const auto count = std::min(g.window, offset + 1);
             joined = time_slice(*cache.window, 0, count);
-            positions = arange(count, int32);
-            if (offset + 1 > g.window) {
-                const auto tail = offset + 1 - g.window;
-                positions = array(tail) + remainder(positions + array(g.window - (tail % g.window)), array(g.window));
-            }
         } else if (offset > 0) {
             joined = concatenate({mlx_circular_cache_history(*cache.window, offset), *appended}, 1);
-            positions = arange(offset + rows - joined.shape(1), offset + rows, 1, int32);
         }
         auto kv = split(joined, Shape{width}, -1);
         keys = transpose(reshape(kv[0], {batch, joined.shape(1), g.kv_heads, g.dim}), {0, 2, 1, 3});
@@ -569,10 +585,10 @@ array apply_layer(const Layer& layer, const Geometry& g, int physical, int offse
             transpose(astype(next_v, dtype), {0, 2, 1, 3}));
         keys = std::move(kv.first);
         values = std::move(kv.second);
-        positions = arange(offset + rows, int32);
     }
     q = transpose(astype(q, dtype), {0, 2, 1, 3});
-    auto attended = attention_rows(q, keys, values, relative, positions, offset, layer.sliding ? g.window : 0,
+    const auto& key_positions = layer.sliding ? positions.sliding : positions.global;
+    auto attended = attention_rows(q, keys, values, relative, key_positions, offset, layer.sliding ? g.window : 0,
         1.0f / std::sqrt(float(g.dim)));
     if (appended && rows > 1) {
         cache.window = mlx_circular_cache_append(*cache.window, *appended, offset, attended);
@@ -634,6 +650,7 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
         throw std::invalid_argument("invalid Inkling tokens or visit cache");
     }
     const int count = tokens.shape(1);
+    const auto positions = attention_positions(g, cache.position, count);
     cache.batch = tokens.shape(0);
     cache.visits.resize(g.loop.visits());
     auto hidden = weights_->embedding_norm(weights_->embedding(tokens, bfloat16));
@@ -656,7 +673,7 @@ array MlxInkling2Model::forward(const array& tokens, MlxInkling2Cache& cache, bo
         const auto& layer = weights_->layers[physical];
         auto messages = previous_output && layer.message_query ?
             std::optional<array>(depth_mix(previous_blocks, *previous_output, *layer.message_query)) : std::nullopt;
-        hidden = apply_layer(layer, g, physical, cache.position, hidden, blocks, messages, cache.visits[visit]);
+        hidden = apply_layer(layer, g, physical, cache.position, hidden, blocks, messages, positions, cache.visits[visit]);
     }
     if (last_logit_only) {
         hidden = time_slice(hidden, count - 1, count);
