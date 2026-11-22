@@ -1387,15 +1387,36 @@ array mlx_qsa_prefill_attention(
 }
 
 array mlx_gather_selected_mla_rows(const array& cache, const array& indices) {
+    using namespace mlx::core;
     if (cache.ndim() != 3 || indices.ndim() != 3 || cache.shape(0) != indices.shape(0))
         throw std::invalid_argument("invalid selected MLA rows");
     const int batch = cache.shape(0), tokens = indices.shape(1), dimension = cache.shape(2);
-    const auto safe_indices = mlx::core::maximum(indices, array(0, mlx::core::int32));
-    const auto expanded_cache = mlx::core::broadcast_to(mlx::core::expand_dims(cache, 1),
+    if (batch == 1 && tokens >= 8 && dimension == 576 && cache.dtype() == float16 &&
+        cache.shape(1) > 0 && cache.strides(1) == dimension && cache.strides(2) == 1 &&
+        cache.offset() % 16 == 0 && indices.dtype() == int32 &&
+        indices.size() > 0 && indices.size() <= (std::numeric_limits<int>::max() - 127) / 32 &&
+        default_device() == Device::gpu) {
+        // A SIMD group copies one latent row without broadcasting IDs across its channels.
+        static const auto gather = fast::metal_kernel("tyloinfer_gather_mla_fp16_rows",
+            {"cache", "indices"}, {"rows"}, R"METAL(
+            const uint task = thread_position_in_grid.x / 32u;
+            if (task >= uint(indices_shape[1]) * uint(indices_shape[2])) return;
+            const uint lane = thread_index_in_simdgroup;
+            const int key = clamp(indices[task], 0, int(cache_shape[1]) - 1);
+            const auto source = reinterpret_cast<device const uint4*>(cache + ulong(key) * 576u);
+            auto output = reinterpret_cast<device uint4*>(rows + ulong(task) * 576u);
+            for (uint word = lane; word < 72u; word += 32u) output[word] = source[word];
+            )METAL", "", false, false);
+        const int groups = (static_cast<int>(indices.size()) + 3) / 4;
+        return gather({cache, contiguous(indices)}, {{1, tokens, indices.shape(2), dimension}}, {float16},
+            {groups * 128, 1, 1}, {128, 1, 1}, {}, std::nullopt, false, {}).front();
+    }
+    const auto safe_indices = maximum(indices, array(0, int32));
+    const auto expanded_cache = broadcast_to(expand_dims(cache, 1),
         Shape{batch, tokens, cache.shape(1), dimension});
-    const auto expanded_indices = mlx::core::broadcast_to(mlx::core::expand_dims(safe_indices, -1),
+    const auto expanded_indices = broadcast_to(expand_dims(safe_indices, -1),
         Shape{batch, tokens, indices.shape(2), dimension});
-    return mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
+    return take_along_axis(expanded_cache, expanded_indices, 2);
 }
 
 namespace {
