@@ -230,7 +230,7 @@ def test_local_tool_refuses_extra_authority_and_invalid_limits(tmp_path):
                     await bridge.tool({"tool_call_id": "call-1", "arguments": arguments})
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.post(
-                    bridge.url + "/tool", json={"arguments": {"prompt": "Task"}}
+                    bridge.url + "/tool", headers={"Content-Length": "0"}
                 )
                 assert response.status_code == 403
             assert backend.calls == []

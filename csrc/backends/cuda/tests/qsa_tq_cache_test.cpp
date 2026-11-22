@@ -5,6 +5,7 @@
 #include "mfq_cuda_attention_ops.h"
 #include "kernels/qsa_tq.h"
 #include "studio/kernels/cuda/qwen4_exp.h"
+#include "tests/numeric_assertions.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -161,7 +162,9 @@ void check_mass_observation() {
         if(status)throw std::runtime_error(cudaGetErrorString(cudaError_t(status)));
         auto actual_hits=hits.cpu(),actual_mass=mass.cpu();
         for(int b=0;b<blocks;++b)
-            if(actual_hits.data_ptr<float>()[b]!=expected_hits[b] || std::abs(actual_mass.data_ptr<float>()[b]-expected_mass[b])>2e-6)
+            if(actual_hits.data_ptr<float>()[b]!=expected_hits[b] ||
+                mfq::test::checked_absolute_error(
+                    actual_mass.data_ptr<float>()[b], expected_mass[b])>2e-6)
                 throw std::runtime_error("QSA history mass differs from uniform causal reference");
     }
     std::cerr<<"adaptive QSA history head reduction, partial masks, invalid/future and duplicate blocks PASS\n";
@@ -248,6 +251,24 @@ void set_directory(const std::string& path) {
     setenv("TYLOINFER_QSA_TQ_BUDGET_BYTES","0",1);
 #endif
 }
+
+/** Select the experimental cache fixture unless the caller explicitly chose a mode. */
+bool ensure_adaptive_cache_mode() {
+    const auto* mode = std::getenv("TYLOINFER_QSA_CACHE_MODE");
+    const auto* bits = std::getenv("TYLOINFER_QSA_RAM_KV_BITS");
+    const auto* adaptive = std::getenv("TYLOINFER_QSA_ADAPTIVE_TQ");
+    if ((mode && *mode) || (bits && *bits) || (adaptive && *adaptive))
+        return mfq::cuda::qsa_tq_cache_enabled();
+    // This executable covers the experimental deferred-history implementation;
+    // keep an explicit caller-selected mode untouched.
+#ifdef _WIN32
+    _putenv_s("TYLOINFER_QSA_ADAPTIVE_TQ", "1");
+#else
+    setenv("TYLOINFER_QSA_ADAPTIVE_TQ", "1", 1);
+#endif
+    return true;
+}
+
 void check(int heads,int width,bool gated=false,bool half=false,bool ssd=true) {
     constexpr int kv_heads=2,index_width=13;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
@@ -545,7 +566,8 @@ void check_nonzero_attention(int heads,int kh,int width) {
             const auto actual=output.data_ptr<float>()[(row*heads+h)*width+d];
             const auto baseline=fp32.data_ptr<float>()[(row*heads+h)*width+d];
             tensor_core_error=std::max(tensor_core_error,double(std::abs(actual-baseline)));
-            if(std::abs(actual-baseline)>2e-4)throw std::runtime_error("tensor-core QSA differs from FP32 attention on the same quantized KV");
+            if(mfq::test::checked_absolute_error(actual, baseline)>2e-4)
+                throw std::runtime_error("tensor-core QSA differs from FP32 attention on the same quantized KV");
             const double error=std::abs(actual-expected);maximum_error=std::max(maximum_error,error);
             // Same relative Affine8 outlier bound as the smaller-amplitude
             // uniform test; the tensor-core-only error is checked separately.
@@ -646,6 +668,10 @@ int main(int argc,char** argv)try {
     int devices=0;const auto available=cudaGetDeviceCount(&devices);
     if(available!=cudaSuccess || !devices) {
         std::cerr<<"adaptive QSA cache test SKIP: "<<cudaGetErrorString(available)<<" devices="<<devices<<'\n';return 77;
+    }
+    if (!ensure_adaptive_cache_mode()) {
+        std::cerr << "adaptive QSA cache test SKIP: legacy QSA cache mode is selected\n";
+        return 77;
     }
     set_directory(argc>1?argv[1]:(std::filesystem::current_path()/"qsa-tq-test-cache").string());
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());

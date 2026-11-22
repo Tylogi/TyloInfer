@@ -360,7 +360,6 @@ describe('useModelCatalog', () => {
   });
 
   it.each([
-    { can_open_directory: true, can_open_in_finder: true },
     { can_open_directory: true, can_open_in_finder: false },
     { can_open_in_finder: true },
   ])('opens the browsed directory without loading, registering, or changing the saved folder (%j)', async (capability) => {

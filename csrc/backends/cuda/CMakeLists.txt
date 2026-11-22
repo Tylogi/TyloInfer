@@ -383,6 +383,8 @@ if(BUILD_TESTING)
         ${TYLOINFER_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${TYLOINFER_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
+    mfq_add_cuda_test(tyloinfer-cuda-tensor-capture-lifetime-test
+        ${TYLOINFER_CUDA_ROOT}/tests/native_tensor_capture_lifetime_test.cu)
     add_test(NAME mfq-contiguous-convert-test
         COMMAND mfq-native-tensor-cuda-test --contiguous-convert-check)
     set_tests_properties(mfq-contiguous-convert-test PROPERTIES SKIP_RETURN_CODE 77)
@@ -1070,6 +1072,8 @@ set_target_properties(mfq-cuda-runtime PROPERTIES
 if(BUILD_TESTING)
     target_link_libraries(mfq-flash-next-test PRIVATE
         mfq-cuda-runtime)
+    add_test(NAME tyloinfer-cuda-numeric-assertions-test
+        COMMAND mfq-flash-next-test --numerical-assertions-check)
     add_executable(mfq-cuda-runtime-state-test
         ${TYLOINFER_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)

@@ -3,6 +3,10 @@ import { mockStudioServer } from './mockServer';
 
 test('overview shares statistics scope with the compact footer and keeps concurrency live', async ({ page }) => {
   const state = await mockStudioServer(page);
+  await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    runtime_state: 'ready', model: 'Studio Test Model', max_context: 8192,
+    active_requests: 1, failed_requests: 3, sampling_defaults: {},
+  } }));
   let polls = 0;
   await page.route('**/api/v1/runtime/serving?*', async route => {
     polls += 1;
@@ -26,7 +30,8 @@ test('overview shares statistics scope with the compact footer and keeps concurr
   await expect(summary.getByRole('heading', { name: 'Session' })).toBeVisible();
   await expect(summary.locator('.overview-session-stats')).toContainText('4,096');
   await expect(summary.getByTitle('Session uptime')).toHaveText('2m 5s');
-  await expect(summary.locator('p')).toContainText('failed requests · 1 active');
+  await expect(summary.locator('.overview-session-status').getByText('3 failed', { exact: true })).toBeVisible();
+  await expect(summary.locator('.overview-session-status').getByText('1 active', { exact: true })).toBeVisible();
   await expect(page.locator('.metric-tile').filter({ hasText: 'Prefill' })).toContainText('2,500');
   await expect(page.locator('.metric-tile').filter({ hasText: 'Concurrency' })).toContainText('1');
   await expect(page.locator('.metric-tile').filter({ hasText: 'Concurrency' })).toContainText('2 queued');

@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include "kernels/qsa_tq.h"
 #include "kernels/qsa_tq_fa.h"
+#include "tests/numeric_assertions.h"
 #include "kernels/gguf.h"
 #include <vector>
 #include <algorithm>
@@ -34,7 +35,9 @@ void check_materialized_gate() {
             if(fp16)a=__half2float(__float2half(a));
             float expected=a*u;if(fp16)expected=__half2float(__float2half(expected));
             const float actual=fp16?__half2float(oh[i]):out[i];
-            if(std::abs(actual-expected)>(fp16?.002f:2.e-6f)*std::max(1.f,std::abs(expected)))throw std::runtime_error("Materialized gate changed dtype rounding");
+            if(mfq::test::checked_absolute_error(actual, expected)>
+                (fp16?.002f:2.e-6f)*std::max(1.f,std::abs(expected)))
+                throw std::runtime_error("Materialized gate changed dtype rounding");
         }
     }
     std::cout<<"FP16/FP32 sigmoid and SiLU fused materialization, odd tails PASS"<<std::endl;
@@ -83,7 +86,8 @@ void clear_graph_history(GraphFixture& f,cudaStream_t stream) {
 void assert_graph_history(const GraphHistory& expected,GraphFixture& f) {
  const auto actual=read_graph_history(f);
  for(int i=0;i<f.blocks;++i)if(expected.hits[i]!=actual.hits[i] || !std::isfinite(actual.mass[i]) ||
-     std::abs(expected.mass[i]-actual.mass[i])>1.e-5f)throw std::runtime_error("Graph changed attention history");
+     mfq::test::checked_absolute_error(expected.mass[i],actual.mass[i])>1.e-5f)
+     throw std::runtime_error("Graph changed attention history");
 }
 void check_prefill_graph() {
 

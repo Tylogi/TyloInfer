@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_tensor.h"
 #include "mlx_moe_ops.h"
@@ -2897,7 +2898,7 @@ void test_two_stage_nint_shared_decode(
         const auto packed_values = evaluated_floats(*packed);
         float error = 0.0f, scale = 0.0f;
         for (std::size_t index = 0; index < expected_values.size(); ++index) {
-            error = std::max(error, std::abs(expected_values[index] - packed_values[index]));
+            error = std::max(error, mfq::test::checked_absolute_error(expected_values[index], packed_values[index]));
             scale = std::max(scale, std::abs(expected_values[index]));
         }
         require(error == 0.0f, "packed shared router error=" + std::to_string(error) +
@@ -3035,7 +3036,7 @@ void test_two_stage_nint_shared_decode(
         const auto expected_values = evaluated_floats(expected_shared);
         float error = 0.0f, scale = 0.0f;
         for (std::size_t index = 0; index < actual_shared.size(); ++index) {
-            error = std::max(error, std::abs(actual_shared[index] - expected_values[index]));
+            error = std::max(error, mfq::test::checked_absolute_error(actual_shared[index], expected_values[index]));
             scale = std::max(scale, std::abs(expected_values[index]));
         }
         require(scale > 1e-5f && error <= std::max(5e-7f, 0.005f * scale),
@@ -6525,7 +6526,7 @@ void test_concatenate_resident_mfe_experts() {
         actual.size() == expected.size(),
         "resident MFE expert concatenation output shape mismatch");
     for (std::size_t index = 0; index < actual.size(); ++index) {
-        if (std::fabs(actual[index] - expected[index]) > 1e-6f) {
+        if (mfq::test::checked_absolute_error(actual[index], expected[index]) > 1e-6f) {
             const auto route = index / output;
             throw std::runtime_error(
                 "resident MFE expert concatenation mismatch: expert="

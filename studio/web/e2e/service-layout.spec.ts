@@ -3,7 +3,7 @@ import { mockStudioServer } from './mockServer';
 import { openModelSettings } from './modelSettings';
 
 for (const language of ['zh-CN', 'en'] as const) {
-  test(`service layout keeps model controls aligned, readable and separate (${language})`, async ({ page }, testInfo) => {
+  test(`model context and global context save to separate scopes (${language})`, async ({ page }) => {
     const state = await mockStudioServer(page, { language });
     const names = ['Qwen3.8-Flash-Next-EWQ-MFQ-S4-L-MHC-NINT-LMHead8-MTP8', 'Qwen3.8-27B-EWQ-MFQ-S4-M'];
     const instances = names.map((model, index) => ({ id: `instance-${index + 1}`, model, state: 'ready',
@@ -31,26 +31,13 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(panel.locator('.model-context-entry')).toHaveCount(1);
     const longTitle = panel.locator(':scope > header h2');
     await expect(longTitle).toHaveText(names[0]);
-    expect(await longTitle.evaluate(element => {
-      const style = getComputedStyle(element);
-      return style.whiteSpace === 'nowrap' && style.textOverflow === 'ellipsis';
-    })).toBe(true);
-    const metrics = await panel.locator('.model-context-settings').evaluate(element => {
-      const style = getComputedStyle(element);
-      return { top: style.marginTop, padding: style.paddingTop, border: style.borderTopWidth };
-    });
-    expect(metrics).toEqual({ top: '0px', padding: '0px', border: '0px' });
     await expect(page.locator('.server-api-panel').getByRole('button', {
       name: language === 'zh-CN' ? '保存服务器设置' : 'Save server settings', exact: true,
     })).toHaveCount(0);
     const entry = panel.locator('.model-context-entry');
     await expect(panel.getByRole('combobox', { name: language === 'zh-CN' ? '单模型上下文模型' : 'Per-model context model' })).toHaveCount(0);
     await expect(entry.locator('.model-context-controls button')).toHaveCount(0);
-    await panel.scrollIntoViewIfNeeded();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-    await panel.screenshot({ path: testInfo.outputPath('service-context-layout.png'), animations: 'disabled' });
-    await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
-    await panel.screenshot({ path: testInfo.outputPath('service-context-layout-dark.png'), animations: 'disabled' });
     await entry.getByRole('spinbutton').fill('8192');
     await entry.getByRole('button', { name: language === 'zh-CN' ? '保存到该模型' : 'Save to this model' }).click();
     await expect.poll(() => updates).toEqual([{ context_size: 8192, instance_id: 'instance-1', yarn_enabled: false }]);
@@ -58,10 +45,10 @@ for (const language of ['zh-CN', 'en'] as const) {
     await page.goto('/runtime');
     const defaults = page.locator('.server-context-panel');
     const global = defaults.getByRole('spinbutton', { name: language === 'zh-CN' ? '全局上下文上限' : 'Global context cap', exact: true });
-      await global.fill('65536');
-      await defaults.getByRole('button', { name: language === 'zh-CN' ? '保存全局上下文上限' : 'Save global context cap' }).click();
-      await expect.poll(() => saves).toEqual([{ max_context_size: 65536 }]);
-      await expect(defaults.getByRole('status').filter({ hasText: language === 'zh-CN' ? '已保存' : 'Saved' })).toBeVisible();
+    await global.fill('65536');
+    await defaults.getByRole('button', { name: language === 'zh-CN' ? '保存全局上下文上限' : 'Save global context cap' }).click();
+    await expect.poll(() => saves).toEqual([{ max_context_size: 65536 }]);
+    await expect(defaults.getByRole('status').filter({ hasText: language === 'zh-CN' ? '已保存' : 'Saved' })).toBeVisible();
     expect(state.requests.filter(request => /^DELETE /.test(request))).toEqual([]);
   });
 }

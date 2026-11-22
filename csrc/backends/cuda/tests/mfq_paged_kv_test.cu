@@ -1,4 +1,5 @@
 #include "mfq_cuda_paged_kv.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mfq_native_tensor.h"
 
 #include <cuda_runtime_api.h>
@@ -173,13 +174,12 @@ void check_kernels(int D,int ratio,int Page,int PagesPerChunk,mfq::cuda::ScalarT
                 expected /= denominator;
                 const auto output_index =
                     (static_cast<size_t>(batch) * Hq + query_head) * D + dim;
-                const auto error = std::abs(
-                    direct_values[output_index] - expected);
-                if (!std::isfinite(direct_values[output_index]) ||
-                        error > 2.5e-3 ||
-                        std::abs(split_values[output_index] -
+                const auto error = mfq::test::checked_absolute_error(
+                    direct_values[output_index], expected);
+                if (error > 2.5e-3 ||
+                        mfq::test::checked_absolute_error(split_values[output_index],
                             direct_values[output_index]) > 2.5e-3 ||
-                        std::abs(dynamic_values[output_index] -
+                        mfq::test::checked_absolute_error(dynamic_values[output_index],
                             direct_values[output_index]) > 2.5e-3) {
                     throw std::runtime_error(
                         "Paged KV attention numerical mismatch at " +

@@ -1,4 +1,5 @@
 #include "mlx_linear_attention.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_kernel_prepare.h"
 #include "metal_device_info.h"
 
@@ -24,7 +25,7 @@ void require_close(
     float actual,
     float expected,
     float tolerance = 2e-4f) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
         throw std::runtime_error(
             "linear-attention mismatch: actual=" +
             std::to_string(actual) +
@@ -74,8 +75,7 @@ void require_vector_close(
     float tolerance,
     const char* name) {
     for (std::size_t index = 0; index < expected.size(); ++index) {
-        if (!std::isfinite(actual[index]) ||
-            std::fabs(actual[index] - expected[index]) > tolerance) {
+        if (mfq::test::checked_absolute_error(actual[index], expected[index]) > tolerance) {
             throw std::runtime_error(
                 std::string(name) + " mismatch at " +
                 std::to_string(index) + ": actual=" +

@@ -384,14 +384,23 @@ int main() {
                 mfq::AsyncRangeReader disjoint(path,mode);
                 std::vector<std::byte> output(8*9,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
                 for(std::size_t i=0;i<8;++i)spans.push_back({i*8192+3,output.data()+i*9+1,7});
-                disjoint.read(spans);
-                for(std::size_t i=0;i<8;++i) {
-                    require(output[i*9]==std::byte{0x5a} && output[i*9+8]==std::byte{0x5a},"disjoint read changed guards");
-                    require(std::equal(output.begin()+i*9+1,output.begin()+i*9+8,expected.begin()+i*8192+3),"disjoint read changed bytes");
+                std::uint64_t first_allocations=0;
+                for(int round=0;round<2;++round) {
+                    std::fill(output.begin(),output.end(),std::byte{0x5a});
+                    disjoint.read(spans);
+                    for(std::size_t i=0;i<8;++i) {
+                        require(output[i*9]==std::byte{0x5a} && output[i*9+8]==std::byte{0x5a},"disjoint read changed guards");
+                        require(std::equal(output.begin()+i*9+1,output.begin()+i*9+8,expected.begin()+i*8192+3),"disjoint read changed bytes");
+                    }
+                    const auto stats=disjoint.stats();
+                    require(stats.logical_bytes==56*std::uint64_t(round+1) && !stats.staging_bytes,
+                        "disjoint reads changed byte accounting or retained active staging");
+                    // A reused slab can exceed this read's byte count. Check
+                    // actual allocation reuse instead of comparing capacities.
+                    if(!round)first_allocations=stats.staging_allocations;
+                    else require(stats.staging_allocations==first_allocations,
+                        "disjoint reads discarded reusable staging storage");
                 }
-                const auto stats=disjoint.stats();
-                require(stats.logical_bytes==56 && !stats.staging_bytes && stats.staging_peak_bytes<=stats.physical_bytes,
-                    "disjoint direct ranges allocated a redundant staging copy");
             }
             {
                 mfq::FileRangeReader batched(path,mode);

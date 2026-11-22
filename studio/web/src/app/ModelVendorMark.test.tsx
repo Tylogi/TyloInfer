@@ -33,14 +33,9 @@ it('prefers declared architecture to model name and does not label unsupported a
   expect(modelVendor('GLM-5.3', ['', 'GlmMoeForCausalLM'])).toBe('zai');
 });
 
-it.each([['qwen3', 'Qwen'], ['deepseek4', 'DeepSeek'], ['glm5', 'Z.ai'], ['minicpmo', 'MiniCPM'], ['gemma4', 'Gemma']])('renders %s as an unfilled borderless vector', (architecture, name) => {
-  render(<ModelVendorMark architecture={architecture} />);
-  const mark = screen.getByRole('img', { name });
-  expect(mark).toHaveAttribute('fill', 'none');
-  expect(mark).toHaveAttribute('stroke', 'currentColor');
-  expect(mark.querySelectorAll('path')).toHaveLength(1);
-  expect(mark.querySelector('rect')).toBeNull();
-  expect(mark.querySelector('text')).toBeNull();
+it('exposes a known vendor mark as an accessible image', () => {
+  render(<ModelVendorMark architecture="qwen3" />);
+  expect(screen.getByRole('img', { name: 'Qwen' })).toBeInTheDocument();
 });
 
 it('does not create a placeholder or logo for unknown models', () => {

@@ -1,4 +1,5 @@
 #include "../models/dflash2/mlx_dflash2.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_kernel_prepare.h"
 #include "qwen4_ops.h"
 #include "mlx_linear_attention.h"
@@ -121,7 +122,7 @@ int main() {
         for (int i = 0; i < 15; ++i) mass += std::exp(15. - i - edge);
         for (int i = 0; i < 7; ++i)
             if (proposal.tokens.data<std::int32_t>()[i] != 777 ||
-                std::abs(proposal.confidence.data<float>()[i] - 1. / mass) > 1e-5)
+                mfq::test::checked_absolute_error(proposal.confidence.data<float>()[i], 1. / mass) > 1e-5)
                 throw std::runtime_error("joint selector differs from CPU reference");
         {
             MlxDFlash2Context other;

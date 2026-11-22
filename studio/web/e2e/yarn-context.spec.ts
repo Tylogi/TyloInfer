@@ -1,12 +1,14 @@
 import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
-import { openModelSettings } from './modelSettings';
+import { modelArtifact, openModelSettings } from './modelSettings';
 
 for (const language of ['zh-CN', 'en'] as const) {
   test(`per-model YaRN limits and save-time clamping (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language });
     const model = 'Qwen3.8-Flash-Next-EWQ-MFQ-S4-L-MHC-NINT-LMHead8-MTP8';
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact-qwen', name: model }] } }));
+    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
+      modelArtifact('artifact-qwen', model, { architecture: 'qwen4_exp' }),
+    ] } }));
     await page.route('**/api/v1/models/*/cache-profile', route => route.fulfill({ json: {
       max_context: 262144, fixed_bytes: 29978, fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [
         { group: 'QSA', name: 'raw_kv', layers: 13, bytes_per_row: 26624, tokens_per_row: 1, allocation: 'power_of_two', minimum_rows: 16 },

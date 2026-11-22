@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -387,6 +388,66 @@ def test_job_manager_completes_and_cancels_registered_handlers(tmp_path: Path) -
             await asyncio.sleep(0.01)
         assert cancelled.status == JobStatus.CANCELLED
         await manager.close()
+
+    asyncio.run(run())
+
+
+def test_close_waits_for_user_cancel_cleanup(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = make_store(tmp_path)
+        started = asyncio.Event()
+        release_cancel = threading.Event()
+        cancel_started = threading.Event()
+        cleanup_entered = threading.Event()
+        allow_store_write = threading.Event()
+        cleanup_finished = threading.Event()
+        original_cancel_job = store.cancel_job
+
+        def blocking_cancel_job(job_id, *, now=None):
+            cancel_started.set()
+            assert release_cancel.wait(5)
+            cleanup_entered.set()
+            assert allow_store_write.wait(5)
+            result = original_cancel_job(job_id, now=now)
+            cleanup_finished.set()
+            return result
+
+        store.cancel_job = blocking_cancel_job  # type: ignore[method-assign]
+
+        async def handler(context, payload):
+            del payload
+            started.set()
+            await asyncio.Event().wait()
+
+        manager = JobManager(store, {"test.block": handler}, max_concurrency=1)
+        close_task = None
+        try:
+            job = await manager.submit(CreateJobRequest(kind="test.block"))
+            await started.wait()
+            cancelling = await manager.cancel(job.id)
+            assert cancelling.status == JobStatus.CANCELLING
+            assert await asyncio.to_thread(cancel_started.wait, 5)
+
+            close_task = asyncio.create_task(manager.close())
+            await asyncio.sleep(0)
+            assert not close_task.done()
+
+            release_cancel.set()
+            assert await asyncio.to_thread(cleanup_entered.wait, 5)
+            # A second task.cancel() would let close() return while the store write
+            # is still gated in the worker thread.
+            assert not close_task.done()
+            allow_store_write.set()
+            await close_task
+            assert await asyncio.to_thread(cleanup_finished.wait, 5)
+            assert store.get_job(job.id).status == JobStatus.CANCELLED
+        finally:
+            release_cancel.set()
+            allow_store_write.set()
+            if close_task is None:
+                await manager.close()
+            elif not close_task.done():
+                await close_task
 
     asyncio.run(run())
 

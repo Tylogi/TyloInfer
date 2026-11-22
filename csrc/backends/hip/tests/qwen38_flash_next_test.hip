@@ -47,6 +47,7 @@ extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "qwen4_graph_reuse_check.h"
 #include "qwen4_session_check.h"
 #include "qwen4_predictor_graph_check.h"
+#include "../../../tests/numeric_assertions.h"
 
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv,
@@ -75,7 +76,8 @@ void require_constant(
     for (int64_t index = 0; index < host.numel(); ++index) {
         maximum_error = std::max(
             maximum_error,
-            std::abs(host.data_ptr<float>()[index] - expected));
+            mfq::test::checked_absolute_error(
+                host.data_ptr<float>()[index], expected));
     }
     if (maximum_error > tolerance) {
         throw std::runtime_error(
@@ -93,7 +95,8 @@ void require_qsa_gqa_means(
         for (int width = 0; width < 256; ++width) {
             maximum_error = std::max(
                 maximum_error,
-                std::abs(host.data_ptr<float>()[head * 256 + width] - expected));
+                mfq::test::checked_absolute_error(
+                    host.data_ptr<float>()[head * 256 + width], expected));
         }
     }
     if (maximum_error > tolerance) {

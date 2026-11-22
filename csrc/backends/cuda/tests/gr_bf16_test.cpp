@@ -1,4 +1,5 @@
 #include "float_projection.h"
+#include "../../../tests/numeric_assertions.h"
 #include "dense_f32_projection_test.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
@@ -41,7 +42,7 @@ void check_prefill(int width,int outputs,int rows,bool strided) {
             const double term=double(source.data_ptr<float>()[m*width+k])*weight.data_ptr<float>()[n*width+k];
             expected+=term;magnitude+=std::abs(term);
         }
-        if(std::abs(values.data_ptr<float>()[m*outputs+n]-expected)>magnitude*2e-5+1e-6)
+        if(mfq::test::checked_absolute_error(values.data_ptr<float>()[m*outputs+n],expected)>magnitude*2e-5+1e-6)
             throw std::runtime_error("BF16 GR prefill differs from Strata-precision CPU dot");
     }
 }
@@ -59,7 +60,7 @@ void check_dense(int width,int outputs,int rows,tb::ScalarType dtype) {
             const double v=double(source.data_ptr<float>()[m*width+k])*weights.data_ptr<float>()[n*width+k];
             sum+=v;magnitude+=std::abs(v);
         }
-        if(std::abs(values.data_ptr<float>()[m*outputs+n]-sum)>.004*magnitude+1e-6)
+        if(mfq::test::checked_absolute_error(values.data_ptr<float>()[m*outputs+n],sum)>.004*magnitude+1e-6)
             throw std::runtime_error("BF16 dense projection differs from rounded-input CPU dot");
     }
     if((actual.to(tb::kBFloat16).to(tb::kFloat32)-actual.to(tb::kFloat32)).abs().max().item<float>()!=0)
@@ -248,7 +249,8 @@ void benchmark_prefill_mix(int hidden,int rank,int streams,int rows,int sets,int
             if(!new_output[i].defined())throw std::runtime_error("GR prefill mix benchmark did not select fused kernel");},[]{});
         old_graphs.push_back(std::move(old));new_graphs.push_back(std::move(current));
     }
-    for(int i=0;i<sets;++i)if((old_output[i]-new_output[i]).abs().max().item<float>()>(full?1e-4f:3e-6f))
+    for(int i=0;i<sets;++i)if(mfq::test::checked_absolute_error(
+            (old_output[i]-new_output[i]).abs().max().item<float>(),0.f)>(full?1e-4f:3e-6f))
         throw std::runtime_error("GR prefill mix benchmark parity failed");
     std::array<std::vector<float>,2> times;
     for(int trial=0;trial<5;++trial)for(int pass=0;pass<2;++pass) {
@@ -310,7 +312,8 @@ void benchmark_shared_gate_multiply(int rows,int width,int outputs,int iteration
     after.capture([&]{auto output=try_shared_gate_multiply_cuda(x,weight,expert);
         if(!output)throw std::runtime_error("FP32 gate benchmark did not use the fused entry");result[1]=*output;},[]{});
     before.run();after.run();
-    if((result[0]-result[1]).abs().max().item<float>()>2e-6f)throw std::runtime_error("FP32 gate benchmark parity failed");
+    if(mfq::test::checked_absolute_error((result[0]-result[1]).abs().max().item<float>(),0.f)>2e-6f)
+        throw std::runtime_error("FP32 gate benchmark parity failed");
     std::array<std::vector<float>,2> times;
     for(int trial=0;trial<7;++trial)for(int order=0;order<2;++order) {
         const int mode=(trial+order)%2;auto& window=mode?after:before;
@@ -369,7 +372,7 @@ void check(int hidden,int rank,int streams,int rows,tb::ScalarType type,bool una
         double sum=0;
         for(int k=0;k<width;++k)sum+=double(w.data_ptr<float>()[r*width+k])*x.data_ptr<float>()[m*width+k];
         sum/=streams;const auto expected=sum/(1+std::exp(-sum));
-        if(std::abs(actual_low.data_ptr<float>()[m*rank+r]-expected)>2e-5*(1+std::abs(expected)))
+        if(mfq::test::checked_absolute_error(actual_low.data_ptr<float>()[m*rank+r],expected)>2e-5*(1+std::abs(expected)))
             throw std::runtime_error("generic BF16 residual Down differs from CPU projection and SiLU");
     }
     auto output=try_gr_bf16_up_mix_cuda(low,input,up,streams);
@@ -383,7 +386,7 @@ void check(int hidden,int rank,int streams,int rows,tb::ScalarType type,bool una
             expected+=x.data_ptr<float>()[m*width+s*hidden+h]/(1+std::exp(-sum));
         }
         expected/=streams;
-        if(std::abs(actual.data_ptr<float>()[m*hidden+h]-expected)>2e-5*(1+std::abs(expected)))
+        if(mfq::test::checked_absolute_error(actual.data_ptr<float>()[m*hidden+h],expected)>2e-5*(1+std::abs(expected)))
             throw std::runtime_error("generic BF16 residual Up differs from CPU projection and stream mix");
     }
 }

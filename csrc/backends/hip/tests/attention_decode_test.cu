@@ -1,4 +1,5 @@
 #include "mfq_hip_attention_ops.h"
+#include "../../../tests/numeric_assertions.h"
 #include "hip_execution.h"
 
 #include <hip/hip_runtime.h>
@@ -76,7 +77,7 @@ struct Fixture {
         double error = 0., norm = 0.;
         for (size_t i = 0; i < expected.size(); ++i) {
             const double actual = host.data_ptr<float>()[i], difference = actual - expected[i];
-            if (!std::isfinite(actual) || std::abs(difference) > tolerance * (1. + std::abs(expected[i])))
+            if (mfq::test::checked_absolute_error(actual, expected[i]) > tolerance * (1. + std::abs(expected[i])))
                 throw std::runtime_error("decode attention differs from FP64 reference");
             error += difference * difference; norm += expected[i] * expected[i];
         }

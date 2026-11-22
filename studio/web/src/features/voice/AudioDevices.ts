@@ -15,6 +15,9 @@ export class AudioDevices {
   private resampler: StreamingLinearResampler | null = null;
   private playAt = 0;
   private playing = new Set<AudioBufferSourceNode>();
+  private captureGeneration = 0;
+  private outputGeneration = 0;
+  private closedOutputContexts = new WeakSet<AudioContext>();
 
 
   get capturing(): boolean {
@@ -22,15 +25,40 @@ export class AudioDevices {
   }
 
 
+  /** Ensures playback output exists; a later close invalidates pending setup. */
   async ensureOutput(): Promise<void> {
-    this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
-    await this.outputContext.resume();
+    const generation = ++this.outputGeneration;
+    const existing = this.outputContext;
+    const context = existing ?? new AudioContext({ sampleRate: OUTPUT_RATE });
+    this.closedOutputContexts.delete(context);
+    try {
+      await context.resume();
+    } catch (cause) {
+      if (this.outputContext !== context && !this.closedOutputContexts.has(context)) {
+        this.closedOutputContexts.add(context);
+        await context.close().catch(() => undefined);
+      }
+      throw cause;
+    }
+    if (generation !== this.outputGeneration) {
+      if (this.outputContext !== context && !this.closedOutputContexts.has(context)) {
+        await context.close().catch(() => undefined);
+      }
+      return;
+    }
+    this.outputContext ??= context;
   }
 
 
+  /** Starts microphone capture; stale permission/setup completions are cancelled and cleaned up. */
   async startCapture(onSamples: (samples: Float32Array) => void): Promise<void> {
+    const generation = ++this.captureGeneration;
+    let stream: MediaStream | null = null;
+    let inputContext: AudioContext | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let capture: AudioWorkletNode | null = null;
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           echoCancellation: true,
@@ -38,22 +66,53 @@ export class AudioDevices {
           autoGainControl: true,
         },
       });
-      try {
-        this.inputContext = new AudioContext({ sampleRate: INPUT_RATE });
-      } catch {
-        this.inputContext = new AudioContext();
+      if (generation !== this.captureGeneration) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
       }
-      this.resampler = new StreamingLinearResampler(this.inputContext.sampleRate, INPUT_RATE);
-      await Promise.all([this.inputContext.resume(), this.ensureOutput()]);
-      await this.inputContext.audioWorklet.addModule('/pcm-capture-worklet.js');
-      this.source = this.inputContext.createMediaStreamSource(this.stream);
-      this.capture = new AudioWorkletNode(this.inputContext, 'pcm-capture');
-      const silent = this.inputContext.createGain();
+      try {
+        inputContext = new AudioContext({ sampleRate: INPUT_RATE });
+      } catch {
+        inputContext = new AudioContext();
+      }
+      const resampler = new StreamingLinearResampler(inputContext.sampleRate, INPUT_RATE);
+      await Promise.all([inputContext.resume(), this.ensureOutput()]);
+      if (generation !== this.captureGeneration) {
+        stream.getTracks().forEach((track) => track.stop());
+        await inputContext.close().catch(() => undefined);
+        return;
+      }
+      await inputContext.audioWorklet.addModule('/pcm-capture-worklet.js');
+      source = inputContext.createMediaStreamSource(stream);
+      capture = new AudioWorkletNode(inputContext, 'pcm-capture');
+      const silent = inputContext.createGain();
       silent.gain.value = 0;
-      this.source.connect(this.capture).connect(silent).connect(this.inputContext.destination);
-      this.capture.port.onmessage = (event: MessageEvent<Float32Array>) => onSamples(event.data);
+      source.connect(capture).connect(silent).connect(inputContext.destination);
+      capture.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        if (generation === this.captureGeneration && this.capture === capture) onSamples(event.data);
+      };
+      if (generation !== this.captureGeneration) {
+        source.disconnect();
+        capture.port.onmessage = null;
+        capture.disconnect();
+        stream.getTracks().forEach((track) => track.stop());
+        await inputContext.close().catch(() => undefined);
+        return;
+      }
+      this.stream = stream;
+      this.inputContext = inputContext;
+      this.resampler = resampler;
+      this.source = source;
+      this.capture = capture;
     } catch (cause) {
-      await this.close();
+      stream?.getTracks().forEach((track) => track.stop());
+      source?.disconnect();
+      if (capture) {
+        capture.port.onmessage = null;
+        capture.disconnect();
+      }
+      await inputContext?.close().catch(() => undefined);
+      if (generation === this.captureGeneration) await this.close();
       throw cause;
     }
   }
@@ -64,17 +123,23 @@ export class AudioDevices {
   }
 
 
+  /** Cancels pending capture setup and releases only the current microphone resources. */
   async stopCapture(): Promise<void> {
-    this.stream?.getTracks().forEach((track) => track.stop());
+    this.captureGeneration += 1;
+    const stream = this.stream;
+    const source = this.source;
+    const capture = this.capture;
+    const inputContext = this.inputContext;
     this.stream = null;
-    this.source?.disconnect();
-    if (this.capture) this.capture.port.onmessage = null;
-    this.capture?.disconnect();
-    await this.inputContext?.close().catch(() => undefined);
     this.inputContext = null;
     this.resampler = null;
     this.source = null;
     this.capture = null;
+    stream?.getTracks().forEach((track) => track.stop());
+    source?.disconnect();
+    if (capture) capture.port.onmessage = null;
+    capture?.disconnect();
+    await inputContext?.close().catch(() => undefined);
   }
 
 
@@ -111,11 +176,15 @@ export class AudioDevices {
   }
 
 
+  /** Releases the current devices and invalidates pending input/output setup. */
   async close(): Promise<void> {
-    await this.stopCapture();
     this.stopPlayback();
-    await this.outputContext?.close().catch(() => undefined);
+    this.outputGeneration += 1;
+    const output = this.outputContext;
     this.outputContext = null;
+    if (output) this.closedOutputContexts.add(output);
+    await this.stopCapture();
+    await output?.close().catch(() => undefined);
     this.playAt = 0;
   }
 }

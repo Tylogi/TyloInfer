@@ -1,6 +1,8 @@
 #pragma once
 #include "mfq_cuda_paged_kv.h"
 
+#include "tests/numeric_assertions.h"
+
 void kv_quantization_case() {
     using namespace mfq::cuda;
     for (int bits:{2,3,4,6,8}) {
@@ -38,8 +40,11 @@ void kv_quantization_case() {
         for(int i=0;i<2*d;++i)if(zeros.data_ptr<float>()[i]!=0)throw std::runtime_error("TurboQuant zero norm changed");
         auto original=k.to(tb::kCPU),decoded=dk.to(tb::kCPU);
         double error=0,energy=0;
-        for(int64_t i=0;i<k.numel();++i){double x=original.data_ptr<float>()[i],delta=decoded.data_ptr<float>()[i]-x;error+=delta*delta;energy+=x*x;}
-        if(std::sqrt(error/energy)>(bits<3?.5:bits<4?.3:bits<6?.2:.08))throw std::runtime_error("TurboQuant reconstruction error too large");
+        for(int64_t i=0;i<k.numel();++i){double x=original.data_ptr<float>()[i],delta=
+            mfq::test::checked_absolute_error(double(decoded.data_ptr<float>()[i]),x);error+=delta*delta;energy+=x*x;}
+        const double relative=std::sqrt(error/energy);
+        if(!std::isfinite(relative) || relative>(bits<3?.5:bits<4?.3:bits<6?.2:.08))
+            throw std::runtime_error("TurboQuant reconstruction error too large");
         auto pos=tb::tensor(std::vector<int64_t>{510,511,512,39,41,44}).reshape({b,t}).to(tb::kCUDA);
         auto lengths=tb::tensor(std::vector<int64_t>{513,43}).to(tb::kCUDA);
         auto mask=tb::ones({b,length},q.options());mask.narrow(1,2,3).fill_(0);
@@ -69,7 +74,8 @@ void kv_quantization_case() {
                     double expected=0;
                     for(size_t j=0;j<chosen.size();++j)expected+=weights[j]*vc.data_ptr<float>()[((batch*kh+head/(h/kh))*length+chosen[j])*d+dim];
                     if(mass)expected/=mass;
-                    maximum_error=std::max(maximum_error,std::abs(expected-output.data_ptr<float>()[((batch*t+token)*h+head)*d+dim]));
+                    maximum_error=std::max(maximum_error,mfq::test::checked_absolute_error(
+                        expected, output.data_ptr<float>()[((batch*t+token)*h+head)*d+dim]));
                 }
             }
             if(maximum_error>3e-5)throw std::runtime_error("TurboQuant compressed attention differs from decoded CPU oracle: "+std::to_string(maximum_error));

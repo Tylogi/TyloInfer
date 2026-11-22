@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 
@@ -129,15 +130,40 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
     auto owner = std::shared_ptr<void>(pointer, [context, allocation_stream, bytes, uses](void* value) {
         // record_stream registers future consumers, not just work already
         // queued at registration. Fence their last uses when storage dies.
+        std::vector<StreamUses::Use> consumers;
         try {
+            {
+                std::lock_guard lock(uses->mutex);
+                consumers = uses->streams;
+            }
             DeviceGuard guard(allocation_stream.device_index());
-            for (const auto& usage : uses->streams) {
+            for (const auto& usage : consumers) {
                 Event consumed;
                 consumed.record(usage.stream);
                 TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(allocation_stream.stream(), consumed.get(), 0));
             }
         } catch (...) { (void)cudaDeviceSynchronize(); }
         context->release(value, bytes, allocation_stream.stream());
+        if (consumers.empty()) return;
+        try {
+            DeviceGuard guard(allocation_stream.device_index());
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream.stream(), &status));
+            if (status != cudaStreamCaptureStatusActive) return;
+            // The lifetime fence and async free can fork capture back onto
+            // the allocation stream after the consumer already joined it.
+            // Close that branch without enrolling ordinary consumer streams.
+            std::optional<Event> released;
+            for (const auto& usage : consumers) {
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(usage.stream, &status));
+                if (status != cudaStreamCaptureStatusActive) continue;
+                if (!released) {
+                    released.emplace();
+                    released->record(allocation_stream.stream());
+                }
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(usage.stream, released->get(), 0));
+            }
+        } catch (...) { (void)cudaDeviceSynchronize(); }
     });
     auto storage = std::make_shared<TensorStorage>();
     storage->owner = std::move(owner);

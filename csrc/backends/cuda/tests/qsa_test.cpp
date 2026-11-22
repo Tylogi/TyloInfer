@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/model.h"
+#include "../../../tests/numeric_assertions.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
 #include "selected_attention.h"
@@ -340,8 +341,8 @@ void draft_window_graph() {
                             fresh.data_ptr<float>()[(index-prefix)*width+column];
                     expected*=.5/(end-begin+1);
                     const double tolerance=half?.0003:.00001;
-                    if(std::abs(a.data_ptr<float>()[row*width+column]-expected)>tolerance ||
-                        (row==rows-1 && std::abs(b.data_ptr<float>()[column]-expected)>tolerance))
+                    if(mfq::test::checked_absolute_error(a.data_ptr<float>()[row*width+column],expected)>tolerance ||
+                        (row==rows-1 && mfq::test::checked_absolute_error(b.data_ptr<float>()[column],expected)>tolerance))
                         throw std::runtime_error("draft dense-window attention differs from CPU causal-window average");
                 }
                 if(full.position()!=prefix+rows || tail.position()!=prefix+rows)

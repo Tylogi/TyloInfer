@@ -7,6 +7,7 @@
 // dt clamp is caught numerically rather than by inspection.
 
 #include "mfq_hip_activation_ops.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mfq_hip_context.h"
 #include "mfq_hip_norm_ops.h"
 #include "mfq_hip_selective_state_scan_ops.h"
@@ -38,8 +39,7 @@ void require(bool condition, const std::string& message)
 void close_value(float actual, double expected, float atol, float rtol,
                  const std::string& label)
 {
-    if (!std::isfinite(actual) ||
-        std::abs(actual - expected) > atol + rtol * std::abs(expected)) {
+    if (mfq::test::checked_absolute_error(actual, expected) > atol + rtol * std::abs(expected)) {
         throw std::runtime_error(label + " mismatch: actual=" +
             std::to_string(actual) + " expected=" + std::to_string(expected));
     }
@@ -62,7 +62,7 @@ float peak_difference(const std::vector<float>& actual,
     require(actual.size() == expected.size(), "difference size mismatch");
     float peak = 0.0f;
     for (std::size_t index = 0; index < actual.size(); ++index) {
-        peak = std::max(peak, (float)std::abs(actual[index] - expected[index]));
+        peak = std::max(peak, float(mfq::test::checked_absolute_error(actual[index], expected[index])));
     }
     return peak;
 }

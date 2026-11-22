@@ -1,10 +1,10 @@
 
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderMarkdown } from '../src/features/chat/MessageMarkdown';
+import { SavedMessageList } from '../src/features/chat/SavedMessageList';
+import { TooltipProvider } from '../src/shared/ui/Tooltip';
 import { parseHubReference } from '../src/features/models/hubReference';
 import { ModelBrowser } from '../src/features/models/ModelBrowser';
 import { ModelHubPage } from '../src/features/models/ModelHubPage';
@@ -50,10 +50,22 @@ describe('test_assistant_markdown_recovers_fully_escaped_structural_line_breaks'
     expect(view.container.textContent).toContain(text.startsWith('```') ? 'const text = "\\n";' : text);
   });
 
-  it('过渡源码：持久消息仅为助手角色启用修复（非行为）', () => {
-    const saved = readFileSync(resolve('src/features/chat/SavedMessageList.tsx'), 'utf8');
-    expect(saved).toContain('renderMarkdown(parts.text, false, message.role === "assistant")');
-    expect(saved).toContain('renderMarkdown(parts.reasoning, false, message.role === "assistant")');
+  it('持久消息只修复助手文本及思考过程中的转义换行', async () => {
+    const text = String.raw`Heading\n\n- first\n- second`;
+    const { container } = render(
+      <TooltipProvider>
+        <SavedMessageList messages={(['user', 'assistant'] as const).map(role => ({
+          id: role, role, parts: [{ type: 'text' as const, text }, { type: 'reasoning' as const, text }],
+          parent_id: null, created_at: '2026-01-01T00:00:00Z',
+        }))} responses={{}} busy={false} tr={(_zh, en) => en} editDraft={null}
+          setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn() }} />
+      </TooltipProvider>,
+    );
+    const assistant = container.querySelector('.message-assistant')!;
+    await waitFor(() => expect(assistant.querySelectorAll('li')).toHaveLength(4));
+    const user = container.querySelector('.message-user')!;
+    expect(user.querySelector('li')).toBeNull();
+    expect(user).toHaveTextContent(text);
   });
 });
 

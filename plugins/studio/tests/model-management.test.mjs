@@ -20,7 +20,8 @@ function fixture(options = {}) {
     if (handler) { const reply = await handler(method, payload, signal); if (reply !== undefined) return reply; }
     if (method === 'core/read') return ok({ data: payload.resource === 'models' ? [{ id: 'artifact', name: 'Example', loadable: true }] : payload.resource === 'loaded_models' ? loaded : [] });
     if (method === 'models/load' || method === 'models/unload') return ok({ operation_id: id, status: 'accepted' });
-    return ok(operation);
+    if (method === 'operations/get' || method === 'operations/cancel') return ok(operation);
+    throw new Error('unexpected model manager RPC: ' + method);
   } } };
   const manager = createModelManager(connection, { schedule: callback => { timers.add(callback); return () => timers.delete(callback); }, ...options });
   return { manager, connection, calls, timers, setLoaded: value => { loaded = value; }, setJob: value => { operation = value; }, intercept: value => { handler = value; },

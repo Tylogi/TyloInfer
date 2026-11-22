@@ -1,5 +1,9 @@
 #include "mfq_cuda_context.h"
 
+#ifdef NDEBUG
+#error "HIP native tests require assertions to remain enabled"
+#endif
+
 #include <cuda_runtime_api.h>
 
 #include <array>

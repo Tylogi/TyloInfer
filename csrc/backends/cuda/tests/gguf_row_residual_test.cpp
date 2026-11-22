@@ -1,4 +1,5 @@
 #include "tyloinfer/row_residual.h"
+#include "../../../tests/numeric_assertions.h"
 #include "../kernels/gguf_row_residual.h"
 #include "ggml.h"
 #include "../../../tests/row_residual_fixture.h"
@@ -19,7 +20,7 @@ struct Buffer {
 };
 void near(const std::vector<float>& actual,const std::vector<float>& expected) {
     for(std::size_t i=0;i<actual.size();++i)
-        if(std::abs(actual[i]-expected[i])>2e-4f*(1+std::abs(expected[i])))
+        if(mfq::test::checked_absolute_error(actual[i],expected[i])>2e-4f*(1+std::abs(expected[i])))
             throw std::runtime_error("row residual output differs from decoded reference");
 }
 }

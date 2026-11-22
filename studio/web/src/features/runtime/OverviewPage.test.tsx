@@ -4,7 +4,8 @@ import type { RuntimeStatus, ServingStatistics } from '../../shared/api/contract
 import { OverviewPage } from './OverviewPage';
 import { setApiBaseUrl } from '../../shared/api/client';
 
-const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, models: [], instances: [],
+const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, models: [] as { id: string }[], instances: [],
+  selectedModel: 'loaded-0', setSelectedModel: vi.fn(),
   connectionRevision: 0, refreshRuntime: vi.fn(), listener: vi.fn().mockResolvedValue({ anthropic_port: null }),
   data: null as ServingStatistics | null, scope: 'session' }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
@@ -15,7 +16,7 @@ vi.mock('./RuntimeHero', () => ({ RuntimeHero: () => null }));
 vi.mock('./MemoryHierarchy', () => ({ MemoryHierarchy: () => null }));
 vi.mock('./useServingStatistics', () => ({ useServingStatistics: (scope: string) => { state.scope = scope; return { data: state.data, error: null }; } }));
 
-beforeEach(() => { state.runtime = null; state.models = []; state.data = null; });
+beforeEach(() => { state.runtime = null; state.models = []; state.data = null; state.setSelectedModel.mockClear(); });
 afterEach(() => { vi.restoreAllMocks(); setApiBaseUrl(''); });
 
 it('shows the complete Jev URL on the current service port with explicit request instructions', async () => {
@@ -25,6 +26,15 @@ it('shows the complete Jev URL on the current service port with explicit request
   expect(copy).toBeEnabled();
   expect(copy.closest('.overview-api-entry')).toHaveTextContent('https://example.com:9443/inference/v1/systemone');
   expect(screen.getByText('Jev shares the OpenAI port.', { exact: false })).toHaveTextContent('Send POST requests to the Jev URL explicitly');
+});
+
+it('lists all loaded models and allows selecting one beyond the first eight', async () => {
+  state.models = Array.from({ length: 10 }, (_, index) => ({ id: `loaded-${index}` }));
+  await act(async () => { render(<OverviewPage />); });
+  expect(screen.getAllByRole('button', { name: /loaded-\d/ })).toHaveLength(10);
+  expect(screen.getByRole('button', { name: /loaded-0/ })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: /loaded-9/ }));
+  expect(state.setSelectedModel).toHaveBeenCalledExactlyOnceWith('loaded-9');
 });
 
 it('places the combined appearance control beside Refresh in the overview header', async () => {

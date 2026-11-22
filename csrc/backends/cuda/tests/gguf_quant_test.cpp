@@ -1,4 +1,5 @@
 #include "../kernels/gguf.h"
+#include "../../../tests/numeric_assertions.h"
 #include "../kernels/gguf_compact.h"
 #include "tyloinfer/gguf_quant.h"
 #include "ggml-quants.h"
@@ -65,7 +66,7 @@ void check_type(ggml_type type, int columns, int rows=5) {
     for (std::size_t i = 0; i < embedded.size(); ++i) {
         const auto row = ids[i / columns];
         const auto expected = row >= 0 && row < rows ? reference[row * columns + i % columns] : 0.f;
-        if (std::abs(embedded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
+        if (mfq::test::checked_absolute_error(embedded[i], expected) > 1e-6f * std::max(1.f, std::abs(expected)))
             throw std::runtime_error("GGUF embedding mismatch");
     }
     // A captured PLE decoder must read updated row packets on every replay.
@@ -93,7 +94,7 @@ void check_type(ggml_type type, int columns, int rows=5) {
         check(cudaMemcpy(decoded.data(), output.data, 2 * columns * sizeof(float), cudaMemcpyDeviceToHost));
         for (int i = 0; i < 2 * columns; ++i) {
             const auto expected = reference[(i < columns ? first_row : 1) * columns + i % columns];
-            if (std::abs(decoded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
+            if (mfq::test::checked_absolute_error(decoded[i], expected) > 1e-6f * std::max(1.f, std::abs(expected)))
                 throw std::runtime_error("GGUF row packet graph replay mismatch");
         }
     }
@@ -165,7 +166,7 @@ void check_type(ggml_type type, int columns, int rows=5) {
                     const double product=double(reference[r*columns+k])*ggml_fp16_to_fp32(block.d)*block.qs[k%32];
                     expected+=product;magnitude+=std::abs(product);
                 }
-                if(std::abs(y[t*rows+r]-expected)>2e-6*magnitude+1e-6)
+                if(mfq::test::checked_absolute_error(y[t*rows+r],expected)>2e-6*magnitude+1e-6)
                     throw std::runtime_error(std::string(ggml_type_name(type))+" prepared integer dot changed decoded weights or scales");
             }
         }
@@ -406,7 +407,7 @@ void check_type(ggml_type type, int columns, int rows=5) {
         check(cudaMemcpy(decoded_host.data(),decoded.data,decoded_host.size()*sizeof(__half),cudaMemcpyDeviceToHost));
         for(int expert=0;expert<3;++expert)for(int row=0;row<rows;++row)for(int k=0;k<columns;++k) {
             const float expected=__half2float(__float2half(reference[((row+expert)%rows)*columns+k]));
-            if(std::abs(__half2float(decoded_host[(expert*rows+row)*columns+k])-expected)>std::abs(expected)*1e-3f+1e-6f)
+            if(mfq::test::checked_absolute_error(__half2float(decoded_host[(expert*rows+row)*columns+k]),expected)>std::abs(expected)*1e-3f+1e-6f)
                 throw std::runtime_error(std::string(ggml_type_name(type))+" grouped weight decode mismatch");
         }
         DeviceArray<__half> joined_decoded(6*rows*columns);

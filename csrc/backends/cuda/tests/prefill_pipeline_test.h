@@ -1,4 +1,5 @@
 #pragma once
+#include "../../../tests/numeric_assertions.h"
 
 void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false,bool partial_pin=false) {
     struct Setting {
@@ -218,7 +219,7 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
                 auto a=result[0].to(tb::kFloat32),b=result[1].to(tb::kFloat32);
                 double squared=0,reference_squared=0;
                 for(int64_t i=0;i<a.numel();++i) {
-                    const double d=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
+                    const double d=mfq::test::checked_absolute_error(double(a.data_ptr<float>()[i]),b.data_ptr<float>()[i]);
                     squared+=d*d;reference_squared+=double(a.data_ptr<float>()[i])*a.data_ptr<float>()[i];
                 }
                 if(std::sqrt(squared/std::max(reference_squared,1e-20))>.001)

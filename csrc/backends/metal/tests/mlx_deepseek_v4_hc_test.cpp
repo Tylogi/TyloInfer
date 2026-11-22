@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_hc.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_deepseek_v41_mhc.h"
 #include "mlx_transformer.h"
 
@@ -56,7 +57,7 @@ void require_close(
         actual.size() == expected.size(),
         label + " size mismatch");
     for (std::size_t index = 0; index < actual.size(); ++index) {
-        if (std::fabs(actual[index] - expected[index]) >
+        if (mfq::test::checked_absolute_error(actual[index], expected[index]) >
             tolerance) {
             throw std::runtime_error(
                 label + " mismatch at " +

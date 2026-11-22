@@ -1,4 +1,5 @@
 #include "mfq_cuda_attention_ops.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mfq_cuda_context.h"
 #include "runtime/decode_window.h"
 #include "runtime/graph_pool_lease.h"
@@ -27,8 +28,8 @@ static void verify(const tb::Tensor& output, const tb::Tensor& query,
     auto actual = output.to(tb::kCPU, tb::kFloat32).contiguous();
     if (actual.sizes() != expected.sizes()) throw std::runtime_error("prefill shape differs");
     for (int64_t i = 0; i < actual.numel(); ++i) {
-        const auto error = std::abs(double(actual.data_ptr<float>()[i]) - expected.data_ptr<float>()[i]);
-        if (!std::isfinite(error)) throw std::runtime_error("nonfinite prefill output");
+        const auto error = mfq::test::checked_absolute_error(
+            double(actual.data_ptr<float>()[i]), expected.data_ptr<float>()[i]);
         errors.reference = std::max(errors.reference, error);
     }
     if (errors.reference > 1.5e-3) throw std::runtime_error("prefill differs from the attention reference");
@@ -56,7 +57,8 @@ static void verify(const tb::Tensor& output, const tb::Tensor& query,
                     value += scores[j] * v.data_ptr<float>()[((b * kv_heads + h / ratio) * tokens + j) * width + d];
                 value /= denominator;
                 const auto actual_value = actual.data_ptr<float>()[((b * tokens + t) * heads + h) * width + d];
-                errors.fp64 = std::max(errors.fp64, std::abs(double(actual_value) - value));
+                errors.fp64 = std::max(errors.fp64,
+                    mfq::test::checked_absolute_error(double(actual_value), value));
             }
         }
     }
@@ -72,8 +74,9 @@ int main() try {
         throw std::runtime_error("cannot query CUDA capabilities");
     // The shared 32-column FP16 MMA body requires Volta instructions.
     if (properties.major < 7) return 77;
+    const auto context = mfq::cuda::default_context(device);
     const auto stream = mfq_current_cuda_stream();
-    auto pool = mfq::cuda::GraphPoolLease::acquire(mfq::cuda::default_context(device), stream);
+    auto pool = mfq::cuda::GraphPoolLease::acquire(context, stream);
     tb::NoGradGuard guard;
     const auto cpu = tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32);
     Errors errors;

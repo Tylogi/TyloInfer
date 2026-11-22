@@ -1,4 +1,5 @@
 #include "mlx_tensor.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_staging_allocator.h"
 
 #include <cmath>
@@ -277,7 +278,7 @@ void test_nint_record_dtypes() {
 }
 
 void require_close(float actual, float expected) {
-    if (std::fabs(actual - expected) > 1e-5f) {
+    if (mfq::test::checked_absolute_error(actual, expected) > 1e-5f) {
         throw std::runtime_error(
             "dense MLX tensor mismatch: actual=" +
             std::to_string(actual) +

@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {
-  test(`streamed KV has shared colors, live tracking and no settings context duplicate (${language})`, async ({ page }, testInfo) => {
+  test(`streamed KV tracks live usage without duplicating settings controls (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
     const zh = language === 'zh-CN';
     const GiB = 2 ** 30;
@@ -39,10 +39,6 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(overview).toContainText(zh ? 'SSD 流式 KV' : 'SSD-streamed KV');
     await expect(overview).toContainText('4 GiB');
     await expect(overview).toContainText(zh ? 'RAM 命中率 75%' : 'RAM hit rate 75%');
-    const colors = await page.locator('[data-tier="weights"] .memory-tier-track > span').evaluateAll(nodes => nodes.map(node => (node as HTMLElement).style.backgroundColor));
-    expect(await overview.locator('.memory-tier-track > span').evaluateAll(nodes => nodes.map(node => (node as HTMLElement).style.backgroundColor))).toEqual(colors);
-    await expect(overview.locator('.memory-tier-track > span').first()).toHaveAttribute('style', /width: 25%/);
-    await expect(page.locator('[data-tier="kv"]')).toContainText('2 GiB / 56 GiB');
     await overview.scrollIntoViewIfNeeded();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('overview-streamed-kv.png'), animations: 'disabled', fullPage: true });

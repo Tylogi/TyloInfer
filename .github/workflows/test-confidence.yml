@@ -1,0 +1,89 @@
+name: Test confidence
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    name: CPU communication profiles, Python, web and plugins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install CPU build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libssl-dev
+      - name: Install uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install Node and pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.25.0
+      - name: Configure Node and pnpm cache
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: studio/web/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        run: pnpm --dir studio/web install --frozen-lockfile
+      - name: Run the quick gate
+        run: python scripts/test_gates.py quick
+      - name: Upload gate record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-confidence-quick
+          path: .tyloinfer/test-gate-quick-*
+          if-no-files-found: error
+
+  service:
+    name: Real Python service browser protocol
+    runs-on: ubuntu-latest
+    env:
+      TYLOINFER_TEST_PYTHON: ${{ github.workspace }}/studio/.venv/bin/python
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Python extension prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - name: Install uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked Python environment
+        run: uv sync --project studio --extra dev --locked
+      - name: Install Node and pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.25.0
+      - name: Configure Node and pnpm cache
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: studio/web/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        run: pnpm --dir studio/web install --frozen-lockfile
+      - name: Install Chromium and Linux dependencies
+        run: pnpm --dir studio/web exec playwright install --with-deps chromium
+      - name: Run the strict service gate
+        run: python scripts/test_gates.py service
+      - name: Upload service artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-confidence-service
+          path: |
+            studio/web/e2e-service/artifacts
+            .tyloinfer/test-gate-service-*
+            .tyloinfer/playwright-service-*.json
+          if-no-files-found: warn

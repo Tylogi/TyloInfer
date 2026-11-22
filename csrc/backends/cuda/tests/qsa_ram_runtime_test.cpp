@@ -10,6 +10,7 @@
 #include "tyloinfer/qsa_tq_cpu.h"
 #include "tyloinfer/host_memory.h"
 #include "mfq_cuda_context.h"
+#include "tests/numeric_assertions.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -168,7 +169,8 @@ void snapshot_roundtrip(int bits,const std::string& migration_directory={}) {
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES","512");
     const auto actual_initial=append(0,129);
     for(std::int64_t i=0;i<expected_initial.numel();++i)
-        if(std::abs(expected_initial.data_ptr<float>()[i]-actual_initial.data_ptr<float>()[i])>2e-5f)
+        if(mfq::test::checked_absolute_error(
+                expected_initial.data_ptr<float>()[i], actual_initial.data_ptr<float>()[i])>2e-5f)
             throw std::runtime_error("Score tiling changed fresh canonical attention");
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES",std::to_string(64ULL<<20));
     auto snapshot=cache.capture_session(129);const auto expected=append(129,17);
@@ -203,7 +205,8 @@ void snapshot_roundtrip(int bits,const std::string& migration_directory={}) {
             const auto actual=destination.to(tb::kCPU).contiguous();
             const auto reference=eager_expected.narrow(0,token-129,1).contiguous();
             for(std::int64_t i=0;i<actual.numel();++i)
-                if(std::abs(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i])>2e-5f)
+                if(mfq::test::checked_absolute_error(
+                        actual.data_ptr<float>()[i], reference.data_ptr<float>()[i])>2e-5f)
                     throw std::runtime_error("Retained single-token graph changed nonzero index selection: bits="+
                         std::to_string(bits)+" token="+std::to_string(token)+" difference="+
                         std::to_string(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i]));
@@ -224,7 +227,8 @@ void snapshot_roundtrip(int bits,const std::string& migration_directory={}) {
             throw std::runtime_error("CPU Indexer must keep its cache in RAM and support graph decode");
         const auto check=[](const tb::Tensor& actual,const tb::Tensor& reference) {
             for(std::int64_t i=0;i<actual.numel();++i)
-                if(std::abs(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i])>2e-5f)
+                if(mfq::test::checked_absolute_error(
+                        actual.data_ptr<float>()[i], reference.data_ptr<float>()[i])>2e-5f)
                     throw std::runtime_error("CPU Indexer changed QSA output");
         };
         check(append(0,129,&host_cache),expected_initial);
@@ -312,7 +316,8 @@ void pressure(const std::string& directory) {
         auto positions=tb::arange(start,start+count,f.dtype(tb::kInt64)).reshape({1,count});
         auto gate=tb::zeros({1,count,heads,width},h),destination=tb::empty({count,heads,width},h);
         auto result=cache.forward(query,values,values,iq,raw,positions,pool,false,gate,destination).to(tb::kCPU,tb::kFloat32).contiguous();
-        for(int64_t i=0;i<result.numel();++i)if(std::abs(result.data_ptr<float>()[i]-.015625f)>.001f)
+        for(int64_t i=0;i<result.numel();++i)if(mfq::test::checked_absolute_error(
+                result.data_ptr<float>()[i], .015625f)>.001f)
             throw std::runtime_error("RAM/SSD selected attention lost constant-value reconstruction");
     };
     append(0,prompt,false);append(prompt,1,false);cache.wait();
@@ -861,7 +866,8 @@ void ram_pressure_retained_graph() {
         if(!window.valid())window.capture([&]{cache.forward_pending_graph(q,kv,kv,iq,raw,position,gate,out,pool);},[]{});
         window.run();cache.advance_graph(n);
         const auto actual=out.to(tb::kCPU,tb::kFloat32).contiguous();
-        for(int64_t i=0;i<actual.numel();++i)if(std::abs(actual.data_ptr<float>()[i]-.015625f)>.001f)
+        for(int64_t i=0;i<actual.numel();++i)if(mfq::test::checked_absolute_error(
+                actual.data_ptr<float>()[i], .015625f)>.001f)
             throw std::runtime_error("Retained RAM Graph lost its dynamic compact layout after quantization");
     }
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
@@ -1294,7 +1300,8 @@ void prefill_loan_lifetime() {
         auto positions=tb::arange(start,start+count,f.dtype(tb::kInt64)).reshape({1,count});
         auto out=cache->forward(q,v,v,iq,raw,positions,[&](const auto& x,const auto&){return tb::zeros({1,x.size(1)/4,13},f);},false,gate);
         const auto actual=out.to(tb::kCPU,tb::kFloat32).contiguous();
-        for(int64_t i=0;i<actual.numel();++i)if(std::abs(actual.data_ptr<float>()[i]-.015625f)>.00001f)
+        for(int64_t i=0;i<actual.numel();++i)if(mfq::test::checked_absolute_error(
+                actual.data_ptr<float>()[i], .015625f)>.00001f)
             throw std::runtime_error("QSA workspace loan changed causal attention");
     };
     auto storage=tb::empty({8<<20},f.dtype(tb::kUInt8));
@@ -1353,7 +1360,8 @@ void long_prefill_operand_reuse() {
         const double difference=std::abs(results[0].data_ptr<float>()[i]-results[1].data_ptr<float>()[i]);
         if(!std::isfinite(difference))throw std::runtime_error("Long QSA prefill produced nonfinite output");
         maximum=std::max(maximum,difference);
-        if(i%width<2 && std::abs(results[1].data_ptr<float>()[i]-.015625f)>2e-5f)
+        if(i%width<2 && mfq::test::checked_absolute_error(
+                results[1].data_ptr<float>()[i], .015625f)>2e-5f)
             throw std::runtime_error("Long staged QSA changed constant-value causal attention");
     }
     if(maximum>2e-4)throw std::runtime_error("Long staged QSA differs from direct mixed-precision attention");

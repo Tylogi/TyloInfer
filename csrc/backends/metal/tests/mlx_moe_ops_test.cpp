@@ -1,4 +1,5 @@
 #include "mlx_moe_ops.h"
+#include "../../../tests/numeric_assertions.h"
 
 #include <algorithm>
 #include <chrono>
@@ -35,7 +36,7 @@ void require_close(
     float actual,
     float expected,
     float tolerance = 3e-5f) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
         throw std::runtime_error(
             "MoE value mismatch: actual=" +
             std::to_string(actual) +

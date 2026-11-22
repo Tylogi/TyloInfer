@@ -128,9 +128,10 @@ def test_ssd_admission_uses_ram_preallocation(tmp_path, monkeypatch, preallocate
     monkeypatch.setattr('server.runtime.runtime_pool.checkpoint_kv_budget', lambda *a: plan)
     checks = []
     monkeypatch.setattr('server.runtime.runtime_pool.check_ssd_capacity', lambda path, size: checks.append(size))
-    pool = SimpleNamespace(resolve_context_size=lambda *a, **kw: 131072,
+    pool = SimpleNamespace(backend='cuda', resolve_context_size=lambda *a, **kw: 131072,
         _kv_ram_limit=lambda *a: (16 << 20) if ram_limit is None else ram_limit,
         _prefix_cache_directory=lambda: tmp_path)
+    artifact = SimpleNamespace(resource=SimpleNamespace(architecture='qwen4_exp'))
     request = ModelLoadRequest(model='fixture', kv_memory=dict(placement='auto_ssd', ram_preallocated=preallocated, ram_budget_bytes=ram_limit))
-    RuntimePool._validate_kv_memory_budget(pool, None, request)
+    RuntimePool._validate_kv_memory_budget(pool, artifact, request)
     assert checks == [expected_ssd]

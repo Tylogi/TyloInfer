@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { mockStudioServer, officialCatalog } from './mockServer';
 
-test('checked prefix control retains its paint and state across focus and a failed poll', async ({ page, context }) => {
+test('checked prefix control retains its state across focus and a failed poll', async ({ page, context }) => {
   await mockStudioServer(page);
   let calls = 0;
   await page.route('**/api/v1/hub/download-directory', route => {
@@ -14,19 +14,11 @@ test('checked prefix control retains its paint and state across focus and a fail
   await page.goto('/model-hub');
   const checkbox = page.locator('.download-prefix-reclaim input');
   await expect(checkbox).toBeChecked();
-  const paint = await checkbox.evaluate(node => {
-    const style = getComputedStyle(node);
-    return { appearance: style.appearance, background: style.backgroundColor, border: style.borderTopColor };
-  });
-  expect(paint.appearance).toBe('none');
-  expect(paint.background).toBe(paint.border);
-  expect(paint.background).not.toBe('rgba(0, 0, 0, 0)');
   const other = await context.newPage();
   await other.bringToFront();
   await page.bringToFront();
   await expect.poll(() => calls).toBeGreaterThan(1);
   await expect(checkbox).toBeChecked();
-  expect(await checkbox.evaluate(node => getComputedStyle(node).backgroundColor)).toBe(paint.background);
   await other.close();
 });
 

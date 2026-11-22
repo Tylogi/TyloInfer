@@ -1,4 +1,5 @@
 #include "mlx_nint.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_moe_ops.h"
 #include "mlx_platform.h"
 #include "mlx_resident_budget.h"
@@ -372,7 +373,9 @@ void test_native_sub_bit_streams() {
             const auto error = max(abs(actual - expected));
             const auto peak = max(abs(expected));
             eval(error, peak);
-            if (error.item<float>() > std::max(1e-4f, peak.item<float>() * .002f))
+            const auto finite_error = mfq::test::checked_absolute_error(error.item<float>(), 0.0f);
+            const auto finite_peak = mfq::test::checked_absolute_error(peak.item<float>(), 0.0f);
+            if (finite_error > std::max(1e-4f, finite_peak * .002f))
                 throw std::runtime_error("native NINT subgroup matmul mismatch");
         }
     }
@@ -981,7 +984,7 @@ void require_close(
     float actual,
     float expected,
     float tolerance) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
         throw std::runtime_error(
             "NINT Metal result mismatch: actual=" +
             std::to_string(actual) +
@@ -1128,7 +1131,7 @@ void verify_nint_gs24_decode(
                         0.00003f * std::fabs(expected);
                 const float actual = values[
                     input_row * output_size + output_row];
-                if (std::fabs(actual - expected) > tolerance) {
+                if (mfq::test::checked_absolute_error(actual, expected) > tolerance) {
                     throw std::runtime_error(
                         "NINT GS24 mismatch: bits=" +
                         std::to_string(bits) + " rows=" +
@@ -1562,7 +1565,7 @@ void check_matmul_epilogue_dtypes() {
                 actual = contiguous(astype(actual, float32));
                 eval(expected, actual);
                 for (std::size_t index = 0; index < actual.size(); ++index) {
-                    if (std::abs(actual.data<float>()[index] - expected.data<float>()[index]) > 1e-4f)
+                    if (mfq::test::checked_absolute_error(actual.data<float>()[index], expected.data<float>()[index]) > 1e-4f)
                         throw std::runtime_error("NINT mixed residual mismatch: M=" +
                             std::to_string(rows) + " input=" + (dtype == float16 ? "f16" : "f32") +
                             " residual=" + (residual_dtype == float16 ? "f16" :

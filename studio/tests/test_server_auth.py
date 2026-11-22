@@ -9,7 +9,7 @@ import httpx
 from server.api import create_app
 from server.api.auth import ApiKeyManager, hash_api_key
 from server.protocol.models import CreateApiKeyRequest
-from server.state.storage import SCHEMA_VERSION, SessionStore
+from server.state.storage import SessionStore
 
 
 def test_scoped_keys_rotate_revoke_and_never_persist_plaintext(tmp_path: Path) -> None:
@@ -133,18 +133,21 @@ def test_scoped_key_lookup_does_not_block_the_event_loop(tmp_path: Path) -> None
     asyncio.run(run())
 
 
-def test_api_key_schema_eleven_migrates(tmp_path: Path) -> None:
+def test_store_reopen_preserves_api_keys_and_jobs(tmp_path: Path) -> None:
+    """Persisted credentials and jobs remain usable after reopening the database."""
     database = tmp_path / "server.sqlite3"
     store = SessionStore(database)
-    with store._connection() as connection:
-        connection.execute("UPDATE schema_meta SET value = '11' WHERE key = 'schema_version'")
-    migrated = SessionStore(database)
-    with migrated._connection() as connection:
-        version = connection.execute(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()["value"]
-        table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'"
-        ).fetchone()
-    assert version == str(SCHEMA_VERSION)
-    assert table is not None
+    secret = ApiKeyManager(store).create(
+        CreateApiKeyRequest(name="jobs", scopes=["jobs"])
+    )
+    job = store.create_job("test.job", {"model": "tiny"})
+
+    reopened = SessionStore(database)
+    authenticated = ApiKeyManager(reopened).authenticate(secret.token, include_root=False)
+    assert authenticated is not None
+    assert authenticated.resource is not None
+    assert authenticated.resource.id == secret.key.id
+    assert authenticated.scopes == frozenset({"jobs"})
+    restored = reopened.get_job(job.id)
+    assert restored.kind == "test.job"
+    assert restored.payload == {"model": "tiny"}

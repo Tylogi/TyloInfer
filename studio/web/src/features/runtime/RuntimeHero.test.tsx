@@ -2,12 +2,12 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource, RuntimeInstance } from '../../shared/api/types';
 import { useJobStore } from '../../stores/jobStore';
 import { RuntimeHero } from './RuntimeHero';
 import { getApiBaseUrl, setApiBaseUrl } from '../../shared/api/client';
 
-const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, instances: [], studio: null, chinese: false }));
+const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, instances: [] as RuntimeInstance[], studio: null, chinese: false }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.chinese ? zh : en }) }));
 
@@ -16,7 +16,7 @@ function Location() {
   return <output data-testid="location">{location.pathname}{location.hash}</output>;
 }
 
-beforeEach(() => { state.runtime = null; state.chinese = false; useJobStore.getState().setJobs([]); });
+beforeEach(() => { state.runtime = null; state.instances = []; state.chinese = false; useJobStore.getState().setJobs([]); });
 
 it.each([false, true])('opens local checkpoints from the empty-model Load action (Chinese: %s)', chinese => {
   state.chinese = chinese;
@@ -39,14 +39,19 @@ it('uses the serving Studio origin rather than a guessed port when no remote ser
 it('retains the normal Models action when a model is running', () => {
   state.runtime = { model: 'model-a', runtime_state: 'ready' };
   render(<MemoryRouter><RuntimeHero /><Location /></MemoryRouter>);
+  expect(screen.getByText('Running')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Load' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Models' }));
   expect(screen.getByTestId('location').textContent).toBe('/models');
 });
 
-it('does not expose the removed agent action', () => {
-  render(<MemoryRouter><RuntimeHero /><Location /></MemoryRouter>);
-  expect(screen.queryByRole('button', { name: 'Agent' })).not.toBeInTheDocument();
+it('shows a failed instance without presenting it as a running model', () => {
+  state.instances = [{ id: 'failed-load', model: 'broken-model', state: 'failed',
+    devices: [], active_sessions: 0, queued_requests: 0 }];
+  render(<MemoryRouter><RuntimeHero /></MemoryRouter>);
+  expect(screen.getByRole('heading', { name: 'broken-model' })).toBeInTheDocument();
+  expect(screen.getByText('Failed')).toBeInTheDocument();
+  expect(screen.queryByText('Running')).not.toBeInTheDocument();
 });
 
 it('shows an interrupted load after runtime cleanup and lets a new retry show its progress', () => {

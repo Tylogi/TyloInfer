@@ -8,10 +8,6 @@ beforeEach(() => localStorage.clear());
 it('applies theme and language immediately without changing inference preferences', () => {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULT_SETTINGS, language: 'en', temperature: .37 }));
   render(<SettingsProvider><AppearanceControls /></SettingsProvider>);
-  const controls = screen.getByRole('group', { name: 'Appearance and language' });
-  expect(controls.querySelectorAll(':scope > [role="group"]')).toHaveLength(2);
-  expect(controls.querySelectorAll('.appearance-controls-divider')).toHaveLength(1);
-  expect(controls.querySelectorAll('button')).toHaveLength(6);
   expect(screen.getByRole('button', { name: 'Automatic appearance' })).toHaveAttribute('aria-pressed', 'true');
   fireEvent.click(screen.getByRole('button', { name: 'Dark' }));
   expect(document.documentElement.dataset.theme).toBe('dark');

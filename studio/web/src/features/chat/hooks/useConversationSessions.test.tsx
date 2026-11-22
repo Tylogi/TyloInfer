@@ -91,7 +91,12 @@ it('切换会话后迟到的旧历史不能覆盖当前消息', async () => {
   );
   const { result } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.activeId).toBe('a'));
+  const messageSignal = vi.mocked(sessionsApi.listMessages).mock.calls[0][1]!;
+  const responseSignal = vi.mocked(sessionsApi.listResponses).mock.calls[0][1]!;
+  expect(messageSignal.aborted).toBe(false);
   await act(async () => result.current.selectSession('b'));
+  expect(messageSignal.aborted).toBe(true);
+  expect(responseSignal.aborted).toBe(true);
   await waitFor(() => expect(result.current.messages[0]?.id).toBe('b-message'));
   await act(async () =>
     resolveOld([{ id: 'a-message', role: 'user', parts: [], parent_id: null, created_at: '' }]),

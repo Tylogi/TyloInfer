@@ -1,4 +1,5 @@
 #include "mlx_tq.h"
+#include "../../../tests/numeric_assertions.h"
 #include "mlx_tensor.h"
 #include "mfq_container.h"
 #include "qwen35_model.h"
@@ -1668,7 +1669,7 @@ static void check_short_expanding_prefill() {
                 sum += double(source.data<float>()[row * width + k])
                     * decoded.data<float>()[(selected[row] * outputs + col) * width + k];
             const auto oracle = float(float16_t(float(sum)));
-            if (std::abs(output.data<float>()[index] - oracle) > .002f * std::abs(oracle) + .000001f)
+            if (mfq::test::checked_absolute_error(output.data<float>()[index], oracle) > .002f * std::abs(oracle) + .000001f)
                 throw std::runtime_error("TQ short expanding prefill differs from the CPU dot oracle");
         }
     }
