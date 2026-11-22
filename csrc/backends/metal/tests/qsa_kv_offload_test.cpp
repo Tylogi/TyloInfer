@@ -250,13 +250,24 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
     const array overlap({101, 102, -1, 102, 302, -1, 16, 101, 103, 16, 102, 103}, Shape{1, 4, 3}, int32);
     const auto staged = cache.gather_union(overlap);
     const array union_ids({16, 101, 102, 103, 302}, int32);
-    require(staged && all(staged->rows == take(keys, union_ids, 1)).item<bool>() &&
-        all(staged->mask == array({false, true, true, false, false, false, false, true, false, true,
+    require(staged && !staged->remapped && all(staged->rows == take(keys, union_ids, 1)).item<bool>() &&
+        all(staged->selection == array({false, true, true, false, false, false, false, true, false, true,
             true, true, false, true, false, true, false, true, true, false}, Shape{1, 1, 4, 5}, bool_)).item<bool>(),
         "offloaded row union lost selected rows or per-query visibility");
     const auto staged_from_view = cache.gather_union(overlap, &keys);
     require(staged_from_view && all(staged_from_view->rows == staged->rows).item<bool>() &&
-        all(staged_from_view->mask == staged->mask).item<bool>(), "staged view changed sparse row selection");
+        all(staged_from_view->selection == staged->selection).item<bool>(), "staged view changed sparse row selection");
+    const array wide({101, 15, -1, 16, 302, 302, 77, 102, -1, 0, 23, 64}, Shape{1, 4, 3}, int32);
+    require(!cache.gather_union(wide), "oversized union exceeded the dense mask limit");
+    const array wide_rows({0, 15, 16, 23, 64, 77, 101, 102, 302}, int32);
+    const array remapped_ids({6, 1, -1, 2, 8, 8, 5, 7, -1, 0, 3, 4}, Shape{1, 4, 3}, int32);
+    const array* views[] = {nullptr, &keys};
+    for (const auto* view : views) {
+        const auto remapped = cache.gather_union(wide, view, true);
+        require(remapped && remapped->remapped && all(remapped->selection == remapped_ids).item<bool>() &&
+            all(remapped->rows == take(keys, wide_rows, 1)).item<bool>(),
+            "staging lost the original query order, duplicates or masked rows");
+    }
     auto selected = cache.select(query, offset, 4, 128);
     auto scores = qwen4_qsa_block_scores(query, keys);
     auto positions = reshape(arange(0, 1024, 1, int32), Shape{1, 1, 1024});

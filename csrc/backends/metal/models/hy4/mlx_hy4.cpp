@@ -500,14 +500,20 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
             output.push_back(latent_attention(queries, *dense_rows, sinks, scale, g.kv_rank,
                 expand_dims(axis_slice(visible, -1, 0, end), 1)));
         } else {
-            const auto staged = cache.offloaded_latent ?
-                cache.offloaded_latent->gather_union(ids, resident ? &*resident : nullptr) : std::nullopt;
-            if (staged) {
+            const bool allow_remap = stop - start >= 16 && quantization.enabled();
+            const auto staged = cache.offloaded_latent ? cache.offloaded_latent->gather_union(
+                ids, resident ? &*resident : nullptr, allow_remap) : std::nullopt;
+            if (staged && !staged->remapped) {
                 output.push_back(latent_attention(queries, g.indexed_kv.unpack(staged->rows), sinks,
-                    scale, g.kv_rank, staged->mask));
+                    scale, g.kv_rank, staged->selection));
             } else {
                 const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
-                if (resident && !quantization.enabled()) {
+                if (staged) {
+                    const auto unpacked = g.indexed_kv.unpack(staged->rows);
+                    const auto safe = reshape(maximum(staged->selection, array(0, int32)), {-1});
+                    const auto rows = reshape(take(unpacked, safe, 1), {1, ids.shape(1), ids.shape(2), unpacked.shape(-1)});
+                    output.push_back(mlx_gathered_mla_attention(queries, rows, mask, sinks, scale, g.kv_rank));
+                } else if (resident && !quantization.enabled()) {
                     output.push_back(mlx_sparse_selected_mla_attention(queries, *resident, ids, mask, sinks, scale, g.kv_rank));
                 } else {
                     const auto packed = [&] {

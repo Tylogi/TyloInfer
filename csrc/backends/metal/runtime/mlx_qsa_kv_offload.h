@@ -29,7 +29,9 @@ struct MlxQsaIndexSnapshot {
 
 struct MlxQsaStagedRows {
     mlx::core::array rows;
-    mlx::core::array mask;
+    // A visibility mask for dense attention, or per-query row indices after remapping.
+    mlx::core::array selection;
+    bool remapped = false;
 };
 
 class MlxQsaIndexOffload {
@@ -41,8 +43,9 @@ public:
     std::optional<mlx::core::array> try_view() const;
     mlx::core::array gather(const mlx::core::array& indices) const;
     // Read overlapping selections into a shared key buffer when it fits.
+    // Remapping can share unpacking for selections beyond the dense mask limit.
     std::optional<MlxQsaStagedRows> gather_union(const mlx::core::array& indices,
-        const mlx::core::array* resident = nullptr) const;
+        const mlx::core::array* resident = nullptr, bool allow_remap = false) const;
     // With reserve_current_group, the last index is the query's own group.
     // Unused history entries in that mode are represented by -1.
     mlx::core::array select(const mlx::core::array& query, int offset, int ratio, int budget,

@@ -452,7 +452,7 @@ array MlxQsaIndexOffload::gather(const array& indices) const {
     return result;
 }
 
-std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& indices, const array* resident) const {
+std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& indices, const array* resident, bool allow_remap) const {
     if (indices.ndim() != 3 || indices.shape(0) != 1 || indices.shape(1) <= 0 ||
         indices.shape(2) <= 0 || indices.dtype() != mlx::core::int32)
         throw std::invalid_argument("offloaded indexed rows require int32 [1, query, selection]");
@@ -462,8 +462,10 @@ std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& in
     const auto& state = rows_.view();
     const auto buffer = state.store->config().buffer_bytes / 2;
     if (queries < 4 || static_cast<std::size_t>(count) > buffer / sizeof(int)) return std::nullopt;
-    const auto row_limit = std::min(buffer / (state.row_bytes + queries),
+    const auto dense_limit = std::min(buffer / (state.row_bytes + queries),
         static_cast<std::size_t>(indices.shape(2)) * 2);
+    const auto row_limit = allow_remap && indices.nbytes() < buffer
+        ? std::max(dense_limit, (buffer - indices.nbytes()) / state.row_bytes) : dense_limit;
     if (!row_limit) return std::nullopt;
 
     auto ids = mlx::core::contiguous(indices);
@@ -485,8 +487,9 @@ std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& in
     std::sort(selected.begin(), selected.end());
     const auto width = static_cast<int>(selected.size());
     const auto row_bytes = selected.size() * state.row_bytes;
-    const auto mask_bytes = selected.size() * queries;
-    MlxResidentBudgetScope::reserve(row_bytes + mask_bytes);
+    const bool remapped = selected.size() > dense_limit;
+    const auto selection_bytes = remapped ? indices.nbytes() : selected.size() * queries;
+    MlxResidentBudgetScope::reserve(row_bytes + selection_bytes);
     auto rows = [&] {
         if (resident)
             return mlx::core::take(*resident, array(selected.begin(), {width}, mlx::core::int32), 1);
@@ -501,9 +504,15 @@ std::optional<MlxQsaStagedRows> MlxQsaIndexOffload::gather_union(const array& in
     }();
     for (std::size_t i = 0; i < selected.size(); ++i) offsets[selected[i]] = static_cast<int>(i);
 
-    auto mask = array(mlx::core::allocator::malloc(mask_bytes), Shape{1, 1, queries, width}, mlx::core::bool_);
+    if (remapped) {
+        auto selection = array(mlx::core::allocator::malloc(selection_bytes), indices.shape(), mlx::core::int32);
+        auto* slots = selection.data<std::int32_t>();
+        for (std::size_t i = 0; i < ids.size(); ++i) slots[i] = values[i] < 0 ? -1 : offsets[values[i]];
+        return MlxQsaStagedRows{std::move(rows), std::move(selection), true};
+    }
+    auto mask = array(mlx::core::allocator::malloc(selection_bytes), Shape{1, 1, queries, width}, mlx::core::bool_);
     auto* visible = mask.data<std::uint8_t>();
-    std::memset(visible, 0, mask_bytes);
+    std::memset(visible, 0, selection_bytes);
     for (int q = 0; q < queries; ++q) {
         for (int i = 0; i < ids.shape(2); ++i) {
             const int row = values[std::size_t(q) * ids.shape(2) + i];
