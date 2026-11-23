@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <mlx/mlx.h>
 
@@ -74,6 +75,11 @@ mlx::core::array mlx_gather_selected_mla_rows(const mlx::core::array& kv_cache,
     const mlx::core::array& selected_indices);
 
 void mlx_prepare_indexed_mla_prefill();
+
+// Attend directly to independently stored FP16 KV for a packed batch of short indexed queries.
+std::optional<mlx::core::array> mlx_batched_resident_mla_attention(const mlx::core::array& query,
+    std::span<const mlx::core::array> caches, std::span<const mlx::core::array> selections,
+    const mlx::core::array& sinks, float scale);
 
 // The same latent attention over rows already gathered from paged storage.
 mlx::core::array mlx_gathered_mla_attention(const mlx::core::array& query,

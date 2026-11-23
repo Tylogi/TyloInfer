@@ -1499,10 +1499,7 @@ array mla_sink_probabilities(const array& scores, const array& mask, const array
     return exponentials / expand_dims(denominator, -1);
 }
 
-array resident_mla_indexed_dot(const array& x, const array& kv, const array& ids, bool project_values) {
-    using namespace mlx::core;
-    static const auto kernel = fast::metal_kernel("tyloinfer_mla_indexed_nax",
-        {"x", "kv", "ids"}, {"y"}, R"METAL(
+constexpr auto resident_mla_indexed_dot_source = R"METAL(
         constexpr ushort heads = 32, tile_size = 32;
         constexpr ushort inner = PROJECT_VALUES ? 2048 : 576;
         constexpr ushort columns = PROJECT_VALUES ? 512 : 2048;
@@ -1524,11 +1521,11 @@ array resident_mla_indexed_dot(const array& x, const array& kv, const array& ids
         for (ushort i = 0; i < accum.get_capacity(); ++i) accum[i] = 0.f;
         int key = 0;
         if constexpr (!PROJECT_VALUES)
-            key = clamp(selection[column + lane], 0, kv_shape[1] - 1);
+            key = clamp(selection[column + lane], 0, last_key);
         for (uint offset = 0; offset < inner; offset += tile_size) {
             if constexpr (PROJECT_VALUES)
-                key = clamp(selection[offset + lane], 0, kv_shape[1] - 1);
-            const auto from = reinterpret_cast<device const half4*>(kv + ulong(key) * 576u +
+                key = clamp(selection[offset + lane], 0, last_key);
+            const auto from = reinterpret_cast<device const half4*>(cache + ulong(key) * 576u +
                 (PROJECT_VALUES ? column : offset));
             auto to = reinterpret_cast<threadgroup half4*>(tile + lane * tile_size);
             #pragma clang loop unroll(full)
@@ -1542,12 +1539,49 @@ array resident_mla_indexed_dot(const array& x, const array& kv, const array& ids
             auto at = accum.get_multidimensional_index(i);
             y[(ulong(query) * heads + at[1]) * columns + column + at[0]] = half(accum[i]);
         }
-        )METAL", R"METAL(
+        )METAL";
+constexpr auto resident_mla_indexed_header = R"METAL(
         #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
         using namespace mpp::tensor_ops;
-        )METAL");
+        )METAL";
+
+array resident_mla_indexed_dot(const array& x, const array& kv, const array& ids, bool project_values) {
+    using namespace mlx::core;
+    static const auto kernel = fast::metal_kernel("tyloinfer_mla_indexed_nax",
+        {"x", "kv", "ids"}, {"y"},
+        std::string("const auto cache = kv; const int last_key = kv_shape[1] - 1;\n") + resident_mla_indexed_dot_source,
+        resident_mla_indexed_header);
     const int columns = project_values ? 512 : 2048, queries = ids.shape(1);
     return kernel({contiguous(x), kv, ids}, {{1, queries, 32, columns}}, {float16},
+        {columns, queries, 1}, {32, 1, 1}, {{"PROJECT_VALUES", project_values}},
+        std::nullopt, false, {}).front();
+}
+
+array batched_resident_mla_indexed_dot(const array& x, std::span<const array> caches,
+    const array& ids, const array& lanes, bool project_values) {
+    using namespace mlx::core;
+    static const auto kernels = [] {
+        std::array<Kernel, 2> result;
+        for (int width : {3, 4}) {
+            std::vector<std::string> names{"x", "ids", "lanes"};
+            std::string bindings = "const device half* cache; int last_key;\n"
+                "switch (lanes[threadgroup_position_in_grid.y]) {\n";
+            for (int lane = 0; lane < width; ++lane) {
+                const auto label = "kv" + std::to_string(lane);
+                names.push_back(label);
+                bindings += "case " + std::to_string(lane) + ": cache = " + label + "; last_key = " +
+                    label + "_shape[1] - 1; break;\n";
+            }
+            bindings += "default: return; }\n";
+            result[width - 3] = fast::metal_kernel("tyloinfer_batched_mla_indexed_nax_" + std::to_string(width),
+                names, {"y"}, bindings + resident_mla_indexed_dot_source, resident_mla_indexed_header);
+        }
+        return result;
+    }();
+    const int columns = project_values ? 512 : 2048, queries = ids.shape(1);
+    std::vector<array> arguments{contiguous(x), ids, lanes};
+    arguments.insert(arguments.end(), caches.begin(), caches.end());
+    return kernels[caches.size() - 3](arguments, {{1, queries, 32, columns}}, {float16},
         {columns, queries, 1}, {32, 1, 1}, {{"PROJECT_VALUES", project_values}},
         std::nullopt, false, {}).front();
 }
@@ -1566,6 +1600,36 @@ void mlx_prepare_indexed_mla_prefill() {
             preparation->add(resident_mla_indexed_dot(probabilities, cache, indices, true));
         });
     }
+}
+
+std::optional<array> mlx_batched_resident_mla_attention(const array& query,
+    std::span<const array> caches, std::span<const array> selections, const array& sinks, float scale) {
+    using namespace mlx::core;
+    if ((caches.size() != 3 && caches.size() != 4) || selections.size() != caches.size() ||
+        query.ndim() != 4 || query.shape(1) != 32 || query.shape(2) != 1 || query.shape(3) != 576 ||
+        sinks.size() != 32 || !std::isfinite(scale) || scale <= 0 ||
+        default_device() != Device::gpu || !sparse_block_nax_available()) return std::nullopt;
+    std::vector<int> owners;
+    owners.reserve(caches.size() * 3);
+    for (std::size_t lane = 0; lane < caches.size(); ++lane) {
+        const auto& cache = caches[lane];
+        const auto& ids = selections[lane];
+        if (cache.ndim() != 3 || cache.shape(0) != 1 || cache.shape(1) < 1 || cache.shape(2) != 576 ||
+            cache.dtype() != float16 || cache.strides(1) != 576 || cache.strides(2) != 1 || cache.offset() % 16 != 0 ||
+            ids.ndim() != 3 || ids.shape(0) != 1 || ids.shape(1) < 1 || ids.shape(1) > 3 ||
+            ids.shape(2) != 2048 || ids.dtype() != int32) return std::nullopt;
+        owners.insert(owners.end(), ids.shape(1), static_cast<int>(lane));
+    }
+    const int count = static_cast<int>(owners.size());
+    if (query.shape(0) != count) return std::nullopt;
+    const auto lanes = array(owners.begin(), {count}, int32);
+    const auto ids = contiguous(concatenate(std::vector<array>(selections.begin(), selections.end()), 1));
+    const auto mask = reshape(where(ids >= 0, array(0.f, float16), array(-INFINITY, float16)), {count, 1, 2048});
+    const auto q = reshape(astype(astype(query, float32) * scale, float16), {1, count, 32, 576});
+    const auto scores = batched_resident_mla_indexed_dot(q, caches, ids, lanes, false);
+    const auto probabilities = gathered_mla_sink_softmax(reshape(scores, {count, 1, 32, 2048}), mask, sinks);
+    const auto output = batched_resident_mla_indexed_dot(probabilities, caches, ids, lanes, true);
+    return astype(reshape(output, {count, 1, 32, 512}), float32);
 }
 
 array mlx_masked_dense_mla_attention(const array& query, const array& rows, const array& mask,

@@ -860,6 +860,8 @@ array indexed_visibility(const array& ids, int keys) {
     return axis_slice(visible, -1, 0, keys);
 }
 
+bool short_mla_nax_available();
+
 array batch_resident_indexed_mla(const array& query, std::span<const array> caches,
     std::span<const array> selections, const array& sinks, float scale, int value_dim, bool dense) {
     if (dense) {
@@ -884,6 +886,11 @@ array batch_resident_indexed_mla(const array& query, std::span<const array> cach
         return batch_dense_mla_windows(query, windows, sinks, scale, value_dim);
     }
 
+    const auto packed_query = batch_decode_queries(query);
+    if (value_dim == 512 && (caches.size() == 3 || caches.size() == 4) && short_mla_nax_available())
+        if (auto direct = mlx_batched_resident_mla_attention(packed_query, caches, selections, sinks, scale))
+            return reshape(*direct, {1, query.shape(2), query.shape(1), value_dim});
+
     int selected = 0;
     for (const auto& ids : selections) selected = std::max(selected, ids.shape(-1));
     std::vector<array> rows, masks;
@@ -897,12 +904,10 @@ array batch_resident_indexed_mla(const array& query, std::span<const array> cach
         masks.push_back(reshape(where(ids >= 0, array(0.f), array(-std::numeric_limits<float>::infinity())),
             {count, 1, selected}));
     }
-    auto result = mlx_gathered_mla_attention(batch_decode_queries(query), concatenate(rows, 0),
+    auto result = mlx_gathered_mla_attention(packed_query, concatenate(rows, 0),
         concatenate(masks, 0), sinks, scale, value_dim, true);
     return reshape(result, {1, query.shape(2), query.shape(1), value_dim});
 }
-
-bool short_mla_nax_available();
 
 array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
     const array& query, const array& latent, const array& index_pairs, const std::optional<IndexScores>& scoring,
@@ -1830,6 +1835,12 @@ void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& la
                     preparation->add(mlx_gathered_mla_attention(zeros({rows, layer.heads, 1, 576}, float32),
                         zeros({rows, 1, 2048, 576}, float16), zeros({rows, 1, 2048}, float32),
                         layer.sinks, 1.f, 512, true));
+                }
+                if (layer.heads == 32) for (const int batch : {3, 4}) {
+                    const std::vector<array> caches(batch, cache), selections(batch, ids);
+                    if (auto direct = mlx_batched_resident_mla_attention(
+                            zeros({batch * 2, 32, 1, 576}, float32), caches, selections, layer.sinks, 1.f))
+                        preparation->add(*direct);
                 }
             }
         }

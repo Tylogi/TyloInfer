@@ -660,11 +660,50 @@ void test_latent_value_prefix() {
         throw std::runtime_error("indexed MLA prefill disagrees with the gathered reference");
 }
 
+void test_batched_resident_mla() {
+    using namespace mlx::core;
+    constexpr int heads = 32, width = 576, values = 512, selected = 2048;
+    constexpr float scale = 0.0625f;
+    const auto sinks = arange(heads, float32) * 0.03f - 0.1f;
+    for (const int batch : {3, 4}) {
+        int rows = 0;
+        std::vector<array> caches, selections;
+        for (int lane = 0; lane < batch; ++lane) {
+            const int count = 1 + lane % 3, history = 2060 + 7 * lane;
+            auto storage = patterned_half((history + 1) * width, {1, history + 1, width}, 11 + 2 * lane, 0.002f);
+            caches.push_back(slice(storage, {0, 1, 0}, {1, history + 1, width}));
+            const auto index = arange(count * selected, int32);
+            const auto ids = where(index % (7 + lane) == 0, array(-1), (index * 23 + lane) % history);
+            selections.push_back(reshape(ids, {1, count, selected}));
+            rows += count;
+        }
+        const auto query = astype(patterned_half(rows * heads * width, {rows, heads, 1, width}, 7, 0.002f), float32);
+        const auto direct = mfq::metal::mlx_batched_resident_mla_attention(query, caches, selections, sinks, scale);
+        if (!direct) continue;
+
+        std::vector<array> gathered, masks;
+        for (int lane = 0; lane < batch; ++lane) {
+            const auto& ids = selections[lane];
+            const int count = ids.shape(1);
+            gathered.push_back(reshape(mfq::metal::mlx_gather_selected_mla_rows(caches[lane], ids),
+                {count, 1, selected, width}));
+            masks.push_back(reshape(where(ids >= 0, array(0.f), array(-std::numeric_limits<float>::infinity())),
+                {count, 1, selected}));
+        }
+        const auto reference = mfq::metal::mlx_gathered_mla_attention(query, concatenate(gathered, 0),
+            concatenate(masks, 0), sinks, scale, values, true);
+        const auto error = max(abs(reference - *direct)).item<float>();
+        if (direct->shape() != Shape{rows, 1, heads, values} || !std::isfinite(error) || error > 0.001f)
+            throw std::runtime_error("batched resident MLA differs from the gathered reference");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
         test_masked_dense_mla();
         test_latent_value_prefix();
+        test_batched_resident_mla();
         if (argc == 2 && std::string(argv[1]) == "--latent-only") return 0;
         if (argc == 2 && std::string(argv[1]) == "--small-m-only") {
             test_block_gqa_small_m(4, 1);
