@@ -483,13 +483,16 @@ array sliding_decode_softmax(const array& scores, const array& sinks) {
 
 array latent_attention(const array& query, const array& rows, const array& sinks,
     float scale, int value_dim, const std::optional<array>& mask) {
-    if (query.shape(0) == 2 && query.shape(2) == 1 && rows.shape(1) == 512 &&
+    const bool grouped_qk = (query.shape(0) == 3 || query.shape(0) == 4) &&
+        mlx_apple_chip_starts_with("Apple M5");
+    if ((query.shape(0) == 2 || grouped_qk) && query.shape(2) == 1 && rows.shape(1) == 512 &&
         rows.shape(2) == 576 && rows.dtype() == float16 && value_dim == 512 && !mask &&
         default_device() == Device::gpu) {
         const int batch = query.shape(0), heads = query.shape(1), count = rows.shape(1);
         const auto q = astype(query, float16) * array(scale, float16);
-        const auto keys = expand_dims(transpose(rows, {0, 2, 1}), 1);
-        const auto logits = reshape(matmul(q, keys), {batch, heads, count});
+        const auto keys = transpose(rows, {0, 2, 1});
+        const auto logits = grouped_qk ? matmul(reshape(q, {batch, heads, 576}), keys)
+            : reshape(matmul(q, expand_dims(keys, 1)), {batch, heads, count});
         const auto probabilities = sliding_decode_softmax(logits, sinks);
         const auto value = axis_slice(rows, -1, 0, value_dim);
         // Tile the probability-by-value projection across heads to reuse the cached values.
