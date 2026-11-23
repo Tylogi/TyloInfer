@@ -265,6 +265,11 @@ struct EngramProjection {
 };
 
 struct EngramTable {
+    struct TokenWindow {
+        std::span<const std::int32_t> tokens;
+        std::size_t first;
+    };
+
     ModelSource::TensorReader read;
     int grams, heads, width, pad;
     std::vector<std::uint64_t> multipliers;
@@ -297,12 +302,22 @@ struct EngramTable {
                 throw std::runtime_error("invalid Hy4 Engram bucket range");
     }
 
-    array gather(int layer, const std::vector<std::int32_t>& tokens, std::size_t first) const {
+    int layer_slot(int layer) const {
         const auto found = std::find(layers.begin(), layers.end(), layer);
         if (found == layers.end()) throw std::invalid_argument("Hy4 layer has no Engram head");
-        const int entry = static_cast<int>(found - layers.begin());
+        return static_cast<int>(found - layers.begin());
+    }
+
+    array gather(int layer, const std::vector<std::int32_t>& tokens, std::size_t first) const {
+        const std::array selected{layer};
+        const std::array windows{TokenWindow{tokens, first}};
+        return gather(selected, windows);
+    }
+
+    array gather(std::span<const int> selected, std::span<const TokenWindow> windows) const {
         const int columns = (grams - 1) * heads;
-        const int count = static_cast<int>(tokens.size() - first);
+        int count = 0;
+        for (const auto& window : windows) count += static_cast<int>(window.tokens.size() - window.first);
         static const auto decode = [] {
             std::array<float, 256> table{};
             for (unsigned bits = 0; bits < table.size(); ++bits) {
@@ -314,25 +329,31 @@ struct EngramTable {
             }
             return table;
         }();
-        const auto row_count = std::size_t(count) * columns;
+        const auto row_count = selected.size() * count * columns;
         std::vector<float> rows(row_count * width);
-        std::vector<std::uint64_t> addresses(row_count);
+        std::vector<std::uint64_t> addresses;
+        addresses.reserve(row_count);
         const auto mapped = [&](std::int32_t token) { return mapping.at(token); };
-        for (int n = 0; n < count; ++n) {
-            const auto position = first + n;
-            auto hash = static_cast<std::uint64_t>(mapped(tokens[position])) * multipliers[entry * grams];
-            for (int gram = 1; gram < grams; ++gram) {
-                const auto previous = position >= static_cast<std::size_t>(gram) ? tokens[position - gram] : pad;
-                hash ^= static_cast<std::uint64_t>(mapped(previous)) * multipliers[entry * grams + gram];
-                for (int head = 0; head < heads; ++head) {
-                    const int column = (gram - 1) * heads + head;
-                    const int slot = entry * columns + column;
-                    addresses[std::size_t(n) * columns + column] = (hash % sizes[slot] + offsets[slot]) * width;
+        for (const int layer : selected) {
+            const int entry = layer_slot(layer);
+            for (const auto& [tokens, first] : windows) {
+                for (auto position = first; position < tokens.size(); ++position) {
+                    auto hash = static_cast<std::uint64_t>(mapped(tokens[position])) * multipliers[entry * grams];
+                    for (int gram = 1; gram < grams; ++gram) {
+                        const auto previous = position >= static_cast<std::size_t>(gram) ? tokens[position - gram] : pad;
+                        hash ^= static_cast<std::uint64_t>(mapped(previous)) * multipliers[entry * grams + gram];
+                        for (int head = 0; head < heads; ++head) {
+                            const int slot = entry * columns + (gram - 1) * heads + head;
+                            addresses.push_back((hash % sizes[slot] + offsets[slot]) * width);
+                        }
+                    }
                 }
             }
         }
+        // Submit the short decode reads together so independent page faults can overlap.
+        const bool batched = windows.size() > 1 || selected.size() > 1;
         std::vector<std::size_t> order;
-        if (count >= 16) {
+        if (count >= 16 || (batched && row_count >= 32)) {
             order.resize(row_count);
             std::iota(order.begin(), order.end(), 0);
             std::sort(order.begin(), order.end(), [&](auto a, auto b) { return addresses[a] < addresses[b]; });
@@ -353,8 +374,8 @@ struct EngramTable {
             }
         };
         if (order.empty()) decode_rows(0, row_count);
-        else io.run(0, row_count, 64, 8, decode_rows);
-        return array(rows.begin(), {1, count, columns, width}, float32);
+        else io.run(0, row_count, batched ? 8 : 64, 8, decode_rows);
+        return array(rows.begin(), {static_cast<int>(selected.size()), count, columns, width}, float32);
     }
 };
 
@@ -2030,17 +2051,21 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
             verify_sliding_masks.push_back(logical_and(keys <= queries, keys > queries - g.window));
         }
     }
+    std::optional<array> engrams;
+    if (w.engram) {
+        std::vector<EngramTable::TokenWindow> windows;
+        windows.reserve(batch);
+        for (const auto& sequence : sequences) windows.push_back({sequence.history, sequence.first});
+        engrams.emplace(w.engram->gather(w.engram->layers, windows));
+    }
     const float scale = 1.0f / std::sqrt(float(g.q_dim));
     std::optional<PendingResidual> deferred;
     for (int index = 0; index < g.layers; ++index) {
         const auto& layer = w.layers[index];
         std::optional<array> engram;
         if (layer.engram) {
-            std::vector<array> rows;
-            rows.reserve(batch);
-            for (const auto& sequence : sequences)
-                rows.push_back(w.engram->gather(index, sequence.history, sequence.first));
-            engram = concatenate(rows, 1);
+            const int slot = w.engram->layer_slot(index);
+            engram = axis_slice(*engrams, 0, slot, slot + 1);
         }
         const auto mix = prepare_attention_input(layer, g, streams, engram,
             deferred ? &*deferred : nullptr, true);
