@@ -559,6 +559,17 @@ struct MlaWindow {
     array mask;
 };
 
+array uniform_mla_windows(const array& packed_queries, const array& kv, const array& mask,
+    const array& sinks, float scale, int value_dim) {
+    const int batch = kv.shape(0), heads = packed_queries.shape(1), count = mask.shape(1);
+    const auto q = transpose(reshape(packed_queries, {heads, batch, count, packed_queries.shape(-1)}),
+        {1, 0, 2, 3});
+    const auto result = default_device() == Device::gpu && kv.dtype() == float16
+        ? mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, value_dim)
+        : latent_attention(q, kv, sinks, scale, value_dim, expand_dims(mask, 1));
+    return reshape(result, {1, packed_queries.shape(2), heads, value_dim});
+}
+
 array batch_dense_mla_windows(const array& packed_queries, std::span<const MlaWindow> windows,
     const array& sinks, float scale, int value_dim) {
     const int batch = static_cast<int>(windows.size());
@@ -579,15 +590,8 @@ array batch_dense_mla_windows(const array& packed_queries, std::span<const MlaWi
         masks.push_back(key_pad ? pad(window.mask, {2}, {0}, {key_pad}) : window.mask);
     }
     const auto kv = concatenate(rows, 0);
+    if (uniform) return uniform_mla_windows(packed_queries, kv, concatenate(masks, 0), sinks, scale, value_dim);
     const bool fp16_gpu = default_device() == Device::gpu && kv.dtype() == float16;
-    if (uniform) {
-        const auto q = transpose(reshape(packed_queries, {heads, batch, query_count, packed_queries.shape(-1)}),
-            {1, 0, 2, 3});
-        const auto mask = concatenate(masks, 0);
-        const auto result = fp16_gpu ? mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, value_dim)
-            : latent_attention(q, kv, sinks, scale, value_dim, expand_dims(mask, 1));
-        return reshape(result, {1, total, heads, value_dim});
-    }
     std::vector<int> query_lanes;
     query_lanes.reserve(total);
     for (int lane = 0; lane < batch; ++lane)
@@ -764,16 +768,34 @@ array append_indexed_cache(MlxHy4AttentionCache& cache, const IndexPool& index, 
     return stored;
 }
 
+array indexed_visibility(const array& ids, int keys) {
+    const int batch = ids.shape(0), rows = ids.shape(1);
+    const auto allowed = ids >= 0;
+    const auto visible = put_along_axis(zeros({batch, rows, keys + 1}, bool_),
+        where(allowed, ids, array(keys, int32)), allowed, -1);
+    return axis_slice(visible, -1, 0, keys);
+}
+
 array batch_resident_indexed_mla(const array& query, std::span<const array> caches,
     std::span<const array> selections, const array& sinks, float scale, int value_dim, bool dense) {
     if (dense) {
+        const auto& shape = selections.front().shape();
+        if (default_device() == Device::gpu &&
+            std::all_of(selections.begin(), selections.end(), [&](const auto& ids) { return ids.shape() == shape; })) {
+            int keys = 0;
+            for (const auto& cache : caches) keys = std::max(keys, cache.shape(1));
+            std::vector<array> rows;
+            rows.reserve(caches.size());
+            for (const auto& cache : caches) {
+                const int extra = keys - cache.shape(1);
+                rows.push_back(extra ? pad(cache, {1}, {0}, {extra}) : cache);
+            }
+            const auto mask = indexed_visibility(concatenate(std::vector<array>(selections.begin(), selections.end()), 0), keys);
+            return uniform_mla_windows(query, concatenate(rows, 0), mask, sinks, scale, value_dim);
+        }
         std::vector<MlaWindow> windows;
         for (std::size_t lane = 0; lane < caches.size(); ++lane) {
-            const auto& ids = selections[lane];
-            const int keys = caches[lane].shape(1);
-            const auto visible = put_along_axis(zeros({1, ids.shape(1), keys + 1}, bool_),
-                where(ids >= 0, ids, array(keys, int32)), ids >= 0, -1);
-            windows.push_back({caches[lane], axis_slice(visible, -1, 0, keys)});
+            windows.push_back({caches[lane], indexed_visibility(selections[lane], caches[lane].shape(1))});
         }
         return batch_dense_mla_windows(query, windows, sinks, scale, value_dim);
     }
@@ -841,10 +863,8 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
         if (dense_rows && stop - start >= 4) {
             // At short contexts a dense boolean mask costs less than staging
             // a separate copy of the selected latent rows for each query.
-            const auto selected = where(ids >= 0, ids, array(end, int32));
-            auto visible = put_along_axis(zeros({1, stop - start, end + 1}, bool_), selected, ids >= 0, -1);
             output.push_back(latent_attention(queries, *dense_rows, sinks, scale, g.kv_rank,
-                expand_dims(axis_slice(visible, -1, 0, end), 1)));
+                expand_dims(indexed_visibility(ids, end), 1)));
         } else {
             const bool allow_remap = stop - start >= 16 && quantization.enabled();
             const auto staged = cache.offloaded_latent ? cache.offloaded_latent->gather_union(
