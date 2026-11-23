@@ -2010,18 +2010,28 @@ array MlxHy4Model::forward_impl(const array& tokens, MlxHy4Cache& cache, bool la
 
     std::vector<std::int32_t> history = cache.engram_tail;
     const auto first = history.size();
+    std::optional<array> engrams;
     if (w.engram) {
         auto ids = contiguous(astype(tokens, int32));
         ids.eval();
         const auto* data = ids.data<std::int32_t>();
         history.insert(history.end(), data, data + count);
         if (verification) verification->engram_tokens = history;
+        if (offset > 0 && count <= kMlxMtpEngineMaximumDraftDepth + 1 && w.engram->layers.size() > 1) {
+            const std::array windows{EngramTable::TokenWindow{history, first}};
+            engrams.emplace(w.engram->gather(w.engram->layers, windows));
+        }
     }
     std::optional<PendingResidual> deferred;
     const bool merge_layers = count == 1 && g.streams == 4 && g.hidden == 3072;
     for (int layer = 0; layer < g.layers; ++layer) {
         std::optional<array> rows;
-        if (w.layers[layer].engram) rows = w.engram->gather(layer, history, first);
+        if (w.layers[layer].engram) {
+            if (engrams) {
+                const int slot = w.engram->layer_slot(layer);
+                rows.emplace(axis_slice(*engrams, 0, slot, slot + 1));
+            } else rows.emplace(w.engram->gather(layer, history, first));
+        }
         const auto& phases = g.sliding[layer] ? window_phases : indexed_phases;
         streams = run_layer(w.layers[layer], g, cache.layers[layer], std::move(streams), rows,
             phases, pool_phases, offset, w.offload, verification ? &verification->layers[layer] : nullptr,
