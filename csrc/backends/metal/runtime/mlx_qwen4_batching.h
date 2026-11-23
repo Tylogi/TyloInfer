@@ -1,6 +1,6 @@
 #pragma once
 
-#include "continuous_batch.h"
+#include "mlx_request_batch.h"
 #include "../models/dflash2/mlx_dflash2.h"
 #include "mlx_dflash2_serving.h"
 #include "mlx_platform.h"
@@ -191,20 +191,6 @@ struct MlxMtpBatchRound {
     int maximum_drafts;
     bool stable;
 };
-
-inline MlxSamplingParams mlx_batch_sampling(const MfqSamplingParams& input) {
-    MlxSamplingParams result;
-    result.temperature = input.temperature;
-    result.top_k = input.top_k;
-    result.top_p = input.top_p;
-    result.presence_penalty = input.presence_penalty;
-    result.frequency_penalty = input.frequency_penalty;
-    result.repetition_penalty = input.repetition_penalty;
-    result.enable_mtp = input.enable_mtp;
-    result.mtp_max_draft_tokens = input.mtp_max_draft_tokens;
-    result.seed = input.seed;
-    return result;
-}
 
 struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
     MlxQwen4BatchRequest(std::string id, const mfq::engine::InferenceRequest& input)
@@ -1282,5 +1268,50 @@ private:
     std::vector<std::shared_ptr<MlxMtpBatchRound>> completed_rounds_;
     std::vector<std::string> ordinary_cohort_;
 };
+
+// Flash-Next owns its cache and speculative capabilities. Admission and
+// scheduling use the same request-batch interface as other Metal runtimes.
+template<class SessionCache>
+std::unique_ptr<MlxRequestBatch> make_mlx_model_batch(MlxQwen4CausalLm& runtime,
+    SessionCache& session_cache, int chunk_size, bool mtp_available, std::shared_ptr<MlxDFlash2> draft) {
+    MlxQwen4BatchOperations::Hooks hooks;
+    hooks.block_size = session_cache.block_size_tokens();
+    hooks.dflash2 = draft;
+    hooks.restore = [&runtime, &session_cache, draft](auto& request) {
+        request.prefix = session_cache.normalize_stable_prefix_tokens(std::min(
+            request.cache_plan.stable_prefix_tokens, request.prompt.size()));
+        if (!request.prefix || (request.cache_plan.session_id.empty() &&
+            !session_cache.persistent_prefix_enabled())) {
+            request.prefix = 0;
+            return std::size_t{0};
+        }
+        const auto limit = std::min(request.prefix, request.prompt.size() - 1);
+        if (!request.dflash_context)
+            return session_cache.restore_best(runtime, request.cache_plan.session_id,
+                request.prompt, limit, request.mtp);
+
+        MlxDFlash2Context restored_draft;
+        const auto restored = session_cache.restore_best(runtime, request.cache_plan.session_id,
+            request.prompt, limit, false, draft->prefix_cache_key(),
+            [&](const auto& state) {
+                if (!state.dflash || state.dflash->position != state.cache_position) return false;
+                draft->restore_context(restored_draft, *state.dflash);
+                return true;
+            });
+        if (restored) request.dflash_context = std::move(restored_draft);
+        return restored;
+    };
+    hooks.store = [&session_cache, draft](auto& request, auto state) {
+        const std::string_view key = state.dflash ? draft->prefix_cache_key() : std::string_view{};
+        session_cache.store(request.cache_plan.session_id, std::move(state), key);
+    };
+    auto admit = [draft = std::move(draft), mtp_available, batch_mtp = runtime.supports_batch_mtp()]
+        (const mfq::engine::EngineRequest& request) {
+        if (draft && mlx_dflash2_sampling_supported(request.input.sampling)) return true;
+        return !(request.input.sampling.enable_mtp && mtp_available && !batch_mtp);
+    };
+    return make_mlx_request_batch<MlxQwen4BatchOperations>(chunk_size, chunk_size,
+        std::move(admit), runtime, std::move(hooks));
+}
 
 } // namespace mfq::metal

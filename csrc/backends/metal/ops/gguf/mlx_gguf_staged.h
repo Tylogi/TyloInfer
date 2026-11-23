@@ -39,5 +39,7 @@ public:
         const mlx::core::array* gate = nullptr, float limit = 0.f);
     static mlx::core::array weighted_down(const MlxGgufWeight& weight, const mlx::core::array& input,
         const mlx::core::array& ids, const mlx::core::array& probabilities, mlx::core::Dtype dtype);
+    static mlx::core::array routed_pair_ffn(const std::array<MlxGgufWeight, 3>& weights,
+        const mlx::core::array& input, const mlx::core::array& ids, const mlx::core::array& probabilities, float limit);
 };
 } // namespace mfq::metal

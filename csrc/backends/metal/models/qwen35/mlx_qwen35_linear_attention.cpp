@@ -570,6 +570,57 @@ array MlxQwen35LinearAttentionBlock::forward(
     return residual;
 }
 
+void MlxQwen35LinearAttentionBlock::exchange_request_cache(RequestCache& state) noexcept {
+    convolution_state_.swap(state.convolution);
+    recurrent_state_.swap(state.recurrent);
+    std::swap(resources_, state.resources);
+    speculative_rollback_.swap(state.rollback);
+    std::swap(cache_position_, state.position);
+    std::swap(cache_batch_, state.batch);
+}
+
+array MlxQwen35LinearAttentionBlock::forward_attention_batch(const array& input,
+    std::span<RequestCache* const> requests) {
+    using namespace mlx::core;
+    std::vector<array> convolution, recurrent;
+    convolution.reserve(requests.size());
+    recurrent.reserve(requests.size());
+    int offset = 0;
+    for (const auto* request : requests) {
+        if (!request->convolution || !request->recurrent || request->batch != 1 || request->rollback)
+            throw std::invalid_argument("invalid recurrent state in Metal decode batch");
+        convolution.push_back(*request->convolution);
+        recurrent.push_back(*request->recurrent);
+        offset = std::max(offset, request->position);
+    }
+
+    RequestCache joined{concatenate(convolution, 0), concatenate(recurrent, 0), {}, {},
+        offset, static_cast<int>(requests.size())};
+    auto result = [&] {
+        exchange_request_cache(joined);
+        try {
+            auto value = forward_attention(input, offset, true);
+            exchange_request_cache(joined);
+            return value;
+        } catch (...) {
+            exchange_request_cache(joined);
+            throw;
+        }
+    }();
+
+    for (int row = 0; row < static_cast<int>(requests.size()); ++row) {
+        auto& request = *requests[row];
+        const auto& convolution_state = *joined.convolution;
+        const auto& recurrent_state = *joined.recurrent;
+        request.convolution = slice(convolution_state, {row, 0, 0},
+            {row + 1, convolution_state.shape(1), convolution_state.shape(2)});
+        request.recurrent = slice(recurrent_state, {row, 0, 0, 0},
+            {row + 1, recurrent_state.shape(1), recurrent_state.shape(2), recurrent_state.shape(3)});
+        ++request.position;
+    }
+    return result;
+}
+
 array MlxQwen35LinearAttentionBlock::forward_attention(
     const array& input,
     int position_offset,

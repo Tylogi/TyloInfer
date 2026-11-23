@@ -26,6 +26,7 @@
 #include "mlx_dflash2_serving.h"
 #include "mlx_engine.h"
 #include "mlx_qwen4_batching.h"
+#include "mlx_text_batching.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_inference_warmup.h"
 #endif
@@ -367,7 +368,7 @@ void print_help() {
         << "  --yarn-context-extension  permit Qwen YaRN context extension on load\n"
         << "  --prefill-chunk-size N maximum prompt chunk (portable default 2048;\n"
         << "                          capable runtimes may autotune when omitted)\n"
-        << "  --continuous-batching N Flash-Next ordinary decode concurrency (default 8; 0/1 serial)\n"
+        << "  --continuous-batching N Maximum concurrent text sequences on supported models (default 8, 0/1 serial)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
         << "                          MFQ default: full residency; HF default: auto\n"
         << "  --model-name NAME      API model name (default model path stem)\n"
@@ -939,7 +940,8 @@ public:
         std::size_t selected_tokens = 0;
         for (const auto& [session_id, history] : states_) {
             for (std::size_t index = 0; index < history.size(); ++index) {
-                const auto& tokens = history[index].state.tokens;
+                const auto& state = history[index].state;
+                const auto& tokens = state.tokens;
                 if (history[index].media_key != media_key || tokens.empty() || tokens.size() >= prompt.size() ||
                     tokens.size() > maximum_prefix_tokens ||
                     tokens.size() < selected_tokens ||
@@ -947,6 +949,7 @@ public:
                         tokens.begin(), tokens.end(), prompt.begin())) {
                     continue;
                 }
+                if (require_mtp && !has_native_mtp_state(state)) continue;
                 const bool requested_tie =
                     tokens.size() == selected_tokens &&
                     session_id == requested_session &&
@@ -1016,6 +1019,10 @@ public:
                 return saved.media_key == entry.media_key && saved.state.tokens == entry.state.tokens;
             });
         if (previous != history.end()) {
+            if (has_native_mtp_state(previous->state) && !has_native_mtp_state(entry.state)) {
+                previous->last_used = protected_clock;
+                return;
+            }
             bytes_ -= previous->state.bytes;
             *previous = std::move(entry);
         } else {
@@ -1264,6 +1271,12 @@ public:
     }
 
 private:
+    static bool has_native_mtp_state(const SessionState& state) {
+        if constexpr (requires { state.last_hidden; state.mtp_layers; })
+            return state.last_hidden && (state.tokens.size() == 1 || !state.mtp_layers.empty());
+        return true;
+    }
+
     static void reset_runtime(Runtime& runtime) {
         if constexpr (requires { runtime.reset_cache(1); }) {
             runtime.reset_cache(1);
@@ -1889,54 +1902,20 @@ public:
     }
 
     void configure_batching() {
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+        auto& runtime = runtime_holder->value();
+        if constexpr (requires { make_mlx_model_batch(runtime, *session_cache, prefill_chunk_size,
+            runtime_components.mtp_available, runtime_components.dflash2); }) {
             if (configured_batch_capacity > 1) {
-                mfq::metal::MlxQwen4BatchOperations::Hooks hooks;
-                hooks.block_size = session_cache->block_size_tokens();
-                hooks.dflash2 = runtime_components.dflash2;
-                hooks.restore = [this](auto& request) {
-                    request.prefix = session_cache->normalize_stable_prefix_tokens(std::min(
-                        request.cache_plan.stable_prefix_tokens, request.prompt.size()));
-                    if (!request.prefix || (request.cache_plan.session_id.empty() &&
-                        !session_cache->persistent_prefix_enabled())) {
-                        request.prefix = 0;
-                        return std::size_t{0};
-                    }
-                    const auto limit = std::min(request.prefix, request.prompt.size() - 1);
-                    if (!request.dflash_context) {
-                        return session_cache->restore_best(runtime_holder->value(), request.cache_plan.session_id,
-                            request.prompt, limit, request.mtp);
-                    }
-                    const auto& draft = *runtime_components.dflash2;
-                    mfq::metal::MlxDFlash2Context restored_draft;
-                    const auto restored = session_cache->restore_best(runtime_holder->value(),
-                        request.cache_plan.session_id, request.prompt, limit, false, draft.prefix_cache_key(),
-                        [&](const auto& state) {
-                            if (!state.dflash || state.dflash->position != state.cache_position) return false;
-                            draft.restore_context(restored_draft, *state.dflash);
-                            return true;
-                        });
-                    if (restored) request.dflash_context = std::move(restored_draft);
-                    return restored;
-                };
-                hooks.store = [this](auto& request, auto state) {
-                    const std::string_view key = state.dflash ? runtime_components.dflash2->prefix_cache_key() : std::string_view{};
-                    session_cache->store(request.cache_plan.session_id, std::move(state), key);
-                };
-                batching = std::make_unique<MetalBatch>(prefill_chunk_size, prefill_chunk_size,
-                    runtime_holder->value(), std::move(hooks));
-                batching_capacity = static_cast<std::size_t>(configured_batch_capacity);
-                batch_mtp_enabled = runtime_holder->value().supports_batch_mtp();
+                batching = make_mlx_model_batch(runtime, *session_cache, prefill_chunk_size,
+                    runtime_components.mtp_available, runtime_components.dflash2);
             }
         }
+        batching_capacity = batching ? static_cast<std::size_t>(configured_batch_capacity) : 1;
     }
 
     std::size_t request_capacity() const override { return batching_capacity; }
     bool can_batch(const mfq::engine::EngineRequest& request) const override {
-        if (!batching || request.input.media) return false;
-        if (runtime_components.dflash2 && mfq::metal::mlx_dflash2_sampling_supported(request.input.sampling))
-            return true;
-        return !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
+        return batching && batching->can_batch(request);
     }
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
@@ -2933,11 +2912,9 @@ private:
     std::atomic<std::size_t> resident_weight_budget{0};
     mfq::metal::MlxEngineComponents runtime_components;
     std::unique_ptr<mfq::metal::MlxWeightResidency> weight_residency;
-    using MetalBatch = mfq::engine::ContinuousBatch<mfq::metal::MlxQwen4BatchOperations>;
     int configured_batch_capacity;
     std::size_t batching_capacity = 1;
-    bool batch_mtp_enabled = false;
-    std::unique_ptr<MetalBatch> batching;
+    std::unique_ptr<mfq::metal::MlxRequestBatch> batching;
 };
 
 template <typename Runtime, typename Loader>

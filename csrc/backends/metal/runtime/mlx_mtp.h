@@ -179,11 +179,15 @@ struct MlxMtpEngineCallbacks {
     mfq::engine::mtp::PolicyState* policy_state = nullptr;
     std::function<MlxMtpTargetBatch(std::int32_t)> decode_target;
     std::function<void(const mlx::core::array&, int, double)> verified_round;
-    std::function<int()> draft_depth;
+    // A missing depth lets the request's own controller choose this cycle.
+    std::function<std::optional<int>()> draft_depth;
     std::function<std::optional<double>(int)> batch_cycle_ms;
     std::function<std::uint64_t()> batch_park_count;
     std::function<void(const MlxMtpDraftContext&)> prepare_draft_history;
     std::function<mlx::core::array()> draft_logits;
+    // Whole-window greedy proposal when the scheduler has a draft cohort.
+    std::function<bool()> can_batch_draft;
+    std::function<mlx::core::array()> batched_draft_tokens;
 
 };
 
@@ -204,13 +208,14 @@ struct MlxMtpEngineRequest {
 };
 
 struct MlxMtpTargetRequest {
-    enum class Kind { target, first_draft, next_draft };
+    enum class Kind { target, first_draft, next_draft, draft_window };
     std::int32_t pending_token;
     mlx::core::array draft_tokens;
     int draft_count;
     Kind kind = Kind::target;
 };
 using MlxMtpGeneration = mfq::StepSequence<MlxMtpTargetRequest>;
+int mlx_mtp_maximum_depth(const MlxSamplingParams& sampling, int predictor_depth);
 MlxMtpGeneration mlx_mtp_generation(MlxMtpEngineRequest request,
     MlxMtpEngineCallbacks callbacks, MlxMtpGenerationStats& stats);
 

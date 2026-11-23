@@ -40,6 +40,45 @@ int main() {
         require(policy.cost(3) == 12.);
     }
     {
+        using namespace std::chrono_literals;
+        BatchDepthPolicy policy({"a", "b", "c"}, 3, 0, true);
+        const BatchDepthPolicy::Clock::time_point zero{};
+        auto at = zero;
+        const auto observe = [&](const auto& samples, int depth, auto step) {
+            policy.observe(samples, at, at + step, true, false, depth);
+            at += step;
+        };
+        const std::array<BatchAcceptance, 3> accepted{{{1, 1}, {1, 1}, {1, 1}}};
+        const std::array<BatchAcceptance, 3> ordinary{{{0, 0}, {0, 0}, {0, 0}}};
+        require(policy.depth() == 1);
+        for (int step = 0; step < 5; ++step) {
+            observe(accepted, 1, 60ms);
+            require(policy.depth() == 1);
+        }
+        while (policy.depth() == 1 && at < zero + 6s) observe(accepted, 1, 60ms);
+        require(policy.depth() == 0);
+        for (int step = 0; step < 5; ++step) observe(ordinary, 0, 45ms);
+        require(policy.depth() == 1 && policy.cost(0) == 45.);
+        for (int step = 0; step < 5 && policy.depth() == 1; ++step) observe(accepted, 1, 60ms);
+        require(policy.depth() == 2);
+
+        BatchDepthPolicy low_yield({"a", "b", "c"}, 3, 0, true);
+        const std::array<BatchAcceptance, 3> rejected{{{1, 0}, {1, 0}, {1, 0}}};
+        for (int step = 0; step < 4; ++step)
+            low_yield.observe(rejected, zero + step * 60ms, zero + (step + 1) * 60ms,
+                true, false, 1);
+        require(low_yield.depth() == 0);
+
+        BatchDepthPolicy wider({"a", "b", "c"}, 3, 0, true, 2);
+        BatchDepthPolicy capped({"a", "b", "c"}, 1, 0, true, 2);
+        require(wider.depth() == 2 && capped.depth() == 1);
+        const std::array<BatchAcceptance, 3> rejected_wide{{{2, 0}, {2, 0}, {2, 0}}};
+        for (int step = 0; step < 4; ++step)
+            wider.observe(rejected_wide, zero + step * 70ms, zero + (step + 1) * 70ms,
+                true, false, 2);
+        require(wider.depth() == 0);
+    }
+    {
         // Initialization invalidates timing, while its completed token
         // decisions remain real observations. The next valid cycle must be
         // usable immediately; unrelated gaps and interrupted work cannot

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -72,6 +73,7 @@ public:
         bool use_cache = true);
     void reset_cache(int batch = 1, int initial_capacity = 16);
     void materialize_cache();
+    void exchange_request_caches(std::span<MlxQwen35FullAttentionBlock::RequestCache> state) noexcept;
     void trim_cache_to(int position);
     void clear_cache() noexcept;
     int cache_position() const noexcept;
@@ -230,6 +232,30 @@ public:
         const std::vector<std::int64_t>& tokens, bool detached = true) const;
     void restore_text_session_state(
         const MlxQwen35TextSessionState& state);
+    struct BatchCache {
+        using Layer = std::variant<MlxQwen35FullAttentionBlock::RequestCache,
+            MlxQwen35LinearAttentionBlock::RequestCache>;
+        std::vector<Layer> layers;
+        std::vector<MlxQwen35FullAttentionBlock::RequestCache> predictor;
+        std::optional<mlx::core::array> last_hidden;
+        int position = 0, batch = 0, pending_drafts = 0;
+        bool use_mtp = false;
+        bool mtp_ready = false;
+    };
+    int batch_vocabulary() const noexcept { return static_cast<int>(config_.vocab_size); }
+    int batch_cache_position(const BatchCache& cache) const noexcept { return cache.position; }
+    BatchCache make_batch_cache() const;
+    BatchCache take_batch_cache();
+    mlx::core::array prefill_batch_request(BatchCache& cache, const mlx::core::array& tokens);
+    mlx::core::array decode_batch_requests(std::span<BatchCache* const> requests, const mlx::core::array& tokens);
+    MlxQwen35TextSessionState capture_batch_cache(BatchCache& cache, const std::vector<std::int64_t>& tokens);
+    bool supports_batch_mtp() const noexcept { return supports_mtp(); }
+    int batch_context() const noexcept { return context_capacity(); }
+    void enable_batch_mtp(BatchCache& cache) const noexcept { cache.use_mtp = true; }
+    MlxMtpEngineCallbacks batch_mtp_callbacks(BatchCache& cache);
+    std::vector<MlxMtpTargetBatch> verify_batch_requests(std::span<BatchCache* const> requests,
+        std::span<const MlxMtpTargetRequest> steps);
+    void discard_batch_verification(BatchCache& cache);
     bool supports_text_session_state() const noexcept {
         return true;
     }
@@ -264,6 +290,17 @@ public:
     }
 
 private:
+    struct BatchInput {
+        BatchCache* cache;
+        mlx::core::array tokens;
+        int draft_count = 0;
+    };
+    std::vector<MlxMtpTargetBatch> forward_batch(std::span<const BatchInput> inputs);
+    void resolve_batch(BatchCache& cache, int accepted);
+    void exchange_batch_cache(BatchCache& cache) noexcept;
+    template<class Block, class Attention>
+    mlx::core::array forward_loop_layer(const mlx::core::array& hidden, std::size_t index,
+        Block& block, Attention&& attention) const;
     std::int32_t generate_prepared_impl(
         const MlxPreparedPrompt& prompt,
         const MlxSamplingParams& sampling,

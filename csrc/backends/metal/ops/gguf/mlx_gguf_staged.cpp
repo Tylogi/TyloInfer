@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <climits>
+#include <cmath>
 #include <stdexcept>
 
 namespace mfq::metal {
@@ -59,6 +60,13 @@ void load_staged_lookup(threadgroup uint* table, uint local, uint threads) {
     }
 }
 struct GgufStagedIq4Lookup { constant const half2* table; };
+struct GgufStagedIq2Lookup {
+    uint sign(uint index) const { return gguf_sign_mask(index); }
+    float4 values(uint index, uint part, uint signs, uint shift) const {
+        const auto code = as_type<uint2>(gguf_iq2_vectors[index * 2u + part]);
+        return float4(as_type<half4>(code ^ gguf_iq2_signs[(signs >> shift) & 15u]));
+    }
+};
 template<int F> struct GgufStagedIq3Lookup {
     uint sign(uint index) const { return gguf_sign_mask(index); }
     float4 values(uint index, uint signs, uint shift) const {
@@ -71,9 +79,10 @@ auto staged_lookup(threadgroup uint* table) {
     if constexpr (F == 20 || F == 23) return GgufThreadgroupLookup<F>{table};
     else return GgufConstantLookup<F>{};
 }
-template<int F, bool Signed = true>
+template<int F, bool Signed = true, bool HalfIq2 = false>
 auto column_lookup(threadgroup uint* table) {
-    if constexpr ((F == 18 || F == 21) && Signed) return GgufStagedIq3Lookup<F>{};
+    if constexpr (F == 16 && HalfIq2) return GgufStagedIq2Lookup{};
+    else if constexpr ((F == 18 || F == 21) && Signed) return GgufStagedIq3Lookup<F>{};
     else if constexpr (F == 20 || F == 23) return GgufStagedIq4Lookup{gguf_iq4_pairs};
     else return staged_lookup<F>(table);
 }
@@ -309,6 +318,14 @@ vec<O, 4> plane_signed(uint word, uint signs, float scale, uint shift) {
     return vec<O, 4>(select(values, -values, (uint4(signs) & (uint4(1u, 2u, 4u, 8u) << shift)) != 0u));
 }
 template<typename O, class Lookup>
+vec<O, 4> plane_iq2(Lookup lookup, uint index, uint part, uint signs, float scale, uint shift) {
+    return plane_signed<O>(lookup.word(index, part), signs, scale, shift);
+}
+template<typename O>
+vec<O, 4> plane_iq2(GgufStagedIq2Lookup lookup, uint index, uint part, uint signs, float scale, uint shift) {
+    return vec<O, 4>(lookup.values(index, part, signs, shift) * scale);
+}
+template<typename O, class Lookup>
 vec<O, 4> plane_iq3(Lookup lookup, uint index, uint signs, float scale, uint shift) {
     return plane_signed<O>(lookup.word(index, 0u), signs, scale, shift);
 }
@@ -404,21 +421,17 @@ void decode_group_chunks(GroupPayload value, Lookup lookup, uint group, Sink sin
         } else if constexpr (F == 16 || F == 18) {
             const uint aux = F == 16 ? value.a.y : value.b;
             const uint sub = c / 2u, shift = (c % 2u) * 4u;
-            uint a, b;
-            if constexpr (F == 16) {
-                a = lookup.word((value.a.x >> (8u * sub)) & 255u, c % 2u);
-                b = lookup.word((value.a.x >> (8u * (sub + 2u))) & 255u, c % 2u);
-            } else {
-                a = (value.a.x >> (8u * c)) & 255u;
-                b = (value.a.y >> (8u * c)) & 255u;
-            }
+            const uint low_sign = lookup.sign((aux >> (7u * sub)) & 127u);
+            const uint high_sign = lookup.sign((aux >> (7u * (sub + 2u))) & 127u);
             const float scale = UnitScale ? 1.f : d * (.5f + float(aux >> 28u)) * (F == 16 ? .25f : .5f);
-            if constexpr (F == 18) {
-                low = plane_iq3<O>(lookup, a, lookup.sign((aux >> (7u * sub)) & 127u), scale, shift);
-                high = plane_iq3<O>(lookup, b, lookup.sign((aux >> (7u * (sub + 2u))) & 127u), scale, shift);
+            if constexpr (F == 16) {
+                const uint a = (value.a.x >> (8u * sub)) & 255u;
+                const uint b = (value.a.x >> (8u * (sub + 2u))) & 255u;
+                low = plane_iq2<O>(lookup, a, c % 2u, low_sign, scale, shift);
+                high = plane_iq2<O>(lookup, b, c % 2u, high_sign, scale, shift);
             } else {
-                low = plane_signed<O>(a, lookup.sign((aux >> (7u * sub)) & 127u), scale, shift);
-                high = plane_signed<O>(b, lookup.sign((aux >> (7u * (sub + 2u))) & 127u), scale, shift);
+                low = plane_iq3<O>(lookup, (value.a.x >> (8u * c)) & 255u, low_sign, scale, shift);
+                high = plane_iq3<O>(lookup, (value.a.y >> (8u * c)) & 255u, high_sign, scale, shift);
             }
         } else if constexpr (F == 17 || F == 22) {
             const uint sub = c / 2u, shift = (c % 2u) * 4u;
@@ -549,7 +562,18 @@ device const half* gguf_column_row(device const half* x, uint row, uint k) { ret
 device const half* gguf_column_row(GgufColumnInput x, uint row, uint k) {
     return x.values + ulong((x.rows >> (row * 3u)) & 7u) * k;
 }
-template<int F, bool Packed, int L = 1, bool Signed = true, class Auxiliary, class Scales, int Rows, class Input>
+struct GgufPairedColumnInput { device const half* first; device const half* second; };
+device const half* gguf_column_row(GgufPairedColumnInput x, uint row, uint) {
+    return row == 0u ? x.first : x.second;
+}
+uint gguf_expert_peer(device const int* ids, uint route, uint routes) {
+    const uint opposite = (1u - route / routes) * routes;
+    for (uint rank = 0; rank < routes; ++rank)
+        if (ids[opposite + rank] == ids[route]) return opposite + rank;
+    return 2u * routes;
+}
+template<int F, bool Packed, int L = 1, bool Signed = true, bool HalfIq2 = false,
+    class Auxiliary, class Scales, int Rows, class Input>
 inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
     Auxiliary p1, Scales meta, uint column, threadgroup uint* table, thread float (&sums)[Rows]) {
     const uint groups = k / 32u;
@@ -593,7 +617,7 @@ inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
             }
             if constexpr (F == 17 || F == 22) {
                 float4 low_sum(0.f), high_sum(0.f);
-                decode_group_chunks<F, float, true>(current, column_lookup<F, Signed>(table), g,
+                decode_group_chunks<F, float, true>(current, column_lookup<F, Signed, HalfIq2>(table), g,
                     [&](uint c, float4 low, float4 high) __attribute__((always_inline)) {
                         auto input = gguf_column_row(x, 0u, k) + g * 32u + c * 4u;
                         low_sum = fma(low, float4(input[0], input[1], input[2], input[3]), low_sum);
@@ -609,7 +633,7 @@ inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
             }
             if constexpr (has_group_affine<F>()) {
                 float4 partial(0.f), total(0.f);
-                decode_group_chunks<F, float, true>(current, column_lookup<F, Signed>(table), g,
+                decode_group_chunks<F, float, true>(current, column_lookup<F, Signed, HalfIq2>(table), g,
                     [&](uint c, float4 low, float4 high) __attribute__((always_inline)) {
                         auto input = gguf_column_row(x, 0u, k) + g * 32u + c * 4u;
                         const float4 a(input[0], input[1], input[2], input[3]);
@@ -623,7 +647,7 @@ inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
             }
             float4 partial(0.f);
             using W = conditional_t<Packed, half, float>;
-            decode_group_chunks<F, W>(current, column_lookup<F, Signed>(table), g,
+            decode_group_chunks<F, W>(current, column_lookup<F, Signed, HalfIq2>(table), g,
                 [&](uint c, vec<W, 4> low, vec<W, 4> high) __attribute__((always_inline)) {
                     auto input = gguf_column_row(x, 0u, k) + g * 32u + c * 4u;
                     partial = fma(float4(low), float4(input[0], input[1], input[2], input[3]), partial);
@@ -634,7 +658,7 @@ inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
         }
         using W = conditional_t<Packed, half, float>;
         vec<W, 4> values[8];
-        decode_group_chunks<F, W>(payload, column_lookup<F, Signed>(table), g,
+        decode_group_chunks<F, W>(payload, column_lookup<F, Signed, HalfIq2>(table), g,
             [&](uint c, vec<W, 4> low, vec<W, 4> high) __attribute__((always_inline)) { values[c] = low; values[c + 4u] = high; });
         if (g + L < groups) {
             const bool metadata = (g + L) / PlaneLayout<F>::meta_groups != g / PlaneLayout<F>::meta_groups;
@@ -664,8 +688,8 @@ inline void column_dot(Input x, uint rows, uint k, device const uchar* p0,
         }
     }
 }
-template<int FG, int FU, int FGS, int FUS, bool PG, bool PU, int L, bool Clipped, bool HasShared, int Rows, typename T,
-    class GA, class GM, class UA, class UM, class SGA, class SGM, class SUA, class SUM, class Input>
+template<int FG, int FU, int FGS, int FUS, bool PG, bool PU, int L, bool Clipped, bool HasShared, int Rows,
+    bool HalfIq2, typename T, class GA, class GM, class UA, class UM, class SGA, class SGM, class SUA, class SUM, class Input>
 __attribute__((noinline)) void gate_up_columns(Input x, uint live, uint k, uint n, uint e,
     uint n0, uint lane, uint sg, bool shared, float limit, bool reversed,
     device const uchar* gate, GA gate_aux, GM gate_meta, device const uchar* up, UA up_aux, UM up_meta,
@@ -678,8 +702,8 @@ __attribute__((noinline)) void gate_up_columns(Input x, uint live, uint k, uint 
         if (sg == 0u) column_dot<FGS, true, L>(x, live, k, shared_gate, shared_gate_aux, shared_gate_meta, column, gate_table, sums);
         else column_dot<FUS, true, L>(x, live, k, shared_up, shared_up_aux, shared_up_meta, column, FGS == FUS ? gate_table : up_table, sums);
     } else {
-        if (sg == 0u) column_dot<FG, PG, L>(x, live, k, gate, gate_aux, gate_meta, column, gate_table, sums);
-        else column_dot<FU, PU, L>(x, live, k, up, up_aux, up_meta, column, FG == FU ? gate_table : up_table, sums);
+        if (sg == 0u) column_dot<FG, PG, L, true, HalfIq2>(x, live, k, gate, gate_aux, gate_meta, column, gate_table, sums);
+        else column_dot<FU, PU, L, true, HalfIq2>(x, live, k, up, up_aux, up_meta, column, FG == FU ? gate_table : up_table, sums);
     }
     if (sg == 0u && lane % L == 0u) for (uint r = 0u; r < live; ++r) gates[r * 32u + lane / L] = T(sums[r]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1001,7 +1025,7 @@ if (MAX_ROWS <= 8 || (live <= 2u && !continuation)) {
         if constexpr (SOURCE_ROWS) return GgufColumnInput{input, row_map};
         else return input + (MAX_ROWS == 1 ? 0ul : ulong(row0) * k);
     }();
-    gate_up_columns<FG, FU, FGS, FUS, PG, PU, COLUMN_LANES, CLIPPED, HAS_SHARED, decltype(rows)::value>(
+    gate_up_columns<FG, FU, FGS, FUS, PG, PU, COLUMN_LANES, CLIPPED, HAS_SHARED, decltype(rows)::value, HALF_IQ2>(
         source, live, k, n, e, n0,
         thread_index_in_simdgroup, sg, shared, as_type<float>(params[5]), (params[6] >> 31u) != 0u,
         gate, gate_aux, gate_meta, up, up_aux, up_meta,
@@ -1249,6 +1273,94 @@ else {
     else if (MAX_ROWS > 32 && live <= 32u) run(integral_constant<ushort, 32>{});
     else run(integral_constant<ushort, MAX_ROWS>{});
 }
+}
+)METAL", header());
+    return kernel;
+}
+
+const fast::CustomKernelFunction& paired_gate_up_kernel() {
+    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_gate_up_pair",
+        {"gate", "gate_aux", "gate_meta", "up", "up_aux", "up_meta", "x", "ids", "params"}, {"y"}, R"METAL(
+const uint route = threadgroup_position_in_grid.y;
+const uint row = route / ROUTES, expert = uint(ids[route]);
+const uint k = params[0], n = params[1];
+if (expert >= params[2]) return;
+const uint peer = gguf_expert_peer(ids, route, ROUTES);
+const bool matched = peer < 2u * ROUTES;
+if (row && matched) return;
+const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+constexpr uint columns = 32u / LANES;
+const uint column = threadgroup_position_in_grid.x * columns + lane / LANES;
+threadgroup uint table[1];
+threadgroup T gates[2u * columns];
+const auto first = x + ulong(row) * k;
+const float limit = as_type<float>(params[3]);
+auto run = [&](auto count, auto input) {
+    constexpr int rows = decltype(count)::value;
+    float sums[rows];
+    if (sg == 0u) column_dot<16, true, LANES>(input, rows, k, gate, gate_aux, gate_meta, expert * n + column, table, sums);
+    else column_dot<16, true, LANES>(input, rows, k, up, up_aux, up_meta, expert * n + column, table, sums);
+    if (sg == 0u && lane % LANES == 0u) {
+        for (uint r = 0; r < rows; ++r) gates[r * columns + lane / LANES] = T(sums[r]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 1u && lane % LANES == 0u) {
+        for (uint r = 0; r < rows; ++r) {
+            float g = float(gates[r * columns + lane / LANES]), u = float(T(sums[r]));
+            if constexpr (CLIPPED) { g = min(g, limit); u = clamp(u, -limit, limit); }
+            y[ulong(r == 0u ? route : peer) * n + column] = T((g / (1.f + exp(-g))) * u);
+        }
+    }
+};
+if (matched) run(integral_constant<int, 2>{}, GgufPairedColumnInput{first, x + ulong(1u - row) * k});
+else run(integral_constant<int, 1>{}, first);
+)METAL", header());
+    return kernel;
+}
+
+const fast::CustomKernelFunction& paired_down_kernel() {
+    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_down_pair_reduce",
+        {"packed", "aux", "meta", "x", "ids", "probabilities", "params"}, {"y"}, R"METAL(
+const uint tid = thread_index_in_threadgroup;
+const uint route = tid / COLUMNS, lane = tid % COLUMNS;
+const uint row = route / ROUTES;
+const uint k = params[0], n = params[1], experts = params[2];
+const uint column = threadgroup_position_in_grid.x * COLUMNS + lane;
+const uint expert = uint(ids[route]);
+const bool live = expert < experts;
+const uint peer = live ? gguf_expert_peer(ids, route, ROUTES) : 2u * ROUTES;
+const bool matched = peer < 2u * ROUTES;
+threadgroup uint table[1];
+threadgroup T values[2u * ROUTES * COLUMNS];
+// The first request computes both results for a shared expert using one stream of weights.
+if (row == 0u || !matched) {
+    float result = 0.f;
+    if (live) {
+        auto first = x + ulong(route) * k;
+        if (matched) {
+            auto second = x + ulong(peer) * k;
+            float sums[2];
+            column_dot<12, true>(GgufPairedColumnInput{first, second}, 2u, k, packed, aux, meta,
+                expert * n + column, table, sums);
+            result = sums[0];
+            values[peer * COLUMNS + lane] = T(sums[1]);
+        } else {
+            float sums[1];
+            column_dot<12, true>(first, 1u, k, packed, aux, meta,
+                expert * n + column, table, sums);
+            result = sums[0];
+        }
+    }
+    values[route * COLUMNS + lane] = T(result);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (route < 2u) {
+    float total = 0.f;
+    for (uint rank = 0; rank < ROUTES; ++rank) {
+        const uint i = route * ROUTES + rank;
+        if (uint(ids[i]) < experts) total += float(values[i * COLUMNS + lane]) * probabilities[i];
+    }
+    y[route * n + column] = T(total);
 }
 )METAL", header());
     return kernel;
@@ -1653,6 +1765,10 @@ array MlxGgufStagedPrefill::gate_up(const MlxGgufWeight& gate, const MlxGgufWeig
     const auto meta = [&](const MlxGgufWeight& w) { return w.planes_ ? (*w.planes_)[1] : empty_meta; };
     const bool serial = q8 && !shared && (routes.tile_rows == 1 ||
         (routes.tile_rows <= 8 && routes.maximum_live_rows > 0 && routes.maximum_live_rows <= 2));
+    const auto route_count = routes.route_rows.size();
+    const bool half_iq2 = routes.tile_rows == 8 && (route_count == 9 * 16 || route_count == 12 * 16) &&
+        n == 1536 && first.input_size() == 1536 && first.expert_count() == 512 &&
+        first.format_ == 16 && second.format_ == 16 && first.planes_ && second.planes_ && !shared;
     return gate_up_kernel()({first.bytes_, second.bytes_, reverse ? second_input : input, routes.descriptors, routes.count,
         array({uint32_t(gate.input_size()), uint32_t(n), uint32_t(input.shape(0)), uint32_t(gate.expert_count()),
             uint32_t(routes.tile_rows == 1 ? routes.descriptors.size() : 0), std::bit_cast<uint32_t>(limit),
@@ -1663,7 +1779,7 @@ array MlxGgufStagedPrefill::gate_up(const MlxGgufWeight& gate, const MlxGgufWeig
         {{"FG", first.format_}, {"FU", second.format_}, {"T", dtype}, {"PG", first.planes_.has_value()},
             {"PU", second.planes_.has_value()}, {"SEPARATE_INPUT", up_input != nullptr}, {"CLIPPED", limit > 0.f},
             {"MAX_ROWS", routes.tile_rows}, {"HAS_SHARED", shared},
-            {"SOURCE_ROWS", source_topk > 0},
+            {"SOURCE_ROWS", source_topk > 0}, {"HALF_IQ2", half_iq2},
             {"COMPACT_ROUTES", routes.descriptors.ndim() == 2 && routes.descriptors.shape(1) == 3},
             {"FGS", shared_first->format_}, {"FUS", shared_second->format_}, {"COLUMN_LANES", column_lanes},
             {"COLUMN_ONLY", routes.maximum_live_rows > 0 && routes.maximum_live_rows <= 2}}, std::nullopt, false, {}).front();
@@ -1679,8 +1795,10 @@ array MlxGgufStagedPrefill::down(const MlxGgufWeight& weight, const array& input
     if (shared && (!shared->planes_ || shared->shape_ != Shape{n, weight.input_size()}))
         throw std::invalid_argument("GGUF shared Down geometry mismatch");
     if (!shared) shared = &weight;
+    const bool compact_q4_pair = routes.tile_rows == 8 && routes.maximum_live_rows == 2 &&
+        weight.format_ == 12 && weight.input_size() == 1536 && n == 1536;
     const int column_lanes = ((routes.tile_rows == 1 && weight.input_size() > n) ||
-        (routes.tile_rows == 8 && !weight.planes_)) ? 4 : 1;
+        (routes.tile_rows == 8 && !weight.planes_) || compact_q4_pair) ? 4 : 1;
     const auto empty_meta = array({uint16_t(0)}, uint16);
     return down_kernel()({weight.bytes_, contiguous(astype(input, float16)), routes.descriptors, routes.count,
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(input.shape(0)), uint32_t(weight.expert_count()),
@@ -1718,5 +1836,28 @@ array MlxGgufStagedPrefill::weighted_down(const MlxGgufWeight& weight, const arr
 
 bool MlxGgufStagedPrefill::prefers_weighted_down(const MlxGgufWeight& weight) noexcept {
     return weight.planes_ && (weight.format_ < 144 || (weight.format_ <= 151 && weight.format_ != 150));
+}
+
+array MlxGgufStagedPrefill::routed_pair_ffn(const std::array<MlxGgufWeight, 3>& weights,
+    const array& input, const array& ids, const array& probabilities, float limit) {
+    if (!std::isfinite(limit) || limit < 0.f || probabilities.shape() != ids.shape())
+        throw std::invalid_argument("invalid GGUF paired FFN inputs");
+    const auto& [gate, up, down] = weights;
+    constexpr int lanes = 4, columns = 8;
+    const int k = gate.input_size(), n = gate.output_size(), routes = ids.shape(1);
+    const auto dtype = input.dtype();
+    const auto experts = contiguous(astype(ids, int32));
+    const auto hidden = paired_gate_up_kernel()({gate.bytes_, (*gate.planes_)[0], (*gate.planes_)[1],
+        up.bytes_, (*up.planes_)[0], (*up.planes_)[1], contiguous(astype(input, float16)), experts,
+        array({uint32_t(k), uint32_t(n), uint32_t(gate.expert_count()), std::bit_cast<uint32_t>(limit)})},
+        {{2 * routes, n}}, {dtype}, {n / (32 / lanes) * 64, 2 * routes, 1}, {64, 1, 1},
+        {{"T", dtype}, {"LANES", lanes}, {"ROUTES", routes}, {"CLIPPED", limit > 0.f}},
+        std::nullopt, false, {}).front();
+    const int threads = 2 * columns * routes;
+    return paired_down_kernel()({down.bytes_, (*down.planes_)[0], (*down.planes_)[1],
+        contiguous(astype(hidden, float16)), experts, contiguous(astype(probabilities, float32)),
+        array({uint32_t(n), uint32_t(k), uint32_t(down.expert_count())})},
+        {{2, k}}, {dtype}, {k / columns * threads, 1, 1}, {threads, 1, 1},
+        {{"T", dtype}, {"ROUTES", routes}, {"COLUMNS", columns}}, std::nullopt, false, {}).front();
 }
 } // namespace mfq::metal

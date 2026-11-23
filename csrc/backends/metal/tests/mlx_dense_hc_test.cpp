@@ -1,6 +1,7 @@
 #include "qwen4_ops.h"
 #include "mlx_transformer.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_hyper_connection.h"
 
 #include <cmath>
 #include <iostream>
@@ -263,6 +264,38 @@ void check_prefill(Dtype weight_dtype, bool with_injection, int rows = 65, int h
             compare(*actual.injection, array(2.f, float32) * sigmoid(inject(normalized) / array(float(streams), float32)), 0.f);
     }
 }
+
+void check_hy4_packed_residual() {
+    constexpr int streams = 4, hidden = 3072, width = streams * hidden;
+    const auto weights = reshape(sin(arange(2 * streams * width, float32) * .019f) * .004f,
+        {2 * streams, width});
+    const auto bias = arange(2 * streams, float32) * -.03f;
+    const auto scale = cos(arange(2 * streams, float32) * .07f);
+    mfq::metal::MlxHyperConnectionConfig config;
+    config.streams = streams;
+    config.gate_epsilon = .0001f;
+    mfq::metal::MlxHyperConnection connection(weights, bias, config, scale);
+    mfq::metal::MlxRmsNorm norm(1.f + sin(arange(hidden, float32) * .003f) * .1f, 1e-5f, 0.f);
+    for (const int rows : {2, 4, 8, 9, 12, 16}) {
+        const auto residual = astype(reshape(sin(arange(rows * width, float32) * .017f),
+            {1, rows, streams, hidden}), bfloat16);
+        const auto delta = astype(reshape(cos(arange(rows * hidden, float32) * .013f) * .25f,
+            {1, rows, hidden}), bfloat16);
+        const auto initial = connection.collapse(residual, &norm, true);
+        const auto [updated, collapsed] = connection.expand_and_collapse(residual, delta, initial, &norm, true);
+        for (int row = 0; row < rows; ++row) {
+            const auto lane = slice(residual, {0, row, 0, 0}, {1, row + 1, streams, hidden});
+            const auto lane_delta = slice(delta, {0, row, 0}, {1, row + 1, hidden});
+            const auto expected_initial = connection.collapse(lane, &norm);
+            const auto [expected_updated, expected] =
+                connection.expand_and_collapse(lane, lane_delta, expected_initial, &norm);
+            compare(slice(initial.branch, {0, row, 0}, {1, row + 1, hidden}), expected_initial.branch, .016f);
+            compare(slice(updated, {0, row, 0, 0}, {1, row + 1, streams, hidden}), expected_updated, .008f);
+            compare(slice(collapsed.post, {0, row, 0}, {1, row + 1, streams}), expected.post, 3e-6f);
+            compare(slice(collapsed.branch, {0, row, 0}, {1, row + 1, hidden}), expected.branch, .016f);
+        }
+    }
+}
 }
 
 int main() {
@@ -283,6 +316,7 @@ int main() {
         check_prefill(bfloat16, true, 64, 192, 128);
         check_prefill(bfloat16, false, 65, 2560, 320);
         check_batch(float32, true, bfloat16, true);
+        check_hy4_packed_residual();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -35,6 +35,38 @@ mlx::core::array patterned_half(
         mlx::core::float16);
 }
 
+void test_masked_dense_mla() {
+    using namespace mlx::core;
+    constexpr int batch = 4, tokens = 3, heads = 8, keys = 521, dimension = 576, values = 512;
+    constexpr float scale = 0.08f;
+    const auto q = patterned_half(batch * heads * tokens * dimension,
+        {batch, heads, tokens, dimension}, 7, 0.002f);
+    const auto kv = patterned_half(batch * keys * dimension, {batch, keys, dimension}, 11, 0.002f);
+    const auto stop = reshape(array({0, 1, 2, 31, 92, 120, 210, 220, 230, 510, 517, 521}),
+        {batch, tokens, 1});
+    const auto mask = arange(keys, int32) < stop;
+    const auto sinks = astype(arange(heads, int32), float32) * 0.03f - 0.1f;
+    const auto scores = matmul(astype(q, float32),
+        expand_dims(transpose(astype(kv, float32), {0, 2, 1}), 1)) * scale;
+    const auto masked = where(expand_dims(mask, 1), scores, array(-std::numeric_limits<float>::infinity()));
+    const auto logits = concatenate({masked, broadcast_to(reshape(sinks, {1, heads, 1, 1}),
+        {batch, heads, tokens, 1})}, -1);
+    const auto weights = slice(softmax(logits, -1), {0, 0, 0, 0}, {batch, heads, tokens, keys});
+    const auto value = expand_dims(slice(astype(kv, float32), {0, 0, 0}, {batch, keys, values}), 1);
+    const auto expected = transpose(matmul(weights, value), {0, 2, 1, 3});
+    const auto output = mfq::metal::mlx_masked_dense_mla_attention(q, kv, mask, sinks, scale, values);
+    const auto error = max(abs(astype(output, float32) - expected)).item<float>();
+    if (!std::isfinite(error) || error > 0.001f)
+        throw std::runtime_error("masked dense MLA differs from the expanded attention reference");
+    const auto packed_q = reshape(transpose(q, {0, 2, 1, 3}), {batch * tokens, heads, 1, dimension});
+    const auto packed = mfq::metal::mlx_masked_dense_mla_attention(packed_q, kv,
+        reshape(mask, {batch * tokens, 1, keys}), sinks, scale, values,
+        floor_divide(arange(batch * tokens, int32), array(tokens)));
+    const auto packed_error = max(abs(astype(reshape(packed, output.shape()), float32) - expected)).item<float>();
+    if (!std::isfinite(packed_error) || packed_error > 0.001f)
+        throw std::runtime_error("packed dense MLA differs from the expanded attention reference");
+}
+
 void test_block_gqa_matches_expanded_reference(
     float query_scale, float key_scale, int batch = 1, int queries = 3,
     int keys = 20, mlx::core::Dtype dtype = mlx::core::float16) {
@@ -395,6 +427,42 @@ void test_indexer_topk(int width, int rows, int heads, int batch, int offset, bo
     }
 }
 
+void test_indexer_token_ids() {
+    using namespace mlx::core;
+    constexpr int queries = 6, budget = 511, group = 4, stride = (budget + 1) * group;
+    for (const int width : {512, 1258, 2049, 8192}) {
+        const int start = width * group - 5;
+        std::vector<float> scores(queries * width);
+        for (int i = 0; i < queries * width; ++i)
+            scores[i] = float((i * 13 + i / width) % 37 - 18) * 0.125f;
+        const auto input = array(scores.begin(), {1, queries, width}, float32);
+        auto output = mfq::metal::mlx_sparse_indexer_token_ids(input, start);
+        output.eval();
+        const auto* tokens = output.data<std::int32_t>();
+        for (int query = 0; query < queries; ++query) {
+            const int position = start + query, active = std::min(width, position / group);
+            const int keep = std::min(budget, active);
+            std::vector<int> order(active);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                return scores[query * width + a] > scores[query * width + b];
+            });
+            order.resize(keep);
+            std::sort(order.begin(), order.end());
+            for (int i = 0; i < stride; ++i) {
+                const int slot = i / group, offset = i % group;
+                int expected = slot < keep ? order[slot] * group + offset : -1;
+                if (slot == budget) {
+                    const int tail = position / group * group + offset;
+                    expected = tail <= position ? tail : -1;
+                }
+                if (tokens[query * stride + i] != expected)
+                    throw std::runtime_error("grouped indexer token IDs disagree with the CPU oracle");
+            }
+        }
+    }
+}
+
 void test_indexer_topk_rejects_invalid_geometry() {
     using namespace mlx::core;
     for (const Shape& shape : {Shape{1, 0, 4, 750}, Shape{1, 1, 4, 511},
@@ -574,12 +642,68 @@ void test_latent_value_prefix() {
             throw std::runtime_error("sparse MLA value prefix disagrees with the strided-cache reference");
         }
     }
+
+    constexpr int queries = 16, heads = 32, width = 576, values = 512, selected = 2048, history = 2153;
+    const auto q = patterned_half(heads * queries * width, {1, heads, queries, width}, 7, 0.002f);
+    const auto storage_with_offset = patterned_half((history + 1) * width,
+        {1, history + 1, width}, 11, 0.003f);
+    const auto resident = slice(storage_with_offset, {0, 1, 0}, {1, history + 1, width});
+    const auto index = reshape(arange(queries * selected, int32), {1, queries, selected});
+    const auto ids = where(index % 7 == 0, array(-1), (index * 23) % history);
+    const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
+    const auto sinks = astype(arange(heads, int32), float32) * 0.03f - 0.1f;
+    const auto reference = mfq::metal::mlx_gathered_mla_attention(q,
+        mfq::metal::mlx_gather_selected_mla_rows(resident, ids), mask, sinks, 0.0625f, values);
+    const auto optimized = mfq::metal::mlx_sparse_selected_mla_attention(q, resident, ids, mask, sinks, 0.0625f, values);
+    const auto error = max(abs(reference - optimized)).item<float>();
+    if (optimized.shape() != Shape{1, queries, heads, values} || !std::isfinite(error) || error > 0.0005f)
+        throw std::runtime_error("indexed MLA prefill disagrees with the gathered reference");
+}
+
+void test_batched_resident_mla() {
+    using namespace mlx::core;
+    constexpr int heads = 32, width = 576, values = 512, selected = 2048;
+    constexpr float scale = 0.0625f;
+    const auto sinks = arange(heads, float32) * 0.03f - 0.1f;
+    for (const int batch : {3, 4}) {
+        int rows = 0;
+        std::vector<array> caches, selections;
+        for (int lane = 0; lane < batch; ++lane) {
+            const int count = 1 + lane % 3, history = 2060 + 7 * lane;
+            auto storage = patterned_half((history + 1) * width, {1, history + 1, width}, 11 + 2 * lane, 0.002f);
+            caches.push_back(slice(storage, {0, 1, 0}, {1, history + 1, width}));
+            const auto index = arange(count * selected, int32);
+            const auto ids = where(index % (7 + lane) == 0, array(-1), (index * 23 + lane) % history);
+            selections.push_back(reshape(ids, {1, count, selected}));
+            rows += count;
+        }
+        const auto query = astype(patterned_half(rows * heads * width, {rows, heads, 1, width}, 7, 0.002f), float32);
+        const auto direct = mfq::metal::mlx_batched_resident_mla_attention(query, caches, selections, sinks, scale);
+        if (!direct) continue;
+
+        std::vector<array> gathered, masks;
+        for (int lane = 0; lane < batch; ++lane) {
+            const auto& ids = selections[lane];
+            const int count = ids.shape(1);
+            gathered.push_back(reshape(mfq::metal::mlx_gather_selected_mla_rows(caches[lane], ids),
+                {count, 1, selected, width}));
+            masks.push_back(reshape(where(ids >= 0, array(0.f), array(-std::numeric_limits<float>::infinity())),
+                {count, 1, selected}));
+        }
+        const auto reference = mfq::metal::mlx_gathered_mla_attention(query, concatenate(gathered, 0),
+            concatenate(masks, 0), sinks, scale, values, true);
+        const auto error = max(abs(reference - *direct)).item<float>();
+        if (direct->shape() != Shape{rows, 1, heads, values} || !std::isfinite(error) || error > 0.001f)
+            throw std::runtime_error("batched resident MLA differs from the gathered reference");
+    }
 }
 
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
+        test_masked_dense_mla();
         test_latent_value_prefix();
+        test_batched_resident_mla();
         if (argc == 2 && std::string(argv[1]) == "--latent-only") return 0;
         if (argc == 2 && std::string(argv[1]) == "--small-m-only") {
             test_block_gqa_small_m(4, 1);
@@ -612,6 +736,7 @@ int main(int argc, char** argv) {
         test_qsa_prefill(257, 513, mlx::core::float16, false, 1);
         test_qsa_prefill_rejects_invalid_geometry();
         if (argc == 2 && std::string(argv[1]) == "--prefill-only") return 0;
+        test_indexer_token_ids();
         for (int rows = 1; rows <= 6; ++rows) {
             for (int width : {513, 750, 2048, 8192, 16384, 32768}) {
                 test_indexer_topk(width, rows, 4, 1, width * 4 - rows, false);

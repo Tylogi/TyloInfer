@@ -3,6 +3,7 @@
 #include "mlx_eval_timing.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -901,6 +902,58 @@ void test_prefill_decode_and_reset() {
         decode_model.cache_position() == 0 &&
             decode_model.cache_batch() == 0,
         "mixed model clear_cache did not release state");
+}
+
+void test_continuous_decode_and_verification() {
+    using namespace mlx::core;
+    auto model = make_model(false, false, true);
+    auto first_reference = make_model();
+    auto second_reference = make_model();
+    auto first = model.make_batch_cache();
+    auto second = model.make_batch_cache();
+    model.enable_batch_mtp(first);
+    eval(model.prefill_batch_request(first, token_ids({2, 5})));
+    eval(model.prefill_batch_request(second, token_ids({1, 3, 7})));
+    eval(first_reference.forward(token_ids({2, 5}), true));
+    eval(second_reference.forward(token_ids({1, 3, 7}), true));
+    const auto snapshot = model.capture_batch_cache(first, {2, 5});
+    require(snapshot.last_hidden && !snapshot.mtp_layers.empty(), "batched prefill lost the draft cache");
+    model.restore_text_session_state(snapshot);
+    first = model.take_batch_cache();
+    model.enable_batch_mtp(first);
+
+    const std::array requests{&first, &second};
+    auto first_callbacks = model.batch_mtp_callbacks(first);
+    const std::array steps{
+        mfq::metal::MlxMtpTargetRequest{3, array({4, 6}, {2}, int32), 2},
+        mfq::metal::MlxMtpTargetRequest{6, zeros({0}, int32), 0},
+    };
+    const int vocab = model.batch_vocabulary();
+    auto verified = model.verify_batch_requests(requests, steps);
+    auto second_expected = second_reference.forward(token_ids({6}), true);
+    require_array_close(verified[1].logits, reshape(second_expected, {1, vocab}), 3e-3f,
+        "ordinary lane during ragged speculative verification");
+    auto complete_reference = make_model();
+    auto first_expected = complete_reference.forward(token_ids({2, 5, 3, 4, 6}), false);
+    require_array_close(verified[0].logits, reshape(slice(first_expected, {0, 2, 0}, {1, 5, vocab}), {3, vocab}),
+        3e-3f, "ragged speculative verification");
+    first_callbacks.resolve_target(1, 2);
+    eval(first_reference.forward(token_ids({3, 4}), true));
+    require(model.batch_cache_position(first) == 4 && model.batch_cache_position(second) == 4,
+        "verification rollback changed another request's position");
+
+    auto third = model.make_batch_cache();
+    auto third_reference = make_model();
+    eval(model.prefill_batch_request(third, token_ids({7})));
+    eval(third_reference.forward(token_ids({7}), true));
+    const std::array next_requests{&first, &third};
+    auto decoded = model.decode_batch_requests(next_requests, array({2, 3}, {2, 1}, int32));
+    auto expected = concatenate({
+        reshape(first_reference.forward(token_ids({2}), true), {1, vocab}),
+        reshape(third_reference.forward(token_ids({3}), true), {1, vocab})}, 0);
+    require_array_close(decoded, expected, 3e-3f, "continuous decode after partial rollback and admission");
+    require(model.batch_cache_position(first) == 5 && model.batch_cache_position(third) == 2,
+        "continuous decode did not preserve independent positions");
 }
 
 void test_mtp_greedy_identity() {
@@ -1846,6 +1899,7 @@ int main(int argc, char** argv) {
         test_embedding_cache_continuity();
         test_embedding_validation();
         test_prefill_decode_and_reset();
+        test_continuous_decode_and_verification();
         test_chunked_prefill_generation();
         test_mtp_greedy_identity();
         test_mtp_constrained_identity();

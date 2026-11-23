@@ -241,10 +241,10 @@ class SparseIndexerTopkPrimitive final : public mlx::core::Primitive, public Mlx
 public:
     SparseIndexerTopkPrimitive(
         mlx::core::Stream stream, int heads, int items,
-        std::array<int, 4> params)
-        : Primitive(stream), heads_(heads), items_(items), params_(params),
+        std::array<int, 4> params, bool expand_tokens = false)
+        : Primitive(stream), heads_(heads), items_(items), params_(params), expand_tokens_(expand_tokens),
           kernel_name_("mfq_sparse_indexer_topk512_" +
-              std::to_string(heads) + "_" + std::to_string(items)) {}
+              std::to_string(heads) + "_" + std::to_string(items) + (expand_tokens ? "_tokens4" : "")) {}
 
     std::string preparation_key() const override { return kernel_name_; }
     void prepare_gpu() override { (void)prepared_kernel(); }
@@ -284,14 +284,16 @@ public:
     bool is_equivalent(const mlx::core::Primitive& other) const override {
         const auto* primitive = dynamic_cast<const SparseIndexerTopkPrimitive*>(&other);
         return primitive && primitive->heads_ == heads_ &&
-            primitive->items_ == items_ && primitive->params_ == params_;
+            primitive->items_ == items_ && primitive->params_ == params_ &&
+            primitive->expand_tokens_ == expand_tokens_;
     }
 
 private:
     std::string source() const {
         std::string code = "#include <metal_stdlib>\nusing namespace metal;\n";
         code += "#define HEADS " + std::to_string(heads_) +
-            "\n#define ITEMS " + std::to_string(items_) + "\n";
+            "\n#define ITEMS " + std::to_string(items_) +
+            "\n#define EXPAND_TOKENS " + (expand_tokens_ ? "true\n" : "false\n");
         code += "kernel void " + kernel_name_ + "("
             "device const float* scores [[buffer(0)]], "
             "constant int* params [[buffer(1)]], "
@@ -308,6 +310,7 @@ private:
     int heads_;
     int items_;
     std::array<int, 4> params_;
+    bool expand_tokens_;
     std::string kernel_name_;
 };
 
@@ -531,30 +534,6 @@ array typed_contiguous(const array& input, Dtype dtype) {
         result = mlx::core::astype(result, dtype);
     }
     return mlx::core::contiguous(result);
-}
-
-array generic_selected_mla_attention(
-    const array& query,
-    const array& cache,
-    const array& indices,
-    const array& mask,
-    const array& sinks,
-    float scale,
-    int value_dimension) {
-    const int batch = query.shape(0);
-    const int tokens = query.shape(2);
-    const int selected = indices.shape(2);
-    const int dimension = query.shape(3);
-    auto safe_indices = mlx::core::maximum(
-        indices, array(0, mlx::core::int32));
-    auto expanded_cache = mlx::core::broadcast_to(
-        mlx::core::expand_dims(cache, 1),
-        Shape{batch, tokens, cache.shape(1), dimension});
-    auto expanded_indices = mlx::core::broadcast_to(
-        mlx::core::expand_dims(safe_indices, -1),
-        Shape{batch, tokens, selected, dimension});
-    auto gathered = mlx::core::take_along_axis(expanded_cache, expanded_indices, 2);
-    return mlx_gathered_mla_attention(query, gathered, mask, sinks, scale, value_dimension);
 }
 
 int checked_grid_product(
@@ -1078,6 +1057,20 @@ array mlx_sparse_indexer_topk512(
         {mlx::core::contiguous(head_scores)});
 }
 
+array mlx_sparse_indexer_token_ids(const array& scores, int position) {
+    using namespace mlx::core;
+    if (scores.ndim() != 3 || scores.shape(0) != 1 || scores.dtype() != float32 ||
+        scores.shape(1) < 1 || scores.shape(1) > 6 || scores.shape(2) < 512 || scores.shape(2) > 8192 ||
+        position < 0 || position > std::numeric_limits<int>::max() - scores.shape(1))
+        throw std::invalid_argument("invalid grouped sparse MLA selection geometry");
+    const int queries = scores.shape(1), width = scores.shape(2);
+    int items = 2;
+    while (items * 256 < width) items *= 2;
+    return array({1, queries, 2048}, int32, std::make_shared<SparseIndexerTopkPrimitive>(
+        default_stream(default_device()), 1, items, std::array<int, 4>{position, 4, width, queries}, true),
+        {contiguous(scores)});
+}
+
 array mlx_deepselect_topk512(
     const array& scores,
     const std::optional<array>& valid_keys) {
@@ -1410,8 +1403,261 @@ array mlx_qsa_prefill_attention(
     return outputs.size() == 1 ? outputs.front() : mlx::core::concatenate(outputs, 1);
 }
 
+array mlx_gather_selected_mla_rows(const array& cache, const array& indices) {
+    using namespace mlx::core;
+    if (cache.ndim() != 3 || indices.ndim() != 3 || cache.shape(0) != indices.shape(0))
+        throw std::invalid_argument("invalid selected MLA rows");
+    const int batch = cache.shape(0), tokens = indices.shape(1), dimension = cache.shape(2);
+    if (batch == 1 && dimension == 576 && cache.dtype() == float16 &&
+        cache.shape(1) > 0 && cache.strides(1) == dimension && cache.strides(2) == 1 &&
+        cache.offset() % 16 == 0 && indices.dtype() == int32 &&
+        indices.size() > 0 && indices.size() <= (std::numeric_limits<int>::max() - 127) / 32 &&
+        default_device() == Device::gpu) {
+        // A SIMD group copies one latent row without broadcasting IDs across its channels.
+        static const auto gather = fast::metal_kernel("tyloinfer_gather_mla_fp16_rows",
+            {"cache", "indices"}, {"rows"}, R"METAL(
+            const uint task = thread_position_in_grid.x / 32u;
+            if (task >= uint(indices_shape[1]) * uint(indices_shape[2])) return;
+            const uint lane = thread_index_in_simdgroup;
+            const int key = clamp(indices[task], 0, int(cache_shape[1]) - 1);
+            const auto source = reinterpret_cast<device const uint4*>(cache + ulong(key) * 576u);
+            auto output = reinterpret_cast<device uint4*>(rows + ulong(task) * 576u);
+            for (uint word = lane; word < 72u; word += 32u) output[word] = source[word];
+            )METAL", "", false, false);
+        const int groups = (static_cast<int>(indices.size()) + 3) / 4;
+        return gather({cache, contiguous(indices)}, {{1, tokens, indices.shape(2), dimension}}, {float16},
+            {groups * 128, 1, 1}, {128, 1, 1}, {}, std::nullopt, false, {}).front();
+    }
+    const auto safe_indices = maximum(indices, array(0, int32));
+    const auto expanded_cache = broadcast_to(expand_dims(cache, 1),
+        Shape{batch, tokens, cache.shape(1), dimension});
+    const auto expanded_indices = broadcast_to(expand_dims(safe_indices, -1),
+        Shape{batch, tokens, indices.shape(2), dimension});
+    return take_along_axis(expanded_cache, expanded_indices, 2);
+}
+
+namespace {
+array gathered_mla_sink_softmax(const array& scores, const array& mask, const array& sinks) {
+    using namespace mlx::core;
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("tyloinfer_gathered_mla_sink_softmax", {"scores", "mask", "sinks"},
+            {"probabilities"}, R"MSL(
+            constexpr uint THREADS = 256;
+            const uint task = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint subgroup = simdgroup_index_in_threadgroup;
+            const uint tid = thread_index_in_threadgroup;
+            const uint heads = scores_shape[2];
+            const uint keys = scores_shape[3];
+            const float sink = float(sinks[task % heads]);
+            const auto row = scores + ulong(task) * keys;
+            const auto allowed = mask + ulong(task / heads) * keys;
+            float values[TILES];
+            float peak = -INFINITY;
+            for (uint i = tid; i < keys; i += THREADS) {
+                const float value = BOOLEAN_MASK ? (allowed[i] ? float(row[i]) : -INFINITY)
+                    : float(row[i]) + float(allowed[i]);
+                values[i / THREADS] = value;
+                peak = max(peak, value);
+            }
+            threadgroup float maxima[8], sums[8];
+            peak = simd_max(peak);
+            if (lane == 0) maxima[subgroup] = peak;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            peak = sink;
+            for (uint i = 0; i < 8; ++i) peak = max(peak, maxima[i]);
+            float total = 0.f;
+            for (uint i = tid; i < keys; i += THREADS) {
+                const float exp_value = metal::exp(values[i / THREADS] - peak);
+                values[i / THREADS] = exp_value;
+                total += exp_value;
+            }
+            total = simd_sum(total);
+            if (lane == 0) sums[subgroup] = total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = metal::exp(sink - peak);
+            for (uint i = 0; i < 8; ++i) total += sums[i];
+            auto out = probabilities + ulong(task) * keys;
+            for (uint i = tid; i < keys; i += THREADS) out[i] = half(values[i / THREADS] / total);
+            )MSL", "", true, false, options);
+    }();
+    const int keys = scores.shape(-1), rows = static_cast<int>(scores.size() / keys);
+    return kernel({scores, mask, sinks}, {scores.shape()}, {float16}, {rows * 256, 1, 1},
+        {256, 1, 1}, {{"TILES", (keys + 255) / 256}, {"BOOLEAN_MASK", mask.dtype() == bool_}},
+        std::nullopt, false, {}).front();
+}
+
+array mla_sink_probabilities(const array& scores, const array& mask, const array& sinks) {
+    using namespace mlx::core;
+    const auto logits = scores + expand_dims(astype(mask, float32), 2);
+    const auto sink_values = reshape(astype(sinks, float32), {1, 1, scores.shape(2)});
+    const auto maximum = mlx::core::maximum(max(logits, -1), sink_values);
+    const auto exponentials = exp(logits - expand_dims(maximum, -1));
+    const auto denominator = sum(exponentials, -1) + exp(sink_values - maximum);
+    return exponentials / expand_dims(denominator, -1);
+}
+
+constexpr auto resident_mla_indexed_dot_source = R"METAL(
+        constexpr ushort heads = 32, tile_size = 32;
+        constexpr ushort inner = PROJECT_VALUES ? 2048 : 576;
+        constexpr ushort columns = PROJECT_VALUES ? 512 : 2048;
+        const uint query = threadgroup_position_in_grid.y;
+        const uint column = threadgroup_position_in_grid.x * tile_size;
+        const uint lane = thread_index_in_simdgroup;
+        const auto selection = ids + ulong(query) * 2048u;
+        const auto lhs = x + ulong(query) * heads * inner;
+        constexpr auto description = matmul2d_descriptor(heads, tile_size, tile_size, false, !PROJECT_VALUES, false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<description, execution_simdgroup> op;
+        threadgroup half tile[tile_size * tile_size];
+        tensor<device half, dextents<int, 2>, tensor_inline> a(const_cast<device half*>(lhs),
+            dextents<int, 2>(inner, heads));
+        tensor<threadgroup half, dextents<int, 2>, tensor_inline> b(tile, dextents<int, 2>(tile_size, tile_size));
+        auto right = b.template slice<tile_size, tile_size>(0, 0);
+        auto left = a.template slice<tile_size, heads>(0, 0);
+        auto accum = op.template get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+        for (ushort i = 0; i < accum.get_capacity(); ++i) accum[i] = 0.f;
+        int key = 0;
+        if constexpr (!PROJECT_VALUES)
+            key = clamp(selection[column + lane], 0, last_key);
+        for (uint offset = 0; offset < inner; offset += tile_size) {
+            if constexpr (PROJECT_VALUES)
+                key = clamp(selection[offset + lane], 0, last_key);
+            const auto from = reinterpret_cast<device const half4*>(cache + ulong(key) * 576u +
+                (PROJECT_VALUES ? column : offset));
+            auto to = reinterpret_cast<threadgroup half4*>(tile + lane * tile_size);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < tile_size / 4u; ++i) to[i] = from[i];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            left = a.template slice<tile_size, heads>(offset, 0);
+            op.run(left, right, accum);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (ushort i = 0; i < accum.get_capacity(); ++i) if (accum.is_valid_element(i)) {
+            auto at = accum.get_multidimensional_index(i);
+            y[(ulong(query) * heads + at[1]) * columns + column + at[0]] = half(accum[i]);
+        }
+        )METAL";
+constexpr auto resident_mla_indexed_header = R"METAL(
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace mpp::tensor_ops;
+        )METAL";
+
+array resident_mla_indexed_dot(const array& x, const array& kv, const array& ids, bool project_values) {
+    using namespace mlx::core;
+    static const auto kernel = fast::metal_kernel("tyloinfer_mla_indexed_nax",
+        {"x", "kv", "ids"}, {"y"},
+        std::string("const auto cache = kv; const int last_key = kv_shape[1] - 1;\n") + resident_mla_indexed_dot_source,
+        resident_mla_indexed_header);
+    const int columns = project_values ? 512 : 2048, queries = ids.shape(1);
+    return kernel({contiguous(x), kv, ids}, {{1, queries, 32, columns}}, {float16},
+        {columns, queries, 1}, {32, 1, 1}, {{"PROJECT_VALUES", project_values}},
+        std::nullopt, false, {}).front();
+}
+
+array batched_resident_mla_indexed_dot(const array& x, std::span<const array> caches,
+    const array& ids, const array& lanes, bool project_values) {
+    using namespace mlx::core;
+    static const auto kernels = [] {
+        std::array<Kernel, 2> result;
+        for (int width : {3, 4}) {
+            std::vector<std::string> names{"x", "ids", "lanes"};
+            std::string bindings = "const device half* cache; int last_key;\n"
+                "switch (lanes[threadgroup_position_in_grid.y]) {\n";
+            for (int lane = 0; lane < width; ++lane) {
+                const auto label = "kv" + std::to_string(lane);
+                names.push_back(label);
+                bindings += "case " + std::to_string(lane) + ": cache = " + label + "; last_key = " +
+                    label + "_shape[1] - 1; break;\n";
+            }
+            bindings += "default: return; }\n";
+            result[width - 3] = fast::metal_kernel("tyloinfer_batched_mla_indexed_nax_" + std::to_string(width),
+                names, {"y"}, bindings + resident_mla_indexed_dot_source, resident_mla_indexed_header);
+        }
+        return result;
+    }();
+    const int columns = project_values ? 512 : 2048, queries = ids.shape(1);
+    std::vector<array> arguments{contiguous(x), ids, lanes};
+    arguments.insert(arguments.end(), caches.begin(), caches.end());
+    return kernels[caches.size() - 3](arguments, {{1, queries, 32, columns}}, {float16},
+        {columns, queries, 1}, {32, 1, 1}, {{"PROJECT_VALUES", project_values}},
+        std::nullopt, false, {}).front();
+}
+}
+
+void mlx_prepare_indexed_mla_prefill() {
+    using namespace mlx::core;
+    if (auto* preparation = MlxKernelPreparation::current();
+        preparation && default_device() == Device::gpu && sparse_block_nax_available()) {
+        preparation->collect([&] {
+            const auto query = zeros({1, 16, 32, 576}, float16);
+            const auto cache = zeros({1, 2048, 576}, float16);
+            const auto indices = zeros({1, 16, 2048}, int32);
+            const auto probabilities = zeros({1, 16, 32, 2048}, float16);
+            preparation->add(resident_mla_indexed_dot(query, cache, indices, false));
+            preparation->add(resident_mla_indexed_dot(probabilities, cache, indices, true));
+        });
+    }
+}
+
+std::optional<array> mlx_batched_resident_mla_attention(const array& query,
+    std::span<const array> caches, std::span<const array> selections, const array& sinks, float scale) {
+    using namespace mlx::core;
+    if ((caches.size() != 3 && caches.size() != 4) || selections.size() != caches.size() ||
+        query.ndim() != 4 || query.shape(1) != 32 || query.shape(2) != 1 || query.shape(3) != 576 ||
+        sinks.size() != 32 || !std::isfinite(scale) || scale <= 0 ||
+        default_device() != Device::gpu || !sparse_block_nax_available()) return std::nullopt;
+    std::vector<int> owners;
+    owners.reserve(caches.size() * 3);
+    for (std::size_t lane = 0; lane < caches.size(); ++lane) {
+        const auto& cache = caches[lane];
+        const auto& ids = selections[lane];
+        if (cache.ndim() != 3 || cache.shape(0) != 1 || cache.shape(1) < 1 || cache.shape(2) != 576 ||
+            cache.dtype() != float16 || cache.strides(1) != 576 || cache.strides(2) != 1 || cache.offset() % 16 != 0 ||
+            ids.ndim() != 3 || ids.shape(0) != 1 || ids.shape(1) < 1 || ids.shape(1) > 3 ||
+            ids.shape(2) != 2048 || ids.dtype() != int32) return std::nullopt;
+        owners.insert(owners.end(), ids.shape(1), static_cast<int>(lane));
+    }
+    const int count = static_cast<int>(owners.size());
+    if (query.shape(0) != count) return std::nullopt;
+    const auto lanes = array(owners.begin(), {count}, int32);
+    const auto ids = contiguous(concatenate(std::vector<array>(selections.begin(), selections.end()), 1));
+    const auto mask = reshape(where(ids >= 0, array(0.f, float16), array(-INFINITY, float16)), {count, 1, 2048});
+    const auto q = reshape(astype(astype(query, float32) * scale, float16), {1, count, 32, 576});
+    const auto scores = batched_resident_mla_indexed_dot(q, caches, ids, lanes, false);
+    const auto probabilities = gathered_mla_sink_softmax(reshape(scores, {count, 1, 32, 2048}), mask, sinks);
+    const auto output = batched_resident_mla_indexed_dot(probabilities, caches, ids, lanes, true);
+    return astype(reshape(output, {count, 1, 32, 512}), float32);
+}
+
+array mlx_masked_dense_mla_attention(const array& query, const array& rows, const array& mask,
+    const array& sinks, float scale, int value_dimension, const std::optional<array>& kv_lanes) {
+    using namespace mlx::core;
+    if (query.ndim() != 4 || rows.ndim() != 3 || rows.dtype() != float16 ||
+        (kv_lanes ? kv_lanes->shape() != Shape{query.shape(0)} : query.shape(0) != rows.shape(0)) ||
+        query.shape(3) != rows.shape(2) ||
+        mask.shape() != Shape{query.shape(0), query.shape(2), rows.shape(1)} || mask.dtype() != bool_ ||
+        sinks.size() != static_cast<std::size_t>(query.shape(1)) ||
+        value_dimension <= 0 || value_dimension > rows.shape(2))
+        throw std::invalid_argument("invalid masked dense MLA geometry");
+    const int batch = query.shape(0), heads = query.shape(1), tokens = query.shape(2);
+    const int keys = rows.shape(1), dimension = rows.shape(2);
+    const auto scaled = astype(transpose(query, {0, 2, 1, 3}), float32) * scale;
+    const auto q = reshape(astype(scaled, float16), {batch, tokens * heads, dimension});
+    const auto dot = [&](const array& a, const array& b) {
+        return kv_lanes ? gather_mm(a, b, std::nullopt, kv_lanes) : matmul(a, b);
+    };
+    const auto scores = reshape(dot(q, transpose(rows, {0, 2, 1})), {batch, tokens, heads, keys});
+    const auto probabilities = reshape(gathered_mla_sink_softmax(scores, mask, sinks),
+        {batch, tokens * heads, keys});
+    const auto values = slice(rows, {0, 0, 0}, {rows.shape(0), keys, value_dimension});
+    return reshape(dot(probabilities, values), {batch, tokens, heads, value_dimension});
+}
+
 array mlx_gathered_mla_attention(const array& query, const array& rows, const array& mask,
-    const array& sinks, float scale, int value_dimension) {
+    const array& sinks, float scale, int value_dimension, bool packed_queries) {
     if (query.ndim() != 4 || rows.ndim() != 4 || rows.shape(0) != query.shape(0) ||
         rows.shape(1) != query.shape(2) || rows.shape(3) != query.shape(3) ||
         mask.shape() != Shape{rows.shape(0), rows.shape(1), rows.shape(2)} ||
@@ -1427,23 +1673,19 @@ array mlx_gathered_mla_attention(const array& query, const array& rows, const ar
     auto query_values = mlx::core::astype(
         mlx::core::transpose(query, {0, 2, 1, 3}),
         mlx::core::float32);
+    if (use_half && (batch == 2 || packed_queries) && tokens == 1 && selected == 2048 &&
+        dimension == 576 && value_dimension == 512 && (heads == 32 || heads == 64)) {
+        const auto scores = mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
+            mlx::core::transpose(gathered, {0, 1, 3, 2}));
+        const auto probabilities = gathered_mla_sink_softmax(scores, mask, sinks);
+        const auto value = mlx::core::slice(gathered, {0, 0, 0, 0}, {batch, tokens, selected, value_dimension});
+        return mlx::core::astype(mlx::core::matmul(probabilities, value), mlx::core::float32);
+    }
     auto scores = use_half
         ? mlx::core::astype(mlx::core::matmul(mlx::core::astype(query_values * scale, dtype),
             mlx::core::transpose(gathered, {0, 1, 3, 2})), mlx::core::float32)
         : mlx::core::matmul(query_values, mlx::core::transpose(gathered, {0, 1, 3, 2})) * scale;
-    scores = scores + mlx::core::expand_dims(
-        mlx::core::astype(mask, mlx::core::float32), 2);
-    auto sink_values = mlx::core::reshape(
-        mlx::core::astype(sinks, mlx::core::float32),
-        Shape{1, 1, heads});
-    auto maximum = mlx::core::maximum(
-        mlx::core::max(scores, -1), sink_values);
-    auto exponentials = mlx::core::exp(
-        scores - mlx::core::expand_dims(maximum, -1));
-    auto denominator = mlx::core::sum(exponentials, -1) +
-        mlx::core::exp(sink_values - maximum);
-    auto probabilities = exponentials /
-        mlx::core::expand_dims(denominator, -1);
+    const auto probabilities = mla_sink_probabilities(scores, mask, sinks);
     const auto value = value_dimension == dimension ? gathered :
         mlx::core::slice(gathered, {0, 0, 0, 0}, {batch, tokens, selected, value_dimension});
     return mlx::core::astype(mlx::core::matmul(mlx::core::astype(probabilities, dtype), value), mlx::core::float32);
@@ -1490,17 +1732,24 @@ array mlx_sparse_selected_mla_attention(
         throw std::invalid_argument(
             "selected-token sparse MLA scale must be finite and positive");
     }
+    const int queries = selected_query.shape(2);
+    if (selected_query.shape(0) == 1 && heads == 32 && dimension == 576 && value_dimension == 512 &&
+        queries >= 16 && queries <= 64 && indices.shape(2) == 2048 && selected_cache.dtype() == mlx::core::float16 &&
+        selected_cache.strides(1) == dimension && selected_cache.strides(2) == 1 &&
+        selected_cache.offset() % 16 == 0 && mlx::core::default_device() == mlx::core::Device::gpu &&
+        sparse_block_nax_available()) {
+        using namespace mlx::core;
+        // Stage only the selected tile inside each matrix product.
+        const auto q = astype(transpose(selected_query, {0, 2, 1, 3}) * selected_scale, float16);
+        const auto scores = astype(resident_mla_indexed_dot(q, selected_cache, indices, false), float32);
+        const auto probabilities = astype(mla_sink_probabilities(scores, mask, sink_logits), float16);
+        return astype(resident_mla_indexed_dot(probabilities, selected_cache, indices, true), float32);
+    }
     if (heads != 64 || dimension != 512 || value_dimension != dimension) {
         // The gather accepts strides. Materializing a cache view here would copy all
         // historical rows before reading only the selected ones.
-        return generic_selected_mla_attention(
-            selected_query,
-            selected_cache,
-            indices,
-            mask,
-            sink_logits,
-            selected_scale,
-            value_dimension);
+        return mlx_gathered_mla_attention(selected_query, mlx_gather_selected_mla_rows(selected_cache, indices),
+            mask, sink_logits, selected_scale, value_dimension);
     }
     selected_cache = mlx::core::contiguous(selected_cache);
     constexpr int kHeads = 64;

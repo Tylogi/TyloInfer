@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace mfq::metal {
@@ -19,11 +20,15 @@ struct MlxHy4AttentionCache {
     std::optional<mlx::core::array> last_indices;
 };
 
+struct MlxHy4Verification;
+
 struct MlxHy4Cache {
     int position = 0;
     std::vector<MlxHy4AttentionCache> layers;
     std::vector<std::int32_t> engram_tail;
     std::optional<mlx::core::array> last_hidden;
+    std::shared_ptr<MlxHy4Verification> pending_verification;
+    std::optional<mlx::core::array> pending_logits;
 };
 
 struct MlxHy4RowSnapshot {
@@ -52,6 +57,7 @@ public:
 
     mlx::core::array forward(const mlx::core::array& tokens, MlxHy4Cache& cache,
         bool last_logit_only = false) const;
+    mlx::core::array decode_batch(std::span<Cache* const> requests, const mlx::core::array& tokens) const;
     int context() const noexcept;
     int vocabulary() const noexcept;
     TextSessionState capture(const Cache& cache, const std::vector<std::int64_t>& tokens, bool detached) const;
@@ -59,13 +65,29 @@ public:
     std::optional<QsaKvStoreStats> qsa_kv_offload_stats() const;
     std::size_t kv_cache_bytes(const Cache& cache) const noexcept;
     bool supports_mtp() const noexcept;
+    MlxMtpEngineCallbacks batch_mtp_callbacks(Cache& cache, std::optional<mlx::core::array>& last_logits) const;
+    std::vector<mlx::core::array> draft_batch(std::span<Cache* const> requests,
+        std::span<const MlxMtpTargetRequest> steps) const;
+    std::vector<MlxMtpTargetBatch> verify_batch(std::span<Cache* const> requests,
+        std::span<const MlxMtpTargetRequest> steps,
+        std::span<std::optional<mlx::core::array>* const> logits) const;
+    void discard_batch_verification(Cache& cache, std::optional<mlx::core::array>& logits) const;
     int generate_speculative(Cache& cache, MlxMtpEngineRequest request,
         const MlxPrefixCacheHooks& prefix, MlxMtpGenerationStats& stats,
         std::optional<mlx::core::array>& last_logits) const;
 
 private:
     struct Weights;
-    struct Verification;
+    using Verification = MlxHy4Verification;
+    struct BatchInput {
+        Cache* cache;
+        mlx::core::array tokens;
+        Verification* verification = nullptr;
+    };
+    std::vector<mlx::core::array> forward_batch(std::span<const BatchInput> inputs) const;
+    void resolve_verification(Cache& cache, const Verification& verification,
+        const mlx::core::array& logits, int accepted, int proposed,
+        std::optional<mlx::core::array>& last_logits) const;
     mlx::core::array forward_impl(const mlx::core::array& tokens, Cache& cache,
         bool last_logit_only, Verification* verification) const;
     explicit MlxHy4Model(std::shared_ptr<const Weights> weights) : weights_(std::move(weights)) {}

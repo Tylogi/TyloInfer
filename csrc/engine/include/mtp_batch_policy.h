@@ -25,14 +25,18 @@ struct BatchAcceptance {
 class BatchDepthPolicy {
 public:
     using Clock = std::chrono::steady_clock;
-    BatchDepthPolicy(std::vector<std::string> requests, int maximum, std::size_t ordinary_requests = 0)
-        : requests_(std::move(requests)), ordinary_requests_(ordinary_requests),
-          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)), current_(maximum_) {}
+    BatchDepthPolicy(std::vector<std::string> requests, int maximum,
+            std::size_t ordinary_requests = 0, bool shallow_first = false, int shallow_depth = 1)
+        : requests_(std::move(requests)), ordinary_requests_(ordinary_requests), shallow_first_(shallow_first),
+          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)),
+          initial_depth_(shallow_first_ ? std::clamp(shallow_depth, 1, maximum_) : maximum_),
+          current_(initial_depth_) {}
     const auto& requests() const noexcept { return requests_; }
     std::size_t ordinary_requests() const noexcept { return ordinary_requests_; }
     int maximum() const noexcept { return maximum_; }
     void interrupt() noexcept { finished_.reset(); last_depth_ = -1; }
     int depth() const noexcept {
+        if (shallow_first_) return remaining_ || baseline_probe_ ? 0 : current_;
         return standard_warmup_ || standard_.size() < 3 || remaining_ ? 0 : current_;
     }
     std::optional<double> cost(int depth) const {
@@ -112,9 +116,23 @@ public:
         }
         last_seen_[depth] = elapsed_ms_;
         if (remaining_ || baseline_probe_) return;
-        for (int candidate = maximum_; candidate > 0; --candidate) if (costs_[candidate].size() < 3) {
-            current_ = candidate;
+        if (shallow_first_ && !baseline_verified_) {
+            // Calibrate ordinary decode once the shallow draft has steady timing.
+            if (costs_[depth].size() >= 3 &&
+                (conditional_acceptance(0) < .45 || elapsed_ms_ >= 5000)) {
+                baseline_probe_ = true;
+                standard_.clear();
+                standard_warmup_ = 2;
+            }
             return;
+        }
+        if (shallow_first_) {
+            if (costs_[depth].size() < 3) return;
+        } else {
+            for (int candidate = maximum_; candidate > 0; --candidate) if (costs_[candidate].size() < 3) {
+                current_ = candidate;
+                return;
+            }
         }
         ++decisions_;
         const int best = best_depth();
@@ -125,7 +143,9 @@ public:
             int rival = 1;
             for (int candidate = 2; candidate <= maximum_; ++candidate)
                 if (last_seen_[candidate] < last_seen_[rival]) rival = candidate;
-            if (rival != current_ && (score(rival) * 1.15 >= score(best) ||
+            const bool next_unmeasured = shallow_first_ && rival > 1 && costs_[rival].empty() &&
+                costs_[rival - 1].size() >= 3 && score(rival - 1) >= score(best) * .9;
+            if (rival != current_ && (next_unmeasured || score(rival) * 1.15 >= score(best) ||
                 elapsed_ms_ - last_seen_[rival] >= 5000)) {
                 current_ = rival;
                 last_probe_ms_ = elapsed_ms_;
@@ -176,7 +196,7 @@ private:
             acceptance_weight_ = {};
             baseline_verified_ = false;
         }
-        current_ = restart ? maximum_ : best_depth();
+        current_ = restart ? initial_depth_ : best_depth();
     }
     static void append(std::deque<double>& values, double value) {
         if (values.size() == 8) values.pop_front();
@@ -196,7 +216,8 @@ private:
     }
     std::vector<std::string> requests_;
     std::size_t ordinary_requests_;
-    int maximum_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
+    bool shallow_first_;
+    int maximum_, initial_depth_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
     std::array<std::optional<double>, kMaximumReportedDraftDepth> acceptance_{.6};
     std::array<double, kMaximumReportedDraftDepth> acceptance_weight_{};
     std::array<std::deque<double>, kMaximumReportedDraftDepth + 1> costs_;

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <mlx/mlx.h>
 
@@ -105,6 +106,16 @@ public:
     mlx::core::array forward_feed_forward(const mlx::core::array& input) const {
         return ffn_.forward_normalized(input, ffn_norm_);
     }
+
+    struct RequestCache {
+        std::optional<mlx::core::array> convolution, recurrent;
+        MlxResourceTelemetry resources;
+        std::optional<MlxQwen35LinearAttentionRollback> rollback;
+        int position = 0, batch = 0;
+    };
+    void exchange_request_cache(RequestCache& state) noexcept;
+    mlx::core::array forward_attention_batch(const mlx::core::array& input,
+        std::span<RequestCache* const> requests);
 
     void reset_cache(int batch);
     void materialize_cache();

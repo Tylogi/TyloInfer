@@ -308,6 +308,11 @@ void MlxQwen35MtpModule::materialize_cache() {
     }
 }
 
+void MlxQwen35MtpModule::exchange_request_caches(
+    std::span<MlxQwen35FullAttentionBlock::RequestCache> state) noexcept {
+    for (std::size_t i = 0; i < state.size(); ++i) layers_[i].exchange_request_cache(state[i]);
+}
+
 void MlxQwen35MtpModule::trim_cache_to(int position) {
     if (position < 0) {
         throw std::runtime_error(
@@ -874,28 +879,16 @@ array MlxQwen35CausalLm::backbone_forward(
             [&](auto& block) {
                 using Block = std::decay_t<decltype(block)>;
                 if (!loop_hyper_connections_.empty() && loop_hyper_connections_[layer_index]) {
-                    const auto& connections = *loop_hyper_connections_[layer_index];
-                    auto residual = connections.enter ?
-                        mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
-                            Shape{batch, tokens, config_.loop_hyper_connection->streams, hidden.shape(-1)}) :
-                        hidden;
-                    const auto attention = connections.attention.collapse(residual);
-                    auto attended = [&] {
+                    return forward_loop_layer(hidden, layer_index, block, [&](const array& branch) {
                         if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>)
-                            return block.forward_attention(attention.branch,
+                            return block.forward_attention(branch,
                                 explicit_positions ? &*explicit_positions : nullptr, position, use_cache);
                         else {
                             if (speculative_confirmed > 0)
-                                return block.forward_attention_speculative(
-                                    attention.branch, position, speculative_confirmed);
-                            return block.forward_attention(attention.branch, position, use_cache);
+                                return block.forward_attention_speculative(branch, position, speculative_confirmed);
+                            return block.forward_attention(branch, position, use_cache);
                         }
-                    }();
-                    residual = MlxHyperConnection::expand(residual, attended, attention);
-                    const auto feed_forward = connections.feed_forward.collapse(residual);
-                    residual = MlxHyperConnection::expand(residual,
-                        block.forward_feed_forward(feed_forward.branch), feed_forward);
-                    return connections.leave ? mlx::core::mean(residual, -2) : residual;
+                    });
                 }
                 if constexpr (std::is_same_v<Block, MlxQwen35FullAttentionBlock>) {
                     if (decision_state) return block.forward_decision(hidden, *decision_state);
@@ -932,6 +925,20 @@ array MlxQwen35CausalLm::backbone_forward(
     }
     if (!captured.empty()) hidden_capture_ = mlx::core::concatenate(captured, -1);
     return hidden;
+}
+
+template<class Block, class Attention>
+array MlxQwen35CausalLm::forward_loop_layer(const array& hidden, std::size_t index,
+    Block& block, Attention&& attention) const {
+    using namespace mlx::core;
+    const auto& connections = *loop_hyper_connections_[index];
+    auto residual = connections.enter ? broadcast_to(expand_dims(hidden, -2),
+        Shape{hidden.shape(0), hidden.shape(1), config_.loop_hyper_connection->streams, hidden.shape(-1)}) : hidden;
+    const auto attention_input = connections.attention.collapse(residual);
+    residual = MlxHyperConnection::expand(residual, attention(attention_input.branch), attention_input);
+    const auto ffn_input = connections.feed_forward.collapse(residual);
+    residual = MlxHyperConnection::expand(residual, block.forward_feed_forward(ffn_input.branch), ffn_input);
+    return connections.leave ? mean(residual, -2) : residual;
 }
 
 std::pair<array, array>
@@ -974,6 +981,269 @@ array MlxQwen35CausalLm::project_hidden_logits(const array& hidden) const {
 
 array MlxQwen35CausalLm::prefill_logits(const array& token_ids) {
     return forward_embeddings_impl(embed_tokens(token_ids), nullptr, true, 0, false).first;
+}
+
+MlxQwen35CausalLm::BatchCache MlxQwen35CausalLm::make_batch_cache() const {
+    BatchCache cache;
+    cache.layers.reserve(layers_.size());
+    for (const auto& layer : layers_)
+        std::visit([&](const auto& block) {
+            using Block = std::decay_t<decltype(block)>;
+            cache.layers.emplace_back(typename Block::RequestCache{});
+        }, layer);
+    if (mtp_) cache.predictor.resize(mtp_->layer_count());
+    return cache;
+}
+
+void MlxQwen35CausalLm::exchange_batch_cache(BatchCache& cache) noexcept {
+    for (std::size_t i = 0; i < layers_.size(); ++i)
+        std::visit([&](auto& block) {
+            using Block = std::decay_t<decltype(block)>;
+            block.exchange_request_cache(std::get<typename Block::RequestCache>(cache.layers[i]));
+        }, layers_[i]);
+    std::swap(cache_position_, cache.position);
+    std::swap(cache_batch_, cache.batch);
+    last_cache_hidden_.swap(cache.last_hidden);
+    std::swap(stable_mtp_ready_, cache.mtp_ready);
+    if (mtp_) mtp_->exchange_request_caches(cache.predictor);
+}
+
+MlxQwen35CausalLm::BatchCache MlxQwen35CausalLm::take_batch_cache() {
+    auto state = make_batch_cache();
+    exchange_batch_cache(state);
+    clear_cache();
+    return state;
+}
+
+array MlxQwen35CausalLm::prefill_batch_request(BatchCache& cache, const array& tokens) {
+    exchange_batch_cache(cache);
+    try {
+        const int offset = cache_position_;
+        auto [logits, hidden] = forward_embeddings_impl(embed_tokens(tokens), nullptr, true, 0, false);
+        if (cache.use_mtp) {
+            mlx_prime_mtp_chunk(hidden, tokens, last_cache_hidden_,
+                [&](const array& rows, const array& shifted, int) {
+                    return mtp_->forward(rows, shifted, embedding_, true);
+                }, offset);
+            stable_mtp_ready_ = true;
+        }
+        auto last = mlx_last_token_logits(logits, batch_vocabulary());
+        exchange_batch_cache(cache);
+        return last;
+    } catch (...) {
+        exchange_batch_cache(cache);
+        throw;
+    }
+}
+
+MlxQwen35TextSessionState MlxQwen35CausalLm::capture_batch_cache(
+    BatchCache& cache, const std::vector<std::int64_t>& tokens) {
+    exchange_batch_cache(cache);
+    try {
+        auto state = capture_text_session_state(tokens);
+        exchange_batch_cache(cache);
+        return state;
+    } catch (...) {
+        exchange_batch_cache(cache);
+        throw;
+    }
+}
+
+array MlxQwen35CausalLm::decode_batch_requests(std::span<BatchCache* const> requests, const array& tokens) {
+    using namespace mlx::core;
+    const int batch = static_cast<int>(requests.size());
+    if (!batch || tokens.shape() != Shape{batch, 1}) throw std::invalid_argument("invalid Qwen3.5 decode batch");
+    std::vector<BatchInput> inputs;
+    inputs.reserve(batch);
+    for (int row = 0; row < batch; ++row)
+        inputs.push_back({requests[row], slice(tokens, {row, 0}, {row + 1, 1})});
+    auto results = forward_batch(inputs);
+    if (results.size() == 1) return std::move(results.front().logits);
+    std::vector<array> logits;
+    logits.reserve(batch);
+    for (auto& result : results) logits.push_back(std::move(result.logits));
+    return concatenate(logits, 0);
+}
+
+std::vector<MlxMtpTargetBatch> MlxQwen35CausalLm::forward_batch(std::span<const BatchInput> inputs) {
+    using namespace mlx::core;
+    const int batch = static_cast<int>(inputs.size());
+    if (!batch) throw std::invalid_argument("empty Qwen3.5 decode batch");
+    std::vector<BatchCache*> requests;
+    std::vector<array> tokens;
+    std::vector<int> offsets{0};
+    requests.reserve(batch);
+    tokens.reserve(batch);
+    offsets.reserve(batch + 1);
+    for (const auto& input : inputs) {
+        const auto* request = input.cache;
+        if (!request || input.tokens.shape() != Shape{1, input.draft_count + 1} ||
+            request->position <= 0 || input.draft_count + 1 > config_.max_position_embeddings - request->position ||
+            request->batch != 1 || request->layers.size() != layers_.size() || request->pending_drafts ||
+            std::find(requests.begin(), requests.end(), request) != requests.end())
+            throw std::invalid_argument("invalid Qwen3.5 decode request state");
+        requests.push_back(input.cache);
+        tokens.push_back(input.tokens);
+        offsets.push_back(offsets.back() + input.tokens.shape(1));
+    }
+    if (batch == 1) {
+        auto& cache = *inputs.front().cache;
+        const int drafts = inputs.front().draft_count;
+        exchange_batch_cache(cache);
+        try {
+            auto [logits, hidden] = forward_embeddings_impl(embed_tokens(tokens.front()),
+                nullptr, true, drafts > 0 ? 1 : 0);
+            std::vector<MlxMtpTargetBatch> result{
+                {reshape(logits, {drafts + 1, batch_vocabulary()}), std::move(hidden)}};
+            exchange_batch_cache(cache);
+            cache.pending_drafts = drafts;
+            return result;
+        } catch (...) {
+            exchange_batch_cache(cache);
+            throw;
+        }
+    }
+
+    const int total = offsets.back();
+    const bool single_token = total == batch;
+    const int tensor_batch = single_token ? batch : 1;
+    const int tensor_tokens = single_token ? 1 : total;
+    auto hidden = embed_tokens(reshape(concatenate(tokens, 1), {tensor_batch, tensor_tokens}));
+
+    const auto slice_lane = [&](const array& value, int row) {
+        return single_token ? slice(value, {row, 0, 0}, {row + 1, 1, value.shape(-1)}) :
+            slice(value, {0, offsets[row], 0}, {1, offsets[row + 1], value.shape(-1)});
+    };
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+        hidden = std::visit([&](auto& block) {
+            using Block = std::decay_t<decltype(block)>;
+            using State = typename Block::RequestCache;
+            const auto attention = [&](const array& input) {
+                if constexpr (std::is_same_v<Block, MlxQwen35LinearAttentionBlock>) {
+                    if (single_token) {
+                        std::vector<State*> states;
+                        states.reserve(batch);
+                        for (auto* request : requests) states.push_back(&std::get<State>(request->layers[index]));
+                        return block.forward_attention_batch(input, states);
+                    }
+                }
+                std::vector<array> attended;
+                attended.reserve(batch);
+                for (int row = 0; row < batch; ++row) {
+                    auto& request = *requests[row];
+                    auto& state = std::get<State>(request.layers[index]);
+                    const auto lane = slice_lane(input, row);
+                    block.exchange_request_cache(state);
+                    try {
+                        if constexpr (std::is_same_v<Block, MlxQwen35LinearAttentionBlock>) {
+                            attended.push_back(inputs[row].draft_count
+                                ? block.forward_attention_speculative(lane, request.position, 1)
+                                : block.forward_attention(lane, request.position, true));
+                        } else {
+                            attended.push_back(block.forward_attention(lane, nullptr, request.position, true));
+                        }
+                    } catch (...) {
+                        block.exchange_request_cache(state);
+                        throw;
+                    }
+                    block.exchange_request_cache(state);
+                }
+                return concatenate(attended, single_token ? 0 : 1);
+            };
+            if (!loop_hyper_connections_.empty() && loop_hyper_connections_[index])
+                return forward_loop_layer(hidden, index, block, attention);
+            auto residual = hidden + attention(hidden);
+            return residual + block.forward_feed_forward(residual);
+        }, layers_[index]);
+    }
+    const auto logits = project_logits(hidden);
+    std::vector<MlxMtpTargetBatch> result;
+    result.reserve(batch);
+    for (int row = 0; row < batch; ++row) {
+        auto& request = *requests[row];
+        const int count = inputs[row].draft_count + 1;
+        request.position += count;
+        request.pending_drafts = inputs[row].draft_count;
+        result.push_back({reshape(slice_lane(logits, row), {count, batch_vocabulary()}),
+            slice_lane(hidden, row)});
+    }
+    return result;
+}
+
+std::vector<MlxMtpTargetBatch> MlxQwen35CausalLm::verify_batch_requests(
+    std::span<BatchCache* const> requests, std::span<const MlxMtpTargetRequest> steps) {
+    if (requests.size() != steps.size()) throw std::invalid_argument("invalid Qwen3.5 verification batch");
+    std::vector<BatchInput> inputs;
+    inputs.reserve(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        if (steps[i].kind != MlxMtpTargetRequest::Kind::target)
+            throw std::logic_error("unexpected Qwen3.5 speculative stage");
+        inputs.push_back({requests[i], mlx_mtp_verification_ids(
+            steps[i].pending_token, steps[i].draft_tokens, steps[i].draft_count), steps[i].draft_count});
+    }
+    return forward_batch(inputs);
+}
+
+void MlxQwen35CausalLm::resolve_batch(BatchCache& cache, int accepted) {
+    if (!cache.pending_drafts) return;
+    exchange_batch_cache(cache);
+    try {
+        if (accepted == cache.pending_drafts) commit_speculative();
+        else rollback_speculative(accepted, cache.pending_drafts);
+    } catch (...) {
+        exchange_batch_cache(cache);
+        throw;
+    }
+    exchange_batch_cache(cache);
+    cache.pending_drafts = 0;
+}
+
+void MlxQwen35CausalLm::discard_batch_verification(BatchCache& cache) {
+    resolve_batch(cache, 0);
+}
+
+MlxMtpEngineCallbacks MlxQwen35CausalLm::batch_mtp_callbacks(BatchCache& cache) {
+    using namespace mlx::core;
+    if (!mtp_ || !cache.last_hidden || !cache.mtp_ready) throw std::logic_error("Qwen3.5 draft cache was not primed");
+    MlxMtpEngineCallbacks callbacks;
+    callbacks.predictor = mtp_->mtp_descriptor();
+    callbacks.target_cache_position = [&cache] { return cache.position; };
+    callbacks.prepare_draft = [this, &cache](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
+        mtp_->exchange_request_caches(cache.predictor);
+        try {
+            const auto pending = array({context.pending_token}, {1, 1}, int32);
+            auto hidden = mtp_->forward(*cache.last_hidden, pending, embedding_);
+            if (!context.requested_depth) hidden.eval();
+            for (int depth = 0; depth < context.requested_depth; ++depth) {
+                const auto next = select(mlx_last_token_logits(project_normalized(hidden), batch_vocabulary()));
+                if (depth + 1 < context.requested_depth) hidden = mtp_->forward(hidden, reshape(next, {1, 1}), embedding_);
+            }
+            mtp_->trim_cache_to(cache.position);
+        } catch (...) {
+            mtp_->exchange_request_caches(cache.predictor);
+            throw;
+        }
+        mtp_->exchange_request_caches(cache.predictor);
+    };
+    callbacks.committed_target = [this, &cache](const MlxMtpDraftContext& context) {
+        const auto& hidden = *context.verified_hidden;
+        const int accepted = context.accepted_drafts;
+        cache.last_hidden = slice(hidden, {0, accepted, 0}, {1, accepted + 1, hidden.shape(-1)});
+        if (!accepted) return;
+        auto rows = slice(hidden, {0, 0, 0}, {1, accepted, hidden.shape(-1)});
+        auto shifted = array(context.next_token_ids.begin(), {1, accepted}, int32);
+        mtp_->exchange_request_caches(cache.predictor);
+        try {
+            auto committed = mtp_->forward(rows, shifted, embedding_);
+            committed.eval();
+        } catch (...) {
+            mtp_->exchange_request_caches(cache.predictor);
+            throw;
+        }
+        mtp_->exchange_request_caches(cache.predictor);
+    };
+    callbacks.resolve_target = [this, &cache](int accepted, int) { resolve_batch(cache, accepted); };
+    return callbacks;
 }
 
 array MlxQwen35CausalLm::verify_tokens(const array& token_ids) {
