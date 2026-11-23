@@ -849,6 +849,8 @@ array batch_resident_indexed_mla(const array& query, std::span<const array> cach
     return reshape(result, {1, query.shape(2), query.shape(1), value_dim});
 }
 
+bool short_mla_nax_available();
+
 array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index, const Geometry& g,
     const array& query, const array& latent, const array& index_pairs, const std::optional<IndexScores>& scoring,
     const std::optional<RotaryPhases>& pool_phases, const array& sinks, int position, float scale,
@@ -880,7 +882,13 @@ array run_indexed_attention(MlxHy4AttentionCache& cache, const IndexPool& index,
     // Packed recalls can share more SSD blocks across queries within one gather.
     const bool packed_recall = cache.offloaded_latent && end > 2 * g.index_budget &&
         quantization.enabled() && quantization.value_bits() <= 4;
-    const int query_tile = dense_prefill ? 64 : (packed_recall ? 32 : selected_query_tile);
+    const bool resident_nax_prefill = resident && !cache.offloaded_latent && !verified &&
+        !quantization.enabled() && query.shape(1) == 32 && g.kv_rank == 512 && g.rotary == 64 &&
+        g.index_budget == 2048 && count >= 64 && end > 2 * g.index_budget &&
+        resident->dtype() == float16 && resident->strides(1) == 576 &&
+        resident->strides(2) == 1 && resident->offset() % 16 == 0 && short_mla_nax_available();
+    const int query_tile = dense_prefill || resident_nax_prefill ? 64 :
+        (packed_recall ? 32 : selected_query_tile);
     std::vector<array> output;
     for (int start = 0; start < count; start += query_tile) {
         const int stop = std::min(count, start + query_tile);
