@@ -5,6 +5,9 @@ description = "TyloInfer desktop client"
 edition = "2021"
 publish = false
 
+[features]
+agent = []
+
 [build-dependencies]
 icns = "0.4.0"
 ico = "0.5.0"

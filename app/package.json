@@ -13,6 +13,7 @@
     "test:e2e:studio": "playwright test --config web/playwright.config.ts",
     "tauri:studio": "tauri",
     "package:studio": "uv run --no-project ../packaging/build_release.py",
+    "package:agent": "tauri build --config src-tauri/tauri.agent.conf.json",
     "build:plugins": "tsc -p plugins/tsconfig.host.json && node plugins/build.mts",
     "build:dsbot": "tsc -p plugins/tsconfig.host.json && node plugins/build.mts --dsbot",
     "typecheck:plugins": "tsc -p plugins/tsconfig.host.json --noEmit && tsc -p plugins/tsconfig.client.json",

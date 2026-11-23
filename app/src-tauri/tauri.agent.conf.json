@@ -1,0 +1,24 @@
+{
+  "productName": "TyloInfer Agent",
+  "mainBinaryName": "tyloinfer-agent",
+  "identifier": "com.tylogi.tyloinfer.agent",
+  "build": {
+    "beforeDevCommand": null,
+    "devUrl": null,
+    "beforeBuildCommand": "node src-tauri/agent/stage.mjs",
+    "frontendDist": "agent/ui",
+    "features": ["agent"]
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": []
+  },
+  "bundle": {
+    "resources": {
+      "agent/runtime/": "agent-runtime/"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "offlineInstaller" }
+    }
+  }
+}

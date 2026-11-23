@@ -232,19 +232,28 @@ fn standalone_launcher() -> Option<PathBuf> {
         path.is_absolute() && path.extension().is_some_and(|value| value.eq_ignore_ascii_case("exe")))
 }
 
+#[cfg(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64"), test))]
+fn studio_asset_name(name: &str) -> Option<String> {
+    let name = name.to_ascii_lowercase();
+    (!name.starts_with("tyloinfer agent_")).then_some(name)
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn windows_asset_name(name: &str, standalone: bool) -> bool {
-    let name = name.to_ascii_lowercase();
-    if standalone { name.ends_with("_x64-portable.zip") }
-    else { name.ends_with("_x64-setup.exe") }
+    let suffix = if standalone { "_x64-portable.zip" } else { "_x64-setup.exe" };
+    studio_asset_name(name).is_some_and(|name| name.ends_with(suffix))
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), test))]
+fn macos_asset_name(name: &str) -> bool {
+    studio_asset_name(name).is_some_and(|name| {
+        name.ends_with(".dmg") && (name.contains("aarch64") || name.contains("arm64"))
+    })
 }
 
 fn asset_for_platform(release: &GitHubRelease) -> Option<&GitHubAsset> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return release.assets.iter().find(|asset| {
-        let name = asset.name.to_ascii_lowercase();
-        name.ends_with(".dmg") && (name.contains("aarch64") || name.contains("arm64"))
-    });
+    return release.assets.iter().find(|asset| macos_asset_name(&asset.name));
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     return release.assets.iter().find(|asset| {
         windows_asset_name(&asset.name, standalone_launcher().is_some())
@@ -1093,7 +1102,7 @@ pub async fn studio_update_install(
     let _guard = state.lock.lock().await;
     let root = update_root(&app)?;
     let version = safe_version_directory(&version)?;
-    let studio = app.state::<crate::StudioState>();
+    let studio = app.state::<super::StudioState>();
     let _server_guard = studio.start_lock.lock().await;
     let server_app = app.clone();
     #[cfg(target_os = "macos")]
@@ -1104,7 +1113,7 @@ pub async fn studio_update_install(
             let target = current_bundle()?;
             ensure_bundle_parent_writable(&target)?;
             snapshot_current_bundle(&root, &target)?;
-            server_app.state::<crate::StudioState>().stop_owned_server()?;
+            server_app.state::<super::StudioState>().stop_owned_server()?;
             launch_update_helper(&root, &source, &target)
         })
         .await
@@ -1117,7 +1126,7 @@ pub async fn studio_update_install(
         tokio::task::spawn_blocking(move || {
             let installer = cached_installable(&root.join("versions").join(version))
                 .ok_or_else(|| "selected version has not been downloaded".to_string())?;
-            server_app.state::<crate::StudioState>().stop_owned_server()?;
+            server_app.state::<super::StudioState>().stop_owned_server()?;
             if let Some(launcher) = standalone_launcher() {
                 replace_standalone(&installer, &launcher)?;
                 return Command::new(launcher)
@@ -1204,6 +1213,13 @@ pub async fn studio_update_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_updates_ignore_agent_installers_on_the_same_release() {
+        assert!(!windows_asset_name("TyloInfer Agent_0.1.0_x64-setup.exe", false));
+        assert!(!macos_asset_name("TyloInfer Agent_0.1.0_aarch64.dmg"));
+        assert!(macos_asset_name("MFQ.Studio_0.4.0_aarch64.dmg"));
+    }
 
     #[test]
     fn windows_updates_keep_installed_and_standalone_packages_separate() {
