@@ -615,6 +615,38 @@ array batch_dense_mla_windows(const array& packed_queries, std::span<const MlaWi
     const auto kv = concatenate(rows, 0);
     if (uniform) return uniform_mla_windows(packed_queries, kv, concatenate(masks, 0), sinks, scale, value_dim);
     const bool fp16_gpu = default_device() == Device::gpu && kv.dtype() == float16;
+    if (fp16_gpu && (batch == 3 || batch == 4) &&
+        std::all_of(windows.begin(), windows.end(), [](const auto& item) {
+            const int count = item.mask.shape(1);
+            return count == 2 || count == 3;
+        })) {
+        std::vector<std::optional<array>> by_lane(batch);
+        for (int count : {2, 3}) {
+            std::vector<int> group;
+            std::vector<array> packed, keys, permitted;
+            for (int lane = 0, start = 0; lane < batch; ++lane) {
+                const int size = windows[lane].mask.shape(1);
+                if (size == count) {
+                    group.push_back(lane);
+                    packed.push_back(axis_slice(packed_queries, 2, start, start + size));
+                    keys.push_back(rows[lane]);
+                    permitted.push_back(masks[lane]);
+                }
+                start += size;
+            }
+            if (group.empty()) continue;
+            const auto join = [](const std::vector<array>& values, int axis) {
+                return values.size() == 1 ? values.front() : concatenate(values, axis);
+            };
+            const auto output = uniform_mla_windows(join(packed, 2), join(keys, 0),
+                join(permitted, 0), sinks, scale, value_dim);
+            for (int i = 0; i < int(group.size()); ++i)
+                by_lane[group[i]] = axis_slice(output, 1, i * count, (i + 1) * count);
+        }
+        std::vector<array> output;
+        for (auto& values : by_lane) output.push_back(std::move(*values));
+        return concatenate(output, 1);
+    }
     std::vector<int> query_lanes;
     query_lanes.reserve(total);
     for (int lane = 0; lane < batch; ++lane)
@@ -1520,23 +1552,31 @@ struct DflyDraft {
         }
         std::vector<int> offsets{0}, ids, positions;
         std::vector<array> target_hidden;
-        int max_drafts = 0;
+        const int max_drafts = std::max_element(steps.begin(), steps.end(),
+            [](const auto& a, const auto& b) { return a.draft_count < b.draft_count; })->draft_count;
+        const bool short_batch = batch == 3 || batch == 4;
+        const bool packed_history_supported = short_batch && local_window == 0 && g.index_budget == 2048 &&
+            g.kv_rank + g.rotary == 576 && !g.indexed_kv.quantization.enabled() &&
+            default_device() == Device::gpu;
+        // Pad internal windows to share resident history, keeping the requested proposal counts.
+        const bool pad_mixed = packed_history_supported && max_drafts == 2 &&
+            std::all_of(caches.begin(), caches.end(), [&](const auto* cache) {
+                return cache->position >= g.index_budget && cache->position < g.context - max_drafts &&
+                    cache->layers[target_layers.front()].latent.has_value();
+            });
         for (int lane = 0; lane < batch; ++lane) {
             const auto& step = steps[lane];
             ids.push_back(step.pending_token);
-            ids.insert(ids.end(), step.draft_count, mask_id);
-            for (int token = 0; token <= step.draft_count; ++token)
+            const int window = pad_mixed ? max_drafts : step.draft_count;
+            ids.insert(ids.end(), window, mask_id);
+            for (int token = 0; token <= window; ++token)
                 positions.push_back(caches[lane]->position + token);
             offsets.push_back(static_cast<int>(ids.size()));
             target_hidden.push_back(*caches[lane]->last_hidden);
-            max_drafts = std::max(max_drafts, step.draft_count);
         }
         const int total = offsets.back();
         const int count = max_drafts + 1;
-        const bool short_batch = batch == 3 || batch == 4;
-        const bool packed_history = short_batch && total == batch * count &&
-            local_window == 0 && g.index_budget == 2048 && g.kv_rank + g.rotary == 576 &&
-            !g.indexed_kv.quantization.enabled() && default_device() == Device::gpu;
+        const bool packed_history = packed_history_supported && total == batch * count;
         const auto embedded = embedding(array(ids.begin(), {1, total}, int32), bfloat16);
         const auto anchors = take(embedded, array(offsets.begin(), {batch}, int32), 1);
         const auto fused = anchors + fuse_gate *
