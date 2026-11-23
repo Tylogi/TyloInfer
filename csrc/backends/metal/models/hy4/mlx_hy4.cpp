@@ -1764,7 +1764,8 @@ void prepare_short_mla_value_expansion(const Geometry& g) {
     });
 }
 
-void prepare_routed_prefill_kernels(const Geometry& g, const std::vector<Layer>& layers) {
+void prepare_routed_expert_kernels(const Geometry& g, const std::vector<Layer>& layers,
+    bool prepare_verification) {
     auto* preparation = MlxKernelPreparation::current();
     constexpr int rows = 64;
     constexpr int width = 1536;
@@ -1786,8 +1787,16 @@ void prepare_routed_prefill_kernels(const Geometry& g, const std::vector<Layer>&
         const auto input = zeros({rows, width}, bfloat16);
         const auto ids = zeros({rows, g.routes}, int32);
         const auto probabilities = zeros({rows, g.routes}, float32);
-        for (const auto* moe : examples) if (moe)
+        for (const auto* moe : examples) if (moe) {
+            const auto& [gate, up, down] = moe->experts;
             preparation->add(gguf_routed_ffn(moe->experts, input, ids, probabilities, moe->limit, true));
+            if (prepare_verification) for (const int verify_rows : {9, 12}) {
+                const auto activation = zeros({verify_rows, width}, bfloat16);
+                const auto routes = zeros({verify_rows, g.routes}, int32);
+                const auto plan = MlxGgufPrefillPlan::from_topk(activation, routes, gate.expert_count(), 8);
+                preparation->add(plan.gate_up(gate, up, nullptr, nullptr, moe->limit));
+            }
+        }
     });
 }
 
@@ -1913,7 +1922,7 @@ struct MlxHy4Model::Weights {
             const bool has_engram = engram && std::find(engram->layers.begin(), engram->layers.end(), layer) != engram->layers.end();
             layers.emplace_back(MlxGgufLayerTensors(model, source, layer), g, layer, has_engram);
         }
-        prepare_routed_prefill_kernels(g, layers);
+        prepare_routed_expert_kernels(g, layers, !draft_path.empty());
         if (!offload && !g.indexed_kv.quantization.enabled() &&
             g.kv_rank == 512 && g.rotary == 64 && g.index_budget == 2048 && g.context > 2 * g.index_budget &&
             std::any_of(layers.begin(), layers.end(), [](const Layer& layer) { return layer.index && layer.heads == 32; }))

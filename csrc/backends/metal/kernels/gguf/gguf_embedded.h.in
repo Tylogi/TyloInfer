@@ -9,6 +9,16 @@ alignas(4) constant ushort gguf_gyro_codebook[4096] = {
 @TYLOINFER_GGUF_DECODE_SOURCE@
 )GGUFMETAL";
 static constexpr const char* kGgufStagedCodebooks = R"GGUFCODEBOOK(
+constant half4 gguf_iq2_vectors[512] = {
+@TYLOINFER_GGUF_IQ2_VECTOR_SOURCE@
+};
+// Each nibble selects the sign bits for four packed half values.
+constant uint2 gguf_iq2_signs[16] = {
+    uint2(0, 0), uint2(0x8000u, 0), uint2(0x80000000u, 0), uint2(0x80008000u, 0),
+    uint2(0, 0x8000u), uint2(0x8000u, 0x8000u), uint2(0x80000000u, 0x8000u), uint2(0x80008000u, 0x8000u),
+    uint2(0, 0x80000000u), uint2(0x8000u, 0x80000000u), uint2(0x80000000u, 0x80000000u), uint2(0x80008000u, 0x80000000u),
+    uint2(0, 0x80008000u), uint2(0x8000u, 0x80008000u), uint2(0x80000000u, 0x80008000u), uint2(0x80008000u, 0x80008000u),
+};
 constant half4 gguf_iq3_vectors[4096] = {
 @TYLOINFER_GGUF_IQ3_VECTOR_SOURCE@
 };
