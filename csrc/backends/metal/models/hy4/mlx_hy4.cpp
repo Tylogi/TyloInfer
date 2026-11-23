@@ -1756,6 +1756,33 @@ void prepare_short_mla_value_expansion(const Geometry& g) {
     });
 }
 
+void prepare_routed_prefill_kernels(const Geometry& g, const std::vector<Layer>& layers) {
+    auto* preparation = MlxKernelPreparation::current();
+    constexpr int rows = 64;
+    constexpr int width = 1536;
+    if (!preparation || g.context < rows || g.routes != 16 || !short_mla_nax_available()) return;
+
+    std::array<const LatentMoe*, 2> examples{};
+    for (const auto& layer : layers) {
+        if (!layer.moe) continue;
+        const auto& [gate, up, down] = layer.moe->experts;
+        auto& example = examples[layer.moe->limit > 0.f];
+        if (example || gate.format() != 16 || up.format() != 16 || down.format() != 12) continue;
+        if (std::all_of(layer.moe->experts.begin(), layer.moe->experts.end(), [](const MlxGgufWeight& weight) {
+            return weight.expert_count() == 512 && weight.input_size() == width && weight.output_size() == width &&
+                weight.has_staged_planes() && !weight.has_hadamard() && !weight.has_mixed_formats();
+        })) example = &*layer.moe;
+    }
+    preparation->collect([&] {
+        // This shape selects the same grouped expert kernels as longer prefill chunks.
+        const auto input = zeros({rows, width}, bfloat16);
+        const auto ids = zeros({rows, g.routes}, int32);
+        const auto probabilities = zeros({rows, g.routes}, float32);
+        for (const auto* moe : examples) if (moe)
+            preparation->add(gguf_routed_ffn(moe->experts, input, ids, probabilities, moe->limit, true));
+    });
+}
+
 void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& layers) {
     auto* preparation = MlxKernelPreparation::current();
     if (!preparation || default_device() != Device::gpu ||
@@ -1872,6 +1899,7 @@ struct MlxHy4Model::Weights {
             const bool has_engram = engram && std::find(engram->layers.begin(), engram->layers.end(), layer) != engram->layers.end();
             layers.emplace_back(MlxGgufLayerTensors(model, source, layer), g, layer, has_engram);
         }
+        prepare_routed_prefill_kernels(g, layers);
         if (!offload && !g.indexed_kv.quantization.enabled() &&
             g.kv_rank == 512 && g.rotary == 64 && g.index_budget == 2048 && g.context > 2 * g.index_budget &&
             std::any_of(layers.begin(), layers.end(), [](const Layer& layer) { return layer.index && layer.heads == 32; }))
