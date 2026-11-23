@@ -276,7 +276,7 @@ void check_hy4_packed_residual() {
     config.gate_epsilon = .0001f;
     mfq::metal::MlxHyperConnection connection(weights, bias, config, scale);
     mfq::metal::MlxRmsNorm norm(1.f + sin(arange(hidden, float32) * .003f) * .1f, 1e-5f, 0.f);
-    for (const int rows : {2, 4, 8}) {
+    for (const int rows : {2, 4, 8, 9, 12, 16}) {
         const auto residual = astype(reshape(sin(arange(rows * width, float32) * .017f),
             {1, rows, streams, hidden}), bfloat16);
         const auto delta = astype(reshape(cos(arange(rows * hidden, float32) * .013f) * .25f,

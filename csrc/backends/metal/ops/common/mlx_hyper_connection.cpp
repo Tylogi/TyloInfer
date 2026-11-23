@@ -48,6 +48,8 @@ array sinkhorn(array logits, int iterations) {
     return exp(logits);
 }
 
+constexpr int hy4_packed_decode_rows = 16;
+
 struct DecodeGateEpilogue {
     const array& scale;
     const array& bias;
@@ -70,7 +72,7 @@ std::optional<DecodeProjection> decode_projection(const array& residual, const a
     const DecodeGateEpilogue* epilogue, const DecodeResidualUpdate* update = nullptr) {
     if (residual.ndim() != 4 || weight.ndim() != 2 || weight.dtype() != float32 ||
         residual.shape(0) <= 0 || residual.shape(1) <= 0 || residual.shape(2) <= 0 ||
-        residual.shape(0) > (epilogue ? 8 : 6) / residual.shape(1) || !std::isfinite(epsilon) || epsilon <= 0 ||
+        residual.shape(0) > (epilogue ? hy4_packed_decode_rows : 6) / residual.shape(1) || !std::isfinite(epsilon) || epsilon <= 0 ||
         (residual.dtype() != float16 && residual.dtype() != bfloat16) || default_device() != Device::gpu)
         return std::nullopt;
     const int width = weight.shape(1), outputs = weight.shape(0);
@@ -249,7 +251,7 @@ array decode_collapse_norm(const array& residual, const array& pre, const MlxRms
 
 bool compact_hy4_residual(const array& residual, bool packed_decode) {
     return residual.ndim() == 4 && residual.shape(0) > 0 && residual.shape(1) > 0 &&
-        residual.shape(0) <= (packed_decode ? 8 : 1) / residual.shape(1) &&
+        residual.shape(0) <= (packed_decode ? hy4_packed_decode_rows : 1) / residual.shape(1) &&
         residual.shape(2) == 4 && residual.shape(3) == 3072 && residual.dtype() == bfloat16;
 }
 
