@@ -6,6 +6,7 @@
 #include "mlx_platform.h"
 
 #include <mlx/backend/metal/device.h>
+#include <mlx/compile.h>
 #include <mlx/backend/metal/utils.h>
 #include <mlx/backend/metal/kernels/steel/gemm/params.h>
 #include <mlx/primitives.h>
@@ -1499,6 +1500,15 @@ array mla_sink_probabilities(const array& scores, const array& mask, const array
     return exponentials / expand_dims(denominator, -1);
 }
 
+array compiled_mla_sink_probabilities(const array& scores, const array& mask, const array& sinks) {
+    using namespace mlx::core;
+    static const auto probabilities = compile([](const std::vector<array>& inputs) {
+        return std::vector<array>{
+            astype(mla_sink_probabilities(astype(inputs[0], float32), inputs[1], inputs[2]), float16)};
+    });
+    return probabilities({scores, mask, sinks}).front();
+}
+
 constexpr auto resident_mla_indexed_dot_source = R"METAL(
         constexpr ushort heads = 32, tile_size = 32;
         constexpr ushort inner = PROJECT_VALUES ? 2048 : 576;
@@ -1598,6 +1608,10 @@ void mlx_prepare_indexed_mla_prefill() {
             const auto probabilities = zeros({1, 16, 32, 2048}, float16);
             preparation->add(resident_mla_indexed_dot(query, cache, indices, false));
             preparation->add(resident_mla_indexed_dot(probabilities, cache, indices, true));
+            // The compiled softmax shares its kernels across the supported query tile sizes.
+            // Eight queries keep the synthetic float32 intermediates in the preparation budget.
+            preparation->add(compiled_mla_sink_probabilities(zeros({1, 8, 32, 2048}, float16),
+                zeros({1, 8, 2048}, float16), zeros({32}, float32)));
         });
     }
 }
@@ -1741,8 +1755,8 @@ array mlx_sparse_selected_mla_attention(
         using namespace mlx::core;
         // Stage only the selected tile inside each matrix product.
         const auto q = astype(transpose(selected_query, {0, 2, 1, 3}) * selected_scale, float16);
-        const auto scores = astype(resident_mla_indexed_dot(q, selected_cache, indices, false), float32);
-        const auto probabilities = astype(mla_sink_probabilities(scores, mask, sink_logits), float16);
+        const auto scores = resident_mla_indexed_dot(q, selected_cache, indices, false);
+        const auto probabilities = compiled_mla_sink_probabilities(scores, mask, sink_logits);
         return astype(resident_mla_indexed_dot(probabilities, selected_cache, indices, true), float32);
     }
     if (heads != 64 || dimension != 512 || value_dimension != dimension) {
