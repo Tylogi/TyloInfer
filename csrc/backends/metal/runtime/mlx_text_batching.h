@@ -212,7 +212,8 @@ public:
             if (depth_policy_) park_memory_.retired(*depth_policy_);
             depth_policy_.reset();
             if (paired) {
-                depth_policy_ = std::make_shared<DepthPolicy>(std::move(speculative), maximum, ordinary.size(), shallow_batch);
+                depth_policy_ = std::make_shared<DepthPolicy>(
+                    std::move(speculative), maximum, ordinary.size(), shallow_batch, 2);
                 park_memory_.seed(*depth_policy_);
             }
             ordinary_cohort_ = std::move(ordinary);

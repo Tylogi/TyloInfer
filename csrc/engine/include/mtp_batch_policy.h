@@ -26,9 +26,11 @@ class BatchDepthPolicy {
 public:
     using Clock = std::chrono::steady_clock;
     BatchDepthPolicy(std::vector<std::string> requests, int maximum,
-            std::size_t ordinary_requests = 0, bool shallow_first = false)
+            std::size_t ordinary_requests = 0, bool shallow_first = false, int shallow_depth = 1)
         : requests_(std::move(requests)), ordinary_requests_(ordinary_requests), shallow_first_(shallow_first),
-          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)), current_(initial_depth()) {}
+          maximum_(std::clamp(maximum, 1, kMaximumReportedDraftDepth)),
+          initial_depth_(shallow_first_ ? std::clamp(shallow_depth, 1, maximum_) : maximum_),
+          current_(initial_depth_) {}
     const auto& requests() const noexcept { return requests_; }
     std::size_t ordinary_requests() const noexcept { return ordinary_requests_; }
     int maximum() const noexcept { return maximum_; }
@@ -170,8 +172,6 @@ public:
     bool held_up() const noexcept { return decisions_ >= 32; }
 
 private:
-    int initial_depth() const noexcept { return shallow_first_ ? 1 : maximum_; }
-
     int best_depth() const {
         int best = 1;
         for (int candidate = 2; candidate <= maximum_; ++candidate)
@@ -196,7 +196,7 @@ private:
             acceptance_weight_ = {};
             baseline_verified_ = false;
         }
-        current_ = restart ? initial_depth() : best_depth();
+        current_ = restart ? initial_depth_ : best_depth();
     }
     static void append(std::deque<double>& values, double value) {
         if (values.size() == 8) values.pop_front();
@@ -217,7 +217,7 @@ private:
     std::vector<std::string> requests_;
     std::size_t ordinary_requests_;
     bool shallow_first_;
-    int maximum_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
+    int maximum_, initial_depth_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
     std::array<std::optional<double>, kMaximumReportedDraftDepth> acceptance_{.6};
     std::array<double, kMaximumReportedDraftDepth> acceptance_weight_{};
     std::array<std::deque<double>, kMaximumReportedDraftDepth + 1> costs_;

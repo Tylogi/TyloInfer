@@ -68,6 +68,15 @@ int main() {
             low_yield.observe(rejected, zero + step * 60ms, zero + (step + 1) * 60ms,
                 true, false, 1);
         require(low_yield.depth() == 0);
+
+        BatchDepthPolicy wider({"a", "b", "c"}, 3, 0, true, 2);
+        BatchDepthPolicy capped({"a", "b", "c"}, 1, 0, true, 2);
+        require(wider.depth() == 2 && capped.depth() == 1);
+        const std::array<BatchAcceptance, 3> rejected_wide{{{2, 0}, {2, 0}, {2, 0}}};
+        for (int step = 0; step < 4; ++step)
+            wider.observe(rejected_wide, zero + step * 70ms, zero + (step + 1) * 70ms,
+                true, false, 2);
+        require(wider.depth() == 0);
     }
     {
         // Initialization invalidates timing, while its completed token
