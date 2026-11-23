@@ -5,6 +5,7 @@
 #include "mlx_gguf_layer_tensors.h"
 #include "mlx_hyper_connection.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_platform.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_weight_residency.h"
 #include "nlohmann/json.hpp"
@@ -674,7 +675,8 @@ array decode_token_selection(const array& groups, const Geometry& g, int positio
 
 constexpr int index_gather_max_batch = 8;
 
-std::pair<array, array> gather_index_batch(std::span<const array> views, std::span<const array> indices) {
+std::pair<array, array> gather_index_batch(std::span<const array> views, std::span<const array> indices,
+    const array* appended = nullptr) {
     static const auto kernels = [] {
         std::array<fast::CustomKernelFunction, index_gather_max_batch + 1> result;
         for (int batch = 2; batch <= index_gather_max_batch; ++batch) {
@@ -683,9 +685,18 @@ std::pair<array, array> gather_index_batch(std::span<const array> views, std::sp
                 const uint token = thread_position_in_grid.x / 32u;
                 const uint request = threadgroup_position_in_grid.y;
                 const uint lane = thread_index_in_simdgroup;
-                const device half* cache;
-                int chosen;
-                switch (request) {
+                const uint extra = APPEND ? appended_shape[1] : 0u;
+                const uint keys = 2048u + extra;
+                if (token >= keys) return;
+                const device half* source;
+                bool valid;
+                if (token >= 2048u) {
+                    source = appended + (request * extra + token - 2048u) * 576u;
+                    valid = true;
+                } else {
+                    const device half* cache;
+                    int chosen;
+                    switch (request) {
                 )METAL";
             for (int lane = 0; lane < batch; ++lane) {
                 const auto suffix = std::to_string(lane);
@@ -695,14 +706,23 @@ std::pair<array, array> gather_index_batch(std::span<const array> views, std::sp
                     suffix + "[token]; break;\n";
             }
             body += R"METAL(
-                default: return;
+                    default: return;
+                    }
+                    source = cache + ulong(max(chosen, 0)) * 576u;
+                    valid = chosen >= 0;
                 }
-                const uint row = request * 2048u + token;
-                const auto source = reinterpret_cast<device const uint4*>(cache + ulong(max(chosen, 0)) * 576u);
+                const uint row = request * keys + token;
+                const auto packed = reinterpret_cast<device const uint4*>(source);
                 auto dest = reinterpret_cast<device uint4*>(data + ulong(row) * 576u);
-                for (uint word = lane; word < 72u; word += 32u) dest[word] = source[word];
-                if (lane == 0u) mask[row] = half(chosen >= 0 ? 0.0f : -INFINITY);
+                for (uint word = lane; word < 72u; word += 32u) dest[word] = packed[word];
+                if (lane == 0u) {
+                    if constexpr (APPEND) {
+                        for (uint query = 0; query < extra; ++query)
+                            mask[(request * extra + query) * keys + token] = valid && token <= 2048u + query;
+                    } else mask[row] = half(valid ? 0.0f : -INFINITY);
+                }
                 )METAL";
+            names.push_back("appended");
             result[batch] = fast::metal_kernel("hy4_decode_gather_index_batch_" + std::to_string(batch),
                 names, {"data", "mask"}, body);
         }
@@ -710,13 +730,18 @@ std::pair<array, array> gather_index_batch(std::span<const array> views, std::sp
     }();
     const int batch = static_cast<int>(views.size());
     std::vector<array> inputs;
-    inputs.reserve(2 * batch);
+    inputs.reserve(2 * batch + 1);
     for (int lane = 0; lane < batch; ++lane) {
         inputs.push_back(views[lane]);
         inputs.push_back(indices[lane]);
     }
-    auto out = kernels[batch](inputs, {{batch, 1, 2048, 576}, {batch, 1, 2048}}, {float16, float16},
-        {2048 * 32, batch, 1}, {128, 1, 1}, {}, std::nullopt, false, {});
+    inputs.push_back(appended ? *appended : views.front());
+    const int keys = 2048 + (appended ? appended->shape(1) : 0);
+    const int mask_rows = appended ? appended->shape(1) : 1;
+    auto out = kernels[batch](inputs, {{batch, 1, keys, 576}, {batch, mask_rows, keys}},
+        {float16, appended ? bool_ : float16},
+        {(keys + 3) / 4 * 128, batch, 1}, {128, 1, 1}, {{"APPEND", appended != nullptr}},
+        std::nullopt, false, {});
     return {std::move(out[0]), std::move(out[1])};
 }
 
@@ -1042,6 +1067,71 @@ std::optional<array> absorb_mla_decode_query(const array& query, const array& we
         {17 * 64, heads, 1}, {64, 1, 1}, {}, std::nullopt, false, {}).front();
 }
 
+bool short_mla_nax_available() {
+    if (default_device() != Device::gpu || mlx_metal_nax_disabled()) return false;
+    if (!__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) return false;
+    return mlx_apple_chip_starts_with("Apple M5");
+}
+
+array packed_mla_query_absorb_rope(const array& q, const array& w, const array& cosine,
+    const array& sine) {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("hy4_packed_mla_query_absorb_rope",
+            {"q", "w", "cosine", "sine"}, {"out"}, R"METAL(
+        constexpr ushort M = 8, N = TILE, K = 32, D = 192, W = 512, OUT = 576;
+        const uint head = threadgroup_position_in_grid.y;
+        const uint column = threadgroup_position_in_grid.x * N;
+        const uint lane = thread_index_in_simdgroup;
+        if (column == W) {
+            for (uint element = lane; element < ROWS * 64u; element += 32u) {
+                const uint row = element / 64u, channel = element % 64u, pair = channel / 2u;
+                const auto input = q + (ulong(row) * HEADS + head) * 256u + 192u + 2u * pair;
+                const float c = cosine[row * 32u + pair], s = sine[row * 32u + pair];
+                const float even = float(input[0]), odd = float(input[1]);
+                const float value = (channel & 1u) ? even * s + odd * c : even * c - odd * s;
+                out[(ulong(head) * ROWS + row) * OUT + W + channel] = float(bfloat(value));
+            }
+            return;
+        }
+        threadgroup half a_values[M * K];
+        tensor<threadgroup half, dextents<int, 2>, tensor_inline> a(a_values, dextents<int, 2>(K, M));
+        tensor<device half, dextents<int, 2>, tensor_inline> b(const_cast<device half*>(w + ulong(head) * D * W),
+            dextents<int, 2>(W, D));
+        constexpr auto desc = matmul2d_descriptor(M, N, K, false, false, false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<desc, execution_simdgroup> op;
+        auto left = a.template slice<K, M>(0, 0);
+        auto right = b.template slice<N, K>(column, 0);
+        auto sums = op.template get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+        for (ushort i = 0; i < sums.get_capacity(); ++i) sums[i] = 0.f;
+        for (uint offset = 0; offset < D; offset += K) {
+            #pragma clang loop unroll(full)
+            for (uint row = 0; row < M; ++row)
+                a_values[row * K + lane] = row < uint(ROWS)
+                    ? half(float(q[(ulong(row) * HEADS + head) * 256u + offset + lane])) : half(0);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            right = b.template slice<N, K>(column, offset);
+            op.run(left, right, sums);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (ushort i = 0; i < sums.get_capacity(); ++i) if (sums.is_valid_element(i)) {
+            const auto at = sums.get_multidimensional_index(i);
+            if (at[1] < ROWS) out[(ulong(head) * ROWS + at[1]) * OUT + column + at[0]] = float(half(sums[i]));
+        }
+        )METAL", R"METAL(
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace mpp::tensor_ops;
+        )METAL", true, false, options);
+    }();
+    const int rows = q.shape(1), heads = q.shape(2);
+    const int tile = heads == 32 && rows == 8 ? 64 : 32;
+    return kernel({q, w, cosine, sine}, {{1, heads, rows, 576}}, {float32},
+        {(512 / tile + 1) * 32, heads, 1}, {32, 1, 1},
+        {{"ROWS", rows}, {"HEADS", heads}, {"TILE", tile}}, std::nullopt, false, {}).front();
+}
+
 array absorb_mla_query(const array& query, const array& weights) {
     const auto source = astype(query, weights.dtype());
     const int heads = source.shape(1);
@@ -1081,7 +1171,7 @@ array absorb_mla_query(const array& query, const array& weights) {
 
 template <class Attention>
 MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, const RotaryPhases& phases,
-    bool packed = false) {
+    bool packed = false, bool short_verification = false) {
     const int count = in.shape(1), plain = g.q_dim - g.rotary;
     const auto projected = layer.projections(in);
     auto normalized = normalize_mla_decode(projected[0], projected[1], layer.query_norm, layer.latent_norm, phases, g, packed);
@@ -1090,6 +1180,12 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
     auto query = [&] {
         if (count == 1 && plain == 192 && g.rotary == 64)
             if (auto fused = absorb_mla_decode_query(q, layer.key_absorption, phases)) return std::move(*fused);
+        if (short_verification && (count == 6 || count == 8) && plain == 192 && g.rotary == 64 &&
+            (layer.heads == 32 || layer.heads == 64) && q.dtype() == bfloat16 &&
+            layer.key_absorption.dtype() == float16 && layer.key_absorption.shape() == Shape{layer.heads, 192, 512} &&
+            phases.cosine.shape() == Shape{count, 32} && phases.sine.shape() == phases.cosine.shape() &&
+            short_mla_nax_available())
+            return packed_mla_query_absorb_rope(q, layer.key_absorption, phases.cosine, phases.sine);
         const auto no_rope = transpose(axis_slice(q, -1, 0, plain), {0, 2, 1, 3});
         const auto absorbed = absorb_mla_query(no_rope, layer.key_absorption);
         const auto rope_q = transpose(phases(axis_slice(q, -1, plain, g.q_dim)), {0, 2, 1, 3});
@@ -1101,14 +1197,77 @@ MlaRows project_mla(const Attention& layer, const Geometry& g, const array& in, 
     return {std::move(query), std::move(latent), std::move(low), projected[2]};
 }
 
+array expand_and_gate_mla_values(const array& input, const array& values, const array& gate) {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return fast::metal_kernel("hy4_short_mla_value_projection",
+            {"x", "w", "g"}, {"y"}, R"METAL(
+        constexpr ushort M = 8, N = COLUMN_TILE, K = 32, D = 512;
+        const uint head = threadgroup_position_in_grid.y;
+        const uint column = threadgroup_position_in_grid.x * N;
+        const uint lane = thread_index_in_simdgroup;
+        threadgroup half activations[M * K];
+        const auto weights = w + ulong(head) * D * WIDTH;
+        tensor<threadgroup half, dextents<int, 2>, tensor_inline> a(activations, dextents<int, 2>(K, M));
+        tensor<device half, dextents<int, 2>, tensor_inline> b(const_cast<device half*>(weights),
+            dextents<int, 2>(WIDTH, D));
+        constexpr auto descriptor = matmul2d_descriptor(M, N, K, false, false, false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<descriptor, execution_simdgroup> op;
+        auto left = a.template slice<K, M>(0, 0);
+        auto right = b.template slice<N, K>(column, 0);
+        auto output = op.template get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+        for (ushort i = 0; i < output.get_capacity(); ++i) output[i] = 0.f;
+        for (uint offset = 0; offset < D; offset += K) {
+            #pragma clang loop unroll(full)
+            for (uint row = 0; row < M; ++row)
+                activations[row * K + lane] = row < uint(ROWS)
+                    ? x[(ulong(row) * HEADS + head) * D + offset + lane] : half(0);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            right = b.template slice<N, K>(column, offset);
+            op.run(left, right, output);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (ushort i = 0; i < output.get_capacity(); ++i) if (output.is_valid_element(i)) {
+            const auto at = output.get_multidimensional_index(i);
+            if (at[1] >= ROWS) continue;
+            const auto out = (ulong(at[1]) * HEADS + head) * WIDTH + column + at[0];
+            const half expanded = half(output[i]);
+            y[out] = bfloat(float(expanded) / (1.f + metal::exp(-float(g[out]))));
+        }
+        )METAL", R"METAL(
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace mpp::tensor_ops;
+        )METAL", true, false, options);
+    }();
+    const int rows = input.shape(1), heads = input.shape(2), width = values.shape(2);
+    const int columns = heads == 64 ? 64 : 32;
+    return kernel({contiguous(astype(input, float16)), values, gate},
+        {{1, rows, heads * width}}, {bfloat16},
+        {width / columns * 32, heads, 1}, {32, 1, 1},
+        {{"HEADS", heads}, {"WIDTH", width}, {"ROWS", rows}, {"COLUMN_TILE", columns}},
+        std::nullopt, false, {}).front();
+}
+
 template <class Attention>
 array expand_mla(const Attention& layer, const Geometry& g, const array& attention, const array& gate,
-    Dtype dtype, bool normalize = true) {
-    const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), layer.value_expansion.dtype()),
-        layer.value_expansion);
-    const auto gated = reshape(transpose(expanded, {0, 2, 1, 3}),
-        {1, attention.shape(1), layer.heads * g.v_dim}) * sigmoid(astype(gate, float32));
-    auto output = layer.output(astype(gated, dtype));
+    Dtype dtype, bool normalize = true, bool short_verification = false) {
+    const int count = attention.shape(1);
+    const auto gated = [&] {
+        if (short_verification && dtype == bfloat16 && (count == 6 || count == 8) && (layer.heads == 32 || layer.heads == 64) &&
+            g.kv_rank == 512 && g.v_dim == 256 && layer.value_expansion.dtype() == float16 &&
+            attention.shape() == Shape{1, count, layer.heads, 512} &&
+            layer.value_expansion.shape() == Shape{layer.heads, 512, 256} &&
+            gate.shape() == Shape{1, count, layer.heads * 256} &&
+            short_mla_nax_available())
+            return expand_and_gate_mla_values(attention, layer.value_expansion, gate);
+        const auto expanded = matmul(astype(transpose(attention, {0, 2, 1, 3}), layer.value_expansion.dtype()),
+            layer.value_expansion);
+        return astype(reshape(transpose(expanded, {0, 2, 1, 3}),
+            {1, count, layer.heads * g.v_dim}) * sigmoid(astype(gate, float32)), dtype);
+    }();
+    auto output = layer.output(gated);
     return normalize ? layer.post_attention_norm(output) : output;
 }
 
@@ -1344,6 +1503,11 @@ struct DflyDraft {
             max_drafts = std::max(max_drafts, step.draft_count);
         }
         const int total = offsets.back();
+        const int count = max_drafts + 1;
+        const bool short_batch = batch == 3 || batch == 4;
+        const bool packed_history = short_batch && total == batch * count &&
+            local_window == 0 && g.index_budget == 2048 && g.kv_rank + g.rotary == 576 &&
+            !g.indexed_kv.quantization.enabled() && default_device() == Device::gpu;
         const auto embedded = embedding(array(ids.begin(), {1, total}, int32), bfloat16);
         const auto anchors = take(embedded, array(offsets.begin(), {batch}, int32), 1);
         const auto fused = anchors + fuse_gate *
@@ -1358,19 +1522,39 @@ struct DflyDraft {
         const float scale = 1.0f / std::sqrt(float(g.q_dim));
         for (std::size_t index = 0; index < layers.size(); ++index) {
             const auto& layer = layers[index];
-            const auto rows = project_mla(layer, g, layer.attention_norm(hidden), phases, true);
-            std::vector<MlaWindow> windows;
-            for (int lane = 0; lane < batch; ++lane) {
-                const auto [history, valid] = selected_history(g, *caches[lane], index);
-                const auto current = axis_slice(rows.latent, 1, offsets[lane], offsets[lane + 1]);
-                const int count = current.shape(1);
-                const auto slots = arange(count, int32);
-                const auto causal = expand_dims(slots <= expand_dims(slots, 1), 0);
-                const auto past = broadcast_to(expand_dims(valid, 1), {1, count, history.shape(1)});
-                windows.push_back({concatenate({history, current}, 1), concatenate({past, causal}, -1)});
-            }
-            const auto attention = batch_dense_mla_windows(rows.query, windows, layer.sinks, scale, g.kv_rank);
-            auto residual = hidden + expand_mla(layer, g, attention, rows.gate, hidden.dtype());
+            const auto rows = project_mla(layer, g, layer.attention_norm(hidden), phases, true, short_batch);
+            const auto attention = [&] {
+                if (packed_history && std::all_of(caches.begin(), caches.end(), [&](const auto* cache) {
+                        const auto& kv = cache->layers[target_layers[index]];
+                        const auto& ids = cache->layers[index_layers[index]].last_indices;
+                        return kv.latent && ids && ids->shape() == Shape{1, 1, 2048};
+                    })) {
+                    std::vector<array> history, selection;
+                    history.reserve(batch);
+                    selection.reserve(batch);
+                    for (const auto* cache : caches) {
+                        history.push_back(cache->layers[target_layers[index]].latent->view());
+                        selection.push_back(*cache->layers[index_layers[index]].last_indices);
+                    }
+                    const auto current = reshape(rows.latent, {batch, count, 576});
+                    const auto [data, mask] = gather_index_batch(history, selection, &current);
+                    return uniform_mla_windows(rows.query, reshape(data, {batch, 2048 + count, 576}),
+                        mask, layer.sinks, scale, g.kv_rank);
+                }
+                std::vector<MlaWindow> windows;
+                windows.reserve(batch);
+                for (int lane = 0; lane < batch; ++lane) {
+                    const auto [history, valid] = selected_history(g, *caches[lane], index);
+                    const auto current = axis_slice(rows.latent, 1, offsets[lane], offsets[lane + 1]);
+                    const int count = current.shape(1);
+                    const auto slots = arange(count, int32);
+                    const auto causal = expand_dims(slots <= expand_dims(slots, 1), 0);
+                    const auto past = broadcast_to(expand_dims(valid, 1), {1, count, history.shape(1)});
+                    windows.push_back({concatenate({history, current}, 1), concatenate({past, causal}, -1)});
+                }
+                return batch_dense_mla_windows(rows.query, windows, layer.sinks, scale, g.kv_rank);
+            }();
+            auto residual = hidden + expand_mla(layer, g, attention, rows.gate, hidden.dtype(), true, short_batch);
             hidden = residual + layer.ffn(layer.ffn_norm(residual));
         }
         hidden = output_norm(hidden);
@@ -1474,6 +1658,35 @@ void restore_rows(const MlxHy4RowSnapshot& state, int count, int maximum, int wi
         }
     }
 }
+void prepare_packed_mla_query(const Geometry& g) {
+    auto* preparation = MlxKernelPreparation::current();
+    if (!preparation || g.q_dim != 256 || g.rotary != 64 || g.kv_rank != 512 || !short_mla_nax_available())
+        return;
+    preparation->collect([&] {
+        for (const int heads : {32, 64}) {
+            const auto weights = zeros({heads, 192, 512}, float16);
+            for (const int rows : {6, 8}) if (rows <= g.context) {
+                const auto phases = zeros({rows, 32}, float32);
+                preparation->add(packed_mla_query_absorb_rope(zeros({1, rows, heads, 256}, bfloat16),
+                    weights, phases, phases));
+            }
+        }
+    });
+}
+
+void prepare_short_mla_value_expansion(const Geometry& g) {
+    auto* preparation = MlxKernelPreparation::current();
+    if (!preparation || g.kv_rank != 512 || g.v_dim != 256 || !short_mla_nax_available()) return;
+    preparation->collect([&] {
+        for (const int heads : {32, 64}) {
+            const auto weights = zeros({heads, 512, 256}, float16);
+            for (const int count : {6, 8}) if (count <= g.context)
+                preparation->add(expand_and_gate_mla_values(zeros({1, count, heads, 512}, float32),
+                    weights, zeros({1, count, heads * 256}, bfloat16)));
+        }
+    });
+}
+
 void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& layers) {
     auto* preparation = MlxKernelPreparation::current();
     if (!preparation || default_device() != Device::gpu ||
@@ -1508,6 +1721,11 @@ void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& la
             const auto ids = zeros({1, 2, 2048}, int32);
             const auto cache = zeros({1, g.index_budget, 576}, float16);
             preparation->add(mlx_gather_selected_mla_rows(cache, ids));
+            for (const int batch : {3, 4}) {
+                const std::vector<array> caches(batch, cache), selections(batch, zeros({1, 1, 2048}, int32));
+                const auto current = zeros({batch, 2, 576}, float16);
+                preparation->add(gather_index_batch(caches, selections, &current).first);
+            }
             preparation->add(mlx_gathered_mla_attention(zeros({3, layer.heads, 1, 576}, float32),
                 zeros({3, 1, 2048, 576}, float16), zeros({3, 1, 2048}, float32),
                 layer.sinks, 1.f, 512, true));
@@ -1573,6 +1791,8 @@ struct MlxHy4Model::Weights {
             eval(loaded);
             draft.emplace(tensors, config, g);
             for (const auto& tensor : loaded) MlxWeightResidency::track(tensor);
+            prepare_packed_mla_query(g);
+            prepare_short_mla_value_expansion(g);
             prepare_dfly_decode_kernels(g, layers);
         }
     }
@@ -1747,6 +1967,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
     const auto indexed_phases = rotary_phases(positions_array, g.rotary, g.rotary_base);
     const auto sliding_phases = rotary_phases(positions_array, g.rotary, g.window_rotary_base);
     const bool verify_windows = !singleton_batch && max_window <= kMlxMtpEngineMaximumDraftDepth + 1;
+    const bool short_verification = verify_windows && (batch == 3 || batch == 4);
     std::vector<array> verify_sliding_masks;
     if (verify_windows) {
         verify_sliding_masks.reserve(batch);
@@ -1774,7 +1995,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
             deferred ? &*deferred : nullptr, true);
         const auto& in = mix.branch;
         const auto& phases = layer.sliding ? sliding_phases : indexed_phases;
-        const auto rows = project_mla(layer, g, in, phases, true);
+        const auto rows = project_mla(layer, g, in, phases, true, short_verification);
         const auto pairs = layer.index ? std::optional(project_index_pairs(*layer.index, in)) : std::nullopt;
         const auto scoring = layer.index && score_index
             ? std::optional(project_index_scores(*layer.index, g, in, rows.query_low, phases)) : std::nullopt;
@@ -1908,7 +2129,7 @@ std::vector<array> MlxHy4Model::forward_batch(std::span<const BatchInput> inputs
             }
             return concatenate(attended, 1);
         }();
-        const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype());
+        const auto attn_out = expand_mla(layer, g, attention, rows.gate, in.dtype(), true, short_verification);
         auto [updated, ffn_mix] = layer.ffn_hc.expand_and_collapse(streams, attn_out, mix, &layer.ffn_norm, true);
         streams = std::move(updated);
         auto output = project_ffn(layer, g, ffn_mix.branch);
