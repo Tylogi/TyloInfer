@@ -65,8 +65,10 @@ void check_type(ggml_type type, int columns, int rows=5) {
     for (std::size_t i = 0; i < embedded.size(); ++i) {
         const auto row = ids[i / columns];
         const auto expected = row >= 0 && row < rows ? reference[row * columns + i % columns] : 0.f;
-        if (std::abs(embedded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
-            throw std::runtime_error("GGUF embedding mismatch");
+        if (!std::isfinite(embedded[i]) || !std::isfinite(expected) ||
+            std::abs(embedded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
+            throw std::runtime_error("GGUF embedding mismatch at " + std::to_string(i) + ": " +
+                std::to_string(embedded[i]) + " vs " + std::to_string(expected));
     }
     // A captured PLE decoder must read updated row packets on every replay.
     using mfq::cuda::gguf::StagedRow;
@@ -93,8 +95,10 @@ void check_type(ggml_type type, int columns, int rows=5) {
         check(cudaMemcpy(decoded.data(), output.data, 2 * columns * sizeof(float), cudaMemcpyDeviceToHost));
         for (int i = 0; i < 2 * columns; ++i) {
             const auto expected = reference[(i < columns ? first_row : 1) * columns + i % columns];
-            if (std::abs(decoded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
-                throw std::runtime_error("GGUF row packet graph replay mismatch");
+            if (!std::isfinite(decoded[i]) || !std::isfinite(expected) ||
+                std::abs(decoded[i] - expected) > 1e-6f * std::max(1.f, std::abs(expected)))
+                throw std::runtime_error("GGUF row packet graph replay mismatch at " + std::to_string(i) + ": " +
+                    std::to_string(decoded[i]) + " vs " + std::to_string(expected));
         }
     }
     check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph)); check(cudaStreamDestroy(stream));

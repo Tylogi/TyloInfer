@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cuda_execution.h"
-#include "app/studio/kernels/cuda/mxfp4_sq.h"
+#include "app/server/kernels/cuda/mxfp4_sq.h"
 
 #include <cstdint>
 #include <vector>

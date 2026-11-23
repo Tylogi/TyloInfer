@@ -8,6 +8,7 @@
 #include "mfq_cuda_shared_gate.h"
 #include <cmath>
 #include <iostream>
+#include <string>
 #include <cstdlib>
 #include <algorithm>
 #include <array>
@@ -41,8 +42,10 @@ void check_prefill(int width,int outputs,int rows,bool strided) {
             const double term=double(source.data_ptr<float>()[m*width+k])*weight.data_ptr<float>()[n*width+k];
             expected+=term;magnitude+=std::abs(term);
         }
-        if(std::abs(values.data_ptr<float>()[m*outputs+n]-expected)>magnitude*2e-5+1e-6)
-            throw std::runtime_error("BF16 GR prefill differs from Strata-precision CPU dot");
+        const float got=values.data_ptr<float>()[m*outputs+n];
+        if(!std::isfinite(got)||std::abs(got-expected)>magnitude*2e-5+1e-6)
+            throw std::runtime_error("BF16 GR prefill differs from Strata-precision CPU dot at ["+std::to_string(m)+","+std::to_string(n)+"]: "
+                +std::to_string(got)+" vs "+std::to_string(expected));
     }
 }
 void check_dense(int width,int outputs,int rows,tb::ScalarType dtype) {

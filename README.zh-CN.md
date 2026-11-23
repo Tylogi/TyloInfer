@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
+  <img src="app/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
 </p>
 
 <h1 align="center">TyloInfer</h1>
@@ -79,20 +79,20 @@ git clone https://github.com/Tylogi/TyloInfer.git
 cd TyloInfer
 
 # Apple Silicon
-uv sync --project studio --extra metal
+uv sync --project app/server --extra metal
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release \
-  -DTYLOINFER_MLX_ROOT="$(uv run --project studio python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
+  -DTYLOINFER_MLX_ROOT="$(uv run --project app/server python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
 cmake --build build --target mfq-decode-metal --parallel
 
 # 启动服务，从此目录发现模型
-uv run --project studio python -m serve --model-dir ./models \
+uv run --project app/server python -m serve --model-dir ./models \
   --running-executable build/metal/mfq-decode-metal
 ```
 
 NVIDIA 设备将构建步骤替换为：
 
 ```sh
-uv sync --project studio
+uv sync --project app/server
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target mfq-runtime --parallel
 ```
@@ -102,7 +102,7 @@ cmake --build build --target mfq-runtime --parallel
 打开 **http://127.0.0.1:8090/**，下载模型后在「模型」中加载。也可启动时直接加载已有模型：
 
 ```sh
-uv run --project studio python -m serve --model /models/model.gguf \
+uv run --project app/server python -m serve --model /models/model.gguf \
   --running-executable build/mfq-runtime
 ```
 
@@ -114,24 +114,23 @@ API 请求与鉴权配置见[服务部署指南](docs/serve.md#first-api-request
 
 ```sh
 # Python 服务
-uv run --project app/studio --extra dev pytest app/studio/tests
+uv run --project app/server --extra dev pytest app/server/tests
 
 # 与钉住版本的参考实现对拍需要 PyTorch：
-uv run --project studio --extra dev --extra d1-reference \
-  pytest app/studio/tests/test_d1_reference.py
+uv run --project app/server --extra dev --extra d1-reference \
+  pytest app/server/tests/test_d1_reference.py
 
 # 原生运行时：按上文配置并构建后执行
 ctest --test-dir build
 
-# 浏览器界面（首次需安装 app/studio/web 依赖）
-pnpm --dir app/studio/web install --frozen-lockfile
-pnpm --dir app/studio/web test
+# 浏览器界面
+pnpm --dir app install --frozen-lockfile
+pnpm --dir app test:studio
 
-# DSH 插件工作区
-npm --prefix plugins ci
-npm --prefix plugins run build
-npm --prefix plugins run typecheck
-node --test app/plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
+# DSH 插件
+pnpm --dir app build:plugins
+pnpm --dir app typecheck:plugins
+pnpm --dir app test:plugins
 ```
 
 `csrc/tests/` 下的 C++ 用例任意机器都能跑；CUDA 与 Metal 用例需要对应硬件。详见[构建指南](docs/build.md#testing)。

@@ -167,9 +167,12 @@ void snapshot_roundtrip(int bits,const std::string& migration_directory={}) {
     cache.reset();
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES","512");
     const auto actual_initial=append(0,129);
-    for(std::int64_t i=0;i<expected_initial.numel();++i)
-        if(std::abs(expected_initial.data_ptr<float>()[i]-actual_initial.data_ptr<float>()[i])>2e-5f)
-            throw std::runtime_error("Score tiling changed fresh canonical attention");
+    for(std::int64_t i=0;i<expected_initial.numel();++i) {
+        const float want=expected_initial.data_ptr<float>()[i],got=actual_initial.data_ptr<float>()[i];
+        if(!std::isfinite(want)||!std::isfinite(got)||std::abs(got-want)>2e-5f)
+            throw std::runtime_error("Score tiling changed fresh canonical attention at "+std::to_string(i)+
+                ": "+std::to_string(got)+" vs "+std::to_string(want));
+    }
     setting("TYLOINFER_QSA_PREFILL_SCORE_BYTES",std::to_string(64ULL<<20));
     auto snapshot=cache.capture_session(129);const auto expected=append(129,17);
     if(cache.discard_idle_descriptors())throw std::runtime_error("QSA discarded live descriptors");

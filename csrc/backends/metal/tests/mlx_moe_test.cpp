@@ -6525,7 +6525,8 @@ void test_concatenate_resident_mfe_experts() {
         actual.size() == expected.size(),
         "resident MFE expert concatenation output shape mismatch");
     for (std::size_t index = 0; index < actual.size(); ++index) {
-        if (std::fabs(actual[index] - expected[index]) > 1e-6f) {
+        if (!std::isfinite(actual[index]) || !std::isfinite(expected[index]) ||
+            std::fabs(actual[index] - expected[index]) > 1e-6f) {
             const auto route = index / output;
             throw std::runtime_error(
                 "resident MFE expert concatenation mismatch: expert="

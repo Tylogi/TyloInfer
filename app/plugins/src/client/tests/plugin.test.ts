@@ -3,10 +3,14 @@ import { createRequire } from 'node:module';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-const require = createRequire(new URL('../../package.json', import.meta.url));
+const pluginManifest = new URL('../../../package.json', import.meta.url);
+const require = createRequire(pluginManifest);
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 const artifact = await readFile(new URL('../../../lib/client.js', import.meta.url), 'utf8');
+// The client bundle is exercised against the React the plugin itself declares, not the app workspace copy.
+const declared = JSON.parse(await readFile(pluginManifest, 'utf8'));
+assert.equal(React.version, declared.devDependencies.react, 'the client test must run on the plugin declared React');
 function harness(sessionStorage?: any, source: string = artifact) {
   let definition: any;
   const imports: any[] = [];

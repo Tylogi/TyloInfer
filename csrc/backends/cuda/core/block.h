@@ -1,7 +1,7 @@
 #pragma once
 
 #include "rope.h"
-#include "app/studio/kernels/cuda/independent_hc.h"
+#include "app/server/kernels/cuda/independent_hc.h"
 
 #include <cstdint>
 #include <vector>

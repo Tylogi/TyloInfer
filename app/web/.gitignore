@@ -1,0 +1,7 @@
+artifacts/
+playwright-report/
+test-results/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+

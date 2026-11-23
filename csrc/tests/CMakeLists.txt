@@ -1,25 +1,26 @@
-# Backend-independent native tests. Keep assert checks in Release too.
+# Native tests that need no GPU SDK. Keep assert checks in Release too.
 if(MSVC)
     add_compile_options(/UNDEBUG $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 else()
     add_compile_options(-UNDEBUG)
 endif()
 
-
-add_executable(tyloinfer-expert-route-usage-test expert_route_usage_test.cpp)
+# The CUDA backend's host-only tests also run with TYLOINFER_BUILD_CUDA_RUNTIME=OFF.
+set(TYLOINFER_CUDA_TEST_DIR ${PROJECT_SOURCE_DIR}/backends/cuda/tests)
+add_executable(tyloinfer-expert-route-usage-test ${TYLOINFER_CUDA_TEST_DIR}/expert_route_usage_test.cpp)
 target_compile_features(tyloinfer-expert-route-usage-test PRIVATE cxx_std_20)
 add_test(NAME tyloinfer-expert-route-usage-test COMMAND tyloinfer-expert-route-usage-test)
 
-add_executable(tyloinfer-routed-prefill-workspace-test routed_prefill_workspace_test.cpp)
+add_executable(tyloinfer-routed-prefill-workspace-test ${TYLOINFER_CUDA_TEST_DIR}/routed_prefill_workspace_test.cpp)
 target_compile_features(tyloinfer-routed-prefill-workspace-test PRIVATE cxx_std_20)
 add_test(NAME tyloinfer-routed-prefill-workspace-test COMMAND tyloinfer-routed-prefill-workspace-test)
 
-add_executable(tyloinfer-routed-prefill-loan-test routed_prefill_loan_test.cpp)
+add_executable(tyloinfer-routed-prefill-loan-test ${TYLOINFER_CUDA_TEST_DIR}/routed_prefill_loan_test.cpp)
 target_compile_features(tyloinfer-routed-prefill-loan-test PRIVATE cxx_std_20)
 add_test(NAME tyloinfer-routed-prefill-loan-test COMMAND tyloinfer-routed-prefill-loan-test)
 
 add_executable(mfq-cuda-tensor-view-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
+    ${TYLOINFER_CUDA_TEST_DIR}/mfq_cuda_tensor_view_test.cpp
 )
 target_include_directories(mfq-cuda-tensor-view-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda/include
@@ -29,8 +30,8 @@ add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
 
 add_executable(mfq-native-tensor-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/src/mfq_native_tensor.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_cpu_test_stubs.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_test.cpp
+    ${TYLOINFER_CUDA_TEST_DIR}/mfq_native_tensor_cpu_test_stubs.cpp
+    ${TYLOINFER_CUDA_TEST_DIR}/mfq_native_tensor_test.cpp
 )
 target_include_directories(mfq-native-tensor-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda/include
@@ -155,12 +156,12 @@ target_compile_features(mfq-moe-cache-policy-test PRIVATE cxx_std_17)
 add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
 
-add_executable(mfq-cuda-startup-test cuda_startup_test.cpp)
+add_executable(mfq-cuda-startup-test ${TYLOINFER_CUDA_TEST_DIR}/cuda_startup_test.cpp)
 target_compile_features(mfq-cuda-startup-test PRIVATE cxx_std_17)
 add_test(NAME mfq-cuda-startup-test COMMAND mfq-cuda-startup-test)
 
 add_executable(mfq-cuda-model-plan-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/cuda_model_plan_test.cpp
+    ${TYLOINFER_CUDA_TEST_DIR}/cuda_model_plan_test.cpp
 )
 target_include_directories(mfq-cuda-model-plan-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda/include
@@ -170,7 +171,7 @@ target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
 add_executable(mfq-moe-host-memory-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/moe_host_memory_test.cpp
+    ${TYLOINFER_CUDA_TEST_DIR}/moe_host_memory_test.cpp
 )
 target_include_directories(mfq-moe-host-memory-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda
@@ -260,7 +261,7 @@ endif()
 target_compile_features(mfq-qsa-ram-store-test PRIVATE cxx_std_17)
 add_test(NAME mfq-qsa-ram-store-test COMMAND mfq-qsa-ram-store-test ${CMAKE_CURRENT_BINARY_DIR}/qsa-ram-store-test-data)
 
-add_executable(mfq-gguf-cpu-balance-test gguf_cpu_balance_test.cpp)
+add_executable(mfq-gguf-cpu-balance-test ${TYLOINFER_CUDA_TEST_DIR}/gguf_cpu_balance_test.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(mfq-gguf-cpu-balance-test PRIVATE Threads::Threads)
 target_compile_features(mfq-gguf-cpu-balance-test PRIVATE cxx_std_20)

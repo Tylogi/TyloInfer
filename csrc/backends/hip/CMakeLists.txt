@@ -15,7 +15,7 @@ endif()
 enable_language(HIP)
 
 set(TYLOINFER_HIP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(TYLOINFER_HIP_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/app/studio/kernels/hip")
+set(TYLOINFER_HIP_KERNEL_ROOT "${TYLOINFER_REPOSITORY_ROOT}/app/server/kernels/hip")
 
 set(TYLOINFER_HIP_ARCHITECTURES "gfx942" CACHE STRING
     "HIP architectures compiled into MFQ HIP targets")
@@ -371,11 +371,13 @@ if(BUILD_TESTING)
     target_compile_features(mfq-hip-tq-test PRIVATE cxx_std_20)
     target_link_libraries(mfq-hip-tq-test PRIVATE
         mfq-hip-runtime mfq-hip-native-kernels mfq-hip-core mfq-core)
-    add_test(NAME mfq-hip-tq-test COMMAND mfq-hip-tq-test
-        ${TYLOINFER_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-subgroup.bin
-        ${TYLOINFER_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-short-groups.bin
-        ${TYLOINFER_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-columns.bin)
-    set_tests_properties(mfq-hip-tq-test PROPERTIES SKIP_RETURN_CODE 77)
+    set(TYLOINFER_HIP_TQ_FIXTURES
+        ${TYLOINFER_HIP_ROOT}/tests/fixtures/hip-tq-native-subgroup.bin
+        ${TYLOINFER_HIP_ROOT}/tests/fixtures/hip-tq-native-short-groups.bin
+        ${TYLOINFER_HIP_ROOT}/tests/fixtures/hip-tq-native-columns.bin)
+    add_test(NAME mfq-hip-tq-test COMMAND mfq-hip-tq-test ${TYLOINFER_HIP_TQ_FIXTURES})
+    set_tests_properties(mfq-hip-tq-test PROPERTIES
+        REQUIRED_FILES "${TYLOINFER_HIP_TQ_FIXTURES}" SKIP_RETURN_CODE 77)
 
     # The CUDA backend's test sources compile directly as HIP translation
     # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the

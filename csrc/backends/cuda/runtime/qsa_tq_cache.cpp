@@ -15,7 +15,7 @@
 #include "kernels/qsa_tq.h"
 #include "kernels/qsa_tq_encode.h"
 #include "mfq_cuda_resident_allocations.h"
-#include "app/studio/kernels/cuda/qwen4_exp.h"
+#include "app/server/kernels/cuda/qwen4_exp.h"
 #include "tyloinfer/file_read_window.h"
 #include "tyloinfer/host_memory.h"
 #include <atomic>

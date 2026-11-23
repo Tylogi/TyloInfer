@@ -8,7 +8,7 @@
 #include "mfq_hip_kv_quantization.h"
 #include "storage/session_state.h"
 #include "core/rope.h"
-#include "app/studio/kernels/hip/qwen4_exp.h"
+#include "app/server/kernels/hip/qwen4_exp.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/row_stage.h"
 #include <array>

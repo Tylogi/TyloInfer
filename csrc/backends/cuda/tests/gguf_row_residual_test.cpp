@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -18,9 +19,12 @@ struct Buffer {
     template<class T>T* as() { return static_cast<T*>(data); }
 };
 void near(const std::vector<float>& actual,const std::vector<float>& expected) {
-    for(std::size_t i=0;i<actual.size();++i)
-        if(std::abs(actual[i]-expected[i])>2e-4f*(1+std::abs(expected[i])))
-            throw std::runtime_error("row residual output differs from decoded reference");
+    for(std::size_t i=0;i<actual.size();++i) {
+        const float delta=actual[i]-expected[i];
+        if(!std::isfinite(actual[i])||!std::isfinite(expected[i])||std::abs(delta)>2e-4f*(1+std::abs(expected[i])))
+            throw std::runtime_error("row residual output["+std::to_string(i)+"]="+std::to_string(actual[i])
+                +" differs from decoded reference "+std::to_string(expected[i]));
+    }
 }
 }
 int main(int argc,char** argv) try {

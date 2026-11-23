@@ -15,7 +15,7 @@
 #include "storage/session_state.h"
 #include "storage/transformer_loader.h"
 #include "storage/weight_loader.h"
-#include "app/studio/kernels/cuda/loop_mixing.h"
+#include "app/server/kernels/cuda/loop_mixing.h"
 
 #include <array>
 #include <cmath>

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -48,6 +49,10 @@ void compare(const array& left, const array& right, const char* name) {
     const auto* b = rhs.data<float>();
     float maximum = 0.0f;
     for (std::size_t index = 0; index < lhs.size(); ++index) {
+        if (!std::isfinite(a[index]) || !std::isfinite(b[index])) {
+            throw std::runtime_error(
+                std::string(name) + " nonfinite value at " + std::to_string(index));
+        }
         maximum = std::max(maximum, std::abs(a[index] - b[index]));
     }
     if (maximum != 0.0f) {

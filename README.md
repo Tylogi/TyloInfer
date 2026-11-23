@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/studio/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
+  <img src="app/web/src/assets/tylogi-ai-lab-mark.svg" width="72" alt="Tylogi AI Lab">
 </p>
 
 <h1 align="center">TyloInfer</h1>
@@ -79,20 +79,20 @@ git clone https://github.com/Tylogi/TyloInfer.git
 cd TyloInfer
 
 # Apple Silicon
-uv sync --project studio --extra metal
+uv sync --project app/server --extra metal
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release \
-  -DTYLOINFER_MLX_ROOT="$(uv run --project studio python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
+  -DTYLOINFER_MLX_ROOT="$(uv run --project app/server python -c 'import mlx, os; print(os.path.dirname(mlx.__file__))')"
 cmake --build build --target mfq-decode-metal --parallel
 
 # Start the server and discover models in this directory
-uv run --project studio python -m serve --model-dir ./models \
+uv run --project app/server python -m serve --model-dir ./models \
   --running-executable build/metal/mfq-decode-metal
 ```
 
 For NVIDIA, replace the build steps with:
 
 ```sh
-uv sync --project studio
+uv sync --project app/server
 cmake -S csrc -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target mfq-runtime --parallel
 ```
@@ -102,7 +102,7 @@ and start it with `--running-executable build/mfq-runtime`. CMake selects Metal,
 Open **http://127.0.0.1:8090/**, download a model, and load it from **Models**. To load an existing model at startup:
 
 ```sh
-uv run --project studio python -m serve --model /models/model.gguf \
+uv run --project app/server python -m serve --model /models/model.gguf \
   --running-executable build/mfq-runtime
 ```
 
@@ -114,11 +114,11 @@ For API requests and authentication, see the [serving guide](docs/serve.md#first
 
 ```sh
 # Python server
-uv run --project app/studio --extra dev pytest app/studio/tests
+uv run --project app/server --extra dev pytest app/server/tests
 
 # Numerical parity against the pinned reference needs PyTorch:
-uv run --project app/studio --extra dev --extra d1-reference \
-  pytest app/studio/tests/test_d1_reference.py
+uv run --project app/server --extra dev --extra d1-reference \
+  pytest app/server/tests/test_d1_reference.py
 
 # Native runtime: configure and build as above, then
 ctest --test-dir build

@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <string>
 #include <thread>
 
 namespace {
@@ -792,8 +793,9 @@ void batch_policy_observations() {
     using Sample = mtp::BatchAcceptance;
     using Clock = mtp::BatchDepthPolicy::Clock;
     const auto near = [](double actual, double expected) {
-        if (std::abs(actual - expected) > 1e-10)
-            throw std::runtime_error("batch MTP conditional acceptance is inconsistent");
+        if (!std::isfinite(actual) || !std::isfinite(expected) || std::abs(actual - expected) > 1e-10)
+            throw std::runtime_error("batch MTP conditional acceptance is inconsistent: actual=" +
+                std::to_string(actual) + " expected=" + std::to_string(expected));
     };
     {
         mtp::BatchDepthPolicy policy({"one"}, 3);

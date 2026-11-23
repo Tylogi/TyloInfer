@@ -9,7 +9,7 @@ const dsbot = process.argv.includes('--dsbot');
 const output = new URL(dsbot ? './dist/dsbot/' : './', import.meta.url);
 const clientEntry = fileURLToPath(new URL('./src/client/client.tsx', import.meta.url));
 const sharedSource = new URL('../shared/', import.meta.url);
-const versionSource = await readFile(new URL('../studio/_version.py', import.meta.url), 'utf8');
+const versionSource = await readFile(new URL('../server/_version.py', import.meta.url), 'utf8');
 const productVersion = versionSource.match(/^__version__\s*=\s*["']([^"']+)["']/m)?.[1];
 if (!productVersion) throw new Error('TyloInfer product version is missing');
 // The Client shows the Studio presentation inside the host shell, so the shared

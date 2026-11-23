@@ -33,8 +33,8 @@ import zipfile
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT = SCRIPT_DIR.parent
 APP = PROJECT / "app"
-STUDIO = APP / "studio" / "web"
-PYTHON_PROJECT = PROJECT / "app" / "studio"
+TAURI = APP / "src-tauri"
+PYTHON_PROJECT = APP / "server"
 SERVER_ENTRY = PYTHON_PROJECT / "serve.py"
 SERVER_NAME = "tyloinfer-server"
 
@@ -121,9 +121,8 @@ class Context:
     def cargo_target(self) -> Path:
         configured = self.environment.get("CARGO_TARGET_DIR")
         if not configured:
-            return STUDIO / "src-tauri" / "target"
-        path = Path(configured)
-        return path if path.is_absolute() else STUDIO / path
+            return TAURI / "target"
+        return TAURI / configured
 
     @property
     def frameworks(self) -> Path:
@@ -561,15 +560,15 @@ def build_studio(context: Context) -> None:
     if not context.windows:
         environment["APPLE_SIGNING_IDENTITY"] = os.environ.get("APPLE_SIGNING_IDENTITY") or \
             context.signing_identity
-    command = ["tauri", "build",
+    command = ["run", "tauri:studio", "build",
                "--config", f"src-tauri/tauri.release-{'windows' if context.windows else 'macos'}.conf.json"]
     if not context.windows and context.signing_identity != "-":
         command += ["--config", '{"bundle":{"macOS":{"hardenedRuntime":true}}}']
     # The app/ workspace is pnpm-managed (app/pnpm-lock.yaml); npm ci cannot install from it.
-    pnpm = "pnpm.cmd" if context.windows else "pnpm"
-    run([pnpm, "--dir", str(APP), "install", "--frozen-lockfile"], env=environment)
-    run([pnpm, "--dir", str(APP), "run", "check:studio"], env=environment)
-    run([pnpm, "exec"] + command + ["--target", context.triple], cwd=STUDIO, env=environment)
+    pnpm = ["pnpm.cmd" if context.windows else "pnpm", "--dir", str(APP)]
+    run(pnpm + ["install", "--frozen-lockfile"], env=environment)
+    run(pnpm + ["run", "check:studio"], env=environment)
+    run(pnpm + command + ["--target", context.triple], env=environment)
     if context.windows:
         # The PyInstaller workpath is rebuilt by --clean. Reclaim it before Tauri
         # copies the multi-GiB sidecars and runtime resources into NSIS staging.
@@ -617,7 +616,7 @@ def collect_installer(context: Context) -> Path:
 # --- Windows single-file app ---------------------------------------------
 
 def portable_payload(project: Path, executable: Path) -> dict[str, Path]:
-    tauri = project / "app" / "studio" / "web" / "src-tauri"
+    tauri = project / "app" / "src-tauri"
     bundle = json.loads((tauri / "tauri.release-windows.conf.json").read_text())["bundle"]
     files: dict[str, Path] = {}
     names: set[str] = set()
@@ -658,7 +657,7 @@ def nsis_string(value: str) -> str:
 def build_single_file_app(project: Path, executable: Path, output: Path,
                           makensis: Path) -> Path:
     files = portable_payload(project, executable)
-    tauri = project / "app" / "studio" / "web" / "src-tauri"
+    tauri = project / "app" / "src-tauri"
     packaging = project / "packaging"
     version = json.loads((tauri / "tauri.conf.json").read_text())["version"]
     digest = hashlib.sha256()

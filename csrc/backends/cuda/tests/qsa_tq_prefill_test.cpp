@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cuda_fp16.h>
 #include <iostream>
+#include <string>
 #include <vector>
 namespace tb = mfq_tensor_backend;
 namespace tq = tyloinfer::qsa;
@@ -151,9 +152,12 @@ struct Fixture {
         exact(d, logmass, "logmass");
         exact(old_hits, hits, "history hits");
         auto expected = old_mass.cpu(), actual = mass.cpu();
-        for (int i = 0; i < blocks; ++i)
-            if (std::abs(expected.data_ptr<float>()[i] - actual.data_ptr<float>()[i]) > 1.e-5f)
-                throw std::runtime_error("Staged attention changed history mass");
+        for (int i = 0; i < blocks; ++i) {
+            const float want = expected.data_ptr<float>()[i], got = actual.data_ptr<float>()[i];
+            if (!std::isfinite(want) || !std::isfinite(got) || std::abs(got - want) > 1.e-5f)
+                throw std::runtime_error("Staged attention changed history mass at " + std::to_string(i) +
+                    ": " + std::to_string(got) + " vs " + std::to_string(want));
+        }
     }
 };
 int main() try {

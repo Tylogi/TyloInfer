@@ -8,8 +8,8 @@
 #include "models/deepseek_v4/causal_lm.h"
 
 #include "core/causal_model.h"
-#include "app/studio/kernels/hip/deepseek_v4_attention.h"
-#include "app/studio/kernels/hip/deepseek_v4_hc.h"
+#include "app/server/kernels/hip/deepseek_v4_attention.h"
+#include "app/server/kernels/hip/deepseek_v4_hc.h"
 #include "core/block.h"
 #include "models/deepseek_v4/config.h"
 #include "core/ffn.h"

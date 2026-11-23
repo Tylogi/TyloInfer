@@ -22,7 +22,8 @@
 namespace {
 
 void require_close(float actual, float expected, float tolerance = 1e-4f) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (!std::isfinite(actual) || !std::isfinite(expected) ||
+        std::fabs(actual - expected) > tolerance) {
         throw std::runtime_error(
             "transformer primitive mismatch: actual=" +
             std::to_string(actual) +

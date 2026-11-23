@@ -143,7 +143,8 @@ void require_close(
     float actual,
     float expected,
     float tolerance = 2e-4f) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (!std::isfinite(actual) || !std::isfinite(expected) ||
+        std::fabs(actual - expected) > tolerance) {
         throw std::runtime_error(
             "NINT8-0 Metal result mismatch: actual=" +
             std::to_string(actual) +

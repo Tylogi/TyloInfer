@@ -2612,8 +2612,10 @@ void run_host_vram_evacuation() {
                     const auto& expected=baseline.at(tokens==1?0:1);
                     float error=0,magnitude=0;
                     for(int64_t i=0;i<cpu.numel();++i) {
-                        error=std::max(error,std::abs(cpu.data_ptr<float>()[i]-expected.data_ptr<float>()[i]));
-                        magnitude=std::max(magnitude,std::abs(expected.data_ptr<float>()[i]));
+                        const float got=cpu.data_ptr<float>()[i],want=expected.data_ptr<float>()[i];
+                        require(std::isfinite(got)&&std::isfinite(want),"Migrated expert output is not finite");
+                        error=std::max(error,std::abs(got-want));
+                        magnitude=std::max(magnitude,std::abs(want));
                     }
                     require(std::isfinite(error) && error<1e-5f+magnitude*1e-4f,
                         "Migrated expert output differs from the ordinary source-read baseline");

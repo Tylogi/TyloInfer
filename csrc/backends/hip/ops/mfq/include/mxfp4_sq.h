@@ -2,7 +2,7 @@
 #pragma once
 
 #include "../../common/include/hip_execution.h"
-#include "app/studio/kernels/hip/mxfp4_sq.h"
+#include "app/server/kernels/hip/mxfp4_sq.h"
 
 #include <cstdint>
 #include <vector>
