@@ -4,6 +4,7 @@
 
 #include "mlx_gguf_layer_tensors.h"
 #include "mlx_hyper_connection.h"
+#include "mlx_kernel_prepare.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_weight_residency.h"
 #include "nlohmann/json.hpp"
@@ -724,8 +725,13 @@ array choose_resident_tokens(const array& groups, const Geometry& g,
     const int take = query.shape(1);
     const int budget = g.index_budget / g.group_size - 1;
     const int available = std::min(groups.shape(1), (position + take - 1) / g.group_size);
-    const bool direct = take == 1 && available > budget && g.index_budget % index_token_threads == 0 &&
-        default_device() == Device::gpu;
+    const bool gpu = default_device() == Device::gpu;
+    if (gpu && g.group_size == 4 && g.index_budget == 2048 && take <= 6 &&
+        available > budget && available <= 8192) {
+        const auto scores = mlx_sparse_indexer_weighted_scores(query, axis_slice(groups, 1, 0, available), weights);
+        return mlx_sparse_indexer_token_ids(scores, position);
+    }
+    const bool direct = gpu && take == 1 && available > budget && g.index_budget % index_token_threads == 0;
     const auto select = [budget](const array& scores) {
         return astype(sort(axis_slice(argpartition(-scores, budget - 1, -1), -1, 0, budget), -1), int32);
     };
@@ -1500,6 +1506,18 @@ struct MlxHy4Model::Weights {
             g.kv_rank == 512 && g.rotary == 64 && g.index_budget == 2048 && g.context > 2 * g.index_budget &&
             std::any_of(layers.begin(), layers.end(), [](const Layer& layer) { return layer.index && layer.heads == 32; }))
             mlx_prepare_indexed_mla_prefill();
+        const int history_groups = std::min(8192, (g.context - 1) / 4);
+        if (auto* preparation = MlxKernelPreparation::current();
+            preparation && default_device() == Device::gpu && !offload &&
+            g.group_size == 4 && g.index_budget == 2048 && history_groups >= 512) {
+            preparation->collect([&] {
+                for (int width = 512; ; width *= 2) {
+                    const int live = std::min(width, history_groups);
+                    preparation->add(mlx_sparse_indexer_token_ids(zeros({1, 1, live}, float32), live * 4));
+                    if (width >= history_groups) break;
+                }
+            });
+        }
         if (!draft_path.empty()) {
             auto path = std::filesystem::path(draft_path);
             std::ifstream config_file(path.parent_path() / "config.json");

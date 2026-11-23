@@ -241,10 +241,10 @@ class SparseIndexerTopkPrimitive final : public mlx::core::Primitive, public Mlx
 public:
     SparseIndexerTopkPrimitive(
         mlx::core::Stream stream, int heads, int items,
-        std::array<int, 4> params)
-        : Primitive(stream), heads_(heads), items_(items), params_(params),
+        std::array<int, 4> params, bool expand_tokens = false)
+        : Primitive(stream), heads_(heads), items_(items), params_(params), expand_tokens_(expand_tokens),
           kernel_name_("mfq_sparse_indexer_topk512_" +
-              std::to_string(heads) + "_" + std::to_string(items)) {}
+              std::to_string(heads) + "_" + std::to_string(items) + (expand_tokens ? "_tokens4" : "")) {}
 
     std::string preparation_key() const override { return kernel_name_; }
     void prepare_gpu() override { (void)prepared_kernel(); }
@@ -284,14 +284,16 @@ public:
     bool is_equivalent(const mlx::core::Primitive& other) const override {
         const auto* primitive = dynamic_cast<const SparseIndexerTopkPrimitive*>(&other);
         return primitive && primitive->heads_ == heads_ &&
-            primitive->items_ == items_ && primitive->params_ == params_;
+            primitive->items_ == items_ && primitive->params_ == params_ &&
+            primitive->expand_tokens_ == expand_tokens_;
     }
 
 private:
     std::string source() const {
         std::string code = "#include <metal_stdlib>\nusing namespace metal;\n";
         code += "#define HEADS " + std::to_string(heads_) +
-            "\n#define ITEMS " + std::to_string(items_) + "\n";
+            "\n#define ITEMS " + std::to_string(items_) +
+            "\n#define EXPAND_TOKENS " + (expand_tokens_ ? "true\n" : "false\n");
         code += "kernel void " + kernel_name_ + "("
             "device const float* scores [[buffer(0)]], "
             "constant int* params [[buffer(1)]], "
@@ -308,6 +310,7 @@ private:
     int heads_;
     int items_;
     std::array<int, 4> params_;
+    bool expand_tokens_;
     std::string kernel_name_;
 };
 
@@ -1052,6 +1055,20 @@ array mlx_sparse_indexer_topk512(
             mlx::core::default_stream(mlx::core::default_device()),
             head_scores.shape(2), items, params),
         {mlx::core::contiguous(head_scores)});
+}
+
+array mlx_sparse_indexer_token_ids(const array& scores, int position) {
+    using namespace mlx::core;
+    if (scores.ndim() != 3 || scores.shape(0) != 1 || scores.dtype() != float32 ||
+        scores.shape(1) < 1 || scores.shape(1) > 6 || scores.shape(2) < 512 || scores.shape(2) > 8192 ||
+        position < 0 || position > std::numeric_limits<int>::max() - scores.shape(1))
+        throw std::invalid_argument("invalid grouped sparse MLA selection geometry");
+    const int queries = scores.shape(1), width = scores.shape(2);
+    int items = 2;
+    while (items * 256 < width) items *= 2;
+    return array({1, queries, 2048}, int32, std::make_shared<SparseIndexerTopkPrimitive>(
+        default_stream(default_device()), 1, items, std::array<int, 4>{position, 4, width, queries}, true),
+        {contiguous(scores)});
 }
 
 array mlx_deepselect_topk512(

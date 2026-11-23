@@ -1108,10 +1108,24 @@ constexpr const char* kSparseIndexerTopkSource = R"TI_METAL(
     const uint row = threadgroup_position_in_grid.x;
     const uint width = uint(params[2]), rows = uint(params[3]);
     const uint query = row % rows;
-    const uint active = min(width, uint((params[0] + int(query) + 1) / params[1]));
-    if (active <= 512u) {
-        out[row * 512u + tid] = int(tid);
-        out[row * 512u + tid + 256u] = int(tid + 256u);
+    constexpr uint top_k = EXPAND_TOKENS ? 511u : 512u;
+    const int position = params[0] + int(query);
+    const uint active = min(width, uint((position + (EXPAND_TOKENS ? 0 : 1)) / params[1]));
+    out += ulong(row) * (EXPAND_TOKENS ? 2048u : 512u);
+    if constexpr (EXPAND_TOKENS) {
+        if (tid < 4u) {
+            const int token = (position / 4) * 4 + int(tid);
+            out[top_k * 4u + tid] = token <= position ? token : -1;
+        }
+    }
+    if (active <= top_k) {
+        if constexpr (EXPAND_TOKENS) {
+            for (uint i = tid; i < top_k * 4u; i += 256u)
+                out[i] = i < active * 4u ? int(i) : -1;
+        } else {
+            out[tid] = int(tid);
+            out[tid + 256u] = int(tid + 256u);
+        }
         return;
     }
     threadgroup atomic_uint hist[256];
@@ -1119,14 +1133,28 @@ constexpr const char* kSparseIndexerTopkSource = R"TI_METAL(
     uint values[ITEMS];
     for (uint item = 0; item < uint(ITEMS); ++item) {
         const uint index = tid * uint(ITEMS) + item;
-        float score = 0.0f;
+        uint key = 0xffffffffu;
         if (index < active) {
-            for (uint head = 0; head < uint(HEADS); ++head)
-                score += max(scores[(ulong(row) * uint(HEADS) + head) * width + index], 0.0f);
+            if constexpr (EXPAND_TOKENS) {
+                uint bits = as_type<uint>(scores[ulong(row) * width + index]);
+                const uint magnitude = bits & 0x7fffffffu;
+                if (magnitude == 0u) bits = 0u;
+                key = magnitude > 0x7f800000u ? 1u :
+                    ((bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u));
+            } else {
+                float score = 0.0f;
+                for (uint head = 0; head < uint(HEADS); ++head)
+                    score += max(scores[(ulong(row) * uint(HEADS) + head) * width + index], 0.0f);
+                key = as_type<uint>(score);
+            }
         }
-        values[item] = index < active ? as_type<uint>(score) : 0xffffffffu;
+        values[item] = key;
     }
-    if (tid == 0) { state[0] = 0; state[1] = 0x7f800000u; state[2] = 512; }
+    if (tid == 0) {
+        state[0] = 0;
+        state[1] = EXPAND_TOKENS ? 0xfffffffeu : 0x7f800000u;
+        state[2] = top_k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (;;) {
         uint lo = 0xffffffffu, hi = 0;
@@ -1182,8 +1210,8 @@ constexpr const char* kSparseIndexerTopkSource = R"TI_METAL(
     uint selected_count = 0;
     for (uint item = 0; item < uint(ITEMS); ++item) {
         bool equal = values[item] == threshold;
-        selected[item] = values[item] != 0xffffffffu &&
-            (values[item] > threshold || (equal && tie_prefix >= discarded_ties));
+        const bool keep_tie = EXPAND_TOKENS ? tie_prefix < wanted_ties : tie_prefix >= discarded_ties;
+        selected[item] = values[item] != 0xffffffffu && (values[item] > threshold || (equal && keep_tie));
         tie_prefix += uint(equal);
         selected_count += uint(selected[item]);
     }
@@ -1191,8 +1219,13 @@ constexpr const char* kSparseIndexerTopkSource = R"TI_METAL(
     if (lane == 31) counts[sg] = output + selected_count;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint group = 0; group < sg; ++group) output += counts[group];
-    for (uint item = 0; item < uint(ITEMS); ++item) if (selected[item])
-        out[row * 512u + output++] = int(tid * uint(ITEMS) + item);
+    for (uint item = 0; item < uint(ITEMS); ++item) if (selected[item]) {
+        const int group = int(tid * uint(ITEMS) + item);
+        if constexpr (EXPAND_TOKENS) {
+            const uint base = output++ * 4u;
+            for (int offset = 0; offset < 4; ++offset) out[base + offset] = group * 4 + offset;
+        } else out[output++] = group;
+    }
 )TI_METAL";
 
 // DeepSelect-inspired exact top-512 for FP32 score tensors.

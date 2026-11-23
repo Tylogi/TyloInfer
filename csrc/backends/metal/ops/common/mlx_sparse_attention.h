@@ -30,6 +30,9 @@ mlx::core::array mlx_sparse_indexer_topk512(
     int query_offset,
     int block_size);
 
+// Select 511 historical groups of four tokens, then append the causal tail.
+mlx::core::array mlx_sparse_indexer_token_ids(const mlx::core::array& scores, int position);
+
 mlx::core::array mlx_sparse_block_gqa_prefill_tiles(const mlx::core::array& query,
     const mlx::core::array& key, const mlx::core::array& value,
     const std::optional<mlx::core::array>& selected, int query_offset, float scale,

@@ -427,6 +427,42 @@ void test_indexer_topk(int width, int rows, int heads, int batch, int offset, bo
     }
 }
 
+void test_indexer_token_ids() {
+    using namespace mlx::core;
+    constexpr int queries = 6, budget = 511, group = 4, stride = (budget + 1) * group;
+    for (const int width : {512, 1258, 2049, 8192}) {
+        const int start = width * group - 5;
+        std::vector<float> scores(queries * width);
+        for (int i = 0; i < queries * width; ++i)
+            scores[i] = float((i * 13 + i / width) % 37 - 18) * 0.125f;
+        const auto input = array(scores.begin(), {1, queries, width}, float32);
+        auto output = mfq::metal::mlx_sparse_indexer_token_ids(input, start);
+        output.eval();
+        const auto* tokens = output.data<std::int32_t>();
+        for (int query = 0; query < queries; ++query) {
+            const int position = start + query, active = std::min(width, position / group);
+            const int keep = std::min(budget, active);
+            std::vector<int> order(active);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                return scores[query * width + a] > scores[query * width + b];
+            });
+            order.resize(keep);
+            std::sort(order.begin(), order.end());
+            for (int i = 0; i < stride; ++i) {
+                const int slot = i / group, offset = i % group;
+                int expected = slot < keep ? order[slot] * group + offset : -1;
+                if (slot == budget) {
+                    const int tail = position / group * group + offset;
+                    expected = tail <= position ? tail : -1;
+                }
+                if (tokens[query * stride + i] != expected)
+                    throw std::runtime_error("grouped indexer token IDs disagree with the CPU oracle");
+            }
+        }
+    }
+}
+
 void test_indexer_topk_rejects_invalid_geometry() {
     using namespace mlx::core;
     for (const Shape& shape : {Shape{1, 0, 4, 750}, Shape{1, 1, 4, 511},
@@ -661,6 +697,7 @@ int main(int argc, char** argv) {
         test_qsa_prefill(257, 513, mlx::core::float16, false, 1);
         test_qsa_prefill_rejects_invalid_geometry();
         if (argc == 2 && std::string(argv[1]) == "--prefill-only") return 0;
+        test_indexer_token_ids();
         for (int rows = 1; rows <= 6; ++rows) {
             for (int width : {513, 750, 2048, 8192, 16384, 32768}) {
                 test_indexer_topk(width, rows, 4, 1, width * 4 - rows, false);
