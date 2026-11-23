@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
-import type { JobResource, OfficialModelList } from '../../shared/api/types';
+import type { JobResource, OfficialModelList } from '@shared/types/api';
 import { modelsApi } from '../../shared/api/resources/models';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { ApiError } from '../../shared/api/client';

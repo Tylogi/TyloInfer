@@ -9,7 +9,21 @@ function files(path: string): string[] {
   return readdirSync(path, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? files(join(path, entry.name)) : /\.tsx?$/.test(entry.name) && !entry.name.includes('.test.') ? [join(path, entry.name)] : []);
 }
 
+const sharedRoot = resolve(import.meta.dirname, '../../../shared');
+const pluginRoot = resolve(import.meta.dirname, '../../../plugins/src');
+
 describe('业务职责边界', () => {
+  it('三个前端源码树只按允许方向依赖', () => {
+    const forbidden: [string, RegExp][] = [
+      [root, /['"](?:\.\.\/)+plugins\//],
+      [sharedRoot, /['"](?:\.\.\/)+(?:studio|plugins)\//],
+      [pluginRoot, /['"](?:\.\.\/)+studio\/|app\/studio/],
+    ];
+    for (const [directory, pattern] of forbidden) {
+      const offenders = files(directory).filter((file) => pattern.test(readFileSync(file, 'utf8')));
+      expect(offenders.map((file) => file.slice(directory.length)).sort(), directory).toEqual([]);
+    }
+  });
   it('App仅组织Provider和路由，不拥有请求、业务状态或业务表单', () => {
     const app = source('App.tsx');
     expect(app).not.toMatch(/\buseState\b|\buseEffect\b|\bapi\.|\bfetch\(|<form\b|<input\b/);
@@ -40,7 +54,8 @@ describe('业务职责边界', () => {
     for (const file of files(root)) {
       const relative = file.replace(`${root}${sep}`, '').replaceAll(sep, '/');
       expect(relative).not.toBe('api.ts');
-      expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"][^'"]*\/api['"]/);
+      // The shared type barrel is a contract mirror, not the runtime aggregate.
+      expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"]\.\.?\/[^'"]*\/api['"]/);
       expect(readFileSync(file, 'utf8')).not.toMatch(/(?<![:/])\bapi\.[A-Za-z]/);
     }
   });

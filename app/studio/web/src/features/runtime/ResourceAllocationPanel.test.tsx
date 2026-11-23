@@ -2,7 +2,7 @@ import { act, fireEvent, render as baseRender, screen, within } from '@testing-l
 import type { ReactElement } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ResourceAllocationPanel } from './ResourceAllocationPanel';
-import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
+import type { RuntimeInstance, RuntimeStatus } from '@shared/types/api';
 import { TooltipProvider } from '../../shared/ui/Tooltip';
 
 function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }

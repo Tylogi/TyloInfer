@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { useServingStatistics } from './useServingStatistics';
-import type { ServingStatistics } from '../../shared/api/contracts/runtime';
+import type { ServingStatistics } from '@shared/types/contracts/runtime';
 
 const api = vi.hoisted(() => vi.fn());
 vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { servingStatistics: api } }));

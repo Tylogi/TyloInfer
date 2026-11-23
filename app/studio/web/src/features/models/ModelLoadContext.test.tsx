@@ -1,3 +1,4 @@
+import { useStudioSharedPresentation } from '../../../tests/shared-presentation';
 import { useState } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -5,9 +6,10 @@ import { ModelLoadContext } from './ModelLoadContext';
 import { DEFAULT_LOAD_CONTEXT, readLoadContext, saveLoadContext } from './loadContextDefaults';
 import { setApiBaseUrl } from '../../shared/api/client';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { ModelArtifact } from '../../shared/api/types';
+import type { ModelArtifact } from '@shared/types/api';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string) => zh }) }));
+useStudioSharedPresentation((zh: string) => zh);
 
 const model: ModelArtifact = { id: 'fixture', name: 'Dense model', architecture: 'qwen3_5', format: 'gguf',
   shard_count: 1, total_bytes: 2 ** 30, tensor_count: 1, record_count: 1, dtypes: [],

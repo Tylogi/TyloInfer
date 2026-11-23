@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AnalysisWorkspaceView } from '../../../studio/web/src/features/analysis/AnalysisWorkspaceView.tsx';
+import { AnalysisWorkspaceView } from '@shared/features/analysis/AnalysisWorkspaceView.tsx';
 
 export function AnalysisContent({ inventory, api, tr, refreshKey, refresh, selectedModel, analysisSelection: selected, setAnalysisSelection: setSelected, inventoryLoading, inventoryError }) {
   const models = inventory?.models || [];

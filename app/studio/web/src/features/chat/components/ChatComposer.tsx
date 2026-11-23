@@ -1,7 +1,7 @@
 
 import { useRef, type FormEvent, type ReactNode } from 'react';
-import { Icon } from '../../../app/display';
-import { formatNumber } from '../../../app/formatters';
+import { Icon } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
 import { VideoWithFirstFrame } from '../MessageMedia';
 import { useChatAttachmentActions, useChatAttachmentList } from '../ChatAttachmentsProvider';
 import { isGenerationBusy, type GenerationPhase } from '../state/generationController';

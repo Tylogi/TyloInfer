@@ -1,9 +1,9 @@
 import { useSettings } from '../settings/SettingsProvider';
-import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
-import { formatNumber } from '../../app/formatters';
+import { Icon, SectionLabel, TMPanel, EmptyPanel } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
 import type { useModelCatalog } from './useModelCatalog';
-import { ModelVendorMark } from '../../app/ModelVendorMark';
-import { ModelLoadProgress } from './ModelLoadProgress';
+import { ModelVendorMark } from '@shared/ui/ModelVendorMark';
+import { ModelLoadProgress } from '@shared/features/models/ModelLoadProgress';
 
 export function LoadedModels({ catalog, unlistedOnly = false }: { catalog: ReturnType<typeof useModelCatalog>; unlistedOnly?: boolean }) {
   const { tr } = useSettings();

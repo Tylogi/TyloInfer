@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
-import type { AnalysisExpert, AnalysisTensor } from '../../shared/api/types';
-import { analysisCategoryLabel, averageBpw, categoryLabel, expertPoints, ffnPrecisionSeries, layerBudgetSeries, otherProjectionSeries, PRECISION_BPW_MIN, PRECISION_BPW_MAX, precisionColor, projectionSeries, routerWeightLabel, specialTensorBudgets } from './analysisData';
+import type { AnalysisExpert, AnalysisTensor } from '@shared/types/api';
+import { analysisCategoryLabel, averageBpw, categoryLabel, expertPoints, ffnPrecisionSeries, layerBudgetSeries, otherProjectionSeries, PRECISION_BPW_MIN, PRECISION_BPW_MAX, precisionColor, projectionSeries, routerWeightLabel, specialTensorBudgets } from '@shared/features/analysis/analysisData';
 import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
 
 it('labels attention projections by their concrete architecture and their actual layers', () => {

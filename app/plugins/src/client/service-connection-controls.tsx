@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { SettingRow } from '../../../studio/web/src/app/display.tsx';
+import { SettingRow } from '@shared/ui/display.tsx';
 import { CoreError } from './page-kit.tsx';
 
 export function ListenerControls({ listener, api, mutation, disabled, tr }) {

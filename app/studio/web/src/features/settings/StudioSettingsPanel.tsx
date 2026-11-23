@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useSettings } from './SettingsProvider';
 import type { UiLanguage, UiTheme } from './configuration';
-import { Icon, type IconName } from '../../app/display';
+import { Icon, type IconName } from '@shared/ui/display';
 import studioPackage from '../../../../../package.json';
 import './settings-panel.css';
 

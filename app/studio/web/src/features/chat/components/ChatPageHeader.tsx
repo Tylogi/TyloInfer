@@ -1,9 +1,9 @@
 import { useSettings } from '../../settings/SettingsProvider';
 import { useConversationSelector } from '../state/conversationStore';
-import { Icon } from '../../../app/display';
-import { formatNumber } from '../../../app/formatters';
+import { Icon } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
 import type { ChatPageState } from '../hooks/useChatPageState';
-import { ModelVendorMark } from '../../../app/ModelVendorMark';
+import { ModelVendorMark } from '@shared/ui/ModelVendorMark';
 import { useRef, useState } from 'react';
 import { Dialog } from '../../../shared/ui/Dialog';
 import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel';

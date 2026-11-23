@@ -4,8 +4,8 @@ import { useRuntime } from '../../../app/RuntimeProvider';
 import { useSettings } from '../../settings/SettingsProvider';
 import { modeTemplateSettings, type GenerationSettings } from '../../settings/configuration';
 import { DOCUMENT_ACCEPT } from '../attachments';
-import { runtimeModelNames } from '../../runtime/modelSelection';
-import type { SessionMode, SamplingParams } from '../../../shared/api/types';
+import { runtimeModelNames } from '@shared/features/runtime/modelSelection';
+import type { SessionMode, SamplingParams } from '@shared/types/api';
 import { useJobStore } from '../../../stores/jobStore';
 
 const EMPTY_REASONING_VALUES: string[] = [];

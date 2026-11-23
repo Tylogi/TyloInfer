@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { ModelCacheProfile } from '../../shared/api/types';
+import type { ModelCacheProfile } from '@shared/types/api';
 import { useSettings } from '../settings/SettingsProvider';
 
 export function useModelCacheProfiles(models: string[], enabled = true) {

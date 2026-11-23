@@ -1,15 +1,17 @@
 
+import { useStudioSharedPresentation } from '../../../tests/shared-presentation';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import type { useModelCatalog } from './useModelCatalog';
 import { LoadedModels } from './LoadedModels';
-import { LocalCheckpoints } from './LocalCheckpoints';
-import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { LocalCheckpoints } from '@shared/features/models/LocalCheckpoints';
+import { ModelLoadPolicy } from '@shared/features/models/ModelLoadPolicy';
 import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
 }));
+useStudioSharedPresentation((zh: string) => zh);
 
 
 function catalog() {

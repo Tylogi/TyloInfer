@@ -1,9 +1,9 @@
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
-import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { formatBytes } from '../../app/formatters';
+import { SectionLabel, SettingRow, TMPanel } from '@shared/ui/display';
+import { formatBytes } from '@shared/formatters';
 import { MemoryBudgetControls } from './MemoryBudgetControls';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { hasSeparateVram } from '@shared/features/runtime/memoryArchitecture';
 export function MemorySettingsPanel() {
   const { instances, runtime } = useRuntime();
   const { tr } = useSettings();

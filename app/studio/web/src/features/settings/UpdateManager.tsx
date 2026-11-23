@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
-import { Icon } from '../../app/display';
+import { Icon } from '@shared/ui/display';
 import { Switch } from '../../shared/ui/Switch';
 import { browserUpdateStatus, cachedBrowserStatus, compareVersions, isReleaseTag, setBrowserAutomatic, studioBuild } from './releases';
 

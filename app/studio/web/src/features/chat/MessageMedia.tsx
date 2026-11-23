@@ -1,8 +1,8 @@
 
 import { useEffect, useState } from 'react';
 import { mediaApi } from '../../shared/api/resources/media';
-import type { ContentPart } from '../../shared/api/types';
-import { formatNumber } from '../../app/formatters';
+import type { ContentPart } from '@shared/types/api';
+import { formatNumber } from '@shared/formatters';
 
 
 export function VideoWithFirstFrame({

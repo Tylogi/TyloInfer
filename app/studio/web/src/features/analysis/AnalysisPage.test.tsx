@@ -4,7 +4,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { AnalysisPage } from './AnalysisPage';
 import { modelsApi } from '../../shared/api/resources/models';
 import { analysisArtifacts, analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
-import { averageBpw, expertPoints } from './analysisData';
+import { averageBpw, expertPoints } from '@shared/features/analysis/analysisData';
 
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ selectedModel: analysisArtifacts[0].name, connectionRevision: 0 }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));

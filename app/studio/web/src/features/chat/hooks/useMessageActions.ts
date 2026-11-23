@@ -1,10 +1,10 @@
 import { useMemo, useRef, useState } from 'react';
 import type { EditDraft } from '../SavedMessageList';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import type { ContentPart, Message, Session } from '../../../shared/api/types';
+import type { ContentPart, Message, Session } from '@shared/types/api';
 import { textParts, isMediaPart } from '../messageParts';
 import type { useConversationSessions } from './useConversationSessions';
-import { errorMessage } from '../../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 
 interface MessageActionOptions {
   conversation: ReturnType<typeof useConversationSessions>;

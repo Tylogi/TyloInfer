@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { JobEventsView, LogDetailsView, RequestMetricsView } from '../../../studio/web/src/features/runtime/LogDetailsView.tsx';
+import { JobEventsView, LogDetailsView, RequestMetricsView } from '@shared/features/runtime/LogDetailsView.tsx';
 import { CoreError } from './page-kit.tsx';
 import { mergeJobEvents } from './job-events.ts';
 import { terminalStates } from './model-api.ts';

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { expect, it } from 'vitest';
 import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
-import { ArchitectureDiagram } from './ArchitectureDiagram';
+import { ArchitectureDiagram } from '@shared/features/analysis/ArchitectureDiagram';
 const tr = (_zh: string, en: string) => en;
 
 it('opens component subgraphs from overview nodes and supports expanded inspection', async () => {

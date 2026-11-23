@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '../../shared/api/types';
+import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '@shared/types/api';
 import { modelsApi } from '../../shared/api/resources/models';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { ModelBrowser } from './ModelBrowser';

@@ -1,7 +1,7 @@
 import type { LoadContextDefaults } from './loadContextDefaults';
-import type { ModelArtifact, RuntimeStatus } from '../../shared/api/types';
+import type { ModelArtifact, RuntimeStatus } from '@shared/types/api';
 import { modelsApi } from '../../shared/api/resources/models';
-import { ModelLoadContextView } from './ModelLoadContextView';
+import { ModelLoadContextView } from '@shared/features/models/ModelLoadContextView';
 
 export function ModelLoadContext({ value, onChange, disabled, models = [], deviceIds = [] }: {
   value: LoadContextDefaults; onChange(value: LoadContextDefaults): void; disabled?: boolean;

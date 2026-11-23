@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import { expect, it } from 'vitest';
-import { ModelVendorMark, modelVendor } from './ModelVendorMark';
+import { ModelVendorMark, modelVendor } from '@shared/ui/ModelVendorMark';
 
 it.each([
   ['qwen4_exp_text', 'qwen'], ['Qwen3NextForCausalLM', 'qwen'], ['qwen3_vl', 'qwen'],

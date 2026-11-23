@@ -1,13 +1,13 @@
 import { render, screen, within } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import type { ModelArtifact } from '../../shared/api/types';
+import type { ModelArtifact } from '@shared/types/api';
 import type { useModelCatalog } from './useModelCatalog';
-import { LocalCheckpoints } from './LocalCheckpoints';
+import { LocalCheckpoints } from '@shared/features/models/LocalCheckpoints';
 import userEvent from '@testing-library/user-event';
 import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
-vi.mock('./ModelLoadProgress', () => ({ ModelLoadProgress: () => null }));
+vi.mock('@shared/features/models/ModelLoadProgress', () => ({ ModelLoadProgress: () => null }));
 
 it('shows streamed Jev placement and updates pressure when full VRAM is selected', () => {
   const GiB = 2 ** 30;

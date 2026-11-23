@@ -10,7 +10,7 @@ import { useChatInference } from '../src/features/chat/hooks/useChatInference';
 import { ChatToolbar } from '../src/features/chat/components/ChatToolbar';
 import { useConversationSelector } from '../src/features/chat/state/conversationStore';
 import { DOCUMENT_ACCEPT } from '../src/features/chat/attachments';
-import type { RuntimeCapabilities, RuntimeInstance } from '../src/shared/api/types';
+import type { RuntimeCapabilities, RuntimeInstance } from '@shared/types/api';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: vi.fn() }));

@@ -1,13 +1,13 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react';
-import { errorMessage } from '../../app/formatters';
-import { DownloadDirectoryView } from './DownloadDirectoryView';
+import { errorMessage } from '@shared/formatters';
+import { DownloadDirectoryView } from '@shared/features/models/DownloadDirectoryView';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { modelsApi, type DownloadDirectoryStatus } from '../../shared/api/resources/models';
-import type { ModelDirectoryList } from '../../shared/api/types';
+import type { ModelDirectoryList } from '@shared/types/api';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
-import { ModelDirectoryDialog } from './ModelDirectoryDialog';
+import { ModelDirectoryDialog } from '@shared/features/models/ModelDirectoryDialog';
 
 
 export function DownloadDirectoryControl({ onDirectoryChange }: { onDirectoryChange(path: string | undefined): void }) {

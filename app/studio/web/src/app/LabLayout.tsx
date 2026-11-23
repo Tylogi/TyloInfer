@@ -1,6 +1,6 @@
 import { Outlet, useLocation } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
-import { ScreenHeader } from './display';
+import { ScreenHeader } from '@shared/ui/display';
 
 const tools = [
   { path: '/analysis', zh: '分析', en: 'Analysis',

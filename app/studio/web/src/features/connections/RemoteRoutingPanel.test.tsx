@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { connectionsApi } from '../../shared/api/resources/connections';
-import type { RemoteNode } from '../../shared/api/types';
+import type { RemoteNode } from '@shared/types/api';
 import { RemoteRoutingPanel } from './RemoteRoutingPanel';
 
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ready: true, connectionRevision: 1 }) }));

@@ -19,10 +19,10 @@ import type {
   RuntimeCapabilities,
   RealtimeCapabilities,
   VoiceOutputComponentStatus,
-} from '../shared/api/types';
+} from '@shared/types/api';
 import { studioStatus, studioCredential, startLocalStudio, connectExistingStudio, type StudioStatus } from '../studio';
-import { isRuntimeReady, runtimeSelectionNames } from '../features/runtime/modelSelection';
-import { errorMessage } from './formatters';
+import { isRuntimeReady, runtimeSelectionNames } from '@shared/features/runtime/modelSelection';
+import { errorMessage } from '@shared/formatters';
 import { useJobStore } from '../stores/jobStore';
 
 interface RuntimeContextValue {

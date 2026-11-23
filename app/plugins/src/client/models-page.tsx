@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ModelDeleteDialog } from '../../../studio/web/src/features/models/ModelDeleteDialog.tsx';
-import { LocalCheckpoints } from '../../../studio/web/src/features/models/LocalCheckpoints.tsx';
-import { Icon, SectionLabel, TMPanel } from '../../../studio/web/src/app/display.tsx';
+import { ModelDeleteDialog } from '@shared/features/models/ModelDeleteDialog.tsx';
+import { LocalCheckpoints } from '@shared/features/models/LocalCheckpoints.tsx';
+import { Icon, SectionLabel, TMPanel } from '@shared/ui/display.tsx';
 import { CoreError } from './page-kit.tsx';
-import { ModelLibrarySummary } from '../../../studio/web/src/features/models/ModelLibrarySummary.tsx';
+import { ModelLibrarySummary } from '@shared/features/models/ModelLibrarySummary.tsx';
 import { ModelManagement } from './model-panel.tsx';
 import { ModelRegistration } from './model-registration.tsx';
 

@@ -6,10 +6,10 @@ import { ModelsPage } from './ModelsPage';
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 vi.mock('./useModelCatalog', () => ({ useModelCatalog: () => ({ artifacts: [], busy: false, availableModelNames: [], modelFolderPath: '/models' }) }));
 vi.mock('./LoadedModels', () => ({ LoadedModels: () => null }));
-vi.mock('./ModelLoadPolicy', () => ({ ModelLoadPolicy: () => null }));
+vi.mock('@shared/features/models/ModelLoadPolicy', () => ({ ModelLoadPolicy: () => null }));
 vi.mock('./ModelSettingsDialog', () => ({ ModelSettingsDialog: () => null }));
-vi.mock('./LocalCheckpoints', () => ({ LocalCheckpoints: () => <h2>Local checkpoints list</h2> }));
-vi.mock('./ModelDirectoryDialog', () => ({ ModelDirectoryDialog: () => null }));
+vi.mock('@shared/features/models/LocalCheckpoints', () => ({ LocalCheckpoints: () => <h2>Local checkpoints list</h2> }));
+vi.mock('@shared/features/models/ModelDirectoryDialog', () => ({ ModelDirectoryDialog: () => null }));
 
 const scroll = vi.fn();
 beforeEach(() => { scroll.mockClear(); Element.prototype.scrollIntoView = scroll; });

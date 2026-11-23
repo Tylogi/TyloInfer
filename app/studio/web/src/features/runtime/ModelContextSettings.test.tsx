@@ -1,9 +1,10 @@
+import { useStudioSharedPresentation } from '../../../tests/shared-presentation';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ModelContextSettings } from './ModelContextSettings';
 import { useJobStore } from '../../stores/jobStore';
 import { ApiError } from '../../shared/api/client';
-import type { ModelCacheProfile, RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
+import type { ModelCacheProfile, RuntimeInstance, RuntimeStatus } from '@shared/types/api';
 
 const mocks = vi.hoisted(() => ({ policy: vi.fn(), configurePolicy: vi.fn(), reloadGlobal: vi.fn(), addJob: vi.fn(), info: vi.fn(), reload: vi.fn(), warning: vi.fn(), artifacts: vi.fn(), profile: vi.fn() }));
 const state = vi.hoisted(() => ({ language: 'en', ready: true, connectionRevision: 0, reloadingInstances: {},
@@ -11,6 +12,7 @@ const state = vi.hoisted(() => ({ language: 'en', ready: true, connectionRevisio
   instances: [{ id: 'a', model: 'Model A', state: 'ready', context_size: 262144, context_capacity: 262144 }] as RuntimeInstance[] }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ...state, reloadModelContext: mocks.reload, addJob: mocks.addJob }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.language === 'en' ? en : zh }) }));
+useStudioSharedPresentation((zh: string, en: string) => state.language === 'en' ? en : zh);
 vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { contextPolicy: mocks.policy, configureContextPolicy: mocks.configurePolicy, reloadGlobalContextCap: mocks.reloadGlobal, yarnContextInfo: mocks.info } }));
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { modelArtifacts: mocks.artifacts, modelCacheProfile: mocks.profile } }));
 vi.mock('../../stores/toastStore', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: mocks.warning } }));

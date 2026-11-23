@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MemoryBudgetControlsView } from '../../../studio/web/src/features/connections/MemoryBudgetControlsView.tsx';
-import { PrefixCacheControlsView } from '../../../studio/web/src/features/connections/PrefixCacheControlsView.tsx';
-import { hasSeparateVram } from '../../../studio/web/src/features/runtime/memoryArchitecture.ts';
-import { SectionLabel, SettingRow, TMPanel } from '../../../studio/web/src/app/display.tsx';
+import { MemoryBudgetControlsView } from '@shared/features/connections/MemoryBudgetControlsView.tsx';
+import { PrefixCacheControlsView } from '@shared/features/connections/PrefixCacheControlsView.tsx';
+import { hasSeparateVram } from '@shared/features/runtime/memoryArchitecture.ts';
+import { SectionLabel, SettingRow, TMPanel } from '@shared/ui/display.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { CacheDirectoryControl } from './cache-directory.tsx';
 import { bytes, CoreError, Facts } from './page-kit.tsx';

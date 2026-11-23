@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
-import { cacheBreakdown, cacheUsageBytes, estimateCacheBytes, kvOnlyProfile } from './cacheData';
+import { cacheBreakdown, cacheUsageBytes, estimateCacheBytes, kvOnlyProfile } from '@shared/features/models/cacheData';
 
 it('keeps QSA raw, indexer and total amounts consistent at every context', () => {
   const profile = analysisFixture().cache_profile!;

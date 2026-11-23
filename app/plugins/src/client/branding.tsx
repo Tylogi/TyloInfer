@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import mark from '../../../studio/web/src/assets/tylogi-ai-lab-mark.svg?raw';
+import mark from '@shared/assets/tylogi-ai-lab-mark.svg?raw';
 
 export const productName = 'TyloInfer';
 export const productVersion = __TYLOINFER_PRODUCT_VERSION__;

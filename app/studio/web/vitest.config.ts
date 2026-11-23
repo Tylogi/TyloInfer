@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export default defineConfig({
   root: fileURLToPath(new URL('./', import.meta.url)),
+  resolve: { alias: { '@shared': fileURLToPath(new URL('../../shared', import.meta.url)) } },
   plugins: [react()],
   test: {
     environment: 'jsdom',

@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import { expect, it } from 'vitest';
-import { ModelMemoryPressure } from './ModelMemoryPressure';
+import { ModelMemoryPressure } from '@shared/features/models/ModelMemoryPressure';
 
 it.each([
   [25, 100, '25.0%', 25, '25%'],

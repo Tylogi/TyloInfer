@@ -1,4 +1,4 @@
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource } from '@shared/types/api';
 
 export const TERMINAL_JOB_STATUSES = new Set<JobResource["status"]>([
   "succeeded",

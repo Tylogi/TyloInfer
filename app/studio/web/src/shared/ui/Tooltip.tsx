@@ -3,7 +3,7 @@
 
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 import type { ReactElement, ReactNode } from 'react';
-import './primitives.css';
+import '@shared/ui/primitives.css';
 
 
 export interface TooltipProps {

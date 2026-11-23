@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ModelDirectoryDialog } from '../../../studio/web/src/features/models/ModelDirectoryDialog.tsx';
+import { ModelDirectoryDialog } from '@shared/features/models/ModelDirectoryDialog.tsx';
 
 export function ModelRegistration({ api, mutation, refreshKey, open, onOpenChange, triggerRef, modelId, startPath, onRegistered }) {
   const [location, setLocation] = useState(null);

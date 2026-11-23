@@ -6,19 +6,19 @@ import {
   ScreenHeader,
   SectionLabel,
   EmptyPanel,
-} from '../../app/display';
-import { errorMessage } from '../../app/formatters';
-import { runtimeModelNames } from './modelSelection';
-import { ServingStatisticsPanel, ServingTotalsPanel } from './ServingStatisticsPanel';
+} from '@shared/ui/display';
+import { errorMessage } from '@shared/formatters';
+import { runtimeModelNames } from '@shared/features/runtime/modelSelection';
+import { ServingStatisticsPanel, ServingTotalsPanel } from '@shared/features/runtime/ServingStatisticsPanel';
 import { useServingStatistics } from './useServingStatistics';
 import { RuntimeHero } from './RuntimeHero';
-import { MemoryHierarchy } from './MemoryHierarchy';
-import { residentMemoryCapacity } from './memoryArchitecture';
+import { MemoryHierarchy } from '@shared/features/runtime/MemoryHierarchy';
+import { residentMemoryCapacity } from '@shared/features/runtime/memoryArchitecture';
 import { anthropicEndpoint, jevEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
-import { OverviewModels, OverviewEndpoints } from './OverviewPanels';
+import { OverviewModels, OverviewEndpoints } from '@shared/features/runtime/OverviewPanels';
 import { AppearanceControls } from '../../app/AppearanceControls';
 
 export function OverviewPage() {

@@ -6,7 +6,7 @@ import { jobsApi } from '../../shared/api/resources/jobs';
 import { useJobStore } from '../../stores/jobStore';
 import { studioConfirm } from '../../studio';
 import { mergeRequestRecords, requestRecords } from './useLogHistory';
-import type { JobResource, RuntimeInstance, RuntimeLogEntry, RuntimeMetricSnapshot } from '../../shared/api/types';
+import type { JobResource, RuntimeInstance, RuntimeLogEntry, RuntimeMetricSnapshot } from '@shared/types/api';
 
 const state = vi.hoisted(() => ({ ready: true, connectionRevision: 0, refreshRuntime: vi.fn().mockResolvedValue(true),
   refreshError: null as string | null,

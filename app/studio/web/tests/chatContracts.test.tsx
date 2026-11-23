@@ -10,7 +10,7 @@ import { GenerationController } from '../src/features/chat/state/generationContr
 import { DEFAULT_SETTINGS } from '../src/features/settings/configuration';
 import { sessionsApi } from '../src/shared/api/resources/sessions';
 import { mediaApi } from '../src/shared/api/resources/media';
-import type { Message, Session, StreamRequest, ResponseResource } from '../src/shared/api/types';
+import type { Message, Session, StreamRequest, ResponseResource } from '@shared/types/api';
 
 const mocks = vi.hoisted(() => ({
   runtime: { ready: true, connectionRevision: 1, selectedModel: 'model-a', models: [{ id: 'model-a' }], instances: [], runtime: null, realtime: null, capabilities: null, setSelectedModel: vi.fn(), refreshRuntime: vi.fn() },

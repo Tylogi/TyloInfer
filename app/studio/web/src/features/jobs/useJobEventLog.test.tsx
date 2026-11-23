@@ -1,7 +1,7 @@
 
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { JobEventResource, RuntimeLogEntry } from '../../shared/api/types';
+import type { JobEventResource, RuntimeLogEntry } from '@shared/types/api';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { useJobEventLog } from './useJobEventLog';
 

@@ -1,7 +1,7 @@
 
 import { create } from 'zustand';
 import type { Dispatch, SetStateAction } from 'react';
-import type { Message, ResponseResource, Session } from '../../../shared/api/types';
+import type { Message, ResponseResource, Session } from '@shared/types/api';
 
 type Responses = Record<string, ResponseResource>;
 

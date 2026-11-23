@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ModelAliasMapping } from '../src/features/connections/ModelAliasMapping';
 import { PrefixCacheControls } from '../src/features/connections/PrefixCacheControls';
 import { MemoryBudgetControls } from '../src/features/connections/MemoryBudgetControls';
-import { RepositoryFiles } from '../src/features/models/RepositoryFiles';
+import { RepositoryFiles } from '@shared/features/models/RepositoryFiles';
 import { runtimeApi } from '../src/shared/api/resources/runtime';
 import { jobsApi } from '../src/shared/api/resources/jobs';
 import { useJobStore } from '../src/stores/jobStore';

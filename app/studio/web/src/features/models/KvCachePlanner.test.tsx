@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import type { ModelCacheProfile } from '../../shared/api/types';
-import { cacheUsageBytes, estimateCacheBytes, KvCachePlanner } from './KvCachePlanner';
+import type { ModelCacheProfile } from '@shared/types/api';
+import { cacheUsageBytes, estimateCacheBytes, KvCachePlanner } from '@shared/features/models/KvCachePlanner';
 import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
 
 const profile: ModelCacheProfile = {

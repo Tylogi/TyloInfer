@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { errorMessage } from '../../app/formatters';
+import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '@shared/ui/display';
+import { errorMessage } from '@shared/formatters';
 import {
   configureStudio,
   isStudio,
@@ -9,7 +9,7 @@ import {
   type StudioConfig,
 } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { runtimeModelNames } from '../runtime/modelSelection';
+import { runtimeModelNames } from '@shared/features/runtime/modelSelection';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { getApiBaseUrl, getApiToken, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
@@ -22,7 +22,7 @@ import { InferencePolicyPanel } from './InferencePolicyPanel';
 import { ApiAuthenticationPanel } from './ApiAuthenticationPanel';
 import { toast } from '../../stores/toastStore';
 import { ServerConnectionPage } from '../../app/ServerConnectionPage';
-import '../../shared/styles/configuration-layout.css';
+import '@shared/styles/configuration-layout.css';
 
 function browserConfig(): StudioConfig {
   const address = getApiBaseUrl() || 'http://127.0.0.1:8090';

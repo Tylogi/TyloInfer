@@ -4,9 +4,9 @@ TyloInfer 推理服务与完整 DSH Host 分别启动。启动只用官方 `dsh`
 
 ## 两种独立产品形态
 
-TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。Studio使用自己的 `app/studio/web/package.json` 构建入口：`pnpm run build` 只执行TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
+TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Agent产品接入而删除或退役。两个前端的工具链与构建入口都在 `app/package.json`：`pnpm --dir app build:studio` 只执行Studio的TypeScript与Vite构建，桌面Tauri入口也只调用这一路径；不要求构建、安装或启动DSH与新版Agent页面。推理核心继续独立提供HTTP API。
 
-`app/plugins/src/client/` 是 Agent 中的推理界面，不是独立 Studio 的替代安装。插件构建单向复用 Studio 的展示组件和样式源码，但依赖和工具由 `app/plugins/` 自己的 npm 清单和锁文件管理。不需要安装 `app/studio/web/` 的依赖，也不需要构建独立 Studio。
+`app/plugins/src/client/` 是 Agent 中的推理界面，不是独立 Studio 的替代安装。插件构建通过 `@shared` 别名单向复用 `app/shared/` 的展示组件与样式源码，不引用 `app/studio/web/src/`；依赖和工具由 `app/` 工作区的 `package.json` 与 `pnpm-lock.yaml` 管理。不需要安装 `app/studio/web/` 的依赖，也不需要构建独立 Studio。
 
 两种入口的功能与测试分别报告。当前独立Studio无模型预览的特定设置／执行能力限制，不代表整个Studio是待淘汰的过渡产品；旧Python Agent任务／设置门面的删除也不包括删除Studio或推理核心API。
 
@@ -15,9 +15,10 @@ TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Ag
 ## 安装布局与版本
 
 - `dsh/`：独立官方运行包的安装目录、固定版本依赖清单与锁文件（`package.json`／`package-lock.json`）；当前开发安装已归入此处，尚未发布最终安装包。
-- `app/plugins/`：独立 Node 工作区，一个 DSH bundle `@tyloinfer/dsh-plugin`。
+- `app/plugins/`：DSH bundle `@tyloinfer/dsh-plugin` 的源码与打包清单，依赖安装在 `app/` 工作区。
+- `app/shared/`：两端共用的展示层（组件、样式、类型），只有源码，没有自己的 `package.json`。
 - `app/plugins/src/host/`：推理适配和协议握手的 TypeScript 源码；Host 运行入口是构建产物 `lib/host/index.js`。
-- `app/plugins/src/client/`：产品 Client 源码；浏览器入口构建到 `app/app/plugins/lib/client.js`。
+- `app/plugins/src/client/`：产品 Client 源码；浏览器入口构建到 `app/plugins/lib/client.js`。
 - `DSH_HOME`：使用者显式指定的私有 profile、缓存与临时目录，不属于源码或发布资源。
 
 启动前必须核对三项。官方 CLI 不做这些核对，会照常启动并给出难定位的失败（Web 空白或 bundle 未加载）：
@@ -34,12 +35,12 @@ TyloInfer Studio持续作为纯推理引擎桌面软件和WebUI保留，不因Ag
 
 ```sh
 npm --prefix dsh ci
-npm --prefix plugins ci
-npm --prefix plugins run build
+pnpm --dir app install --frozen-lockfile
+pnpm --dir app build:plugins
 
 export DSH_HOME=$PWD/.tyloinfer/agent/home
 ./dsh/node_modules/.bin/dsh --profile tyloinfer-web --from-default-profile web --dump-config
-./dsh/node_modules/.bin/dsh plugin --profile tyloinfer-web add file:$PWD/plugins
+./dsh/node_modules/.bin/dsh plugin --profile tyloinfer-web add file:$PWD/app/plugins
 ./dsh/node_modules/.bin/dsh --profile tyloinfer-web --host 127.0.0.1 --port 8092
 ```
 
@@ -60,7 +61,7 @@ Host 插件的 `connectionFile` 是可选项。只有在 profile 或叠加层里
 使用同一套 Client 构建依赖，从仓库根目录生成 DS Bot 安装包，再将产物安装到现有的 DS Bot profile。将 `my-dsbot` 换成该 profile 的名称。
 
 ```sh
-npm --prefix plugins run build -- --dsbot
+pnpm --dir app build:dsbot
 dsh plugin --profile my-dsbot add "file:$PWD/app/plugins/dist/dsbot"
 ```
 

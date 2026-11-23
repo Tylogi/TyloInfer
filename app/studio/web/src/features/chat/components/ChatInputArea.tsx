@@ -2,7 +2,7 @@
 import { ArrowDownIcon } from '@phosphor-icons/react';
 import { useSettings } from '../../settings/SettingsProvider';
 import { useJobStore } from '../../../stores/jobStore';
-import { formatNumber, errorMessage } from '../../../app/formatters';
+import { formatNumber, errorMessage } from '@shared/formatters';
 import { ChatComposer } from './ChatComposer';
 import { ChatToolbar } from './ChatToolbar';
 import type { ChatPageState } from '../hooks/useChatPageState';

@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import { ModelBrowserView, type ModelBrowserServices } from './ModelBrowserView';
-import type { OfficialModelList } from '../../shared/api/types';
+import { ModelBrowserView, type ModelBrowserServices } from '@shared/features/models/ModelBrowserView';
+import type { OfficialModelList } from '@shared/types/api';
 import { useJobStore } from '../../stores/jobStore';
 
 const tr = (_zh: string, en: string) => en;

@@ -1,12 +1,12 @@
 import { useRef, useState } from 'react';
-import { LogUpdateControl } from './LogUpdateControl';
+import { LogUpdateControl } from '@shared/features/runtime/LogUpdateControl';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource } from '@shared/types/api';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
-import { Icon, ScreenHeader, TMPanel } from '../../app/display';
-import { errorMessage, formatNumber } from '../../app/formatters';
+import { Icon, ScreenHeader, TMPanel } from '@shared/ui/display';
+import { errorMessage, formatNumber } from '@shared/formatters';
 import { isTerminalJob } from '../jobs/jobSchema';
 import { studioConfirm } from '../../studio';
 import { toast } from '../../stores/toastStore';

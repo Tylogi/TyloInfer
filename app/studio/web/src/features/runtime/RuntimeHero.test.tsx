@@ -1,8 +1,9 @@
+import { useStudioSharedPresentation } from '../../../tests/shared-presentation';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
-import type { JobResource } from '../../shared/api/types';
+import type { RuntimeStatus } from '@shared/types/contracts/runtime';
+import type { JobResource } from '@shared/types/api';
 import { useJobStore } from '../../stores/jobStore';
 import { RuntimeHero } from './RuntimeHero';
 import { getApiBaseUrl, setApiBaseUrl } from '../../shared/api/client';
@@ -10,6 +11,7 @@ import { getApiBaseUrl, setApiBaseUrl } from '../../shared/api/client';
 const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, instances: [], studio: null, chinese: false }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.chinese ? zh : en }) }));
+useStudioSharedPresentation((zh: string, en: string) => state.chinese ? zh : en);
 
 function Location() {
   const location = useLocation();

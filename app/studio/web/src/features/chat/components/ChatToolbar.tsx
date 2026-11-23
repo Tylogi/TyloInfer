@@ -1,11 +1,11 @@
 
 import type { CSSProperties } from 'react';
-import type { SessionMode } from '../../../shared/api/types';
+import type { SessionMode } from '@shared/types/api';
 import { useChat } from '../ChatProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { useVoiceLevel } from '../../voice/voiceLevelStore';
 import { useSettings } from '../../settings/SettingsProvider';
-import { Icon } from '../../../app/display';
+import { Icon } from '@shared/ui/display';
 import { Switch } from '../../../shared/ui/Switch';
 const MODE_LABELS: Record<SessionMode, [string, string]> = {
   text: ['文本', 'Text'],

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { PrefixCacheInventoryView, defaultCacheFilters } from '../../../studio/web/src/features/runtime/PrefixCacheInventoryView.tsx';
+import { PrefixCacheInventoryView, defaultCacheFilters } from '@shared/features/runtime/PrefixCacheInventoryView.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { bytes, CoreError, number } from './page-kit.tsx';
 

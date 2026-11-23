@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import { RepositoryFiles } from './RepositoryFiles';
-import type { HubModelVariant } from '../../shared/api/types';
+import { RepositoryFiles } from '@shared/features/models/RepositoryFiles';
+import type { HubModelVariant } from '@shared/types/api';
 
 const tr = (_zh: string, en: string) => en;
 const file = (name: string) => ({ name, byte_size: 1024 });

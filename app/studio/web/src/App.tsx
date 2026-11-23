@@ -6,7 +6,7 @@ import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
 import { LoadingPage } from './app/LoadingPage';
 import { NotFoundPage } from './app/NotFoundPage';
-import './shared/ui/primitives.css';
+import '@shared/ui/primitives.css';
 
 const OverviewPage = lazy(() =>
   import('./features/runtime/OverviewPage').then((module) => ({ default: module.OverviewPage })),

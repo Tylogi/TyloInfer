@@ -1,5 +1,5 @@
 import { useSettings } from '../../settings/SettingsProvider';
-import { Icon } from '../../../app/display';
+import { Icon } from '@shared/ui/display';
 import { useConversationSelector } from '../state/conversationStore';
 import type { ChatPageState } from '../hooks/useChatPageState';
 import { useEffect, useRef, useState } from 'react';

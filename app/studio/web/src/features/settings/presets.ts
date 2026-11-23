@@ -1,5 +1,5 @@
 
-import { GenerationPresetResource, SessionMode } from '../../shared/api/types';
+import { GenerationPresetResource, SessionMode } from '@shared/types/api';
 import { GenerationSettings, DEFAULT_SETTINGS } from './configuration';
 
 export type StoredPresetSettings = Pick<

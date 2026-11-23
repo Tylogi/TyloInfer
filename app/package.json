@@ -11,7 +11,7 @@
     "check:studio": "tsc -b studio/web && cargo check --manifest-path studio/web/src-tauri/Cargo.toml",
     "test:studio": "vitest run --config studio/web/vitest.config.ts",
     "test:e2e:studio": "playwright test --config studio/web/playwright.config.ts",
-    "tauri:studio": "pnpm --dir studio/web exec tauri",
+    "tauri:studio": "cd studio/web && tauri",
     "build:plugins": "tsc -p plugins/tsconfig.host.json && node plugins/build.mts",
     "build:dsbot": "tsc -p plugins/tsconfig.host.json && node plugins/build.mts --dsbot",
     "typecheck:plugins": "tsc -p plugins/tsconfig.host.json --noEmit && tsc -p plugins/tsconfig.client.json",

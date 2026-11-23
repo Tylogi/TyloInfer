@@ -4,7 +4,7 @@ import { useSettings } from '../features/settings/SettingsProvider';
 import { ApiError, getApiBaseUrl, getApiToken, setApiToken, verifyApiToken } from '../shared/api/client';
 import { saveStudioCredential } from '../studio';
 import { useRuntime } from './RuntimeProvider';
-import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
+import tyloInferMark from '@shared/assets/tylogi-ai-lab-mark.svg';
 
 export function LoginPage() {
   const { tr } = useSettings();

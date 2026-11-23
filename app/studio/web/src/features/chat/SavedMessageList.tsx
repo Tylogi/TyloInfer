@@ -1,9 +1,9 @@
 
 import { memo, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react';
-import type { Message, ResponseResource } from '../../shared/api/types';
-import { Icon } from '../../app/display';
-import { formatNumber } from '../../app/formatters';
-import { displayPrefillMetric, preferPositiveMetric } from '../runtime/metrics';
+import type { Message, ResponseResource } from '@shared/types/api';
+import { Icon } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
+import { displayPrefillMetric, preferPositiveMetric } from '@shared/features/runtime/metrics';
 import { DocumentPartView, MediaPartView } from './MessageMedia';
 import { isMediaPart, textParts } from './messageParts';
 import { renderMarkdown } from './MessageMarkdown';

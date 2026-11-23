@@ -14,7 +14,7 @@ import { setVoiceLevel } from '../voice/voiceLevelStore';
 import { ChatComposer } from './components/ChatComposer';
 import { ChatToolbar } from './components/ChatToolbar';
 import { SavedMessageList } from './SavedMessageList';
-import type { JobResource, Message, RuntimeModel, Session } from '../../shared/api/types';
+import type { JobResource, Message, RuntimeModel, Session } from '@shared/types/api';
 import { sessionsApi } from '../../shared/api/resources/sessions';
 import { studioConfirm } from '../../studio';
 import { TooltipProvider } from '../../shared/ui/Tooltip';

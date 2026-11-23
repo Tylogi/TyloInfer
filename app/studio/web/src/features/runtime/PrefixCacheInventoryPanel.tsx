@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtimeApi, type PrefixCacheInventory, type PrefixCacheText, type PrefixCacheFilters } from '../../shared/api/resources/runtime';
-import { PrefixCacheInventoryView } from './PrefixCacheInventoryView';
+import { PrefixCacheInventoryView } from '@shared/features/runtime/PrefixCacheInventoryView';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { hasSeparateVram } from './memoryArchitecture';
+import { hasSeparateVram } from '@shared/features/runtime/memoryArchitecture';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 
-import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
+import { errorMessage, formatBytes, formatNumber } from '@shared/formatters';
 import { studioConfirm } from '../../studio';
 import { toast } from '../../stores/toastStore';
 

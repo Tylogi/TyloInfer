@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import type { useModelCatalog } from './useModelCatalog';
-import { ModelDeleteDialog } from './ModelDeleteDialog';
+import { ModelDeleteDialog } from '@shared/features/models/ModelDeleteDialog';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 

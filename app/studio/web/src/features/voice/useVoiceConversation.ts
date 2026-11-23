@@ -8,7 +8,7 @@ import {
   type LiveVoiceOutput,
 } from './history';
 import { useSettings } from '../settings/SettingsProvider';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { resetVoiceLevel, setVoiceLevel } from './voiceLevelStore';
 
 

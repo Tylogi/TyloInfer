@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { DownloadDirectoryView } from '../../../studio/web/src/features/models/DownloadDirectoryView.tsx';
-import { ModelDirectoryDialog } from '../../../studio/web/src/features/models/ModelDirectoryDialog.tsx';
+import { DownloadDirectoryView } from '@shared/features/models/DownloadDirectoryView.tsx';
+import { ModelDirectoryDialog } from '@shared/features/models/ModelDirectoryDialog.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { CoreError, Facts } from './page-kit.tsx';
 

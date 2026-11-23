@@ -1,9 +1,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import type { SessionMode } from '../../../shared/api/types';
+import type { SessionMode } from '@shared/types/api';
 import { useRuntime } from '../../../app/RuntimeProvider';
-import { errorMessage } from '../../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useConversationStore } from '../state/conversationStore';
 import { useDraftStore } from '../state/draftStore';
 

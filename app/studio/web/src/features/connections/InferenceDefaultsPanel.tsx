@@ -1,8 +1,8 @@
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
-import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { formatNumber } from '../../app/formatters';
+import { SectionLabel, SettingRow, TMPanel } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
 export function InferenceDefaultsPanel() {
   const { settings, replaceSettings, tr } = useSettings();
   const { runtime, realtime } = useRuntime();

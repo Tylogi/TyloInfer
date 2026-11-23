@@ -1,5 +1,5 @@
-import { RuntimeHeroView } from './RuntimeHeroView';
-import { resolveRuntimeHero } from './runtimeHeroState';
+import { RuntimeHeroView } from '@shared/features/runtime/RuntimeHeroView';
+import { resolveRuntimeHero } from '@shared/features/runtime/runtimeHeroState';
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';

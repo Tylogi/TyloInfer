@@ -8,7 +8,7 @@ import { SavedMessageList } from '../src/features/chat/SavedMessageList';
 import { StreamingMessage } from '../src/features/chat/components/StreamingMessage';
 import { GenerationController } from '../src/features/chat/state/generationController';
 import { TooltipProvider } from '../src/shared/ui/Tooltip';
-import type { Message } from '../src/shared/api/types';
+import type { Message } from '@shared/types/api';
 
 const observers: { resize: () => void; observe: ReturnType<typeof vi.fn>; disconnect: ReturnType<typeof vi.fn> }[] = [];
 const frames = new Map<number, FrameRequestCallback>();

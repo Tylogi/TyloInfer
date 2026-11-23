@@ -2,25 +2,9 @@
 
 
 import { create } from 'zustand';
+import type { ToastType, ToastItemData } from '@shared/types/toast';
 
-
-export type ToastType = 'error' | 'success' | 'info' | 'warning';
-
-
-export interface ToastItemData {
-
-  id: string;
-
-  revision: number;
-
-  type: ToastType;
-
-  message: string;
-
-  title?: string;
-
-  duration?: number;
-}
+export type { ToastType, ToastItemData };
 
 
 export interface ShowToastOptions {

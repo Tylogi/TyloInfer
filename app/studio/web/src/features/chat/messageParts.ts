@@ -1,5 +1,5 @@
 
-import { ContentPart, Message } from '../../shared/api/types';
+import { ContentPart, Message } from '@shared/types/api';
 
 
 export function textParts(message: Message): { text: string; reasoning: string } {

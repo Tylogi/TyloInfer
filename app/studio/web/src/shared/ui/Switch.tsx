@@ -1,6 +1,6 @@
 
 import * as SwitchPrimitive from '@radix-ui/react-switch';
-import './primitives.css';
+import '@shared/ui/primitives.css';
 
 interface SwitchProps {
   checked: boolean;

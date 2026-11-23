@@ -1,4 +1,4 @@
-import type { AnalysisExpert, AnalysisTensor, CheckpointAnalysis, ModelArtifact } from '../../src/shared/api/types';
+import type { AnalysisExpert, AnalysisTensor, CheckpointAnalysis, ModelArtifact } from '@shared/types/api';
 
 export const analysisArtifacts: ModelArtifact[] = [
   { id: 'a'.repeat(32), name: 'Qwen3.8-Flash-Next-EWQ-MFQ-S4-L', architecture: 'qwen4_exp', format: 'tq', shard_count: 6,

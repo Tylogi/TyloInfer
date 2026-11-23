@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { HubModelInfo, HubModelSearchPage } from '../../shared/api/types';
+import type { HubModelInfo, HubModelSearchPage } from '@shared/types/api';
 import { CommunityModelBrowser } from './CommunityModelBrowser';
 
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: {

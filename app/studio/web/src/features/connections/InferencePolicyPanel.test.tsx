@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { RuntimeStatus } from '../../shared/api/types';
+import type { RuntimeStatus } from '@shared/types/api';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { InferencePolicyPanel } from './InferencePolicyPanel';
 

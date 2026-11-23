@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ModelDirectoryDialog } from '../../../studio/web/src/features/models/ModelDirectoryDialog.tsx';
+import { ModelDirectoryDialog } from '@shared/features/models/ModelDirectoryDialog.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { terminalStates } from './model-api.ts';
 import { Facts } from './page-kit.tsx';

@@ -149,7 +149,7 @@ test('reuses Studio presentation without importing its standalone transport or r
   try {
     const css = [...scope.styles][0].textContent;
     for (const selector of ['.metric-grid', '.overview-memory-tiers', '.model-library-summary', '.configuration-tabs', '.resource-monitor-grid', '.logs-console', '.model-browser-layout', '.analysis-layout']) assert.ok(css.includes('.tylo-studio-inference ' + selector), selector);
-    assert.equal((artifact.match(/(?:var|const|let) PresenterContext =/g) || []).length, 1);
+    assert.equal((artifact.match(/(?:var|const|let) PresentationContext =/g) || []).length, 1);
     assert.ok(!/fetch\(|getApiToken|setApiBaseUrl|\/api\/v1\//.test(artifact));
     assert.match(artifact, /function AnalysisPanels/);
     assert.match(artifact, /function RuntimeHeroView/);

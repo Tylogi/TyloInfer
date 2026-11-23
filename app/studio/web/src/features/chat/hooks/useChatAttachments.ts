@@ -1,7 +1,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { mediaApi } from '../../../shared/api/resources/media';
-import type { ContentPart } from '../../../shared/api/types';
+import type { ContentPart } from '@shared/types/api';
 import {
   isTextDocument,
   MAX_DOCUMENT_BYTES,

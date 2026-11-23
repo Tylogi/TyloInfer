@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import type { ServingStatistics } from '../../shared/api/contracts/runtime';
-import { errorMessage } from '../../app/formatters';
+import type { ServingStatistics } from '@shared/types/contracts/runtime';
+import { errorMessage } from '@shared/formatters';
 
 export function useServingStatistics(scope: 'session' | 'alltime', revision: number) {
   const [data, setData] = useState<ServingStatistics | null>(null);

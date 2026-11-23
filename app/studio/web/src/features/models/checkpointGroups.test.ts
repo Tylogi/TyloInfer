@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
-import type { ModelArtifact } from '../../shared/api/types';
-import { checkpointModelName, groupCheckpoints } from './checkpointGroups';
+import type { ModelArtifact } from '@shared/types/api';
+import { checkpointModelName, groupCheckpoints } from '@shared/features/models/checkpointGroups';
 
 const artifact = (name: string, architecture = 'qwen4_exp_text', format: ModelArtifact['format'] = 'tq') => ({
   id: name, name, architecture, format,

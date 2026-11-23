@@ -1,7 +1,7 @@
 import { fireEvent, render as baseRender, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { MemoryHierarchy } from './MemoryHierarchy';
+import { MemoryHierarchy } from '@shared/features/runtime/MemoryHierarchy';
 import { TooltipProvider } from '../../shared/ui/Tooltip';
 
 beforeEach(() => {
@@ -36,7 +36,7 @@ it('shows eight separate VRAM, RAM and SSD tiers without treating unknown RAM te
   expect(container.querySelector('[data-storage="vram"]')).not.toBeInTheDocument();
   expect(screen.queryByText('RAM-streamed weights')).not.toBeInTheDocument();
 });
-import type { RuntimeInstance } from '../../shared/api/types';
+import type { RuntimeInstance } from '@shared/types/api';
 
 it.each([false, true])('accounts for RAM embeddings and streamed Jev weights in both panels (detailed=%s)', detailed => {
   const ordinary = model('ordinary', 1024), jev = model('jev', 512);

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import type { ModelArtifact, RuntimeInstance } from '../../shared/api/types';
-import { DFlash2Controls } from './DFlash2Controls';
+import type { ModelArtifact, RuntimeInstance } from '@shared/types/api';
+import { DFlash2Controls } from '@shared/features/models/DFlash2Controls';
 
 const model: ModelArtifact = {
   id: 'a'.repeat(32), name: 'Flash-Next', architecture: 'qwen4_exp_text', format: 'gguf',

@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { ModelLoadContextView } from '../../../studio/web/src/features/models/ModelLoadContextView.tsx';
-import { ModelLoadPolicy } from '../../../studio/web/src/features/models/ModelLoadPolicy.tsx';
-import { DFlash2Controls } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
-import { Icon, SettingRow } from '../../../studio/web/src/app/display.tsx';
+import { ModelLoadContextView } from '@shared/features/models/ModelLoadContextView.tsx';
+import { ModelLoadPolicy } from '@shared/features/models/ModelLoadPolicy.tsx';
+import { DFlash2Controls } from '@shared/features/models/DFlash2Controls.tsx';
+import { Icon, SettingRow } from '@shared/ui/display.tsx';
 import { Dialog } from './shared-primitives.tsx';
 import { PageTabs } from './page-navigation.tsx';
 

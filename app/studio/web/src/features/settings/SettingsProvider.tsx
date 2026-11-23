@@ -12,6 +12,7 @@ import {
 } from 'react';
 import { loadSettings, SETTINGS_KEY, type GenerationSettings } from './configuration';
 import { normalizeFontFamily } from './fontPreferences';
+import { SharedDisplay } from '../../app/shared-display';
 
 interface SettingsContextValue {
   settings: GenerationSettings;
@@ -31,6 +32,11 @@ const SettingsContext = createContext<SettingsContextValue | null>(null);
 
 
 export function SettingsProvider({ children }: { children: ReactNode }) {
+  return <SettingsContexts><SharedDisplay>{children}</SharedDisplay></SettingsContexts>;
+}
+
+
+function SettingsContexts({ children }: { children: ReactNode }) {
   const [settings, replaceSettings] = useState(loadSettings);
   const [contextSize, setContextSize] = useState<number | null>(null);
   const [persistenceError, setPersistenceError] = useState(false);

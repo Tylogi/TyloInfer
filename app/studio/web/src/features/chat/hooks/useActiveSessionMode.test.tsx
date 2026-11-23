@@ -1,7 +1,7 @@
 
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, expect, it } from 'vitest';
-import type { Session } from '../../../shared/api/types';
+import type { Session } from '@shared/types/api';
 import { useConversationStore } from '../state/conversationStore';
 import { useActiveSessionMode } from './useActiveSessionMode';
 

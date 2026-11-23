@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { terminalStates } from './model-api.ts';
 import { Dialog, Switch } from './shared-primitives.tsx';
-import { ModelMonogram } from '../../../studio/web/src/app/display.tsx';
-import { flashNextDraft } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
+import { ModelMonogram } from '@shared/ui/display.tsx';
+import { flashNextDraft } from '@shared/features/models/DFlash2Controls.tsx';
 import { LoadedModelSettings } from './loaded-model-settings.tsx';
 import { ModelLoadDialog } from './model-load-dialog.tsx';
 import { defaultLoadOptions, loadModelDrafts, saveModelDrafts } from './model-load-options.ts';

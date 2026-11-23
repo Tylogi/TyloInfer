@@ -1,7 +1,7 @@
 
-import type { ApiErrorBody } from './types';
-import { ApiError } from './ApiError';
-export { ApiError } from './ApiError';
+import type { ApiErrorBody } from '@shared/types/api';
+import { ApiError } from '@shared/types/ApiError';
+export { ApiError } from '@shared/types/ApiError';
 
 let apiBaseUrl = '';
 let apiToken = '';

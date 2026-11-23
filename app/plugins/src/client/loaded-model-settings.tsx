@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ModelSettingsDialogView } from '../../../studio/web/src/features/models/ModelSettingsDialogView.tsx';
-import { DFlash2Controls } from '../../../studio/web/src/features/models/DFlash2Controls.tsx';
-import { ModelContextSettingsView } from '../../../studio/web/src/features/runtime/ModelContextSettingsView.tsx';
+import { ModelSettingsDialogView } from '@shared/features/models/ModelSettingsDialogView.tsx';
+import { DFlash2Controls } from '@shared/features/models/DFlash2Controls.tsx';
+import { ModelContextSettingsView } from '@shared/features/runtime/ModelContextSettingsView.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { terminalStates } from './model-api.ts';
 import { bytes, CoreError, Facts } from './page-kit.tsx';

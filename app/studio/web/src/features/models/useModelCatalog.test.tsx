@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { JobResource, ModelArtifact } from '../../shared/api/types';
+import type { JobResource, ModelArtifact } from '@shared/types/api';
 import { ToastContainer } from '../../shared/ui/Toast';
 import { useJobStore } from '../../stores/jobStore';
 import { useToastStore } from '../../stores/toastStore';

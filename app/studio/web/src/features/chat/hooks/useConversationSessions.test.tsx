@@ -2,7 +2,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import type { Session, Message, RuntimeInstance } from '../../../shared/api/types';
+import type { Session, Message, RuntimeInstance } from '@shared/types/api';
 import { useConversationStore } from '../state/conversationStore';
 import { useDraftStore } from '../state/draftStore';
 import { useConversationSessions } from './useConversationSessions';

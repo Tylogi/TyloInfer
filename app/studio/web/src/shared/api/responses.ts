@@ -1,5 +1,5 @@
 
-import type { RealtimeFrame, StreamRequest } from './types';
+import type { RealtimeFrame, StreamRequest } from '@shared/types/api';
 import { ApiError, apiUrl, authorizedHeaders, errorFromResponse } from './client';
 import { readEventStream } from './eventStream';
 import { validateResponseFrame, type ResponseFrame } from './responseProtocol';

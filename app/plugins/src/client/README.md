@@ -47,13 +47,13 @@ A missing bridge is displayed as an error, never as invented model statistics. B
 From the repository root:
 
 ```sh
-npm --prefix plugins ci
-npm --prefix plugins run build
+pnpm --dir app install --frozen-lockfile
+pnpm --dir app build:plugins
 ```
 
-This uses the plugin workspace's Vite and dependencies. It reads shared presentation sources and styles from the repository without installing or building `../../studio/web`.
+This uses the `app/` workspace's Vite and dependencies. It reads the shared presentation sources and styles from [`../../../shared/`](../../../shared/) through the `@shared` alias, and never imports `../../studio/web/src`.
 
-The build emits a single lazy `window.__ModuleLoader__.load` factory. React is provided by the Host's `require('react')`; no React runtime or ReactDOM root is bundled. The source uses APIs present in React 18.2. The isolated official Host browser check also covers native rendering, settings persistence, same-session draft retention during inference navigation, refresh recovery and narrow-screen settings. These checks validate the currently exposed bounded workflows, not every standalone Studio control, real-weight inference, real downloads or final visual acceptance by the user.
+[`shared-presenters.tsx`](shared-presenters.tsx) supplies the shared display layer with this package's own translation function, job list and dialog/switch/tooltip controls through `PresentationProvider`; the shared components never reach into Studio stores or the plugin's private state. The build emits a single lazy `window.__ModuleLoader__.load` factory. React is provided by the Host's `require('react')`; no React runtime or ReactDOM root is bundled. The source uses APIs present in React 18.2. The isolated official Host browser check also covers native rendering, settings persistence, same-session draft retention during inference navigation, refresh recovery and narrow-screen settings. These checks validate the currently exposed bounded workflows, not every standalone Studio control, real-weight inference, real downloads or final visual acceptance by the user.
 
 The bare package row in [`cordis.patch.yml`](../../cordis.patch.yml) mounts the [Host](../host/) and lets DSH discover its `./client` export. Compatibility is limited to the pinned `0.2.2-rc.2` DSH release. The bundle is private.
 
@@ -62,7 +62,7 @@ The bare package row in [`cordis.patch.yml`](../../cordis.patch.yml) mounts the 
 Build the installable bundle from the repository root:
 
 ```sh
-npm --prefix plugins run build -- --dsbot
+pnpm --dir app build:dsbot
 ```
 
 Install `app/plugins/dist/dsbot` into the chosen DS Bot profile using DSH's `dsh plugin --profile <profile> add file:<bundle-directory>` command. This bundle carries [`dsbot.patch.yml`](../../dsbot.patch.yml) as its `cordis.patch.yml`, the compiled Host under `lib/host/`, and adds the **Inference engine** controls above Settings at the bottom of the sidebar. The TyloInfer provider defaults to `http://127.0.0.1:8090/v1`. After loading a model, select its automatically registered ID in the DS Bot model settings and configure its context and output limits. See the [model registration and output budget guide](../../../docs/agent-host.md#模型登记和输出预算).

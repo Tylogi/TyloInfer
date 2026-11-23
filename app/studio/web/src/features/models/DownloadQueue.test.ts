@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource } from '@shared/types/api';
 import { downloadEtaSeconds } from './DownloadQueue';
 
 const job: JobResource = { id: 'download', kind: 'download.modelscope', status: 'running', payload: {},

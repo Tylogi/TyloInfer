@@ -1,4 +1,4 @@
-import { SectionLabel, TMPanel } from '../../app/display';
+import { SectionLabel, TMPanel } from '@shared/ui/display';
 import { useSettings } from '../settings/SettingsProvider';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 

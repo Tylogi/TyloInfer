@@ -1,6 +1,6 @@
 # 应用层目录与统一前端构建迁移计划
 
-状态：方案已选定，迁移尚未执行。本文中的目标目录和目标命令尚不存在；本次仅编写计划。
+状态：已执行。`app/studio/`、`app/plugins/`、`app/shared/` 与 `app/package.json` 已落地，插件只通过 `@shared` 引用共用展示源码。下节的目标目录与目标命令即当前仓库现状；未验证项记录在 §8 末尾。
 
 ## 1. 已确定的方向
 
@@ -328,4 +328,20 @@ Tauri 与 `packaging/build_release.py` 调用 `app` 的 Studio 目标，不再�
 
 若需要回退，回退对应源码、锁文件及构建配置，并按回退后的工具链重建。不要用旧构建产物掩盖新代码失败，不删除用户模型、缓存、凭据或 profile，也不通过保留第二份长期源码来维持兼容。
 
-本计划描述后续迁移的实施范围，不代表已经开始迁移。本次没有执行目录移动、依赖安装、构建或运行验证。
+本计划描述迁移的实施范围，现已按 A–E 阶段完成；F 阶段只完成部分验证，见下。
+
+### 执行结果
+
+已验证（本机 Linux，Node 24.20.0，pnpm 工作区 `app/`）：
+
+- 删掉 `app/node_modules` 后清洁安装：`pnpm --dir app install --frozen-lockfile`、`typecheck`、`build`、`build:dsbot` 均通过；插件产物仍是一个懒加载 `window.__ModuleLoader__.load` 工厂，React 保持外部依赖。Studio 解析到 React 19.2.8，插件包解析到 React 18.2.0。
+- 清洁安装后重跑：Studio Web 102 个测试文件、947 个测试全部通过；插件 Node 测试 653 个，652 通过、1 跳过。
+- `app/plugins/src` 对 `app/studio/web/src` 的导入为 0（新增的依赖方向用例）；`app/shared` 对两个应用私有源码的导入也为 0。
+- Python：`HF_HUB_OFFLINE=1 app/studio/.venv/bin/python -m pytest app/studio/tests -q` 为 6 失败、1794 通过、84 跳过。其中 5 个是 `test_cuda_kv_tier_budget.py` 里迁移前已有的 `SimpleNamespace ... has no attribute 'backend'`；`test_server_jobs.py::test_execution_lanes_keep_limits_and_release_cancelled_slots[kinds0]` 单独重跑通过，属于全量并发下的时间敏感用例。
+
+未验证：
+
+- `cargo check --manifest-path app/studio/web/src-tauri/Cargo.toml` 在本机因缺少 `wayland-sys`／`wayland-client.pc` 系统依赖未能运行；Tauri 配置只改了 hook 的 `cwd`。
+- Playwright e2e（196 个用例）只列出了用例，未运行页面：`@playwright/test@1.65.1`（迁移前后同一锁定版本）需要 chromium build 1255，本机只有 1243，`playwright install chromium` 下载卡在 0% 无法完成。
+- CUDA/Metal 原生用例未重新建立迁移前基线，迁移后的失败不能归因于本次改动。
+- 未从清洁安装环境构建发布包，也未在 DSH/DS Bot 中重新挂载验证。

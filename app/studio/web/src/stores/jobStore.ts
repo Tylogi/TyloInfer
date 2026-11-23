@@ -4,7 +4,7 @@
 
 import { create } from 'zustand';
 import { jobsApi } from '../shared/api/resources/jobs';
-import type { JobResource, JobEventResource } from '../shared/api/types';
+import type { JobResource, JobEventResource } from '@shared/types/api';
 
 const ACTIVE_STATUSES: ReadonlySet<JobResource['status']> = new Set([
   'queued',

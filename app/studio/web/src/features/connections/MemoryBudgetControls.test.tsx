@@ -4,7 +4,7 @@ import { MemoryBudgetControls } from './MemoryBudgetControls';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
-import type { RuntimeStatus } from '../../shared/api/types';
+import type { RuntimeStatus } from '@shared/types/api';
 
 const api = vi.hoisted(() => ({ policy: vi.fn(), configure: vi.fn(), getJob: vi.fn(), addJob: vi.fn() }));
 const state = vi.hoisted(() => ({ runtime: null as Partial<RuntimeStatus> | null }));

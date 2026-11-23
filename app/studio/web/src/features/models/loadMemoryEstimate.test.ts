@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
-import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate';
-import type { ModelArtifact } from '../../shared/api/types';
+import { availableLoadMemory, estimateModelWeights } from '@shared/features/models/loadMemoryEstimate';
+import type { ModelArtifact } from '@shared/types/api';
 
 it('counts unified memory once even for CUDA', () => {
   expect(availableLoadMemory({ memory_architecture: 'unified', backend: 'cuda', host_memory_available_bytes: 48,

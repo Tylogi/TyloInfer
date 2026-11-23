@@ -4,7 +4,7 @@ import { expect, it } from 'vitest';
 
 it('keeps chat mode and reasoning selects the same height as toolbar buttons', () => {
   const style = document.createElement('style');
-  style.textContent = ['src/features/chat/chat.css', 'src/shared/styles/selects.css']
+  style.textContent = ['src/features/chat/chat.css', '../../shared/styles/selects.css']
     .map((path) => readFileSync(resolve(import.meta.dirname, '../', path), 'utf8'))
     .join('\n');
   const toolbar = document.createElement('div');

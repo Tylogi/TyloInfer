@@ -27,10 +27,10 @@ it('保留富文本依赖及公式样式入口', () => {
 it('表格与监控指标保留独立的中性样式约束', () => {
   const styles = [
     'src/features/chat/chat.css', 'src/features/chat/markdown/markdown.css', 'src/shared/styles/overrides.css',
-    'src/shared/styles/components.css', 'src/features/runtime/runtime.css',
+    '../../shared/styles/components.css', '../../shared/features/runtime/runtime.css',
   ].map((file) => readFileSync(resolve(import.meta.dirname, '../', file), 'utf8')).join('\n');
   expect(styles).toContain('.rich-text table');
   expect(styles).toContain('.runtime-chart polyline');
   expect(styles).not.toContain('.metric-tile::before');
-  expect(readFileSync(resolve(import.meta.dirname, '../src/app/display.tsx'), 'utf8')).not.toContain('metric-tile accent-');
+  expect(readFileSync(resolve(import.meta.dirname, '../../../shared/ui/display.tsx'), 'utf8')).not.toContain('metric-tile accent-');
 });

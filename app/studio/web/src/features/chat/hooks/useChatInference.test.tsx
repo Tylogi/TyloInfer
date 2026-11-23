@@ -1,6 +1,6 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { RuntimeStatus } from '../../../shared/api/types';
+import type { RuntimeStatus } from '@shared/types/api';
 import { DEFAULT_SETTINGS } from '../../settings/configuration';
 import { useChatInference } from './useChatInference';
 

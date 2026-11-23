@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { ModelLoadPolicy } from '@shared/features/models/ModelLoadPolicy';
 import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 import type { useModelCatalog } from './useModelCatalog';
 

@@ -5,7 +5,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderMarkdown } from '../src/features/chat/MessageMarkdown';
-import { parseHubReference } from '../src/features/models/hubReference';
+import { parseHubReference } from '@shared/features/models/hubReference';
 import { ModelBrowser } from '../src/features/models/ModelBrowser';
 import { ModelHubPage } from '../src/features/models/ModelHubPage';
 import { modelsApi } from '../src/shared/api/resources/models';

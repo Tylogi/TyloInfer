@@ -1,10 +1,10 @@
-import { AnalysisWorkspaceView } from './AnalysisWorkspaceView';
+import { AnalysisWorkspaceView } from '@shared/features/analysis/AnalysisWorkspaceView';
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { CheckpointAnalysis, ModelArtifact } from '../../shared/api/types';
+import type { CheckpointAnalysis, ModelArtifact } from '@shared/types/api';
 import { useSettings } from '../settings/SettingsProvider';
 
 export function AnalysisPage() {

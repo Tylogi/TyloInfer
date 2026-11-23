@@ -1,8 +1,8 @@
 
 import { expect, it } from 'vitest';
-import { displayPrefillMetric, preferPositiveMetric } from '../src/features/runtime/metrics';
+import { displayPrefillMetric, preferPositiveMetric } from '@shared/features/runtime/metrics';
 import { textParts } from '../src/features/chat/messageParts';
-import type { Message } from '../src/shared/api/types';
+import type { Message } from '@shared/types/api';
 
 it('优先使用运行时上报的预填充耗时与速度，不把 TTFT 当作预填充', () => {
   expect(displayPrefillMetric({

@@ -1,10 +1,10 @@
 
 import { useState, type Dispatch, type SetStateAction } from 'react';
-import type { JobResource, RuntimeLogEntry } from '../../shared/api/types';
+import type { JobResource, RuntimeLogEntry } from '@shared/types/api';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { modelsApi } from '../../shared/api/resources/models';
 import { studioConfirm } from '../../studio';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useJobStore } from '../../stores/jobStore';

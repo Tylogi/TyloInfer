@@ -1,5 +1,5 @@
 
-import type { RuntimeLogEntry, JobResource, JobEventResource, JobKindResource } from '../types';
+import type { RuntimeLogEntry, JobResource, JobEventResource, JobKindResource } from '@shared/types/api';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 import { readEventStream } from '../eventStream';
 

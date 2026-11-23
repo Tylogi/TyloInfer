@@ -1,6 +1,6 @@
 
 import type { Page } from '@playwright/test';
-import type { Message, OfficialModelList, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
+import type { Message, OfficialModelList, ResponseResource, Session, StreamRequest } from '@shared/types/api';
 
 const createdAt = '2026-09-23T00:00:00Z';
 const model = 'Studio Test Model';

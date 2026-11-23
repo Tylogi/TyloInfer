@@ -1,11 +1,11 @@
-import { PrefixCacheOverview } from './PrefixCacheOverview';
+import { PrefixCacheOverview } from '@shared/features/runtime/PrefixCacheOverview';
 import { useRef, useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
-import { ScreenHeader } from '../../app/display';
-import { errorMessage, formatNumber } from '../../app/formatters';
+import { ScreenHeader } from '@shared/ui/display';
+import { errorMessage, formatNumber } from '@shared/formatters';
 import { studioConfirm } from '../../studio';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
 import { ResourceAllocationPanel } from './ResourceAllocationPanel';

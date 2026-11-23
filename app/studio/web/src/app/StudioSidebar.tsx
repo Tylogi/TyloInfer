@@ -3,9 +3,9 @@ import { useLocation, useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { StudioSettingsPanel } from '../features/settings/StudioSettingsPanel';
 import { useUiStore } from '../stores/uiStore';
-import { Icon, type IconName } from './display';
+import { Icon, type IconName } from '@shared/ui/display';
 import { Dialog } from '../shared/ui/Dialog';
-import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
+import tyloInferMark from '@shared/assets/tylogi-ai-lab-mark.svg';
 
 const inferenceLinks: { path: string; label: [string, string]; icon: IconName }[] = [
   { path: '/inference', label: ['概览', 'Overview'], icon: 'gauge' },

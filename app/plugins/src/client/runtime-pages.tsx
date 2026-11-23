@@ -1,21 +1,21 @@
 import { RuntimeCache } from './runtime-cache.tsx';
 import { useLogHistory } from './log-history.tsx';
-import { OverviewModels, OverviewEndpoints } from '../../../studio/web/src/features/runtime/OverviewPanels.tsx';
-import { runtimeModelNames } from '../../../studio/web/src/features/runtime/modelSelection.ts';
+import { OverviewModels, OverviewEndpoints } from '@shared/features/runtime/OverviewPanels.tsx';
+import { runtimeModelNames } from '@shared/features/runtime/modelSelection.ts';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { terminalStates } from './model-api.ts';
 import React, { useEffect, useRef, useState } from 'react';
 import { ReadOnlyJobDetails, ReadOnlyLogDetails } from './log-details.tsx';
 import { CacheInventory } from './cache-inventory.tsx';
 import { bytes, CoreError, EmptyGuidance, number } from './page-kit.tsx';
-import { Icon, SectionLabel, TMPanel } from '../../../studio/web/src/app/display.tsx';
-import { RuntimeHeroView } from '../../../studio/web/src/features/runtime/RuntimeHeroView.tsx';
-import { resolveRuntimeHero } from '../../../studio/web/src/features/runtime/runtimeHeroState.ts';
-import { MemoryHierarchy } from '../../../studio/web/src/features/runtime/MemoryHierarchy.tsx';
-import { ResourceAllocationView } from '../../../studio/web/src/features/runtime/ResourceAllocationView.tsx';
-import { ResourceMonitorView } from '../../../studio/web/src/features/runtime/ResourceMonitorView.tsx';
-import { ServingStatisticsPanel, ServingTotalsPanel } from '../../../studio/web/src/features/runtime/ServingStatisticsPanel.tsx';
-import { residentMemoryCapacity } from '../../../studio/web/src/features/runtime/memoryArchitecture.ts';
+import { Icon, SectionLabel, TMPanel } from '@shared/ui/display.tsx';
+import { RuntimeHeroView } from '@shared/features/runtime/RuntimeHeroView.tsx';
+import { resolveRuntimeHero } from '@shared/features/runtime/runtimeHeroState.ts';
+import { MemoryHierarchy } from '@shared/features/runtime/MemoryHierarchy.tsx';
+import { ResourceAllocationView } from '@shared/features/runtime/ResourceAllocationView.tsx';
+import { ResourceMonitorView } from '@shared/features/runtime/ResourceMonitorView.tsx';
+import { ServingStatisticsPanel, ServingTotalsPanel } from '@shared/features/runtime/ServingStatisticsPanel.tsx';
+import { residentMemoryCapacity } from '@shared/features/runtime/memoryArchitecture.ts';
 
 export function OverviewContent({ values, inventory, api, tr, go, refreshKey, selectedModel, selectModel, loading }) {
   const instances = values.instances?.value?.data ?? inventory?.instances ?? [];

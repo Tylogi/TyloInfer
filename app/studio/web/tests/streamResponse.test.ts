@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../src/shared/api/client';
 import { streamResponse } from '../src/shared/api/responses';
-import type { StreamRequest } from '../src/shared/api/types';
+import type { StreamRequest } from '@shared/types/api';
 
 const request: StreamRequest = {
   request_id: 'request-1',

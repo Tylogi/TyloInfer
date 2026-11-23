@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import { InferencePolicyView } from './InferencePolicyView';
+import { InferencePolicyView } from '@shared/features/connections/InferencePolicyView';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
 

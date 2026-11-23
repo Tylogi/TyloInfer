@@ -5,7 +5,7 @@ import { expect, it, vi } from 'vitest';
 import { OverviewPage } from '../src/features/runtime/OverviewPage';
 import { SavedMessageList } from '../src/features/chat/SavedMessageList';
 import { TooltipProvider } from '../src/shared/ui/Tooltip';
-import type { Message, ResponseResource, ResponsePerformance } from '../src/shared/api/types';
+import type { Message, ResponseResource, ResponsePerformance } from '@shared/types/api';
 
 const performance: ResponsePerformance = {
   ttft_ms: 200, prefill_tokens: 40,

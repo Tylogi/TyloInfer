@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import type { RuntimeStatus, ServingStatistics } from '../../shared/api/contracts/runtime';
+import type { RuntimeStatus, ServingStatistics } from '@shared/types/contracts/runtime';
 import { OverviewPage } from './OverviewPage';
 import { setApiBaseUrl } from '../../shared/api/client';
 
@@ -12,7 +12,7 @@ vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh:
   settings: { theme: 'system', language: 'system' }, updateSettings: vi.fn() }) }));
 vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { runtimeListener: state.listener } }));
 vi.mock('./RuntimeHero', () => ({ RuntimeHero: () => null }));
-vi.mock('./MemoryHierarchy', () => ({ MemoryHierarchy: () => null }));
+vi.mock('@shared/features/runtime/MemoryHierarchy', () => ({ MemoryHierarchy: () => null }));
 vi.mock('./useServingStatistics', () => ({ useServingStatistics: (scope: string) => { state.scope = scope; return { data: state.data, error: null }; } }));
 
 beforeEach(() => { state.runtime = null; state.models = []; state.data = null; });

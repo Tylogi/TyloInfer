@@ -14,10 +14,10 @@ import {
 import { useLocation } from 'react-router';
 import { sessionsApi } from '../../shared/api/resources/sessions';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import type { ContentPart, Session, SessionMode } from '../../shared/api/types';
+import type { ContentPart, Session, SessionMode } from '@shared/types/api';
 import { studioConfirm } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { useConversationSessions } from './hooks/useConversationSessions';
 import { useChatGeneration } from './hooks/useChatGeneration';

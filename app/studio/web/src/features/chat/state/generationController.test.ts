@@ -1,6 +1,6 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
+import type { ResponseResource, Session, StreamRequest } from '@shared/types/api';
 import { GenerationController, type ConversationSnapshot } from './generationController';
 import type { ResponseFrame } from '../../../shared/api/responseProtocol';
 

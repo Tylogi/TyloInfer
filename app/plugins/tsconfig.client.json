@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "paths": { "@shared/*": ["../shared/*"] },
     "target": "es2024",
     "module": "esnext",
     "moduleResolution": "bundler",

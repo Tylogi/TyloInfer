@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { HubModelVariant } from '../../shared/api/types';
-import { downloadPatterns, isSharedEngram } from './downloadPatterns';
+import type { HubModelVariant } from '@shared/types/api';
+import { downloadPatterns, isSharedEngram } from '@shared/features/models/downloadPatterns';
 
 function variant(files: string[]): HubModelVariant {
   return { id: 'tq:TQ2.5/model', label: 'TQ2.5/model', format: 'tq', files, byte_size: 1024,

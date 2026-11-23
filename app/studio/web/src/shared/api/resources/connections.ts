@@ -1,5 +1,5 @@
 
-import type { RemoteNode } from '../types';
+import type { RemoteNode } from '@shared/types/api';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const connectionsApi = {

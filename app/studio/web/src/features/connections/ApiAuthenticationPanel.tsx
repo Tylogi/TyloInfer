@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { SettingRow } from '../../app/display';
-import { errorMessage } from '../../app/formatters';
+import { SettingRow } from '@shared/ui/display';
+import { errorMessage } from '@shared/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { getApiBaseUrl, getApiToken, setApiToken } from '../../shared/api/client';
 import { runtimeApi, type RuntimeAuthenticationPolicy } from '../../shared/api/resources/runtime';

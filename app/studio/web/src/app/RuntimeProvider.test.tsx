@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
 import { ApiError } from '../shared/api/client';
-import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '../shared/api/types';
+import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '@shared/types/api';
 import { connectExistingStudio, startLocalStudio, studioCredential, studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';

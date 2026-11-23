@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { ModelContextSettingsView } from '../../../studio/web/src/features/runtime/ModelContextSettingsView.tsx';
-import { SectionLabel, TMPanel } from '../../../studio/web/src/app/display.tsx';
+import { ModelContextSettingsView } from '@shared/features/runtime/ModelContextSettingsView.tsx';
+import { SectionLabel, TMPanel } from '@shared/ui/display.tsx';
 
 const profiles = () => ({ cacheProfiles: {}, cacheErrors: {} });
 const unavailable = () => Promise.reject(new Error('Global instance reload is not exposed by this bridge'));

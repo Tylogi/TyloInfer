@@ -2,7 +2,7 @@
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import { ApiError } from '../../../shared/api/client';
 import { streamResponse } from '../../../shared/api/responses';
-import type { Message, ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
+import type { Message, ResponseResource, Session, StreamRequest } from '@shared/types/api';
 import type { ResponseFrame } from '../../../shared/api/responseProtocol';
 
 export type GenerationPhase =

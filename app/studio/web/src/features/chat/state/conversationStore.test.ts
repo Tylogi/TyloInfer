@@ -1,6 +1,6 @@
 
 import { beforeEach, expect, it } from 'vitest';
-import type { Message, ResponseResource, Session } from '../../../shared/api/types';
+import type { Message, ResponseResource, Session } from '@shared/types/api';
 import { useConversationStore } from './conversationStore';
 
 const first = { id: 'a', model: 'model-a', title: 'A', mode: 'text', revision: 0 } as Session;

@@ -20,6 +20,7 @@ const release = !modified && git("tag", "--points-at", "HEAD").split("\n").inclu
 
 export default defineConfig({
   root: fileURLToPath(webRoot),
+  resolve: { alias: { '@shared': fileURLToPath(new URL('../../shared', webRoot)) } },
   plugins: [react()],
   define: {
     __TYLOINFER_STUDIO_BUILD__: JSON.stringify({

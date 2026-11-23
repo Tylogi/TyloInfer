@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "paths": { "@shared/*": ["../../shared/*"] },
     "target": "ES2022",
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],

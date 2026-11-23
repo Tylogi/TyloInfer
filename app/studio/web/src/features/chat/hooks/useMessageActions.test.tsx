@@ -2,7 +2,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import type { Message, Session } from '../../../shared/api/types';
+import type { Message, Session } from '@shared/types/api';
 import { useMessageActions } from './useMessageActions';
 import type { useConversationSessions } from './useConversationSessions';
 

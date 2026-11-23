@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ModelBrowserView } from '../../../studio/web/src/features/models/ModelBrowserView.tsx';
-import { DownloadQueueView } from '../../../studio/web/src/features/models/DownloadQueueView.tsx';
-import { useDownloadReuseView } from '../../../studio/web/src/features/models/useDownloadReuseView.ts';
-import { parseHubReference } from '../../../studio/web/src/features/models/hubReference.ts';
-import { Icon } from '../../../studio/web/src/app/display.tsx';
+import { ModelBrowserView } from '@shared/features/models/ModelBrowserView.tsx';
+import { DownloadQueueView } from '@shared/features/models/DownloadQueueView.tsx';
+import { useDownloadReuseView } from '@shared/features/models/useDownloadReuseView.ts';
+import { parseHubReference } from '@shared/features/models/hubReference.ts';
+import { Icon } from '@shared/ui/display.tsx';
 import { bytes, CoreError, Facts, rows } from './page-kit.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { DownloadDirectory } from './download-directory.tsx';

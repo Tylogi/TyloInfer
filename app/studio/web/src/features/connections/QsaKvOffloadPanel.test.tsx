@@ -1,11 +1,13 @@
+import { useStudioSharedPresentation } from '../../../tests/shared-presentation';
 import { useState } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { ModelCacheProfile, RuntimeInstance } from '../../shared/api/types';
-import { QsaKvOffloadPanel } from './QsaKvOffloadPanel';
+import type { ModelCacheProfile, RuntimeInstance } from '@shared/types/api';
+import { QsaKvOffloadPanel } from '@shared/features/connections/QsaKvOffloadPanel';
 
 const state = vi.hoisted(() => ({ language: 'en' }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.language === 'zh-CN' ? zh : en }) }));
+useStudioSharedPresentation((zh: string, en: string) => state.language === 'zh-CN' ? zh : en);
 const model = { id: 'qsa', model: 'Qwen3.8-Flash-Next', state: 'ready', qsa_kv_offload_supported: true } as RuntimeInstance;
 const profile: ModelCacheProfile = { max_context: 262144, fixed_bytes: 29978,
   fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [

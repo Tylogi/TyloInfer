@@ -4,7 +4,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import { CopySimpleIcon, MinusIcon, SquareIcon, XIcon } from '@phosphor-icons/react';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { studioCustomTitlebar } from '../shared/platform/studio';
-import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
+import tyloInferMark from '@shared/assets/tylogi-ai-lab-mark.svg';
 import './desktop-window.css';
 
 

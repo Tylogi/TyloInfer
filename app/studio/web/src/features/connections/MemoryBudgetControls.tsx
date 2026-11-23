@@ -5,7 +5,7 @@ import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
-import { MemoryBudgetControlsView } from './MemoryBudgetControlsView';
+import { MemoryBudgetControlsView } from '@shared/features/connections/MemoryBudgetControlsView';
 const services = { memoryPolicy: runtimeApi.memoryPolicy, configureMemoryPolicy: runtimeApi.configureMemoryPolicy, getJob: jobsApi.getJob };
 export function MemoryBudgetControls({ residency, children }: { residency: string; children?: ReactNode }) {
   const { runtime, addJob } = useRuntime();

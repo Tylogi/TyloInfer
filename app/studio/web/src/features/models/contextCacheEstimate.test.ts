@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
-import type { ModelCacheProfile } from '../../shared/api/types';
-import { contextCacheEstimate, streamingCacheEstimate, quantizedCacheProfile } from './cacheData';
+import type { ModelCacheProfile } from '@shared/types/api';
+import { contextCacheEstimate, streamingCacheEstimate, quantizedCacheProfile } from '@shared/features/models/cacheData';
 
 const profile: ModelCacheProfile = { max_context: 262144, fixed_bytes: 1024 + 29978, fixed_components: [
   { group: 'GDN', name: 'recurrent_state', bytes: 1024 },

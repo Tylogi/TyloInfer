@@ -1,25 +1,29 @@
-import React, { createContext, useContext, useMemo } from 'react';
+import React, { useMemo } from 'react';
+import { PresentationProvider, useSharedDisplay } from '@shared/presentation';
+import { Dialog, Switch, Tooltip } from './shared-primitives.tsx';
 
-const PresenterContext = createContext(null);
+// The plugin Client owns its job data through host RPC. It normalises what the
+// inference core reports and hands the shared display layer the same shapes
+// Studio provides from its own stores.
 export function SharedPresenters({ tr, inventory, runtime, operation, jobs = [], children }) {
-  const value = useMemo(() => {
+  const presented = useMemo(() => {
     const native = [...jobs, ...(operation ? [operation] : [])];
-    const presented = native.filter(job => typeof job?.kind === 'string').map(job => {
+    const shown = native.filter(job => typeof job?.kind === 'string').map(job => {
       const payload = job.payload || {};
       const artifact = inventory?.models.find(item => item.id === payload.model);
       return { ...job, payload: artifact ? { ...payload, model: artifact.name } : payload };
     });
-    return { tr, runtime, inventory, jobs: [...new Map(presented.map(job => [job.id, job])).values()] };
-  }, [tr, inventory, runtime, operation, jobs]);
-  return <PresenterContext.Provider value={value}>{children}</PresenterContext.Provider>;
+    return [...new Map(shown.map(job => [job.id, job])).values()];
+  }, [inventory, operation, jobs]);
+  const value = useMemo(() => ({
+    tr,
+    useJobStore: (selector) => selector({ jobs: presented }),
+    readLoadContext: () => ({ jev_weights: 'stream' }),
+    primitives: { Dialog, Switch, Tooltip },
+  }), [tr, presented]);
+  return <PresentationProvider value={value}>{children}</PresentationProvider>;
 }
+
 export function useSettings() {
-  const value = useContext(PresenterContext);
-  if (!value) throw new Error('Shared presenter context is missing');
-  return { tr: value.tr };
+  return { tr: useSharedDisplay().tr };
 }
-export function useJobStore(selector) {
-  const value = useContext(PresenterContext);
-  return selector({ jobs: value?.jobs || [] });
-}
-export function readLoadContext() { return { jev_weights: 'stream' }; }

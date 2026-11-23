@@ -2,7 +2,7 @@
 import { lazy, Suspense } from 'react';
 import { useSettings } from '../../settings/SettingsProvider';
 import { useConversationSelector } from '../state/conversationStore';
-import { Icon } from '../../../app/display';
+import { Icon } from '@shared/ui/display';
 import { AudioClip } from '../../voice/AudioClip';
 import { renderMarkdown } from '../MessageMarkdown';
 import { StreamingMessage } from './StreamingMessage';

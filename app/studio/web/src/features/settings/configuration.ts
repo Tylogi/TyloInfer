@@ -1,5 +1,5 @@
 
-import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../shared/api/types';
+import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '@shared/types/api';
 
 export type UiLanguage = "system" | "zh-CN" | "en";
 

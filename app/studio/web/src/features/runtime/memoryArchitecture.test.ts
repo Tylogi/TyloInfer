@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { hasSeparateVram, residentMemoryCapacity, memoryPoolUsage } from './memoryArchitecture';
+import { hasSeparateVram, residentMemoryCapacity, memoryPoolUsage } from '@shared/features/runtime/memoryArchitecture';
 
 it('uses reported topology for CUDA UMA devices and separate VRAM devices', () => {
   expect(hasSeparateVram({ memory_architecture: 'unified', backend: 'cuda' })).toBe(false);

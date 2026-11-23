@@ -1,8 +1,8 @@
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { ModelLoadProgress } from './ModelLoadProgress';
+import { ModelLoadProgress } from '@shared/features/models/ModelLoadProgress';
 import { useJobStore } from '../../stores/jobStore';
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource } from '@shared/types/api';
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_zh: string, en: string) => en }),

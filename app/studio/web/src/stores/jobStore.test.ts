@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { jobsApi } from '../shared/api/resources/jobs';
 import { useJobStore } from './jobStore';
-import type { JobResource, JobEventResource } from '../shared/api/types';
+import type { JobResource, JobEventResource } from '@shared/types/api';
 
 const mockJob1: JobResource = {
   id: 'job-1',

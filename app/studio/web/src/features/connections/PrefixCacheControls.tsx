@@ -4,7 +4,7 @@ import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
-import { PrefixCacheControlsView } from './PrefixCacheControlsView';
+import { PrefixCacheControlsView } from '@shared/features/connections/PrefixCacheControlsView';
 const services = { memoryPolicy: runtimeApi.memoryPolicy, configureMemoryPolicy: runtimeApi.configureMemoryPolicy, getJob: jobsApi.getJob };
 export function PrefixCacheControls({ budget }: { budget: number }) {
   const { runtime, addJob, connectionRevision } = useRuntime();

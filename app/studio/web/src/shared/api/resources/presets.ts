@@ -1,5 +1,5 @@
 
-import type { GenerationPresetResource } from '../types';
+import type { GenerationPresetResource } from '@shared/types/api';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const presetsApi = {

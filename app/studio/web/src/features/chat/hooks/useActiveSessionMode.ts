@@ -1,5 +1,5 @@
 
-import type { SessionMode } from '../../../shared/api/types';
+import type { SessionMode } from '@shared/types/api';
 import { useConversationSelector } from '../state/conversationStore';
 
 

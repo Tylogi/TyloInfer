@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import type { JobResource, RuntimeLogEntry } from '../../shared/api/types';
-import { mergeRequestRecords, requestRecords, type RequestLogRecord } from './requestRecords';
-export { mergeRequestRecords, requestRecords, type RequestLogRecord } from './requestRecords';
+import type { JobResource, RuntimeLogEntry } from '@shared/types/api';
+import { mergeRequestRecords, requestRecords, type RequestLogRecord } from '@shared/features/runtime/requestRecords';
+export { mergeRequestRecords, requestRecords, type RequestLogRecord } from '@shared/features/runtime/requestRecords';
 import { useJobStore } from '../../stores/jobStore';
 
 export function useLogHistory(paused: boolean) {

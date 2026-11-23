@@ -1,7 +1,7 @@
 
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
-import { Icon } from './display';
+import { Icon } from '@shared/ui/display';
 
 
 export function RuntimeAlerts({ connectionProblem }: { connectionProblem: string | null }) {

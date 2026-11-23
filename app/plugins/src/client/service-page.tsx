@@ -1,11 +1,11 @@
 import React, { useMemo, useState } from 'react';
-import { InferencePolicyView } from '../../../studio/web/src/features/connections/InferencePolicyView.tsx';
-import { ModelAliasMappingView } from '../../../studio/web/src/features/connections/ModelAliasMappingView.tsx';
-import { RemoteRoutingView } from '../../../studio/web/src/features/connections/RemoteRoutingView.tsx';
-import { runtimeModelNames } from '../../../studio/web/src/features/runtime/modelSelection.ts';
+import { InferencePolicyView } from '@shared/features/connections/InferencePolicyView.tsx';
+import { ModelAliasMappingView } from '@shared/features/connections/ModelAliasMappingView.tsx';
+import { RemoteRoutingView } from '@shared/features/connections/RemoteRoutingView.tsx';
+import { runtimeModelNames } from '@shared/features/runtime/modelSelection.ts';
 import { useServiceConfirmation } from './service-confirmation.tsx';
 import { CoreError } from './page-kit.tsx';
-import { Icon, SectionLabel, SettingRow, TMPanel } from '../../../studio/web/src/app/display.tsx';
+import { Icon, SectionLabel, SettingRow, TMPanel } from '@shared/ui/display.tsx';
 import { PageTabs } from './page-navigation.tsx';
 import { MemoryControls } from './memory-controls.tsx';
 import { GlobalContext } from './global-context.tsx';

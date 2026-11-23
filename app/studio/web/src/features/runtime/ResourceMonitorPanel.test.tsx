@@ -1,6 +1,6 @@
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { RuntimeResources } from '../../shared/api/types';
+import type { RuntimeResources } from '@shared/types/api';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
 
 const mocks = vi.hoisted(() => ({ resources: vi.fn(), ready: true, revision: 0 }));

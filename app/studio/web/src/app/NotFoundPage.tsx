@@ -2,7 +2,7 @@
 import { ArrowLeftIcon, HouseIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
-import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
+import tyloInferMark from '@shared/assets/tylogi-ai-lab-mark.svg';
 
 
 export function NotFoundPage() {

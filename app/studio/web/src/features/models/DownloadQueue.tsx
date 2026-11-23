@@ -1,15 +1,15 @@
-import { DownloadQueueView } from './DownloadQueueView';
+import { DownloadQueueView } from '@shared/features/models/DownloadQueueView';
 import { useState } from 'react';
-import type { JobResource } from '../../shared/api/types';
+import type { JobResource } from '@shared/types/api';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
 import type { DownloadOrigin } from './ModelBrowser';
 import { useConnectionScope } from '../../app/useConnectionScope';
 
-export { isModelDownload, isActiveDownload, downloadProgress, downloadEtaSeconds } from './DownloadQueueView';
+export { isModelDownload, isActiveDownload, downloadProgress, downloadEtaSeconds } from '@shared/features/models/DownloadQueueView';
 export function DownloadQueue({ jobs, onJobCreated }: {
   jobs: JobResource[];
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;

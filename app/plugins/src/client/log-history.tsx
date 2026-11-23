@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { mergeRequestRecords, requestRecords } from '../../../studio/web/src/features/runtime/requestRecords.ts';
+import { mergeRequestRecords, requestRecords } from '@shared/features/runtime/requestRecords.ts';
 
 const empty = () => ({ logs: [], requests: [], jobs: [], errors: {}, updatedAt: null });
 export function useLogHistory(api, values, paused, refreshKey) {

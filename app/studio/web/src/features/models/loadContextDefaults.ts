@@ -1,12 +1,7 @@
 import { getApiBaseUrl } from '../../shared/api/client';
+import type { LoadContextDefaults } from '@shared/types/load-context';
 
-export interface LoadContextDefaults {
-  context_size: number | null;
-  reserve_percent: 5 | 10 | 20;
-  precision: number | null;
-  jev_weights?: 'stream' | 'vram';
-  vram_preallocated: boolean;
-}
+export type { LoadContextDefaults };
 
 export const DEFAULT_LOAD_CONTEXT: LoadContextDefaults = {
   context_size: null, reserve_percent: 10, precision: null, jev_weights: 'stream', vram_preallocated: true,

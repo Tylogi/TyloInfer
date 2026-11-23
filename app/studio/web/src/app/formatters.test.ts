@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { ApiError } from '../shared/api/client';
-import { errorMessage } from './formatters';
+import { errorMessage } from '@shared/formatters';
 
 const apiError = (code: string, message = '[Errno 48] address already in use', details: Record<string, unknown> = {}) => new ApiError(409, { error: { code, message, details, retryable: false } });
 

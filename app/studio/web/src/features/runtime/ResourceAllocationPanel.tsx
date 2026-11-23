@@ -1,4 +1,4 @@
-import { ResourceAllocationView } from './ResourceAllocationView';
+import { ResourceAllocationView } from '@shared/features/runtime/ResourceAllocationView';
 import { useEffect } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';

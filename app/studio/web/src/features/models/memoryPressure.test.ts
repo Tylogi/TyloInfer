@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { memoryPressureRows, type PressureSystem } from './memoryPressure';
+import { memoryPressureRows, type PressureSystem } from '@shared/features/models/memoryPressure';
 
 const system: PressureSystem = { memory_pools: [
   { kind: 'vram', capacity_bytes: 24 }, { kind: 'vram', capacity_bytes: 32 }, { kind: 'ram', capacity_bytes: 64 },

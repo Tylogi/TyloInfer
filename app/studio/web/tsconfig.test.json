@@ -1,6 +1,7 @@
 {
   "extends": "./tsconfig.app.json",
   "compilerOptions": {
+    "paths": { "@shared/*": ["../../shared/*"] },
     "composite": false,
     "types": ["vite/client", "@testing-library/jest-dom", "node"]
   },

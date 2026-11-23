@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import type { RuntimeResources } from '../../shared/api/types';
-import { ResourceMonitorView } from './ResourceMonitorView';
+import type { RuntimeResources } from '@shared/types/api';
+import { ResourceMonitorView } from '@shared/features/runtime/ResourceMonitorView';
 
 export function ResourceMonitorPanel() {
   const { ready, connectionRevision, runtime } = useRuntime();

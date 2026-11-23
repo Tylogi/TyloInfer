@@ -1,12 +1,12 @@
 import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { JobKindResource, JobResource } from '../../shared/api/types';
+import type { JobKindResource, JobResource } from '@shared/types/api';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
-import { Icon } from '../../app/display';
+import { Icon } from '@shared/ui/display';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';

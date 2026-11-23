@@ -1,4 +1,4 @@
-@import '../../features/models/model-workbench.css';
+@import '../../../../../shared/features/models/model-workbench.css';
 
 .skip-link { position: fixed; z-index: 20; top: 10px; left: 10px; transform: translateY(-160%); border: 1px solid var(--accent-border); border-radius: 7px; padding: 8px 11px; color: var(--on-accent); background: var(--accent); font-size: 11px; transition: transform 160ms ease; }
 .skip-link:focus { transform: translateY(0); }

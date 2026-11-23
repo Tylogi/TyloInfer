@@ -4,7 +4,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
 import { useModelCacheProfiles } from '../models/useModelCacheProfiles';
-import { ModelContextSettingsView } from './ModelContextSettingsView';
+import { ModelContextSettingsView } from '@shared/features/runtime/ModelContextSettingsView';
 export function ModelContextSettings({ scope = 'all', modelName }: { scope?: 'all' | 'global' | 'model'; modelName?: string }) {
   const runtimeState = useRuntime();
   const connectionScope = useConnectionScope();

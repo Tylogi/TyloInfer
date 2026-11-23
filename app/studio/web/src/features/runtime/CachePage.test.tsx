@@ -3,7 +3,7 @@ import { TooltipProvider } from '../../shared/ui/Tooltip';
 import { act, fireEvent, render as baseRender, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CachePage } from './CachePage';
-import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
+import type { RuntimeStatus } from '@shared/types/contracts/runtime';
 
 function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 

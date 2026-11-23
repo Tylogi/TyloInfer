@@ -117,21 +117,17 @@ For API requests and authentication, see the [serving guide](docs/serve.md#first
 uv run --project app/studio --extra dev pytest app/studio/tests
 
 # Numerical parity against the pinned reference needs PyTorch:
-uv run --project studio --extra dev --extra d1-reference \
+uv run --project app/studio --extra dev --extra d1-reference \
   pytest app/studio/tests/test_d1_reference.py
 
 # Native runtime: configure and build as above, then
 ctest --test-dir build
 
-# Browser UI (installs its pnpm dependencies on first run)
-pnpm --dir app/studio/web install --frozen-lockfile
-pnpm --dir app/studio/web test
-
-# DSH plugin workspace
-npm --prefix plugins ci
-npm --prefix plugins run build
-npm --prefix plugins run typecheck
-node --test app/plugins/src/host/tests/*.test.ts plugins/src/client/tests/*.test.ts
+# Frontends: Studio web and the DSH plugin share the app/ workspace
+pnpm --dir app install --frozen-lockfile
+pnpm --dir app typecheck
+pnpm --dir app build
+pnpm --dir app test
 ```
 
 The C++ cases under `csrc/tests/` run anywhere; the CUDA and Metal cases need that hardware. Full notes are in the [build guide](docs/build.md#testing).

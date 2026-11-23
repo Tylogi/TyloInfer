@@ -1,5 +1,5 @@
 
-import type { ApiErrorBody, RealtimeFrame, SessionState } from './types';
+import type { ApiErrorBody, RealtimeFrame, SessionState } from '@shared/types/api';
 
 type ResponsePayload =
   | { type: 'session.state'; state: SessionState; revision: number }

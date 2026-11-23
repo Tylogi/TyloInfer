@@ -1,5 +1,5 @@
 
-import type { MediaResource, DocumentResource } from '../types';
+import type { MediaResource, DocumentResource } from '@shared/types/api';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const mediaApi = {

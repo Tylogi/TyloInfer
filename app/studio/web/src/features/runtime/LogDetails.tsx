@@ -1,9 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { JobResource, RuntimeLogEntry } from '../../shared/api/types';
-import { errorMessage } from '../../app/formatters';
-import { JobEventsView, LogDetailsView, RequestMetricsView } from './LogDetailsView';
-import { Icon } from '../../app/display';
+import type { JobResource, RuntimeLogEntry } from '@shared/types/api';
+import { errorMessage } from '@shared/formatters';
+import { JobEventsView, LogDetailsView, RequestMetricsView } from '@shared/features/runtime/LogDetailsView';
+import { Icon } from '@shared/ui/display';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 import type { RequestLogRecord } from './useLogHistory';

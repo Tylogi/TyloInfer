@@ -1,9 +1,9 @@
 import { useRuntime } from '../../app/RuntimeProvider';
-import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { formatNumber } from '../../app/formatters';
+import { SectionLabel, SettingRow, TMPanel } from '@shared/ui/display';
+import { formatNumber } from '@shared/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { PrefixCacheControls } from './PrefixCacheControls';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { hasSeparateVram } from '@shared/features/runtime/memoryArchitecture';
 
 export function PrefixCacheSettingsPanel() {
   const { runtime } = useRuntime();

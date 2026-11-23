@@ -7,7 +7,7 @@ import type {
   SessionArchive,
   Message,
   ResponseResource,
-} from '../types';
+} from '@shared/types/api';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const sessionsApi = {

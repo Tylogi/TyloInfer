@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isOperationId, terminalStates } from './model-api.ts';
 import { useSettings } from './shared-presenters.tsx';
-import { ToastItem } from '../../../studio/web/src/shared/ui/ToastItem.tsx';
-import { ApiError } from '../../../studio/web/src/shared/api/ApiError.ts';
-import { errorMessage } from '../../../studio/web/src/app/formatters.ts';
+import { ToastItem } from '@shared/ui/ToastItem.tsx';
+import { ApiError } from '@shared/types/ApiError.ts';
+import { errorMessage } from '@shared/formatters.ts';
 
 export const number = value => Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—';
 export const bytes = value => !Number.isFinite(value) ? '—' : value >= 2 ** 30 ? `${number(value / 2 ** 30)} GiB` : value >= 2 ** 20 ? `${number(value / 2 ** 20)} MiB` : `${number(value)} B`;

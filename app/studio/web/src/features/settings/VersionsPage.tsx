@@ -1,4 +1,4 @@
-import { ScreenHeader } from '../../app/display';
+import { ScreenHeader } from '@shared/ui/display';
 import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { useSettings } from './SettingsProvider';
 

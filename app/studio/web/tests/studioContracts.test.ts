@@ -1,9 +1,11 @@
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const sourceRoot = resolve(import.meta.dirname, '../src');
+// The display layer moved out of Studio, so the source contracts read both trees.
+const otherRoots = [resolve(import.meta.dirname, '../../../shared')];
 
 
 function readSources(...paths: string[]): string {
@@ -15,7 +17,8 @@ function readSources(...paths: string[]): string {
       ? [readFileSync(location, 'utf8').replace(/\r\n/g, '\n')]
       : [];
   }
-  return paths.flatMap((path) => collect(join(sourceRoot, path))).join('\n');
+  return paths.flatMap((path) => [join(sourceRoot, path), ...otherRoots.map((root) => join(root, path))]
+    .filter((location) => existsSync(location))).flatMap(collect).join('\n');
 }
 
 
@@ -25,9 +28,9 @@ function readStyles(path = join(sourceRoot, 'styles.css')): string {
   );
 }
 
-const APP = readSources('App.tsx', 'app', 'features');
+const APP = readSources('App.tsx', 'app', 'features', 'ui');
 const APP_ENTRY = readSources('App.tsx');
-const API = readSources('shared/api');
+const API = readSources('shared/api', 'types');
 const MAIN = readSources('main.tsx');
 const STYLES = readStyles();
 

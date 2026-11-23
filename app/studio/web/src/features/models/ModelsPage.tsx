@@ -1,14 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { useLocation } from 'react-router';
 import { useSettings } from '../settings/SettingsProvider';
-import { Icon, ScreenHeader } from '../../app/display';
+import { Icon, ScreenHeader } from '@shared/ui/display';
 import { useModelCatalog } from './useModelCatalog';
-import { ModelDirectoryDialog } from './ModelDirectoryDialog';
+import { ModelDirectoryDialog } from '@shared/features/models/ModelDirectoryDialog';
 import { LoadedModels } from './LoadedModels';
 import { ModelSettingsDialog } from './ModelSettingsDialog';
-import { LocalCheckpoints } from './LocalCheckpoints';
-import { ModelLibrarySummary } from './ModelLibrarySummary';
-import '../../shared/styles/configuration-layout.css';
+import { LocalCheckpoints } from '@shared/features/models/LocalCheckpoints';
+import { ModelLibrarySummary } from '@shared/features/models/ModelLibrarySummary';
+import '@shared/styles/configuration-layout.css';
 
 export function ModelsPage() {
   const catalog = useModelCatalog();

@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
-import { architectureReference, architectureSchedule, architectureViews } from './architectureData';
+import { architectureReference, architectureSchedule, architectureViews } from '@shared/features/analysis/architectureData';
 const tr = (_zh: string, en: string) => en;
 
 it('derives the attention cycle and available subgraphs from each checkpoint', () => {

@@ -2,11 +2,11 @@
 
 
 import { useToastStore } from '../../stores/toastStore';
-import { ToastItem } from './ToastItem';
-import './primitives.css';
+import { ToastItem } from '@shared/ui/ToastItem';
+import '@shared/ui/primitives.css';
 
-export { ToastItem } from './ToastItem';
-export type { ToastItemProps } from './ToastItem';
+export { ToastItem } from '@shared/ui/ToastItem';
+export type { ToastItemProps } from '@shared/ui/ToastItem';
 
 
 

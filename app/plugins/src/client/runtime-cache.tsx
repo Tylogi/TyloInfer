@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { PrefixCacheOverview } from '../../../studio/web/src/features/runtime/PrefixCacheOverview.tsx';
+import { PrefixCacheOverview } from '@shared/features/runtime/PrefixCacheOverview.tsx';
 import { ConfirmationDialog } from './shared-primitives.tsx';
 import { bytes, Facts } from './page-kit.tsx';
 import { isOperationId, terminalStates } from './model-api.ts';

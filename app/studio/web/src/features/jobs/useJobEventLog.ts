@@ -1,8 +1,8 @@
 
 import { useEffect, useState } from 'react';
-import type { RuntimeLogEntry } from '../../shared/api/types';
+import type { RuntimeLogEntry } from '@shared/types/api';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import { errorMessage } from '../../app/formatters';
+import { errorMessage } from '@shared/formatters';
 import { toast } from '../../stores/toastStore';
 
 
