@@ -70,6 +70,8 @@ mlx::core::array mlx_sparse_selected_mla_attention(
 mlx::core::array mlx_gather_selected_mla_rows(const mlx::core::array& kv_cache,
     const mlx::core::array& selected_indices);
 
+void mlx_prepare_indexed_mla_prefill();
+
 // The same latent attention over rows already gathered from paged storage.
 mlx::core::array mlx_gathered_mla_attention(const mlx::core::array& query,
     const mlx::core::array& gathered, const mlx::core::array& mask,

@@ -1496,6 +1496,10 @@ struct MlxHy4Model::Weights {
             const bool has_engram = engram && std::find(engram->layers.begin(), engram->layers.end(), layer) != engram->layers.end();
             layers.emplace_back(MlxGgufLayerTensors(model, source, layer), g, layer, has_engram);
         }
+        if (!offload && !g.indexed_kv.quantization.enabled() &&
+            g.kv_rank == 512 && g.rotary == 64 && g.index_budget == 2048 && g.context > 2 * g.index_budget &&
+            std::any_of(layers.begin(), layers.end(), [](const Layer& layer) { return layer.index && layer.heads == 32; }))
+            mlx_prepare_indexed_mla_prefill();
         if (!draft_path.empty()) {
             auto path = std::filesystem::path(draft_path);
             std::ifstream config_file(path.parent_path() / "config.json");

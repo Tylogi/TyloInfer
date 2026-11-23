@@ -606,6 +606,22 @@ void test_latent_value_prefix() {
             throw std::runtime_error("sparse MLA value prefix disagrees with the strided-cache reference");
         }
     }
+
+    constexpr int queries = 16, heads = 32, width = 576, values = 512, selected = 2048, history = 2153;
+    const auto q = patterned_half(heads * queries * width, {1, heads, queries, width}, 7, 0.002f);
+    const auto storage_with_offset = patterned_half((history + 1) * width,
+        {1, history + 1, width}, 11, 0.003f);
+    const auto resident = slice(storage_with_offset, {0, 1, 0}, {1, history + 1, width});
+    const auto index = reshape(arange(queries * selected, int32), {1, queries, selected});
+    const auto ids = where(index % 7 == 0, array(-1), (index * 23) % history);
+    const auto mask = where(ids >= 0, array(0.0f), array(-std::numeric_limits<float>::infinity()));
+    const auto sinks = astype(arange(heads, int32), float32) * 0.03f - 0.1f;
+    const auto reference = mfq::metal::mlx_gathered_mla_attention(q,
+        mfq::metal::mlx_gather_selected_mla_rows(resident, ids), mask, sinks, 0.0625f, values);
+    const auto optimized = mfq::metal::mlx_sparse_selected_mla_attention(q, resident, ids, mask, sinks, 0.0625f, values);
+    const auto error = max(abs(reference - optimized)).item<float>();
+    if (optimized.shape() != Shape{1, queries, heads, values} || !std::isfinite(error) || error > 0.0005f)
+        throw std::runtime_error("indexed MLA prefill disagrees with the gathered reference");
 }
 
 int main(int argc, char** argv) {
