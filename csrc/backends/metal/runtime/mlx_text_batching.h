@@ -101,7 +101,11 @@ public:
     using Decoded = std::unordered_map<std::string, std::int64_t>;
 
     MlxTextBatchOperations(Runtime& runtime, SessionCache& sessions)
-        : runtime_(runtime), sessions_(sessions), batch_depth_enabled_([] {
+        : runtime_(runtime), sessions_(sessions), automatic_batch_depth_([&runtime] {
+            if constexpr (MlxBatchDraftRuntime<Runtime> && MlxBatchSpeculativeRuntime<Runtime>)
+                return !std::getenv("TYLOINFER_METAL_TEXT_BATCH_MTP_POLICY") && runtime.supports_batch_mtp();
+            return false;
+        }()), batch_depth_enabled_(automatic_batch_depth_ || [] {
             const auto* value = std::getenv("TYLOINFER_METAL_TEXT_BATCH_MTP_POLICY");
             return MlxBatchSpeculativeRuntime<Runtime> && value && std::string_view(value) == "batch";
         }()), batch_drafts_enabled_([] {
@@ -187,24 +191,28 @@ public:
         if (!batch_depth_enabled_) return;
         std::vector<std::string> speculative, ordinary;
         int maximum = 0;
-        bool all_caps_known = true;
+        bool all_caps_known = true, all_draft_batchable = true;
         for (const auto& request : state.active) {
             if (request->produced >= request->generation_limit) continue;
             if (request->speculative) {
                 speculative.push_back(request->id);
                 maximum = std::max(maximum, request->draft_cap);
                 all_caps_known = all_caps_known && request->draft_cap > 0;
+                all_draft_batchable = all_draft_batchable && request->draft_batchable && !request->token_constraint;
             } else ordinary.push_back(request->id);
         }
         std::sort(speculative.begin(), speculative.end());
         std::sort(ordinary.begin(), ordinary.end());
-        const bool paired = all_caps_known && !speculative.empty() && speculative.size() + ordinary.size() > 1;
+        const bool shallow_batch = automatic_batch_depth_ && all_draft_batchable && maximum > 1 &&
+            ordinary.empty() && (speculative.size() == 3 || speculative.size() == 4);
+        const bool paired = all_caps_known && !speculative.empty() && speculative.size() + ordinary.size() > 1 &&
+            (!automatic_batch_depth_ || shallow_batch);
         if (!paired || !depth_policy_ || depth_policy_->requests() != speculative ||
                 depth_policy_->maximum() != maximum || ordinary_cohort_ != ordinary) {
             if (depth_policy_) park_memory_.retired(*depth_policy_);
             depth_policy_.reset();
             if (paired) {
-                depth_policy_ = std::make_shared<DepthPolicy>(std::move(speculative), maximum, ordinary.size());
+                depth_policy_ = std::make_shared<DepthPolicy>(std::move(speculative), maximum, ordinary.size(), shallow_batch);
                 park_memory_.seed(*depth_policy_);
             }
             ordinary_cohort_ = std::move(ordinary);
@@ -574,6 +582,7 @@ private:
 
     Runtime& runtime_;
     SessionCache& sessions_;
+    const bool automatic_batch_depth_;
     const bool batch_depth_enabled_;
     const bool batch_drafts_enabled_;
     std::shared_ptr<DepthPolicy> depth_policy_;
