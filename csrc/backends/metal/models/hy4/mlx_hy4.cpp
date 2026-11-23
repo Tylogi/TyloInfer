@@ -1474,6 +1474,47 @@ void restore_rows(const MlxHy4RowSnapshot& state, int count, int maximum, int wi
         }
     }
 }
+void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& layers) {
+    auto* preparation = MlxKernelPreparation::current();
+    if (!preparation || default_device() != Device::gpu ||
+        g.hidden != 3072 || g.streams != 4 || g.kv_rank != 512 || g.rotary != 64)
+        return;
+    const auto indexed = std::find_if(layers.begin(), layers.end(), [](const Layer& layer) { return bool(layer.index); });
+    const auto routed = std::find_if(layers.begin(), layers.end(), [](const Layer& layer) { return bool(layer.moe); });
+    preparation->collect([&] {
+        for (int count = 1; count <= std::min(8, g.context); ++count) {
+            const auto& layer = indexed != layers.end() ? *indexed : layers.front();
+            const auto streams = zeros({1, count, 4, 3072}, bfloat16);
+            const auto mix = layer.attention_hc.collapse(streams, &layer.attention_norm, count > 1);
+            const auto phases = rotary_phases(arange(count, int32), g.rotary, g.rotary_base);
+            const auto rows = project_mla(layer, g, mix.branch, phases, count > 1);
+            preparation->add(rows.query);
+            preparation->add(rows.latent);
+            const auto update = zeros({1, count, g.hidden}, bfloat16);
+            const auto ffn = layer.ffn_hc.expand_and_collapse(
+                streams, update, mix, &layer.ffn_norm, count > 1);
+            preparation->add(ffn.second.branch);
+            if (routed != layers.end())
+                preparation->add(project_ffn(*routed, g, ffn.second.branch));
+        }
+        if (indexed != layers.end() && g.index_budget == 2048 && g.context > g.index_budget) {
+            const auto& layer = *indexed;
+            const auto query = zeros({3, layer.heads, 2, 576}, float32);
+            for (const int wanted : {g.window + 1, g.index_budget + 2, 2 * g.index_budget}) {
+                const int keys = std::min(wanted, g.context);
+                preparation->add(mlx_masked_dense_mla_attention(query, zeros({3, keys, 576}, float16),
+                    zeros({3, 2, keys}, bool_), layer.sinks, 1.f, 512));
+            }
+            const auto ids = zeros({1, 2, 2048}, int32);
+            const auto cache = zeros({1, g.index_budget, 576}, float16);
+            preparation->add(mlx_gather_selected_mla_rows(cache, ids));
+            preparation->add(mlx_gathered_mla_attention(zeros({3, layer.heads, 1, 576}, float32),
+                zeros({3, 1, 2048, 576}, float16), zeros({3, 1, 2048}, float32),
+                layer.sinks, 1.f, 512, true));
+        }
+    });
+}
+
 }  // namespace
 
 struct MlxHy4Model::Weights {
@@ -1532,6 +1573,7 @@ struct MlxHy4Model::Weights {
             eval(loaded);
             draft.emplace(tensors, config, g);
             for (const auto& tensor : loaded) MlxWeightResidency::track(tensor);
+            prepare_dfly_decode_kernels(g, layers);
         }
     }
 };
