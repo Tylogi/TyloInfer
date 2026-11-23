@@ -1737,6 +1737,48 @@ void prepare_dfly_decode_kernels(const Geometry& g, const std::vector<Layer>& la
             preparation->add(mlx_gathered_mla_attention(zeros({3, layer.heads, 1, 576}, float32),
                 zeros({3, 1, 2048, 576}, float16), zeros({3, 1, 2048}, float32),
                 layer.sinks, 1.f, 512, true));
+            if (g.context > 2 * g.index_budget && short_mla_nax_available()) {
+                for (const int rows : {6, 8}) {
+                    preparation->add(mlx_gathered_mla_attention(zeros({rows, layer.heads, 1, 576}, float32),
+                        zeros({rows, 1, 2048, 576}, float16), zeros({rows, 1, 2048}, float32),
+                        layer.sinks, 1.f, 512, true));
+                }
+            }
+        }
+    });
+}
+
+void prepare_short_dfly_proposals(const Geometry& g, const DflyDraft& draft,
+    const MlxEmbedding& embedding, const MlxLinear& output) {
+    auto* preparation = MlxKernelPreparation::current();
+    if (!preparation || !short_mla_nax_available() || g.kv_rank != 512 || g.rotary != 64 ||
+        g.index_budget != 2048 || g.context < g.index_budget + 2 ||
+        g.indexed_kv.quantization.enabled() || draft.local_window != 0)
+        return;
+    preparation->collect([&] {
+        // All proposal lanes can share the same synthetic history during preparation.
+        MlxSequenceCache resident(g.index_budget, 576, float16);
+        resident.append(zeros({1, g.index_budget, 576}, float16));
+        const auto indices = zeros({1, 1, g.index_budget}, int32);
+        const auto hidden = zeros({1, 1, g.hidden}, bfloat16);
+        std::array<MlxHy4Cache, 4> states;
+        std::array<MlxHy4Cache*, 4> caches;
+        std::vector<MlxMtpTargetRequest> steps;
+        for (int lane = 0; lane < 4; ++lane) {
+            auto& state = states[lane];
+            state.position = g.index_budget;
+            state.last_hidden = hidden;
+            state.layers.resize(g.layers);
+            for (const int layer : draft.target_layers) state.layers[layer].latent = resident;
+            for (const int layer : draft.index_layers) state.layers[layer].last_indices = indices;
+            caches[lane] = &state;
+            steps.push_back(MlxMtpTargetRequest{0, zeros({0}, int32), 1,
+                MlxMtpTargetRequest::Kind::draft_window});
+        }
+        for (const int batch : {3, 4}) {
+            const auto proposals = draft.propose_batch(g, std::span(caches).first(batch),
+                std::span(steps).first(batch), embedding, output);
+            for (const auto& proposal : proposals) preparation->add(proposal);
         }
     });
 }
@@ -1802,6 +1844,7 @@ struct MlxHy4Model::Weights {
             prepare_packed_mla_query(g);
             prepare_short_mla_value_expansion(g);
             prepare_dfly_decode_kernels(g, layers);
+            if (!offload) prepare_short_dfly_proposals(g, *draft, token_embedding, output);
         }
     }
 };
