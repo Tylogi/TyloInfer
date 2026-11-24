@@ -164,7 +164,7 @@ prepare_qk(mfq_tensor_backend::Tensor query, mfq_tensor_backend::Tensor key,
     TYLOINFER_RUNTIME_CHECK(pos(positions) && pos(write_positions),
                             "QK preparation positions differ");
     MfqCudaGuard guard(device);
-    auto output = tb::empty(query.sizes(), query.options().dtype(tb::kFloat32));
+    const tb::Tensor output = tb::empty(query.sizes(), query.options().dtype(tb::kFloat32));
     const auto layout = [](const tb::Tensor &x) {
         return HeadLayout{x.stride(0), x.stride(1), x.stride(2)};
     };

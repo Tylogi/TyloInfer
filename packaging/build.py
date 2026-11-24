@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import ctypes
 import hashlib
@@ -43,13 +44,30 @@ def fail(message: str) -> None:
     raise SystemExit(f"error: {message}")
 
 
-def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
-        quiet: bool = False) -> str:
-    result = subprocess.run([str(item) for item in command], cwd=cwd, env=env,
-                            capture_output=quiet, text=True)
+def run(command: Sequence[str | Path], *, cwd: Path | None = None,
+        env: dict[str, str] | None = None, capture: bool = False) -> str:
+    """Stream build commands; capture only queries, retaining diagnostics on failure."""
+    arguments = [str(item) for item in command]
+    display = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+    try:
+        result = subprocess.run(arguments, cwd=cwd, env=env,
+                                capture_output=capture, text=True)
+    except OSError as error:
+        fail(f"could not run {display}: {error}")
     if result.returncode != 0:
-        fail(f"command failed ({result.returncode}): {' '.join(str(item) for item in command)}")
-    return result.stdout if quiet else ""
+        details = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part) if capture else ""
+        fail(f"command failed ({result.returncode}): {display}"
+             + (f"\n{details}" if details else ""))
+    return result.stdout if capture else ""
+
+
+def remove_directory(directory: Path) -> None:
+    """A missing staging directory is harmless; a failed cleanup is not."""
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        if directory.exists():
+            raise
 
 
 def _flags(flag: str, values: tuple[str, ...]) -> list[str]:
@@ -95,8 +113,6 @@ class Context:
     deployment_target: str = "26.2"
     signing_identity: str = "-"
     cuda_architectures: str = ""
-    cuda_root: Path | None = None
-    native_output: Path | None = None
     environment: dict[str, str] = field(default_factory=os.environ.copy)
 
     @property
@@ -133,6 +149,10 @@ class Context:
     def windows_runtime(self) -> Path:
         return SCRIPT_DIR / "windows-runtime"
 
+    @property
+    def cuda_root(self) -> Path:
+        return configured_cuda_root(self.environment)
+
 
 # --- preflight ------------------------------------------------------------
 
@@ -145,54 +165,16 @@ def add_to_path(environment: dict[str, str], directory: str) -> None:
 
 def require_commands(environment: dict[str, str], names: tuple[str, ...]) -> None:
     for name in names:
-        if shutil.which(name, path=environment.get("PATH")) is None:
-            fail(f"{name} is required; install it and make it available to this script")
+        if shutil.which(name, path=environment.get("PATH", "")) is None:
+            fail(f"{name} is required on PATH; prepare the build toolchain before running this script"
+                 + (" (use an x64 Visual Studio Developer PowerShell on Windows)" if os.name == "nt" else ""))
 
 
-def import_visual_studio(environment: dict[str, str]) -> None:
-    program_files_x86 = environment.get("ProgramFiles(x86)") or environment.get("ProgramFiles", "")
-    vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-    if not vswhere.is_file():
-        fail("Visual Studio Build Tools with the C++ workload are required")
-
-    def versus(*arguments: str) -> str:
-        return run([str(vswhere), *arguments], quiet=True).strip()
-
-    installation = versus("-latest", "-products", "*",
-                          "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                          "-property", "installationPath").splitlines()[:1]
-    if not installation:
-        installation = [directory for directory in
-                        versus("-all", "-products", "*", "-property", "installationPath").splitlines()
-                        if (Path(directory) / "Common7" / "Tools" / "VsDevCmd.bat").is_file()]
-    if not installation:
-        fail("Visual Studio C++ x64 tools are required")
-
-    development = Path(installation[0].strip()) / "Common7" / "Tools" / "VsDevCmd.bat"
-    if not development.is_file():
-        fail(f"VsDevCmd.bat is missing from {installation[0]}")
-    # shortcut: the console codepage is assumed, which is fine for build-host
-    # paths that are plain ASCII; switch to an explicit encoding if not.
-    lines = run(["cmd.exe", "/d", "/s", "/c",
-                 f'call "{development}" -no_logo -arch=x64 -host_arch=x64 >nul && set'],
-                env=environment, quiet=True)
-    for line in lines.splitlines():
-        name, separator, value = line.partition("=")
-        if separator and name:
-            environment[name] = value
-
-
-def find_cuda_root(environment: dict[str, str]) -> Path:
+def configured_cuda_root(environment: dict[str, str]) -> Path:
     configured = environment.get("CUDA_PATH")
-    if configured and (Path(configured) / "bin" / "nvcc.exe").is_file():
-        return Path(configured)
-    parent = Path(environment.get("ProgramFiles", "")) / "NVIDIA GPU Computing Toolkit" / "CUDA"
-    if parent.is_dir():
-        for candidate in sorted((path for path in parent.iterdir() if path.is_dir()),
-                                key=lambda path: path.name, reverse=True):
-            if (candidate / "bin" / "nvcc.exe").is_file():
-                return candidate
-    fail("CUDA Toolkit with nvcc is required")
+    if not configured or not (Path(configured) / "bin" / "nvcc.exe").is_file():
+        fail("set CUDA_PATH to the CUDA Toolkit to package (must contain bin/nvcc.exe)")
+    return Path(configured)
 
 
 def total_physical_bytes() -> int:
@@ -235,31 +217,31 @@ def preflight(context: Context) -> None:
         require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm", "codesign",
                                       "hdiutil", "install_name_tool", "lipo", "xcrun"))
         for shader in ("metal", "metallib"):
-            if subprocess.run(["xcrun", "--find", shader], capture_output=True).returncode != 0:
-                fail("Xcode Metal Toolchain is required to build release shaders")
+            run(["xcrun", "--find", shader], env=environment, capture=True)
         return
 
     if sys.platform != "win32" or sys.maxsize <= 2 ** 31:
         fail("this release target must be built on 64-bit Windows")
-    program_files = environment.get("ProgramFiles", "")
-    program_files_x86 = environment.get("ProgramFiles(x86)") or program_files
-    add_to_path(environment, str(Path(program_files) / "CMake" / "bin"))
-    add_to_path(environment, str(Path(environment.get("USERPROFILE", "")) / ".cargo" / "bin"))
-    add_to_path(environment, str(Path(program_files_x86) / "NSIS"))
-    import_visual_studio(environment)
     if context.product == "agent":
         require_commands(environment, ("node", "pnpm.cmd", "cargo", "cl"))
         return
-    context.cuda_root = find_cuda_root(environment)
-    environment["CUDA_PATH"] = str(context.cuda_root)
-    add_to_path(environment, str(context.cuda_root / "bin"))
-    add_to_path(environment, str(context.cuda_root / "lib" / "x64"))
     require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm.cmd", "cl", "nvcc"))
+    nvcc = context.cuda_root / "bin" / "nvcc.exe"
+    configured_nvcc = shutil.which("nvcc", path=environment.get("PATH", ""))
+    if not configured_nvcc or Path(configured_nvcc).resolve() != nvcc.resolve():
+        fail("nvcc on PATH must match CUDA_PATH; select one CUDA Toolkit in the build terminal")
+    redist = environment.get("VCTOOLSREDISTDIR")
+    if not redist or not (Path(redist) / "x64").is_dir():
+        fail("VCToolsRedistDir must point to the MSVC redistributables; use an x64 VS developer terminal")
 
 
 def clean(context: Context) -> None:
     for name in context.stage_directories:
-        shutil.rmtree(SCRIPT_DIR / name, ignore_errors=True)
+        remove_directory(SCRIPT_DIR / name)
+
+
+def initialize_staging(context: Context) -> None:
+    """Prepare staging and temporary paths for both clean and incremental builds."""
     for directory in (context.native_build, context.pyinstaller_build, context.spec,
                       context.sidecars, context.resources, context.output):
         directory.mkdir(parents=True, exist_ok=True)
@@ -296,13 +278,21 @@ def release_path_sources(context: Context) -> list[tuple[str, str]]:
     return [
         (home, "/mfq-build/home"),
         (run([str(context.in_venv("python")), "-c", "import sys; print(sys.base_prefix)"],
-             env=context.environment, quiet=True).strip(), "/mfq-build/python"),
+             env=context.environment, capture=True).strip(), "/mfq-build/python"),
         (str(context.venv), "/mfq-build/venv"),
         (context.environment.get("CARGO_HOME") or os.path.join(home, ".cargo"), "/mfq-build/cargo"),
         (context.environment.get("RUSTUP_HOME") or os.path.join(home, ".rustup"), "/mfq-build/rustup"),
         (str(context.cargo_target), "/mfq-build/target"),
         (str(PROJECT), "/mfq-src"),
     ]
+
+
+def cuda_host_option(flag: str) -> str:
+    # NVCC parses a comma-separated list, then forwards to the host compiler.
+    # Preserve an inner pair of quotes for that second command-line parse.
+    if "," in flag:
+        fail("CUDA release path mappings cannot contain commas")
+    return "--compiler-options=" + subprocess.list2cmdline([f'"{flag}"'])
 
 
 def configure_release_paths(context: Context) -> None:
@@ -312,14 +302,14 @@ def configure_release_paths(context: Context) -> None:
     if context.windows:
         native.append("/experimental:deterministic")
         for source, destination in release_path_sources(context):
+            if not source:
+                continue
             spellings = [source]
             if short := short_path(source):
                 spellings.append(short)
             for path in spellings:
                 for spelling in (path, path.replace("\\", "/")):
-                    # The MSVC flag stays inside one CMAKE_*_FLAGS string, so it
-                    # carries its own quoting; cc-rs is told via the env var.
-                    native.append(f'"/pathmap:{spelling}={destination}"')
+                    native.append(f"/pathmap:{spelling}={destination}")
                     rust.append(f"--remap-path-prefix={spelling}={destination}")
         rust += ["-C", "link-arg=/PDBALTPATH:tyloinfer.pdb"]
     else:
@@ -339,6 +329,13 @@ def configure_release_paths(context: Context) -> None:
     rust = (inherited.split("\x1f") if inherited else
             environment.get("RUSTFLAGS", "").split()) + rust
     environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rust)
+    if context.windows:
+        # Serialize the same structured options for NVCC independently. Arbitrary
+        # user CXXFLAGS belong to C++; CUDA host overrides belong in CUDAFLAGS.
+        environment["CUDAFLAGS"] = " ".join([
+            environment.get("CUDAFLAGS", ""), *(cuda_host_option(flag) for flag in native),
+        ]).strip()
+        native = [f'"{flag}"' for flag in native]
     # OBJCXXFLAGS falls back to CXXFLAGS before either one gains release flags.
     objective = environment.get("OBJCXXFLAGS") or environment.get("CXXFLAGS", "")
     for name, base in (("CFLAGS", environment.get("CFLAGS", "")),
@@ -353,17 +350,26 @@ def reject_in_use_environment(context: Context) -> None:
     python = context.in_venv("python")
     if not python.is_file():
         return
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
     try:
-        handle = ctypes.windll.kernel32.CreateFileW(
+        handle = create_file(
             str(python), 0x40000000, 0, None, 3, 0x80, None)  # open existing, no sharing
     except OSError:
         fail(f"release Python environment is in use or not writable: {context.venv}")
-    if handle in (-1, None):
+    if handle in (ctypes.c_void_p(-1).value, None):
         error = ctypes.get_last_error()
-        if error in (32, 5):  # sharing violation, access denied
-            fail(f"release Python environment is in use or not writable: {context.venv}")
-        return
-    ctypes.windll.kernel32.CloseHandle(handle)
+        fail(f"release Python environment is in use or not writable: {context.venv} "
+             f"(Win32 error {error})")
+    close_handle(handle)
 
 
 # --- release environment --------------------------------------------------
@@ -372,7 +378,7 @@ def create_release_environment(context: Context) -> None:
     environment = context.environment
     environment["VIRTUAL_ENV"] = str(context.venv)
     add_to_path(environment, str(context.venv / context.bin_directory))
-    if os.environ.get("TYLOINFER_RELEASE_REUSE_VENV") == "1":
+    if environment.get("TYLOINFER_RELEASE_REUSE_VENV") == "1":
         for name in ("python", "pyinstaller"):
             if not os.access(context.in_venv(name), os.X_OK if not context.windows else os.R_OK):
                 fail(f"reused release environment has no {name}")
@@ -380,7 +386,7 @@ def create_release_environment(context: Context) -> None:
     if context.windows:
         reject_in_use_environment(context)
     run(["uv", "venv", "--clear", "--python",
-         os.environ.get("TYLOINFER_RELEASE_PYTHON", "3.12"), context.venv],
+         environment.get("TYLOINFER_RELEASE_PYTHON", "3.12"), context.venv],
         cwd=PROJECT, env=environment)
     run(["uv", "sync", "--project", PYTHON_PROJECT, "--locked", "--active",
          "--no-default-groups", "--no-editable", "--group", "release",
@@ -404,7 +410,7 @@ def stage_licenses(context: Context) -> None:
 def mlx_root(context: Context) -> Path:
     root = Path(run([str(context.in_venv("python")), "-c",
                      "import mlx; print(next(iter(mlx.__path__)))"],
-                    env=context.environment, quiet=True).strip())
+                    env=context.environment, capture=True).strip())
     for name in ("lib/libmlx.dylib", "lib/libjaccl.dylib", "lib/mlx.metallib"):
         if not (root / name).is_file():
             fail(f"missing MLX runtime file: {root / name}")
@@ -414,13 +420,11 @@ def mlx_root(context: Context) -> Path:
 def build_native(context: Context, root: Path | None = None) -> None:
     environment = context.environment
     defines = ["-DTYLOINFER_BUILD_RUNTIME_COMMUNICATION=ON",
-               f"-DTYLOINFER_ENABLE_MFQ_COMPAT={os.environ.get('TYLOINFER_ENABLE_MFQ_COMPAT', 'OFF')}"]
+               f"-DTYLOINFER_ENABLE_MFQ_COMPAT={environment.get('TYLOINFER_ENABLE_MFQ_COMPAT', 'OFF')}"]
     if context.windows:
-        cuda_flags = " ".join(f"--compiler-options={flag}" for flag in
-                              environment["CXXFLAGS"].split())
         configure = ["-DCMAKE_C_FLAGS=" + environment["CFLAGS"],
                      "-DCMAKE_CXX_FLAGS=" + environment["CXXFLAGS"],
-                     f"-DCMAKE_CUDA_FLAGS={environment.get('CUDAFLAGS', '')} {cuda_flags}",
+                     f"-DCMAKE_CUDA_FLAGS={environment.get('CUDAFLAGS', '')}",
                      f"-DCMAKE_CUDA_COMPILER={context.cuda_root / 'bin' / 'nvcc.exe'}",
                      f"-DCMAKE_CUDA_ARCHITECTURES={context.cuda_architectures}",
                      f"-DTYLOINFER_CUDA_ARCHITECTURES={context.cuda_architectures}",
@@ -444,13 +448,13 @@ def build_native(context: Context, root: Path | None = None) -> None:
          *extra_build, "--parallel", context.jobs], env=environment)
 
 
-def copy_newest_native(context: Context) -> None:
-    """The CUDA target lands in a generator-dependent subdirectory."""
-    built = [path for path in context.native_build.rglob(f"{context.native_target}.exe")]
-    if not built:
-        fail("native build did not create mfq-runtime.exe")
-    context.native_output = max(built, key=lambda path: path.stat().st_mtime)
-    shutil.copyfile(context.native_output, context.sidecar)
+def stage_native(context: Context) -> Path:
+    """Ninja and the CUDA CMake target place the executable at the build root."""
+    executable = context.native_build / f"{context.native_target}{context.executable}"
+    if not executable.is_file():
+        fail(f"native build did not create {executable}")
+    shutil.copyfile(executable, context.sidecar)
+    return executable
 
 
 def copy_files(directory: Path, destination: Path, *patterns: str) -> None:
@@ -461,11 +465,11 @@ def copy_files(directory: Path, destination: Path, *patterns: str) -> None:
             shutil.copyfile(source, destination / source.name)
 
 
-def stage_windows_runtime(context: Context) -> None:
+def stage_windows_runtime(context: Context, native_output: Path) -> None:
     destination = context.windows_runtime
-    shutil.rmtree(destination, ignore_errors=True)
+    remove_directory(destination)
     destination.mkdir(parents=True)
-    copy_files(context.native_output, destination, "*.dll")
+    copy_files(native_output.parent, destination, "*.dll")
 
     root = context.cuda_root
     runtime = next((directory for directory in (root / "bin" / "x64", root / "bin")
@@ -477,7 +481,7 @@ def stage_windows_runtime(context: Context) -> None:
         if not any(destination.glob(pattern)):
             fail(f"the CUDA Toolkit did not provide the native runtime DLL matching {pattern}")
 
-    redist = context.environment.get("VCToolsRedistDir")
+    redist = context.environment.get("VCTOOLSREDISTDIR")
     if not redist:
         fail("the Visual Studio environment did not provide VCToolsRedistDir")
     x64 = Path(redist) / "x64"
@@ -534,7 +538,7 @@ def stage_macos_runtime(context: Context, root: Path) -> None:
                    context.frameworks / video.name, sidecar):
         run(["codesign", "--force", "--sign", context.signing_identity, signed], env=environment)
         run(["codesign", "--verify", "--strict", "--verbose=2", signed], env=environment)
-    architectures = run(["lipo", "-archs", sidecar], env=environment, quiet=True).split()
+    architectures = run(["lipo", "-archs", sidecar], env=environment, capture=True).split()
     if context.architecture not in architectures:
         fail(f"{sidecar} is not {context.architecture}")
     self_test(sidecar, context.resources / "mlx.metallib", environment, context.frameworks)
@@ -565,11 +569,15 @@ def build_server(context: Context) -> None:
 # --- Studio ---------------------------------------------------------------
 
 
-def build_studio(context: Context) -> None:
+def tauri_environment(context: Context) -> dict[str, str]:
     environment = {**context.environment, "CI": "true"}
     if not context.windows:
-        environment["APPLE_SIGNING_IDENTITY"] = os.environ.get("APPLE_SIGNING_IDENTITY") or \
-            context.signing_identity
+        environment["APPLE_SIGNING_IDENTITY"] = context.signing_identity
+    return environment
+
+
+def build_studio(context: Context) -> None:
+    environment = tauri_environment(context)
     command = ["run", "tauri:studio", "build",
                "--config", f"src-tauri/tauri.release-{'windows' if context.windows else 'macos'}.conf.json"]
     if not context.windows and context.signing_identity != "-":
@@ -582,17 +590,15 @@ def build_studio(context: Context) -> None:
     if context.windows:
         # The PyInstaller workpath is rebuilt by --clean. Reclaim it before Tauri
         # copies the multi-GiB sidecars and runtime resources into NSIS staging.
-        shutil.rmtree(context.pyinstaller_build, ignore_errors=True)
+        remove_directory(context.pyinstaller_build)
 
 
 def build_agent(context: Context) -> None:
     # The existing Tauri hook stages Node, DSH, the plugin, licenses and signatures.
     if context.clean:
-        shutil.rmtree(context.cargo_target, ignore_errors=True)
-        shutil.rmtree(TAURI / "agent/runtime", ignore_errors=True)
-    environment = {**context.environment, "CI": "true"}
-    if not context.windows:
-        environment["APPLE_SIGNING_IDENTITY"] = context.signing_identity
+        remove_directory(context.cargo_target)
+        remove_directory(TAURI / "agent/runtime")
+    environment = tauri_environment(context)
     pnpm = ["pnpm.cmd" if context.windows else "pnpm", "--dir", str(APP)]
     run(pnpm + ["install", "--frozen-lockfile"], env=environment)
     run(pnpm + ["exec", "tauri", "build", "--config", "src-tauri/tauri.agent.conf.json",
@@ -600,44 +606,44 @@ def build_agent(context: Context) -> None:
         env=environment)
 
 
+def select_artifact(directory: Path, pattern: str) -> Path:
+    candidates = sorted(path for path in directory.glob(pattern) if path.is_file())
+    if not candidates:
+        fail(f"no build artifact matching {pattern} in {directory}")
+    if len(candidates) != 1:
+        fail(f"ambiguous build artifacts in {directory}; remove stale outputs: "
+             + ", ".join(path.name for path in candidates))
+    return candidates[0]
+
+
 def collect_installer(context: Context) -> Path:
     context.output.mkdir(parents=True, exist_ok=True)
     bundle = context.cargo_target / context.triple / "release/bundle"
+    source = select_artifact(bundle / ("nsis" if context.windows else "dmg"),
+                             "*.exe" if context.windows else "*.dmg")
+    release = context.output / source.name
+    shutil.copyfile(source, release)
     if context.windows:
-        directory = bundle / "nsis"
-        created = sorted(directory.glob("*.exe"), key=lambda path: path.stat().st_mtime)
-        if not created:
-            fail("Tauri did not create an NSIS installer")
-        release = context.output / created[-1].name
-        shutil.copyfile(created[-1], release)
         print(f"copied {release}", flush=True)
         return release
-
-    directory = bundle / "dmg"
-    if not directory.is_dir():
-        fail("Tauri did not create a DMG directory")
-    created = sorted(directory.glob("*.dmg"), key=lambda path: path.stat().st_mtime,
-                     reverse=True)
-    if not created:
-        fail("Tauri did not create a DMG")
-    release = context.output / created[0].name
-    shutil.copyfile(created[0], release)
-    run(["hdiutil", "verify", release])
+    run(["hdiutil", "verify", release], env=context.environment)
     mount = Path(tempfile.mkdtemp(prefix="mfq-release-verify."))
     try:
         run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, release],
-            quiet=True)
+            env=context.environment, capture=True)
         try:
             app = mount / ("TyloInfer Agent.app" if context.product == "agent" else "TyloInfer.app")
-            run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
+            run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app],
+                env=context.environment)
             if context.product == "studio":
                 self_test(app / "Contents/MacOS/mfq-decode-metal",
                           app / "Contents/Resources/mlx.metallib", context.environment)
-                run([app / "Contents/Resources" / SERVER_NAME / SERVER_NAME, "--version"], quiet=True)
+                run([app / "Contents/Resources" / SERVER_NAME / SERVER_NAME, "--version"],
+                    env=context.environment, capture=True)
         finally:
-            run(["hdiutil", "detach", mount], quiet=True)
+            run(["hdiutil", "detach", mount], env=context.environment, capture=True)
     finally:
-        shutil.rmtree(mount, ignore_errors=True)
+        remove_directory(mount)
     return release
 
 
@@ -653,12 +659,16 @@ def portable_payload(project: Path, executable: Path) -> dict[str, Path]:
         path = PurePosixPath(destination.replace("\\", "/"))
         if path.is_absolute() or ".." in path.parts or ":" in str(path):
             raise ValueError(f"Unsafe archive path: {destination}")
-        if path.name.casefold() in names:
+        # Compare whole paths: resources mapped to the archive root have a bare
+        # file name, which would otherwise collide with same-named files deeper
+        # in the tree (windows-runtime/VCRUNTIME140.dll vs _internal/...).
+        key = str(path).casefold()
+        if key in names:
             raise ValueError(f"Duplicate archive path: {path}")
         if not source.is_file():
             raise FileNotFoundError(source)
         files[str(path)] = source
-        names.add(str(path).casefold())
+        names.add(key)
 
     add(executable, "tyloinfer.exe")
     for source, destination in bundle["resources"].items():
@@ -683,7 +693,7 @@ def nsis_string(value: str) -> str:
 
 
 def build_single_file_app(project: Path, executable: Path, output: Path,
-                          makensis: Path) -> Path:
+                          makensis: Path, *, environment: dict[str, str] | None = None) -> Path:
     files = portable_payload(project, executable)
     tauri = project / "app" / "src-tauri"
     packaging = project / "packaging"
@@ -720,7 +730,7 @@ def build_single_file_app(project: Path, executable: Path, output: Path,
     script.write_text(template, encoding="utf-8")
     print(f"Packing {len(files)} files into a standalone executable", flush=True)
     try:
-        subprocess.run([str(makensis), "-INPUTCHARSET", "UTF8", "-V2", str(script)], check=True)
+        run([makensis, "-INPUTCHARSET", "UTF8", "-V2", script], env=environment)
         partial.replace(destination)
     finally:
         partial.unlink(missing_ok=True)
@@ -744,11 +754,12 @@ def build_portable(context: Context) -> None:
     executable = context.cargo_target / context.triple / "release/tyloinfer.exe"
     makensis = context.cargo_target / ".tauri/NSIS/makensis.exe"
     if not makensis.is_file():
-        found = shutil.which("makensis", path=context.environment.get("PATH"))
+        found = shutil.which("makensis", path=context.environment.get("PATH", ""))
         if not found:
             fail("makensis is required to build the single-file app")
         makensis = Path(found)
-    build_single_file_app(PROJECT, executable, context.output, makensis)
+    build_single_file_app(PROJECT, executable, context.output, makensis,
+                          environment=context.environment)
 
 
 # --- orchestration --------------------------------------------------------
@@ -761,13 +772,14 @@ def build_release(context: Context) -> None:
         return
     if context.clean:
         clean(context)
+    initialize_staging(context)
     create_release_environment(context)
     configure_release_paths(context)
     stage_licenses(context)
     if context.windows:
         build_native(context)
-        copy_newest_native(context)
-        stage_windows_runtime(context)
+        native_output = stage_native(context)
+        stage_windows_runtime(context, native_output)
     else:
         root = mlx_root(context)
         build_native(context, root)
@@ -779,9 +791,13 @@ def build_release(context: Context) -> None:
         build_portable(context)
 
 
-def new_context(target: str, clean_requested: bool, product: str = "studio") -> Context:
+def new_context(target: str, clean_requested: bool, product: str = "studio", *,
+                environment: dict[str, str] | None = None) -> Context:
     windows = target == "windows"
-    environment = os.environ.copy()
+    # The caller prepares the toolchain; keep all build-local changes private.
+    environment = dict(os.environ if environment is None else environment)
+    if os.name == "nt":
+        environment = {name.upper(): value for name, value in environment.items()}
     output = Path(environment.get("TYLOINFER_RELEASE_OUTPUT_DIR") or SCRIPT_DIR / "dist")
     if product == "agent":
         # Separate Cargo output prevents Studio and Agent bundles from mixing.
@@ -795,7 +811,7 @@ def new_context(target: str, clean_requested: bool, product: str = "studio") -> 
         architecture="amd64" if windows else "arm64",
         product=product,
         clean=clean_requested or (product == "studio" and not windows),
-        venv=Path(os.environ.get("TYLOINFER_RELEASE_VENV") or SCRIPT_DIR / ".venv"),
+        venv=Path(environment.get("TYLOINFER_RELEASE_VENV") or SCRIPT_DIR / ".venv"),
         output=output,
         build=SCRIPT_DIR / "build",
         native_build=SCRIPT_DIR / "build/runtime",
@@ -820,10 +836,10 @@ def new_context(target: str, clean_requested: bool, product: str = "studio") -> 
             *_flags("--collect-all", ("mlx", "mlx_lm", "transformers", "socksio")),
             "--copy-metadata", "requests",
         ]),
-        deployment_target=os.environ.get("TYLOINFER_RELEASE_MACOS_DEPLOYMENT_TARGET", "26.2"),
-        signing_identity=os.environ.get("TYLOINFER_RELEASE_SIGNING_IDENTITY")
-        or os.environ.get("APPLE_SIGNING_IDENTITY") or "-",
-        cuda_architectures=os.environ.get("TYLOINFER_RELEASE_CUDA_ARCHITECTURES")
+        deployment_target=environment.get("TYLOINFER_RELEASE_MACOS_DEPLOYMENT_TARGET", "26.2"),
+        signing_identity=environment.get("TYLOINFER_RELEASE_SIGNING_IDENTITY")
+        or environment.get("APPLE_SIGNING_IDENTITY") or "-",
+        cuda_architectures=environment.get("TYLOINFER_RELEASE_CUDA_ARCHITECTURES")
         or "80-real;86-real;89",
         environment=environment,
     )

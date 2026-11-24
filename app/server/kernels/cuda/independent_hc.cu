@@ -171,10 +171,10 @@ template<bool Matrix> TwoStreamMhcMix prepare_routes(
             std::isfinite(rms_epsilon) && rms_epsilon > 0 && std::isfinite(gate_epsilon) && gate_epsilon >= 0 &&
             std::isfinite(post_magnitude) && post_magnitude > 0 && std::isfinite(pre_scale) && pre_scale > 0 &&
             (!with_matrix || iterations > 0), "invalid hyperconnection router geometry or parameters");
-    auto partials = tb::empty({rows, tiles, gates + 1}, function.options());
-    auto branch = tb::empty({batch, tokens, hidden}, streams.options());
-    auto post = with_post ? tb::empty({batch, tokens, count}, function.options()) : tb::Tensor{};
-    auto matrix = with_matrix ? tb::empty({batch, tokens, 4}, function.options()) : tb::Tensor{};
+    tb::Tensor partials = tb::empty({rows, tiles, gates + 1}, function.options());
+    tb::Tensor branch = tb::empty({batch, tokens, hidden}, streams.options());
+    tb::Tensor post = with_post ? tb::empty({batch, tokens, count}, function.options()) : tb::Tensor{};
+    tb::Tensor matrix = with_matrix ? tb::empty({batch, tokens, 4}, function.options()) : tb::Tensor{};
     auto stream = mfq_current_cuda_stream();
     const auto launch = [&](auto sample) {
         using T = decltype(sample);

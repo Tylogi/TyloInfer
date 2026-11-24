@@ -399,9 +399,9 @@ static mfq_tensor_backend::Tensor attention_impl_cuda(mfq_tensor_backend::Tensor
     B, Hq, Hk, T, Tk, D, rep, (float)scale, (int)causal, window)
 #define ATT_SPLIT(BD)                                                                                 \
     do {                                                                                              \
-        auto po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));                 \
-        auto pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
-        auto pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
+        mfq_tensor_backend::Tensor po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));                 \
+        mfq_tensor_backend::Tensor pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
+        mfq_tensor_backend::Tensor pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
         attention_split_part_kernel<BD, scalar_t><<<total * parts, BD, shmem, stream>>>(               \
             q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),                    \
             po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),                          \
@@ -1178,9 +1178,9 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
             seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                               \
             Hq, Hk, T, capacity, D, rep, (int)window, (float)scale, bias, sink, extent);         \
     } else {                                                                                     \
-        auto po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));            \
-        auto pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
-        auto pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
+        mfq_tensor_backend::Tensor po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));            \
+        mfq_tensor_backend::Tensor pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
+        mfq_tensor_backend::Tensor pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
         attention_cache_swa_split_part_kernel<BD, scalar_t,R><<<total * parts, BD, shmem, stream>>>( \
             q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),  \
             seq_len.data_ptr<int64_t>(), po.data_ptr<float>(), pm.data_ptr<float>(),             \

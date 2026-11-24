@@ -9,6 +9,8 @@ use std::{
 };
 use url::Url;
 
+pub(super) const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) struct Host(Child);
 
 impl Host {
@@ -17,7 +19,15 @@ impl Host {
         home: &Path,
         workspace: &Path,
     ) -> io::Result<(Self, Receiver<Url>)> {
+        // Tauri's canonicalized Windows resource path uses \\?\. Node 24
+        // fails resolving a verbatim script entry (EISDIR on the drive), before
+        // boot.mjs even runs. Keep OS-only prefixes out of Node args/env/PATH.
+        let runtime = dunce::simplified(runtime);
+        let home = dunce::simplified(home);
+        let workspace = dunce::simplified(workspace);
         fs::create_dir_all(home)?;
+        // Keep DSH's startup diagnostics instead of hiding every loader failure.
+        let diagnostics = fs::File::create(home.join("agent-startup.log"))?;
         let node = runtime.join(if cfg!(windows) { "node.exe" } else { "node" });
         let path = env::var_os("PATH").unwrap_or_default();
         let path =
@@ -34,7 +44,7 @@ impl Host {
             .env_remove("NODE_OPTIONS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(diagnostics));
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -108,6 +118,33 @@ mod tests {
         ] {
             assert!(ready_url(&format!("tyloinfer-agent ready: {url}")).is_none());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a staged Agent runtime"]
+    fn staged_runtime_starts_through_the_desktop_host() {
+        let runtime = env::var_os("TYLOINFER_AGENT_TEST_RUNTIME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/runtime"));
+        // Tauri resource_dir() is canonicalized: Windows returns a verbatim
+        // (\\?\) path, unlike the ordinary path used by the packaging smoke test.
+        let runtime = fs::canonicalize(runtime).unwrap();
+        let home = env::temp_dir().join(format!("Agent host 测试 {}", uuid::Uuid::new_v4()));
+        let workspace = env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.clone());
+        let started = Instant::now();
+        let (host, ready) = Host::start(&runtime, &home, &workspace).unwrap();
+        let result = ready.recv_timeout(STARTUP_TIMEOUT);
+        drop(host);
+        let diagnostics = fs::read_to_string(home.join("agent-startup.log")).unwrap_or_default();
+        fs::remove_dir_all(&home).unwrap();
+        assert!(
+            result.is_ok(),
+            "DSH failed after {:?}: {result:?}\n{diagnostics}",
+            started.elapsed()
+        );
+        eprintln!("DSH desktop handoff in {:?}", started.elapsed());
     }
 
     #[cfg(unix)]
