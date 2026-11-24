@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readSync, renameSync, rmSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 const here = import.meta.dirname;
 const app = resolve(here, '../..');
@@ -19,8 +19,8 @@ const nodeLicense = [join(nodeDir, 'LICENSE'), join(nodeDir, '..', 'LICENSE')].f
 if (!nodeLicense) throw new Error('Use the official Node.js archive with its LICENSE alongside node.exe or above bin/node.');
 
 function run(command, args, cwd) {
-  // Windows npm/pnpm are .cmd files; only fixed command names and shell-safe relative arguments use cmd.
-  const cmd = windows && ['npm', 'pnpm'].includes(command);
+  // Windows pnpm is a .cmd file; only fixed commands and shell-safe relative arguments use cmd.
+  const cmd = windows && command === 'pnpm';
   const result = spawnSync(cmd ? 'cmd.exe' : command, cmd ? ['/d', '/c', command, ...args] : args, { cwd, stdio: 'inherit' });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${command} failed (exit ${result.status ?? result.signal}).`);
@@ -53,17 +53,11 @@ function signMacRuntime(stage, node) {
 const stage = mkdtempSync(join(here, '.stage-'));
 try {
   run('pnpm', ['run', 'build:plugins'], app);
-  for (const file of ['package.json', 'package-lock.json']) copyFileSync(join(root, 'dsh', file), join(stage, file));
-  // Keep the platform prebuilds rather than recompiling or downloading native modules in lifecycle hooks.
-  const installFlags = ['--ignore-scripts', '--omit=dev', '--include=optional', '--no-audit', '--no-fund'];
-  run('npm', ['ci', ...installFlags], stage);
-  run('npm', ['pack', '../../../plugins', '--workspaces=false', '--ignore-scripts'], stage);
-  const archive = readdirSync(stage).find(name => /^tyloinfer-dsh-plugin-[0-9A-Za-z.-]+\.tgz$/.test(name));
-  if (!archive) throw new Error('TyloInfer plugin archive was not created.');
-  run('npm', ['install', '--offline', ...installFlags, `./${archive}`], stage);
-  rmSync(join(stage, archive));
-  rmSync(join(stage, 'package-lock.json'));
-  // The app boots DSH through its Node entry point, not npm's platform-specific bin links.
+  // Deploy the app's locked production graph as real directories for Tauri's resource copier.
+  run('pnpm', ['--filter', '@tyloinfer/app', '--config.node-linker=hoisted',
+    '--config.package-import-method=copy', 'deploy', '--prod', '--ignore-scripts',
+    `src-tauri/agent/${basename(stage)}`], app);
+  // The app boots DSH through its Node entry point, not the package manager's bin links.
   rmSync(join(stage, 'node_modules', '.bin'), { recursive: true, force: true });
 
   const node = join(stage, windows ? 'node.exe' : 'node');

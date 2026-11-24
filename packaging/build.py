@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Build the self-contained TyloInfer desktop release for one platform.
+"""Build self-contained Studio or Agent desktop releases on the target OS."""
 #
-#   uv run --no-project packaging/build_release.py --target macos
-#   uv run --no-project packaging/build_release.py --target windows
+#   uv run --no-project packaging/build.py --app studio --target macos
+#   uv run --no-project packaging/build.py --app agent --target windows
 #
 # Overrides (environment): TYLOINFER_RELEASE_PYTHON, TYLOINFER_RELEASE_VENV,
 # TYLOINFER_RELEASE_OUTPUT_DIR, TYLOINFER_RELEASE_JOBS,
@@ -91,6 +91,7 @@ class Context:
     jobs: str
     uv_extras: tuple[str, ...]
     pyinstaller_extras: list[str]
+    product: str = "studio"
     deployment_target: str = "26.2"
     signing_identity: str = "-"
     cuda_architectures: str = ""
@@ -174,7 +175,7 @@ def import_visual_studio(environment: dict[str, str]) -> None:
     # paths that are plain ASCII; switch to an explicit encoding if not.
     lines = run(["cmd.exe", "/d", "/s", "/c",
                  f'call "{development}" -no_logo -arch=x64 -host_arch=x64 >nul && set'],
-                quiet=True)
+                env=environment, quiet=True)
     for line in lines.splitlines():
         name, separator, value = line.partition("=")
         if separator and name:
@@ -228,6 +229,9 @@ def preflight(context: Context) -> None:
     if not context.windows:
         if sys.platform != "darwin" or platform.machine() != "arm64":
             fail("this release target requires native Apple Silicon macOS")
+        if context.product == "agent":
+            require_commands(environment, ("node", "pnpm", "cargo", "codesign", "hdiutil", "xcrun"))
+            return
         require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm", "codesign",
                                       "hdiutil", "install_name_tool", "lipo", "xcrun"))
         for shader in ("metal", "metallib"):
@@ -243,6 +247,9 @@ def preflight(context: Context) -> None:
     add_to_path(environment, str(Path(environment.get("USERPROFILE", "")) / ".cargo" / "bin"))
     add_to_path(environment, str(Path(program_files_x86) / "NSIS"))
     import_visual_studio(environment)
+    if context.product == "agent":
+        require_commands(environment, ("node", "pnpm.cmd", "cargo", "cl"))
+        return
     context.cuda_root = find_cuda_root(environment)
     environment["CUDA_PATH"] = str(context.cuda_root)
     add_to_path(environment, str(context.cuda_root / "bin"))
@@ -575,7 +582,23 @@ def build_studio(context: Context) -> None:
         shutil.rmtree(context.pyinstaller_build, ignore_errors=True)
 
 
+def build_agent(context: Context) -> None:
+    # The existing Tauri hook stages Node, DSH, the plugin, licenses and signatures.
+    if context.clean:
+        shutil.rmtree(context.cargo_target, ignore_errors=True)
+        shutil.rmtree(TAURI / "agent/runtime", ignore_errors=True)
+    environment = {**context.environment, "CI": "true"}
+    if not context.windows:
+        environment["APPLE_SIGNING_IDENTITY"] = context.signing_identity
+    pnpm = ["pnpm.cmd" if context.windows else "pnpm", "--dir", str(APP)]
+    run(pnpm + ["install", "--frozen-lockfile"], env=environment)
+    run(pnpm + ["exec", "tauri", "build", "--config", "src-tauri/tauri.agent.conf.json",
+                "--target", context.triple, "--bundles", "nsis" if context.windows else "dmg"],
+        env=environment)
+
+
 def collect_installer(context: Context) -> Path:
+    context.output.mkdir(parents=True, exist_ok=True)
     bundle = context.cargo_target / context.triple / "release/bundle"
     if context.windows:
         directory = bundle / "nsis"
@@ -590,7 +613,8 @@ def collect_installer(context: Context) -> Path:
     directory = bundle / "dmg"
     if not directory.is_dir():
         fail("Tauri did not create a DMG directory")
-    created = sorted(directory.glob("*.dmg"))
+    created = sorted(directory.glob("*.dmg"), key=lambda path: path.stat().st_mtime,
+                     reverse=True)
     if not created:
         fail("Tauri did not create a DMG")
     release = context.output / created[0].name
@@ -601,11 +625,12 @@ def collect_installer(context: Context) -> Path:
         run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, release],
             quiet=True)
         try:
-            app = mount / "TyloInfer.app"
+            app = mount / ("TyloInfer Agent.app" if context.product == "agent" else "TyloInfer.app")
             run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
-            self_test(app / "Contents/MacOS/mfq-decode-metal",
-                      app / "Contents/Resources/mlx.metallib", context.environment)
-            run([app / "Contents/Resources" / SERVER_NAME / SERVER_NAME, "--version"], quiet=True)
+            if context.product == "studio":
+                self_test(app / "Contents/MacOS/mfq-decode-metal",
+                          app / "Contents/Resources/mlx.metallib", context.environment)
+                run([app / "Contents/Resources" / SERVER_NAME / SERVER_NAME, "--version"], quiet=True)
         finally:
             run(["hdiutil", "detach", mount], quiet=True)
     finally:
@@ -727,6 +752,10 @@ def build_portable(context: Context) -> None:
 
 def build_release(context: Context) -> None:
     preflight(context)
+    if context.product == "agent":
+        build_agent(context)
+        print(f"built {collect_installer(context)}", flush=True)
+        return
     if context.clean:
         clean(context)
     create_release_environment(context)
@@ -747,24 +776,33 @@ def build_release(context: Context) -> None:
         build_portable(context)
 
 
-def new_context(target: str, clean_requested: bool) -> Context:
+def new_context(target: str, clean_requested: bool, product: str = "studio") -> Context:
     windows = target == "windows"
     environment = os.environ.copy()
+    output = Path(environment.get("TYLOINFER_RELEASE_OUTPUT_DIR") or SCRIPT_DIR / "dist")
+    if product == "agent":
+        # Separate Cargo output prevents Studio and Agent bundles from mixing.
+        cargo_target = TAURI / environment.get("CARGO_TARGET_DIR", "target")
+        environment["CARGO_TARGET_DIR"] = str((cargo_target / "agent").resolve())
+        if not environment.get("TYLOINFER_RELEASE_OUTPUT_DIR"):
+            output /= "agent"
     return Context(
         windows=windows,
         triple="x86_64-pc-windows-msvc" if windows else "aarch64-apple-darwin",
         architecture="amd64" if windows else "arm64",
-        clean=clean_requested or not windows,
+        product=product,
+        clean=clean_requested or (product == "studio" and not windows),
         venv=Path(os.environ.get("TYLOINFER_RELEASE_VENV") or SCRIPT_DIR / ".venv"),
-        output=Path(os.environ.get("TYLOINFER_RELEASE_OUTPUT_DIR") or SCRIPT_DIR / "dist"),
+        output=output,
         build=SCRIPT_DIR / "build",
         native_build=SCRIPT_DIR / "build/runtime",
         pyinstaller_build=SCRIPT_DIR / "build/pyinstaller",
         spec=SCRIPT_DIR / "build/spec",
         sidecars=SCRIPT_DIR / "sidecars",
         resources=SCRIPT_DIR / "Resources",
-        stage_directories=("build", "sidecars", "Resources", "windows-runtime", "dist") if windows
-        else ("build", "sidecars", "Frameworks", "Resources", "dist"),
+        # Published artifacts are not staging files; keep both products on clean builds.
+        stage_directories=("build", "sidecars", "Resources", "windows-runtime") if windows
+        else ("build", "sidecars", "Frameworks", "Resources"),
         native_target="mfq-runtime" if windows else "mfq-decode-metal",
         jobs=windows_jobs(environment) if windows else (
             environment.get("TYLOINFER_RELEASE_JOBS") or str(os.cpu_count() or 1)),
@@ -790,11 +828,17 @@ def new_context(target: str, clean_requested: bool) -> Context:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True, choices=("macos", "windows"))
+    parser.add_argument("--app", choices=("studio", "agent"), default="studio",
+                        help="desktop app to package (default: studio)")
+    parser.add_argument("--target", choices=("macos", "windows"),
+                        default={"darwin": "macos", "win32": "windows"}.get(sys.platform),
+                        required=sys.platform not in ("darwin", "win32"),
+                        help="target platform (defaults to the current macOS/Windows host)")
     parser.add_argument("--clean", action="store_true",
-                        help="also rebuild the native sidecar from scratch (default on macOS)")
+                        help="rebuild Studio staging or Agent Cargo/runtime staging from scratch "
+                             "(default for Studio on macOS; keeps published artifacts)")
     arguments = parser.parse_args()
-    build_release(new_context(arguments.target, arguments.clean))
+    build_release(new_context(arguments.target, arguments.clean, arguments.app))
     return 0
 
 

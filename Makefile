@@ -1,8 +1,9 @@
-# Wrapper around the CMake build in csrc/. Options and targets are documented in
-# docs/build.md; this file only remembers the per-host configure line and target.
+# Shortcuts for native builds, the app workspace and desktop packaging.
+# Options and targets are documented in docs/build.md and docs/packaging.md.
 
 BUILD_DIR  ?= build
 BUILD_TYPE ?= Release
+APP        ?= studio
 JOBS       ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 SERVER_VENV := app/server/.venv
 
@@ -19,7 +20,7 @@ else
   CONFIGURE :=
 endif
 
-.PHONY: all help configure engine server ui dev build serve test clean
+.PHONY: all help configure engine server ui dev build package serve test clean
 
 PARTS := engine server ui
 
@@ -32,6 +33,8 @@ help:
 	@echo "make engine R=<target>           build one native target, e.g. a test binary"
 	@echo "make test engine                 build and run the native C++ tests (R=<target> for one)"
 	@echo "make dev                         all three parts, Python with the dev extra"
+	@echo "make package                     package Studio for this macOS/Windows host"
+	@echo "make package APP=agent           package Agent (ARGS=--clean to rebuild)"
 	@echo "make clean                       remove $(BUILD_DIR)/"
 
 $(BUILD_DIR)/CMakeCache.txt:
@@ -67,6 +70,9 @@ dev: engine ui
 ui:
 	pnpm --dir app install --frozen-lockfile
 	pnpm --dir app run build:studio
+
+package:
+	pnpm --dir app run package --app "$(APP)" $(ARGS)
 
 # Start only; run make build first so the runtime, Python env and Web UI exist.
 serve:

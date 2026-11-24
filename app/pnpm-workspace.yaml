@@ -1,2 +1,6 @@
 packages:
   - plugins
+
+injectWorkspacePackages: true
+syncInjectedDepsAfterScripts:
+  - build:plugins
