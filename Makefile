@@ -3,7 +3,6 @@
 
 BUILD_DIR  ?= build
 BUILD_TYPE ?= Release
-APP        ?= studio
 JOBS       ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 SERVER_VENV := app/server/.venv
 
@@ -33,8 +32,8 @@ help:
 	@echo "make engine R=<target>           build one native target, e.g. a test binary"
 	@echo "make test engine                 build and run the native C++ tests (R=<target> for one)"
 	@echo "make dev                         all three parts, Python with the dev extra"
-	@echo "make package                     package Studio for this macOS/Windows host"
-	@echo "make package APP=agent           package Agent (ARGS=--clean to rebuild)"
+	@echo "make package studio|agent        package one app (default: Studio)"
+	@echo "make package agent -- --clean    clean rebuild of Agent"
 	@echo "make clean                       remove $(BUILD_DIR)/"
 
 $(BUILD_DIR)/CMakeCache.txt:
@@ -72,7 +71,7 @@ ui:
 	pnpm --dir app run build:studio
 
 package:
-	pnpm --dir app run package --app "$(APP)" $(ARGS)
+	pnpm --dir app run package --app "$(or $(filter studio agent,$(MAKECMDGOALS)),studio)" $(if $(filter --clean,$(MAKECMDGOALS)),--clean)
 
 # Start only; run make build first so the runtime, Python env and Web UI exist.
 serve:
@@ -85,5 +84,15 @@ test:
 	cmake --build $(BUILD_DIR) $(if $(R),--target $(R),) --parallel $(JOBS)
 	ctest --test-dir $(BUILD_DIR) -R '$(or $(R),.)' --output-on-failure
 
+# With package, these goals are arguments, not separate build or cleanup jobs.
+ifneq ($(filter package,$(MAKECMDGOALS)),)
+.PHONY: studio agent --clean
+studio agent --clean:
+	@:
+ifneq ($(filter clean,$(MAKECMDGOALS)),)
+$(error Use 'make package $(or $(filter studio agent,$(MAKECMDGOALS)),studio) -- --clean')
+endif
+else
 clean:
 	rm -rf $(BUILD_DIR)
+endif
