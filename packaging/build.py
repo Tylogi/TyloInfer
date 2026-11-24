@@ -270,6 +270,9 @@ def clean(context: Context) -> None:
         context.environment["TEMP"] = str(temporary)
         context.environment["TMP"] = str(temporary)
         context.environment["PYINSTALLER_CONFIG_DIR"] = str(context.build / "pyinstaller-cache")
+    else:
+        # Frameworks is in stage_directories; stage_macos_runtime only writes into it.
+        context.frameworks.mkdir(parents=True, exist_ok=True)
 
 
 # --- keep build-host paths out of the binaries ----------------------------

@@ -71,7 +71,7 @@ ui:
 	pnpm --dir app run build:studio
 
 package:
-	pnpm --dir app run package --app "$(or $(filter studio agent,$(MAKECMDGOALS)),studio)" $(if $(filter --clean,$(MAKECMDGOALS)),--clean)
+	cd app && pnpm run package --app "$(or $(filter studio agent,$(MAKECMDGOALS)),studio)" $(if $(filter --clean,$(MAKECMDGOALS)),--clean)
 
 # Start only; run make build first so the runtime, Python env and Web UI exist.
 serve:

@@ -1,6 +1,13 @@
 packages:
   - plugins
 
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true
+
 injectWorkspacePackages: true
 syncInjectedDepsAfterScripts:
   - build:plugins
