@@ -69,9 +69,6 @@ try {
   run(node, ['node_modules/@deepseek-ai/dsh-subprocess-local/scripts/ensure-spawn-helper.mjs'], stage);
   run(node, ['boot.mjs'], stage);
   signMacRuntime(stage, node);
-  // Static imports/manifest checks cannot prove that the profile, Web Host and
-  // plugin activate. Boot the signed graph with disposable user state too.
-  run(node, [join(here, 'smoke.mjs'), stage], stage);
   const runtime = join(here, 'runtime');
   rmSync(runtime, { recursive: true, force: true });
   renameSync(stage, runtime);

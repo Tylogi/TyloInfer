@@ -48,5 +48,10 @@ if (process.argv[2] === 'launch') {
     await shutdown.shutdown(1);
     throw new Error('The Agent profile did not start the Web Host.');
   }
-  process.stdout.write(`tyloinfer-agent ready: ${connection.authenticatedUrl(webServer.getOrigin())}\n`);
+  const provider = ctx.get('settings')?.describe({ redactSecrets: true }).find(row => row.ns === 'llm-pi-ai')?.value?.providers?.tyloinfer;
+  const port = Number(/^http:\/\/(?:127\.0\.0\.1|localhost):([1-9]\d{0,4})(?:\/v1)?\/?$/.exec(provider?.baseURL ?? '')?.[1]);
+  process.stdout.write(`tyloinfer-agent ready: ${JSON.stringify({
+    url: connection.authenticatedUrl(webServer.getOrigin()),
+    core_port: port <= 65535 ? port : null,
+  })}\n`);
 }

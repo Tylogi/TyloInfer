@@ -208,24 +208,19 @@ def windows_jobs(environment: dict[str, str]) -> str:
 
 def preflight(context: Context) -> None:
     environment = context.environment
+    node = ("node",) if context.product == "agent" else ()
     if not context.windows:
         if sys.platform != "darwin" or platform.machine() != "arm64":
             fail("this release target requires native Apple Silicon macOS")
-        if context.product == "agent":
-            require_commands(environment, ("node", "pnpm", "cargo", "codesign", "hdiutil", "xcrun"))
-            return
         require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm", "codesign",
-                                      "hdiutil", "install_name_tool", "lipo", "xcrun"))
+                                      "hdiutil", "install_name_tool", "lipo", "xcrun", *node))
         for shader in ("metal", "metallib"):
             run(["xcrun", "--find", shader], env=environment, capture=True)
         return
 
     if sys.platform != "win32" or sys.maxsize <= 2 ** 31:
         fail("this release target must be built on 64-bit Windows")
-    if context.product == "agent":
-        require_commands(environment, ("node", "pnpm.cmd", "cargo", "cl"))
-        return
-    require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm.cmd", "cl", "nvcc"))
+    require_commands(environment, ("uv", "cmake", "ninja", "cargo", "pnpm.cmd", "cl", "nvcc", *node))
     nvcc = context.cuda_root / "bin" / "nvcc.exe"
     configured_nvcc = shutil.which("nvcc", path=environment.get("PATH", ""))
     if not configured_nvcc or Path(configured_nvcc).resolve() != nvcc.resolve():
@@ -529,8 +524,9 @@ def stage_macos_runtime(context: Context, root: Path) -> None:
     manifest = context.native_build / "metal/lib/mfq-metal/manifest.json"
     if not manifest.is_file() or manifest.stat().st_size == 0:
         fail("native build did not create the precompiled MFQ Metal libraries")
-    shutil.copytree(context.native_build / "metal/lib/mfq-metal",
-                    context.resources / "mfq-metal")
+    metal = context.resources / "mfq-metal"
+    remove_directory(metal)
+    shutil.copytree(context.native_build / "metal/lib/mfq-metal", metal)
 
     run(["install_name_tool", "-add_rpath", "@executable_path/../Frameworks", sidecar],
         env=environment)
@@ -561,6 +557,14 @@ def build_server(context: Context) -> None:
     if not context.server.is_file():
         fail(f"PyInstaller did not create {context.server}")
     if not context.windows:
+        # PyInstaller hoists libmlx.dylib into _internal, but leaves mlx.metallib
+        # under mlx/lib/. libmlx loads its default metallib from its own directory;
+        # without this move the server traps right after "Application startup complete".
+        internal = context.resources / SERVER_NAME / "_internal"
+        nested = internal / "mlx" / "lib" / "mlx.metallib"
+        if not nested.is_file():
+            fail("PyInstaller did not collect the MLX default metallib")
+        nested.replace(internal / "mlx.metallib")
         run(["codesign", "--verify", "--strict", "--verbose=2", context.server], env=environment)
     run([context.server, "--version"], env=environment)
     print(f"built {context.server}", flush=True)
@@ -599,10 +603,15 @@ def build_agent(context: Context) -> None:
         remove_directory(context.cargo_target)
         remove_directory(TAURI / "agent/runtime")
     environment = tauri_environment(context)
+    platform_config = TAURI / f"tauri.release-{'windows' if context.windows else 'macos'}.conf.json"
+    core_bundle = json.loads(platform_config.read_text())
+    del core_bundle["bundle"]["resources"]["../web/dist"]
+    if not context.windows and context.signing_identity != "-":
+        core_bundle["bundle"]["macOS"]["hardenedRuntime"] = True
     pnpm = ["pnpm.cmd" if context.windows else "pnpm", "--dir", str(APP)]
     run(pnpm + ["install", "--frozen-lockfile"], env=environment)
     run(pnpm + ["exec", "tauri", "build", "--config", "src-tauri/tauri.agent.conf.json",
-                "--target", context.triple, "--bundles", "nsis" if context.windows else "dmg"],
+                "--config", json.dumps(core_bundle), "--target", context.triple],
         env=environment)
 
 
@@ -766,10 +775,6 @@ def build_portable(context: Context) -> None:
 
 def build_release(context: Context) -> None:
     preflight(context)
-    if context.product == "agent":
-        build_agent(context)
-        print(f"built {collect_installer(context)}", flush=True)
-        return
     if context.clean:
         clean(context)
     initialize_staging(context)
@@ -785,9 +790,12 @@ def build_release(context: Context) -> None:
         build_native(context, root)
         stage_macos_runtime(context, root)
     build_server(context)
-    build_studio(context)
+    if context.product == "agent":
+        build_agent(context)
+    else:
+        build_studio(context)
     print(f"built {collect_installer(context)}", flush=True)
-    if context.windows:
+    if context.windows and context.product == "studio":
         build_portable(context)
 
 
@@ -803,8 +811,6 @@ def new_context(target: str, clean_requested: bool, product: str = "studio", *,
         # Separate Cargo output prevents Studio and Agent bundles from mixing.
         cargo_target = TAURI / environment.get("CARGO_TARGET_DIR", "target")
         environment["CARGO_TARGET_DIR"] = str((cargo_target / "agent").resolve())
-        if not environment.get("TYLOINFER_RELEASE_OUTPUT_DIR"):
-            output /= "agent"
     return Context(
         windows=windows,
         triple="x86_64-pc-windows-msvc" if windows else "aarch64-apple-darwin",
@@ -854,7 +860,7 @@ def main() -> int:
                         required=sys.platform not in ("darwin", "win32"),
                         help="target platform (defaults to the current macOS/Windows host)")
     parser.add_argument("--clean", action="store_true",
-                        help="rebuild Studio staging or Agent Cargo/runtime staging from scratch "
+                        help="rebuild Core staging and, for Agent, Cargo/DSH staging from scratch "
                              "(default for Studio on macOS; keeps published artifacts)")
     arguments = parser.parse_args()
     build_release(new_context(arguments.target, arguments.clean, arguments.app))

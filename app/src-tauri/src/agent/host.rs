@@ -1,6 +1,7 @@
 use std::{
     env, fs, io,
     io::{BufRead, BufReader},
+    num::NonZeroU16,
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -13,12 +14,18 @@ pub(super) const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct Host(Child);
 
+#[derive(serde::Deserialize)]
+pub(super) struct Ready {
+    pub url: Url,
+    pub core_port: Option<NonZeroU16>,
+}
+
 impl Host {
     pub(super) fn start(
         runtime: &Path,
         home: &Path,
         workspace: &Path,
-    ) -> io::Result<(Self, Receiver<Url>)> {
+    ) -> io::Result<(Self, Receiver<Ready>)> {
         // Tauri's canonicalized Windows resource path uses \\?\. Node 24
         // fails resolving a verbatim script entry (EISDIR on the drive), before
         // boot.mjs even runs. Keep OS-only prefixes out of Node args/env/PATH.
@@ -57,9 +64,9 @@ impl Host {
             let mut sender = Some(sender);
             // Drain stdout for the process lifetime, but never log the authentication URL.
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(url) = ready_url(&line) {
+                if let Some(launch) = ready_message(&line) {
                     if let Some(sender) = sender.take() {
-                        let _ = sender.send(url);
+                        let _ = sender.send(launch);
                     }
                 }
             }
@@ -70,22 +77,27 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        drop(self.0.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        loop {
-            match self.0.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-                _ => break,
-            }
-        }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        stop_child(&mut self.0);
     }
 }
 
-fn ready_url(line: &str) -> Option<Url> {
-    let url = Url::parse(line.strip_prefix("tyloinfer-agent ready: ")?).ok()?;
+pub(super) fn stop_child(child: &mut Child) {
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn ready_message(line: &str) -> Option<Ready> {
+    let ready: Ready = serde_json::from_str(line.strip_prefix("tyloinfer-agent ready: ")?).ok()?;
+    let url = &ready.url;
     let mut query = url.query_pairs();
     let has_token = matches!(query.next(), Some((key, token)) if key == "token" && !token.is_empty())
         && query.next().is_none();
@@ -97,7 +109,7 @@ fn ready_url(line: &str) -> Option<Url> {
         && url.password().is_none()
         && url.fragment().is_none()
         && has_token)
-        .then_some(url)
+        .then_some(ready)
 }
 
 #[cfg(test)]
@@ -106,8 +118,14 @@ mod tests {
 
     #[test]
     fn only_the_authenticated_local_boot_announcement_is_accepted() {
-        assert!(ready_url("tyloinfer-agent ready: http://127.0.0.1:4321/?token=fixture").is_some());
-        assert!(ready_url("dsh web: http://127.0.0.1:4321/?token=fixture").is_none());
+        let local = r#"tyloinfer-agent ready: {"url":"http://127.0.0.1:4321/?token=fixture","core_port":8090}"#;
+        assert_eq!(ready_message(local).unwrap().core_port.unwrap().get(), 8090);
+        assert!(ready_message(&local.replace("8090", "0")).is_none());
+        assert!(ready_message(&local.replace("8090", "null"))
+            .unwrap()
+            .core_port
+            .is_none());
+        assert!(ready_message("dsh web: http://127.0.0.1:4321/?token=fixture").is_none());
         for url in [
             "http://127.0.0.2:4321/?token=fixture",
             "http://127.0.0.1:4321/",
@@ -116,7 +134,9 @@ mod tests {
             "http://user@127.0.0.1:4321/?token=fixture",
             "http://127.0.0.1:0/?token=fixture",
         ] {
-            assert!(ready_url(&format!("tyloinfer-agent ready: {url}")).is_none());
+            assert!(
+                ready_message(&format!(r#"tyloinfer-agent ready: {{"url":"{url}"}}"#)).is_none()
+            );
         }
     }
 
@@ -126,8 +146,7 @@ mod tests {
         let runtime = env::var_os("TYLOINFER_AGENT_TEST_RUNTIME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/runtime"));
-        // Tauri resource_dir() is canonicalized: Windows returns a verbatim
-        // (\\?\) path, unlike the ordinary path used by the packaging smoke test.
+        // Tauri resource_dir() returns a canonicalized verbatim path on Windows.
         let runtime = fs::canonicalize(runtime).unwrap();
         let home = env::temp_dir().join(format!("Agent host 测试 {}", uuid::Uuid::new_v4()));
         let workspace = env::var_os("USERPROFILE")
@@ -139,11 +158,13 @@ mod tests {
         drop(host);
         let diagnostics = fs::read_to_string(home.join("agent-startup.log")).unwrap_or_default();
         fs::remove_dir_all(&home).unwrap();
-        assert!(
-            result.is_ok(),
-            "DSH failed after {:?}: {result:?}\n{diagnostics}",
-            started.elapsed()
-        );
+        let ready = result.unwrap_or_else(|error| {
+            panic!(
+                "DSH failed after {:?}: {error}\n{diagnostics}",
+                started.elapsed()
+            )
+        });
+        assert_eq!(ready.core_port.map(NonZeroU16::get), Some(8090));
         eprintln!("DSH desktop handoff in {:?}", started.elapsed());
     }
 
@@ -154,12 +175,16 @@ mod tests {
         let runtime = env::temp_dir().join(format!("agent runtime {}", uuid::Uuid::new_v4()));
         fs::create_dir(&runtime).unwrap();
         let node = runtime.join("node");
-        fs::write(&node, b"#!/bin/sh\nprintf 'tyloinfer-agent ready: http://127.0.0.1:4321/?token=fixture\\n'\nread -r unused\nprintf 'closed' > \"$DSH_HOME/exited\"\n").unwrap();
+        fs::write(&node, b"#!/bin/sh\nprintf 'tyloinfer-agent ready: {\"url\":\"http://127.0.0.1:4321/?token=fixture\"}\\n'\nread -r unused\nprintf 'closed' > \"$DSH_HOME/exited\"\n").unwrap();
         fs::set_permissions(node, fs::Permissions::from_mode(0o755)).unwrap();
         let home = runtime.join("data");
         let (host, ready) = Host::start(&runtime, &home, &runtime).unwrap();
         assert_eq!(
-            ready.recv_timeout(Duration::from_secs(2)).unwrap().port(),
+            ready
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .url
+                .port(),
             Some(4321)
         );
         drop(host);

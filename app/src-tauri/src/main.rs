@@ -5,6 +5,7 @@
 
 #[cfg(feature = "agent")]
 mod agent;
+mod core_process;
 #[cfg(not(feature = "agent"))]
 mod studio;
 
