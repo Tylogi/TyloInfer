@@ -551,7 +551,7 @@ void matvec_quad_pair_small_m(const QuadProjection* projections,size_t count,int
         const bool offset=d.type==GGML_TYPE_IQ1_S || d.type==GGML_TYPE_IQ1_M || d.type==GGML_TYPE_Q2_K;
         const bool split=iq2 || (tokens>=5 && offset);
         const auto* input=split?interleaved:native;
-        if(split!=position_major[i] || !input || (reinterpret_cast<uintptr_t>(input)&3) ||
+        if(static_cast<uint8_t>(split)!=position_major[i] || !input || (reinterpret_cast<uintptr_t>(input)&3) ||
                 (split && tokens>=5 && (reinterpret_cast<uintptr_t>(input)&15)))
             throw std::invalid_argument("Typed pair activation layout/alignment differs");
     }

@@ -945,7 +945,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         if(physical>=0 && id<history.block_count) {
                             const int slot=history.inverse[int64_t(token)*history.block_count+id];
                             if(slot>=0)history.logmass[(int64_t(token)*ne02+head)*history.selected_count+slot]=
-                                mass4>0?KQ_max_new[pair]+__logf(mass4):-INFINITY;
+                                mass4>0?KQ_max_new[pair]+__logf(mass4):-CUDART_INF_F;
                         }
                     }
                 }
@@ -1716,7 +1716,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             const int token=jt*ncols1+col/ncols2,head=head_base+col%ncols2;
             if(token<int(ne01.z) && head_base%history.gqa+col%ncols2<history.gqa) {
                 const float2 meta=((const float2*)tile_Q)[col*(tile_stride/2)+nbatch_combine/2];
-                history.norm[int64_t(token)*ne02+head]=meta.y>0?meta.x+__logf(meta.y):-INFINITY;
+                history.norm[int64_t(token)*ne02+head]=meta.y>0?meta.x+__logf(meta.y):-CUDART_INF_F;
             }
         }
         __syncthreads();

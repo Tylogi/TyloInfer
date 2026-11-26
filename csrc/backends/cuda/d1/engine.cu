@@ -2,6 +2,7 @@
 #include "models/lfm3/layer_weights.h"
 #include "models/lfm3/request.h"
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include "backends/cuda/kernels/gguf.h"
@@ -192,7 +193,7 @@ __global__ void softmax_kernel(const float* scores, float* probability, const in
     __shared__ float sums[256];
     const auto row = std::size_t(blockIdx.x) * tokens;
     const int query = start + int(blockIdx.x % chunk);
-    float maximum = -INFINITY;
+    float maximum = -CUDART_INF_F;
     for (int key = threadIdx.x; key < tokens; key += blockDim.x) {
         const bool visible = window ? key <= query && key > query - window : query < state || key < state || groups[key] == groups[query];
         if (visible) maximum = fmaxf(maximum, scores[row + key] * scale);

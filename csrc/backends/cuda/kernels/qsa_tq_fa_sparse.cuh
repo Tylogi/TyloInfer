@@ -97,7 +97,7 @@ static __global__ void qsa_fa_split(tyloinfer::qsa::TqPrefillAttention a,const h
         }
         for(int i=threadIdx.y*32+threadIdx.x;i<64;i+=warps*32) {
             const int q=group*8+i/8,h=head+i%8;
-            if(q<a.queries && h<kv_head*gqa+gqa)history.norm[int64_t(q)*a.heads+h]=-INFINITY;
+            if(q<a.queries && h<kv_head*gqa+gqa)history.norm[int64_t(q)*a.heads+h]=-CUDART_INF_F;
         }
         return;
     }
@@ -119,7 +119,7 @@ static __global__ void qsa_fa_split(tyloinfer::qsa::TqPrefillAttention a,const h
 static __global__ void qsa_fa_merge(float* output,float* norm,const float* partial,const float* norms,
         int rows,int parts) {
     const int row=blockIdx.x,d=threadIdx.x;
-    float maximum=-INFINITY;
+    float maximum=-CUDART_INF_F;
     for(int p=0;p<parts;++p)maximum=fmaxf(maximum,norms[int64_t(p)*rows+row]);
     float sum=0,value=0;
     for(int p=0;p<parts;++p) {
@@ -128,5 +128,5 @@ static __global__ void qsa_fa_merge(float* output,float* norm,const float* parti
         sum+=scale;value+=scale*partial[(int64_t(p)*rows+row)*256+d];
     }
     output[int64_t(row)*256+d]=sum>0?value/sum:0.f;
-    if(!d && norm)norm[row]=sum>0?maximum+__logf(sum):-INFINITY;
+    if(!d && norm)norm[row]=sum>0?maximum+__logf(sum):-CUDART_INF_F;
 }

@@ -34,7 +34,7 @@ static void dequantize_gyro(const void * src, float * dst, int64_t count, unsign
 }
 
 #define GGML_GYRO_DECODER(name, bits, steps) \
-    static void dequantize_row_##name(const void * src, float * dst, int64_t count) { \
+    static void dequantize_row_##name(const void * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t count) { \
         dequantize_gyro(src, dst, count, bits, steps); \
     }
 GGML_GYRO_DECODER(tq2_t, 8, 32)

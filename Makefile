@@ -3,10 +3,17 @@
 
 BUILD_DIR  ?= build
 BUILD_TYPE ?= Release
-JOBS       ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 SERVER_VENV := app/server/.venv
 
-ifeq ($(shell uname -s),Darwin)
+ifneq ($(strip $(filter Windows_NT,$(OS))$(ComSpec)$(COMSPEC)$(SystemRoot)$(SYSTEMROOT)),)
+  HOST_OS := Windows
+  JOBS ?= $(or $(NUMBER_OF_PROCESSORS),1)
+else
+  HOST_OS := $(shell uname -s)
+  JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
+endif
+
+ifeq ($(HOST_OS),Darwin)
   # CMake looks for MLX under <repo>/.venv; uv keeps it in the server project.
   TARGET    := mfq-decode-metal
   RUNTIME   := $(BUILD_DIR)/metal/$(TARGET)
@@ -88,7 +95,6 @@ test:
 ifneq ($(filter package,$(MAKECMDGOALS)),)
 .PHONY: studio agent --clean
 studio agent --clean:
-	@:
 ifneq ($(filter clean,$(MAKECMDGOALS)),)
 $(error Use 'make package $(or $(filter studio agent,$(MAKECMDGOALS)),studio) -- --clean')
 endif
