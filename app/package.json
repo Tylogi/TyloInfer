@@ -11,6 +11,7 @@
     "preview:studio": "vite preview --config web/vite.config.ts",
     "check:studio": "tsc -b web && cargo check --manifest-path src-tauri/Cargo.toml",
     "test:studio": "vitest run --config web/vitest.config.ts",
+    "test:packaging": "node --test src-tauri/agent/runtime-stage.test.mjs",
     "test:e2e:studio": "playwright test --config web/playwright.config.ts",
     "tauri:studio": "tauri",
     "package": "uv run --no-project ../packaging/build.py",

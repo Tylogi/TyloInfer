@@ -3,3 +3,4 @@
 /target/
 /agent/runtime/
 /agent/.stage-*/
+/agent/.runtime-backup-*/

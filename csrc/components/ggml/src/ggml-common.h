@@ -2,6 +2,7 @@
 
 #if defined(GGML_COMMON_DECL_C)
 #include <stdint.h>
+#include <assert.h>
 
 typedef uint16_t ggml_half;
 typedef uint32_t ggml_half2;

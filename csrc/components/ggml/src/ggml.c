@@ -618,7 +618,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 }
 
-static void dequantize_row_q2_0(const void * src, float * dst, int64_t count) {
+static void dequantize_row_q2_0(const void * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t count) {
     GGML_ASSERT(count % 64 == 0);
     const uint8_t * block = src;
     for (int64_t base = 0; base < count; base += 64, block += 18) {
@@ -633,7 +633,7 @@ static void dequantize_row_q2_0(const void * src, float * dst, int64_t count) {
     }
 }
 
-static void dequantize_row_ptq1_0(const void * src, float * dst, int64_t count) {
+static void dequantize_row_ptq1_0(const void * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t count) {
     GGML_ASSERT(count % 128 == 0);
     const uint8_t * block = src;
     const unsigned powers[] = { 1, 3, 9, 27, 81 };

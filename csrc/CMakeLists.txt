@@ -6,6 +6,14 @@ include(CTest)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Release flag overrides must not disable C++ stack unwinding on Windows.
+if(MSVC)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xcompiler=/EHsc>
+    )
+endif()
+
 set(TYLOINFER_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 option(TYLOINFER_ENABLE_MFQ_COMPAT "Include legacy MFQ inference formats" OFF)

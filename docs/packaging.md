@@ -7,8 +7,7 @@ TyloInfer Studio and Agent desktop releases support macOS and Windows. One scrip
 
 Studio packages include the server, Python environment, native runtime, and
 required runtime libraries. Agent is a separate DSH desktop shell with bundled
-Node.js and the TyloInfer plugin; it connects to a separately running TyloInfer
-service rather than bundling Studio's Python/CUDA runtime.
+Node.js, the TyloInfer plugin, and the same local Core service and native runtime.
 
 ## macOS
 
@@ -95,10 +94,29 @@ uv run --no-project packaging/build.py --app agent --target windows
 # On macOS, use --target macos.
 ```
 
-Agent needs Rust, the platform C++ build tools, pnpm, and the official Node.js 24
-archive (24.9 or newer, with its LICENSE). It does not need CUDA or the release
-Python environment. Its separate Cargo output and runtime staging do not replace
-Studio artifacts.
+Agent needs the Core build prerequisites above, plus the official Node.js 24
+archive (24.9 or newer, with its LICENSE). Its separate Cargo output and runtime
+staging do not replace Studio artifacts.
+
+Windows Agent requires Windows 10 1803 or newer (or Windows 11). The build
+precompresses Core and Agent resources into a ZIP before handing them to NSIS,
+avoiding its 2 GiB uncompressed solid-block limit. The installer extracts the ZIP
+with Windows' native tar.exe and removes the temporary archive. Disk space checks
+include both the temporary ZIP and its expanded payload. End users do not
+need Python, Node.js, CUDA Toolkit, or a development environment. Uninstall removes
+only installed payload paths and keeps the user profile outside the installation.
+
+The validated Agent stage is promoted with bounded retries for temporary Windows
+file locks. A failed promotion restores the previous runtime and retains the
+validated stage; if rollback also fails, the error reports both recovery paths.
+Do not remove a reported backup until the prior runtime has been recovered.
+
+Run packaging regressions without building CUDA or Rust:
+
+```shell
+node --test app/src-tauri/agent/runtime-stage.test.mjs
+python -m unittest discover -s packaging/tests -v
+```
 
 The Tauri build hook deploys the locked production dependency graph, checks the
 bundled manifests, and launches the actual profile with a temporary `DSH_HOME`.

@@ -196,7 +196,7 @@ __global__ void attend(const float* query, const History* ring_key, const Histor
     const int row = item / heads, head = item % heads, kv = head / (heads / kv_heads);
     const auto begin = max(std::int64_t(0), position - window + 1);
     const int past = int(position - begin), total = past + rows;
-    float maximum = -INFINITY, mass = 0, accumulator[Values]{};
+    float maximum = -CUDART_INF_F, mass = 0, accumulator[Values]{};
     float q[Values];
     #pragma unroll
     for (int i = 0; i < Values; ++i) q[i] = lane + i * 32 < dimension ?
@@ -230,7 +230,7 @@ template<int Values>
 __global__ void merge(const float* partial, float* output, int count, int dimension, int chunks) {
     const int item = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
     if (item >= count) return;
-    float maximum = -INFINITY, mass = 0, accumulator[Values]{};
+    float maximum = -CUDART_INF_F, mass = 0, accumulator[Values]{};
     for (int chunk = 0; chunk < chunks; ++chunk)
         maximum = fmaxf(maximum, partial[(std::int64_t(chunk) * count + item) * (dimension + 2)]);
     for (int chunk = 0; chunk < chunks; ++chunk) {

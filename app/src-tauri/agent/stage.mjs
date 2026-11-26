@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readSync, renameSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { publishRuntime, removeDirectory } from './runtime-stage.mjs';
 
 const here = import.meta.dirname;
 const app = resolve(here, '../..');
@@ -58,7 +59,7 @@ try {
     '--config.package-import-method=copy', 'deploy', '--prod', '--ignore-scripts',
     `src-tauri/agent/${basename(stage)}`], app);
   // The app boots DSH through its Node entry point, not the package manager's bin links.
-  rmSync(join(stage, 'node_modules', '.bin'), { recursive: true, force: true });
+  removeDirectory(join(stage, 'node_modules', '.bin'));
 
   const node = join(stage, windows ? 'node.exe' : 'node');
   copyFileSync(process.execPath, node);
@@ -69,9 +70,17 @@ try {
   run(node, ['node_modules/@deepseek-ai/dsh-subprocess-local/scripts/ensure-spawn-helper.mjs'], stage);
   run(node, ['boot.mjs'], stage);
   signMacRuntime(stage, node);
-  const runtime = join(here, 'runtime');
-  rmSync(runtime, { recursive: true, force: true });
-  renameSync(stage, runtime);
-} finally {
-  rmSync(stage, { recursive: true, force: true });
+  run(node, [join(here, 'smoke.mjs'), stage], app);
+} catch (error) {
+  try {
+    removeDirectory(stage);
+  } catch (cleanupError) {
+    console.warn('Could not remove failed Agent stage at ' + stage + ': ' + cleanupError.message);
+  }
+  throw error;
+}
+await publishRuntime(stage, join(here, 'runtime'));
+if (windows && process.env.TYLOINFER_STAGE_AGENT_ARCHIVE === '1') {
+  run('uv', ['run', '--no-project', '../packaging/build.py', '--app', 'agent',
+    '--target', 'windows', '--stage-agent-archive'], app);
 }

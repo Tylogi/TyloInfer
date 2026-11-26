@@ -31,6 +31,8 @@ import sys
 import tempfile
 import zipfile
 
+from agent_payload import build_agent_payload
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT = SCRIPT_DIR.parent
 APP = PROJECT / "app"
@@ -608,6 +610,19 @@ def build_agent(context: Context) -> None:
     del core_bundle["bundle"]["resources"]["../web/dist"]
     if not context.windows and context.signing_identity != "-":
         core_bundle["bundle"]["macOS"]["hardenedRuntime"] = True
+    if context.windows:
+        # The hook prepares this archive after validating the deployed Node graph.
+        environment["TYLOINFER_STAGE_AGENT_ARCHIVE"] = "1"
+        core_bundle["bundle"]["resources"] = {
+            "agent/runtime/": None,
+            "../web/dist": None,
+            "../../packaging/build/agent-payload.zip": "agent-payload.zip",
+        }
+        core_bundle["bundle"]["externalBin"] = []
+        core_bundle["bundle"]["windows"]["nsis"].update({
+            "compression": "none",
+            "installerHooks": "../../packaging/windows_agent_hooks.nsh",
+        })
     pnpm = ["pnpm.cmd" if context.windows else "pnpm", "--dir", str(APP)]
     run(pnpm + ["install", "--frozen-lockfile"], env=environment)
     run(pnpm + ["exec", "tauri", "build", "--config", "src-tauri/tauri.agent.conf.json",
@@ -862,7 +877,13 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true",
                         help="rebuild Core staging and, for Agent, Cargo/DSH staging from scratch "
                              "(default for Studio on macOS; keeps published artifacts)")
+    parser.add_argument("--stage-agent-archive", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if arguments.stage_agent_archive:
+        if arguments.app != "agent" or arguments.target != "windows":
+            parser.error("--stage-agent-archive requires Windows Agent")
+        build_agent_payload(PROJECT, SCRIPT_DIR / "build/agent-payload.zip")
+        return 0
     build_release(new_context(arguments.target, arguments.clean, arguments.app))
     return 0
 

@@ -25,7 +25,7 @@ __global__ void __launch_bounds__(128) attend_tiled(const float* __restrict__ qu
     if(start>=total) {
         for(int i=tid;i<32*(Dimension+2);i+=128) {
             const int qi=i/(Dimension+2),d=i%(Dimension+2);
-            if(qbase+qi<queries)destination(qi)[d]=d==0?-INFINITY:0.f;
+            if(qbase+qi<queries)destination(qi)[d]=d==0?-CUDART_INF_F:0.f;
         }
         return;
     }
@@ -40,7 +40,7 @@ __global__ void __launch_bounds__(128) attend_tiled(const float* __restrict__ qu
         }
         *reinterpret_cast<float4*>(qs+qi*AS+d4*4)=q;
     }
-    if(tid<32){peaks[tid]=-INFINITY;masses[tid]=0.f;}
+    if(tid<32){peaks[tid]=-CUDART_INF_F;masses[tid]=0.f;}
     float output[QueriesPerThread][8]{};
     const int output_q=tid/DimThreads*QueriesPerThread,output_d=tid%DimThreads*8;
     const auto fetch=[&](int first,float4 (&reg)[Loads],const History* ring,const float* block) {
@@ -83,21 +83,21 @@ __global__ void __launch_bounds__(128) attend_tiled(const float* __restrict__ qu
                 for(int j=0;j<4;++j) {
                     const int qi=qgroup*4+i,t=kgroup*4+j,k=first+t,row=(qbase+qi)/gqa;
                     const bool valid=qbase+qi<queries && k<total && (k>=past || lo+k>position+row-window);
-                    scores[qi*33+t]=valid?accum[i][j]:-INFINITY;
+                    scores[qi*33+t]=valid?accum[i][j]:-CUDART_INF_F;
                 }
         }
         __syncthreads();
         {
-            const int qi=tid>>2,sub=tid&3;float values[8],maximum=-INFINITY;
+            const int qi=tid>>2,sub=tid&3;float values[8],maximum=-CUDART_INF_F;
 #pragma unroll
             for(int u=0;u<8;++u){values[u]=scores[qi*33+sub*8+u];maximum=fmaxf(maximum,values[u]);}
             maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,1));
             maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,2));
-            const float peak=fmaxf(peaks[qi],maximum),correction=peaks[qi]==-INFINITY?0.f:__expf(peaks[qi]-peak);
+            const float peak=fmaxf(peaks[qi],maximum),correction=peaks[qi]==-CUDART_INF_F?0.f:__expf(peaks[qi]-peak);
             float mass=0;
 #pragma unroll
             for(int u=0;u<8;++u) {
-                const float p=values[u]==-INFINITY?0.f:__expf(values[u]-peak);
+                const float p=values[u]==-CUDART_INF_F?0.f:__expf(values[u]-peak);
                 probabilities[(sub*8+u)*PS+qi]=p;mass+=p;
             }
             mass+=__shfl_xor_sync(0xffffffff,mass,1);mass+=__shfl_xor_sync(0xffffffff,mass,2);

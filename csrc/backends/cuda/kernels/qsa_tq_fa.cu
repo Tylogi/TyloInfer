@@ -3,6 +3,7 @@
 // Copyright (c) 2023-2026 The ggml authors.
 // Native additions preserve four-token groups, packed H4 KV, and QSA history.
 // See LICENSES/llama.cpp-MIT.txt.
+#include <math_constants.h>
 #include "qsa_tq_fa_mma.cuh"
 #include "qsa_tq_fa.h"
 #include "qsa_tq_fa_sparse.cuh"
